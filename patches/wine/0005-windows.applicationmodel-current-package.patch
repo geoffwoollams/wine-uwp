@@ -1,0 +1,593 @@
+Subject: windows.applicationmodel: Package/PackageId/PackageStatus for the current package
+
+diff --git a/dlls/windows.applicationmodel/Makefile.in b/dlls/windows.applicationmodel/Makefile.in
+index fb6bf8e..0e5274f 100644
+--- a/dlls/windows.applicationmodel/Makefile.in
++++ b/dlls/windows.applicationmodel/Makefile.in
+@@ -5,4 +5,6 @@ SOURCES = \
+ 	classes.idl \
+ 	designmode.c \
+ 	main.c \
+-	package.c
++	package.c \
++	packageid_gen.c \
++	packagestatus_gen.c
+diff --git a/dlls/windows.applicationmodel/package.c b/dlls/windows.applicationmodel/package.c
+index 5d55188..51b66df 100644
+--- a/dlls/windows.applicationmodel/package.c
++++ b/dlls/windows.applicationmodel/package.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "private.h"
++#include "appmodel.h"
+ #include "wine/debug.h"
+ 
+ #include "pathcch.h"
+@@ -373,9 +374,16 @@ static const struct IStorageItemVtbl storage_item_vtbl =
+     storage_item_IsOfType,
+ };
+ 
++
++/* IPackage4 {65aed1ae-b95b-450c-882b-6255187f397e}: not in Wine's IDL. Believed: SignatureKind, IsOptional, VerifyContentIntegrityAsync. */
++static const GUID IID_IPackage4_probe = { 0x65aed1ae, 0xb95b, 0x450c, { 0x88, 0x2b, 0x62, 0x55, 0x18, 0x7f, 0x39, 0x7e } };
++static HRESULT WINAPI package_QueryInterface( IPackage *iface, REFIID iid, void **out );
+ struct package
+ {
+     IPackage IPackage_iface;
++    IPackage2 IPackage2_iface;
++    IPackage3 IPackage3_iface;
++    const void *const *IPackage4_vtbl; /* hand-declared, probing */
+     LONG ref;
+ };
+ 
+@@ -400,6 +408,27 @@ static HRESULT WINAPI package_QueryInterface( IPackage *iface, REFIID iid, void
+         return S_OK;
+     }
+ 
++    if (IsEqualGUID( iid, &IID_IPackage2 ))
++    {
++        *out = &impl->IPackage2_iface;
++        IInspectable_AddRef( (IInspectable *)&impl->IPackage_iface );
++        return S_OK;
++    }
++
++    if (IsEqualGUID( iid, &IID_IPackage4_probe ))
++    {
++        *out = &impl->IPackage4_vtbl;
++        IInspectable_AddRef( (IInspectable *)&impl->IPackage_iface );
++        return S_OK;
++    }
++
++    if (IsEqualGUID( iid, &IID_IPackage3 ))
++    {
++        *out = &impl->IPackage3_iface;
++        IInspectable_AddRef( (IInspectable *)&impl->IPackage_iface );
++        return S_OK;
++    }
++
+     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+     *out = NULL;
+     return E_NOINTERFACE;
+@@ -444,8 +473,9 @@ static HRESULT WINAPI package_GetTrustLevel( IPackage *iface, TrustLevel *trust_
+ 
+ static HRESULT WINAPI package_get_Id( IPackage *iface, IPackageId **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    return package_id_create( value );
+ }
+ 
+ static HRESULT WINAPI package_get_InstalledLocation( IPackage *iface, IStorageFolder **value )
+@@ -496,6 +526,148 @@ static const struct IPackageVtbl package_vtbl =
+ 
+ DEFINE_IINSPECTABLE( package_statics, IPackageStatics, struct package_statics, IActivationFactory_iface )
+ 
++
++/* IPackage2: display properties from AppxManifest.xml. */
++static inline struct package *impl_from_IPackage2( IPackage2 *iface )
++{
++    return CONTAINING_RECORD( iface, struct package, IPackage2_iface );
++}
++static HRESULT WINAPI package2_QueryInterface( IPackage2 *iface, REFIID iid, void **out )
++{ return package_QueryInterface( &impl_from_IPackage2( iface )->IPackage_iface, iid, out ); }
++static ULONG WINAPI package2_AddRef( IPackage2 *iface )
++{ return package_AddRef( &impl_from_IPackage2( iface )->IPackage_iface ); }
++static ULONG WINAPI package2_Release( IPackage2 *iface )
++{ return package_Release( &impl_from_IPackage2( iface )->IPackage_iface ); }
++static HRESULT WINAPI package2_GetIids( IPackage2 *iface, ULONG *c, IID **i ) { return E_NOTIMPL; }
++static HRESULT WINAPI package2_GetRuntimeClassName( IPackage2 *iface, HSTRING *n ) { return E_NOTIMPL; }
++static HRESULT WINAPI package2_GetTrustLevel( IPackage2 *iface, TrustLevel *l ) { *l = BaseTrust; return S_OK; }
++/* Text of <Properties><element> in the package's AppxManifest.xml, as a new HSTRING ("" if missing). */
++static HRESULT manifest_property( const char *element, HSTRING *value )
++{
++    WCHAR path[MAX_PATH], buffer[512] = L"";
++    char *data = NULL, open_tag[64], close_tag[64], *props, *p, *e;
++    UINT32 len = MAX_PATH - 20;
++    LARGE_INTEGER size;
++    DWORD read = 0;
++    HANDLE file;
++
++    if (!GetCurrentPackagePath( &len, path ))
++    {
++        wcscat( path, L"\\AppxManifest.xml" );
++        file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++        if (file != INVALID_HANDLE_VALUE)
++        {
++            if (GetFileSizeEx( file, &size ) && size.QuadPart < 4 * 1024 * 1024 && (data = malloc( size.QuadPart + 1 )))
++            {
++                if (!ReadFile( file, data, size.QuadPart, &read, NULL )) read = 0;
++                data[read] = 0;
++            }
++            CloseHandle( file );
++        }
++    }
++    snprintf( open_tag, sizeof(open_tag), "<%s>", element );
++    snprintf( close_tag, sizeof(close_tag), "</%s>", element );
++    if (data && (props = strstr( data, "<Properties" )) && (p = strstr( props, open_tag )) && (e = strstr( p, close_tag )))
++    {
++        p += strlen( open_tag );
++        *e = 0;
++        /* TODO: XML entities and ms-resource: references (resources.pri) */
++        if (strncmp( p, "ms-resource:", 12 )) MultiByteToWideChar( CP_UTF8, 0, p, -1, buffer, ARRAY_SIZE(buffer) );
++    }
++    free( data );
++    return WindowsCreateString( buffer, wcslen( buffer ), value );
++}
++
++static HRESULT WINAPI package2_get_DisplayName( IPackage2 *iface, HSTRING *value )
++{
++    TRACE( "iface %p.\n", iface );
++    return manifest_property( "DisplayName", value );
++}
++static HRESULT WINAPI package2_get_PublisherDisplayName( IPackage2 *iface, HSTRING *value )
++{
++    TRACE( "iface %p.\n", iface );
++    return manifest_property( "PublisherDisplayName", value );
++}
++static HRESULT WINAPI package2_get_Description( IPackage2 *iface, HSTRING *value )
++{
++    TRACE( "iface %p.\n", iface );
++    return manifest_property( "Description", value );
++}
++static HRESULT WINAPI package2_get_Logo( IPackage2 *iface, IUriRuntimeClass **value )
++{ FIXME( "iface %p, value %p stub!\n", iface, value ); *value = NULL; return E_NOTIMPL; }
++static HRESULT WINAPI package2_get_IsResourcePackage( IPackage2 *iface, boolean *value ) { *value = FALSE; return S_OK; }
++static HRESULT WINAPI package2_get_IsBundle( IPackage2 *iface, boolean *value ) { *value = FALSE; return S_OK; }
++static HRESULT WINAPI package2_get_IsDevelopmentMode( IPackage2 *iface, boolean *value ) { *value = FALSE; return S_OK; }
++
++static const struct IPackage2Vtbl package2_vtbl =
++{
++    package2_QueryInterface, package2_AddRef, package2_Release,
++    package2_GetIids, package2_GetRuntimeClassName, package2_GetTrustLevel,
++    package2_get_DisplayName, package2_get_PublisherDisplayName, package2_get_Description, package2_get_Logo,
++    package2_get_IsResourcePackage, package2_get_IsBundle, package2_get_IsDevelopmentMode,
++};
++
++
++static inline struct package *impl_from_IPackage3( IPackage3 *iface )
++{
++    return CONTAINING_RECORD( iface, struct package, IPackage3_iface );
++}
++static HRESULT WINAPI package3_QueryInterface( IPackage3 *iface, REFIID iid, void **out )
++{ return package_QueryInterface( &impl_from_IPackage3( iface )->IPackage_iface, iid, out ); }
++static ULONG WINAPI package3_AddRef( IPackage3 *iface )
++{ return package_AddRef( &impl_from_IPackage3( iface )->IPackage_iface ); }
++static ULONG WINAPI package3_Release( IPackage3 *iface )
++{ return package_Release( &impl_from_IPackage3( iface )->IPackage_iface ); }
++static HRESULT WINAPI package3_GetIids( IPackage3 *iface, ULONG *c, IID **i ) { return E_NOTIMPL; }
++static HRESULT WINAPI package3_GetRuntimeClassName( IPackage3 *iface, HSTRING *n ) { return E_NOTIMPL; }
++static HRESULT WINAPI package3_GetTrustLevel( IPackage3 *iface, TrustLevel *l ) { *l = BaseTrust; return S_OK; }
++static HRESULT WINAPI package3_get_Status( IPackage3 *iface, IPackageStatus **value )
++{ TRACE( "iface %p, value %p.\n", iface, value ); return package_status_create( value ); }
++static HRESULT WINAPI package3_get_InstalledDate( IPackage3 *iface, DateTime *value )
++{
++    FILETIME ft;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    GetSystemTimeAsFileTime( &ft );
++    value->UniversalTime = ((INT64)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
++    return S_OK;
++}
++static HRESULT WINAPI package3_GetAppListEntriesAsync( IPackage3 *iface, __FIAsyncOperation_1___FIVectorView_1_Windows__CApplicationModel__CCore__CAppListEntry **operation )
++{ FIXME( "iface %p, operation %p stub!\n", iface, operation ); return E_NOTIMPL; }
++
++static const struct IPackage3Vtbl package3_vtbl =
++{
++    package3_QueryInterface, package3_AddRef, package3_Release,
++    package3_GetIids, package3_GetRuntimeClassName, package3_GetTrustLevel,
++    package3_get_Status, package3_get_InstalledDate, package3_GetAppListEntriesAsync,
++};
++
++
++static inline struct package *impl_from_IPackage4_vtbl( void *iface )
++{
++    return CONTAINING_RECORD( iface, struct package, IPackage4_vtbl );
++}
++static HRESULT WINAPI package4_QueryInterface( void *iface, REFIID iid, void **out )
++{ return package_QueryInterface( &impl_from_IPackage4_vtbl( iface )->IPackage_iface, iid, out ); }
++static ULONG WINAPI package4_AddRef( void *iface )
++{ return package_AddRef( &impl_from_IPackage4_vtbl( iface )->IPackage_iface ); }
++static ULONG WINAPI package4_Release( void *iface )
++{ return package_Release( &impl_from_IPackage4_vtbl( iface )->IPackage_iface ); }
++static HRESULT WINAPI package4_GetIids( void *iface, ULONG *c, IID **i ) { return E_NOTIMPL; }
++static HRESULT WINAPI package4_GetRuntimeClassName( void *iface, HSTRING *n ) { return E_NOTIMPL; }
++static HRESULT WINAPI package4_GetTrustLevel( void *iface, TrustLevel *l ) { *l = BaseTrust; return S_OK; }
++static HRESULT WINAPI package4_slot6( void *iface, INT32 *value )
++{ FIXME( "IPackage4 slot 6 (SignatureKind?) -> Store\n" ); *value = 3; return S_OK; }
++static HRESULT WINAPI package4_slot7( void *iface, boolean *value )
++{ FIXME( "IPackage4 slot 7 (IsOptional?) -> FALSE\n" ); *value = FALSE; return S_OK; }
++static HRESULT WINAPI package4_slot8( void *iface, void *a )
++{ FIXME( "IPackage4 slot 8 called (a=%p)\n", a ); return E_NOTIMPL; }
++static const void *const package4_vtbl[] =
++{
++    package4_QueryInterface, package4_AddRef, package4_Release,
++    package4_GetIids, package4_GetRuntimeClassName, package4_GetTrustLevel,
++    package4_slot6, package4_slot7, package4_slot8,
++};
++
+ static HRESULT WINAPI package_statics_get_Current( IPackageStatics *iface, IPackage **value )
+ {
+     struct package *impl;
+@@ -506,6 +678,9 @@ static HRESULT WINAPI package_statics_get_Current( IPackageStatics *iface, IPack
+     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+ 
+     impl->IPackage_iface.lpVtbl = &package_vtbl;
++    impl->IPackage2_iface.lpVtbl = &package2_vtbl;
++    impl->IPackage3_iface.lpVtbl = &package3_vtbl;
++    impl->IPackage4_vtbl = package4_vtbl;
+     impl->ref = 1;
+ 
+     *value = &impl->IPackage_iface;
+diff --git a/dlls/windows.applicationmodel/packageid_gen.c b/dlls/windows.applicationmodel/packageid_gen.c
+new file mode 100644
+index 0000000..20e1858
+--- /dev/null
++++ b/dlls/windows.applicationmodel/packageid_gen.c
+@@ -0,0 +1,158 @@
++/* Windows.ApplicationModel.PackageId for the current package. */
++#include "private.h"
++#include "appmodel.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(model);
++
++/* The identity is the one kernelbase reads from the app's AppxManifest.xml (GetCurrentPackageId and friends). */
++static const PACKAGE_ID *current_id(void)
++{
++    static UINT64 buffer[256];
++    static const PACKAGE_ID *id;
++    UINT32 len = sizeof(buffer);
++
++    if (!id && !GetCurrentPackageId(&len, (BYTE *)buffer)) id = (const PACKAGE_ID *)buffer;
++    return id;
++}
++
++static HRESULT id_string(const WCHAR *str, HSTRING *value)
++{
++    if (!str) str = L"";
++    return WindowsCreateString(str, wcslen(str), value);
++}
++
++struct package_id
++{
++    IPackageId IPackageId_iface;
++    LONG ref;
++};
++
++static HRESULT package_id_qi(struct package_id *impl, REFIID iid, void **out)
++{
++    TRACE("%p, %s, %p.\n", impl, debugstr_guid(iid), out);
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IPackageId))
++    {
++        *out = &impl->IPackageId_iface;
++        InterlockedIncrement(&impl->ref);
++        return S_OK;
++    }
++    FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG package_id_addref(struct package_id *impl) { return InterlockedIncrement(&impl->ref); }
++static ULONG package_id_release(struct package_id *impl)
++{
++    ULONG ref = InterlockedDecrement(&impl->ref);
++    if (!ref) free(impl);
++    return ref;
++}
++
++
++/* ---- IPackageId on package_id ---- */
++static inline struct package_id *impl_from_package_id(IPackageId *iface)
++{ return CONTAINING_RECORD(iface, struct package_id, IPackageId_iface); }
++
++static HRESULT WINAPI package_id_QueryInterface(IPackageId *iface, REFIID iid, void **out)
++{ return package_id_qi(impl_from_package_id(iface), iid, out); }
++static ULONG WINAPI package_id_AddRef(IPackageId *iface)
++{ return package_id_addref(impl_from_package_id(iface)); }
++static ULONG WINAPI package_id_Release(IPackageId *iface)
++{ return package_id_release(impl_from_package_id(iface)); }
++static HRESULT WINAPI package_id_GetIids(IPackageId *iface, ULONG *count, IID **iids)
++{ FIXME("iface %p stub!\n", iface); return E_NOTIMPL; }
++static HRESULT WINAPI package_id_GetRuntimeClassName(IPackageId *iface, HSTRING *name)
++{ FIXME("iface %p stub!\n", iface); return E_NOTIMPL; }
++static HRESULT WINAPI package_id_GetTrustLevel(IPackageId *iface, TrustLevel *level)
++{ *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI package_id_get_Name(IPackageId *iface, HSTRING *value)
++{
++    struct package_id *impl __attribute__((unused)) = impl_from_package_id(iface);
++    return id_string(current_id() ? current_id()->name : NULL, value);
++}
++
++static HRESULT WINAPI package_id_get_Version(IPackageId *iface, __x_ABI_CWindows_CApplicationModel_CPackageVersion *value)
++{
++    struct package_id *impl __attribute__((unused)) = impl_from_package_id(iface);
++    const PACKAGE_ID *id = current_id();
++    if (!id) { memset(value, 0, sizeof(*value)); return S_OK; }
++    value->Major = id->version.Major; value->Minor = id->version.Minor;
++    value->Build = id->version.Build; value->Revision = id->version.Revision;
++    return S_OK;
++}
++
++static HRESULT WINAPI package_id_get_Architecture(IPackageId *iface, __x_ABI_CWindows_CSystem_CProcessorArchitecture *value)
++{
++    struct package_id *impl __attribute__((unused)) = impl_from_package_id(iface);
++    *value = current_id() ? current_id()->processorArchitecture : ProcessorArchitecture_X64; /* same values as PROCESSOR_ARCHITECTURE_* */
++    return S_OK;
++}
++
++static HRESULT WINAPI package_id_get_ResourceId(IPackageId *iface, HSTRING *value)
++{
++    struct package_id *impl __attribute__((unused)) = impl_from_package_id(iface);
++    return WindowsCreateString(L"", 0, value);
++}
++
++static HRESULT WINAPI package_id_get_Publisher(IPackageId *iface, HSTRING *value)
++{
++    struct package_id *impl __attribute__((unused)) = impl_from_package_id(iface);
++    return id_string(current_id() ? current_id()->publisher : NULL, value);
++}
++
++static HRESULT WINAPI package_id_get_PublisherId(IPackageId *iface, HSTRING *value)
++{
++    struct package_id *impl __attribute__((unused)) = impl_from_package_id(iface);
++    return id_string(current_id() ? current_id()->publisherId : NULL, value);
++}
++
++static HRESULT WINAPI package_id_get_FullName(IPackageId *iface, HSTRING *value)
++{
++    struct package_id *impl __attribute__((unused)) = impl_from_package_id(iface);
++    WCHAR name[PACKAGE_FULL_NAME_MAX_LENGTH + 1] = L"";
++    UINT32 len = ARRAY_SIZE(name);
++    GetCurrentPackageFullName(&len, name);
++    return id_string(name, value);
++}
++
++static HRESULT WINAPI package_id_get_FamilyName(IPackageId *iface, HSTRING *value)
++{
++    struct package_id *impl __attribute__((unused)) = impl_from_package_id(iface);
++    WCHAR name[PACKAGE_FAMILY_NAME_MAX_LENGTH + 1] = L"";
++    UINT32 len = ARRAY_SIZE(name);
++    GetCurrentPackageFamilyName(&len, name);
++    return id_string(name, value);
++}
++
++static const IPackageIdVtbl package_id_vtbl =
++{
++    package_id_QueryInterface,
++    package_id_AddRef,
++    package_id_Release,
++    package_id_GetIids,
++    package_id_GetRuntimeClassName,
++    package_id_GetTrustLevel,
++    package_id_get_Name,
++    package_id_get_Version,
++    package_id_get_Architecture,
++    package_id_get_ResourceId,
++    package_id_get_Publisher,
++    package_id_get_PublisherId,
++    package_id_get_FullName,
++    package_id_get_FamilyName,
++};
++
++
++HRESULT package_id_create( IPackageId **out )
++{
++    struct package_id *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IPackageId_iface.lpVtbl = &package_id_vtbl;
++    impl->ref = 1;
++    *out = &impl->IPackageId_iface;
++    return S_OK;
++}
+diff --git a/dlls/windows.applicationmodel/packagestatus_gen.c b/dlls/windows.applicationmodel/packagestatus_gen.c
+new file mode 100644
+index 0000000..bc9e599
+--- /dev/null
++++ b/dlls/windows.applicationmodel/packagestatus_gen.c
+@@ -0,0 +1,168 @@
++/* PackageStatus, always "OK". */
++#include "private.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(model);
++
++struct package_status
++{
++    IPackageStatus IPackageStatus_iface;
++    LONG ref;
++};
++
++static HRESULT package_status_qi(struct package_status *impl, REFIID iid, void **out)
++{
++    TRACE("%p, %s, %p.\n", impl, debugstr_guid(iid), out);
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IPackageStatus))
++    {
++        *out = &impl->IPackageStatus_iface;
++        InterlockedIncrement(&impl->ref);
++        return S_OK;
++    }
++    FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG package_status_addref(struct package_status *impl) { return InterlockedIncrement(&impl->ref); }
++static ULONG package_status_release(struct package_status *impl)
++{
++    ULONG ref = InterlockedDecrement(&impl->ref);
++    if (!ref) free(impl);
++    return ref;
++}
++
++/* ---- IPackageStatus on package_status ---- */
++static inline struct package_status *impl_from_pstatus(IPackageStatus *iface)
++{ return CONTAINING_RECORD(iface, struct package_status, IPackageStatus_iface); }
++
++static HRESULT WINAPI pstatus_QueryInterface(IPackageStatus *iface, REFIID iid, void **out)
++{ return package_status_qi(impl_from_pstatus(iface), iid, out); }
++static ULONG WINAPI pstatus_AddRef(IPackageStatus *iface)
++{ return package_status_addref(impl_from_pstatus(iface)); }
++static ULONG WINAPI pstatus_Release(IPackageStatus *iface)
++{ return package_status_release(impl_from_pstatus(iface)); }
++static HRESULT WINAPI pstatus_GetIids(IPackageStatus *iface, ULONG *count, IID **iids)
++{ FIXME("iface %p stub!\n", iface); return E_NOTIMPL; }
++static HRESULT WINAPI pstatus_GetRuntimeClassName(IPackageStatus *iface, HSTRING *name)
++{ FIXME("iface %p stub!\n", iface); return E_NOTIMPL; }
++static HRESULT WINAPI pstatus_GetTrustLevel(IPackageStatus *iface, TrustLevel *level)
++{ *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI pstatus_VerifyIsOK(IPackageStatus *iface, boolean *value)
++{
++    struct package_status *impl __attribute__((unused)) = impl_from_pstatus(iface);
++    *value = TRUE;
++    return S_OK;
++}
++
++static HRESULT WINAPI pstatus_get_NotAvailable(IPackageStatus *iface, boolean *value)
++{
++    struct package_status *impl __attribute__((unused)) = impl_from_pstatus(iface);
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI pstatus_get_PackageOffline(IPackageStatus *iface, boolean *value)
++{
++    struct package_status *impl __attribute__((unused)) = impl_from_pstatus(iface);
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI pstatus_get_DataOffline(IPackageStatus *iface, boolean *value)
++{
++    struct package_status *impl __attribute__((unused)) = impl_from_pstatus(iface);
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI pstatus_get_Disabled(IPackageStatus *iface, boolean *value)
++{
++    struct package_status *impl __attribute__((unused)) = impl_from_pstatus(iface);
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI pstatus_get_NeedsRemediation(IPackageStatus *iface, boolean *value)
++{
++    struct package_status *impl __attribute__((unused)) = impl_from_pstatus(iface);
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI pstatus_get_LicenseIssue(IPackageStatus *iface, boolean *value)
++{
++    struct package_status *impl __attribute__((unused)) = impl_from_pstatus(iface);
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI pstatus_get_Modified(IPackageStatus *iface, boolean *value)
++{
++    struct package_status *impl __attribute__((unused)) = impl_from_pstatus(iface);
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI pstatus_get_Tampered(IPackageStatus *iface, boolean *value)
++{
++    struct package_status *impl __attribute__((unused)) = impl_from_pstatus(iface);
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI pstatus_get_DependencyIssue(IPackageStatus *iface, boolean *value)
++{
++    struct package_status *impl __attribute__((unused)) = impl_from_pstatus(iface);
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI pstatus_get_Servicing(IPackageStatus *iface, boolean *value)
++{
++    struct package_status *impl __attribute__((unused)) = impl_from_pstatus(iface);
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI pstatus_get_DeploymentInProgress(IPackageStatus *iface, boolean *value)
++{
++    struct package_status *impl __attribute__((unused)) = impl_from_pstatus(iface);
++    *value = FALSE;
++    return S_OK;
++}
++
++static const IPackageStatusVtbl pstatus_vtbl =
++{
++    pstatus_QueryInterface,
++    pstatus_AddRef,
++    pstatus_Release,
++    pstatus_GetIids,
++    pstatus_GetRuntimeClassName,
++    pstatus_GetTrustLevel,
++    pstatus_VerifyIsOK,
++    pstatus_get_NotAvailable,
++    pstatus_get_PackageOffline,
++    pstatus_get_DataOffline,
++    pstatus_get_Disabled,
++    pstatus_get_NeedsRemediation,
++    pstatus_get_LicenseIssue,
++    pstatus_get_Modified,
++    pstatus_get_Tampered,
++    pstatus_get_DependencyIssue,
++    pstatus_get_Servicing,
++    pstatus_get_DeploymentInProgress,
++};
++
++
++HRESULT package_status_create( IPackageStatus **out )
++{
++    struct package_status *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IPackageStatus_iface.lpVtbl = &pstatus_vtbl;
++    impl->ref = 1;
++    *out = &impl->IPackageStatus_iface;
++    return S_OK;
++}
+diff --git a/dlls/windows.applicationmodel/private.h b/dlls/windows.applicationmodel/private.h
+index d253871..c84ab56 100644
+--- a/dlls/windows.applicationmodel/private.h
++++ b/dlls/windows.applicationmodel/private.h
+@@ -37,6 +37,8 @@
+ #include "windows.applicationmodel.h"
+ 
+ extern IActivationFactory *package_factory;
++extern HRESULT package_id_create( IPackageId **out );
++extern HRESULT package_status_create( IPackageStatus **out );
+ extern IActivationFactory *design_mode_factory;
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \

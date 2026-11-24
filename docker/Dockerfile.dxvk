@@ -1,0 +1,7 @@
+# Build environment for DXVK's dxgi.dll (MinGW with POSIX threads, as DXVK requires).
+FROM debian:trixie
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    meson ninja-build glslang-tools python3 git ca-certificates \
+    gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix binutils-mingw-w64-x86-64 \
+ && rm -rf /var/lib/apt/lists/*

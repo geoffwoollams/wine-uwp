@@ -1,0 +1,57 @@
+Subject: dxgi: implement CreateSwapChainForCoreWindow via the CoreWindow's HWND
+
+diff --git a/dlls/dxgi/factory.c b/dlls/dxgi/factory.c
+index ebdb42a..bab89f5 100644
+--- a/dlls/dxgi/factory.c
++++ b/dlls/dxgi/factory.c
+@@ -316,14 +316,48 @@ static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForHwnd(IWineDXGIFa
+     return DXGI_ERROR_UNSUPPORTED;
+ }
+ 
++/* ICoreWindowInterop {45D64A29-A63E-4CB6-B498-5781D298CB4F}; only get_WindowHandle (slot 6) is used. */
++static const GUID IID_ICoreWindowInterop_dxgi =
++        {0x45d64a29, 0xa63e, 0x4cb6, {0xb4, 0x98, 0x57, 0x81, 0xd2, 0x98, 0xcb, 0x4f}};
++
++struct core_window_interop_vtbl
++{
++    HRESULT (STDMETHODCALLTYPE *QueryInterface)(void *, REFIID, void **);
++    ULONG (STDMETHODCALLTYPE *AddRef)(void *);
++    ULONG (STDMETHODCALLTYPE *Release)(void *);
++    void *GetIids, *GetRuntimeClassName, *GetTrustLevel;
++    HRESULT (STDMETHODCALLTYPE *get_WindowHandle)(void *, HWND *);
++};
++
+ static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForCoreWindow(IWineDXGIFactory *iface,
+         IUnknown *device, IUnknown *window, const DXGI_SWAP_CHAIN_DESC1 *desc,
+         IDXGIOutput *output, IDXGISwapChain1 **swapchain)
+ {
+-    FIXME("iface %p, device %p, window %p, desc %p, output %p, swapchain %p stub!\n",
++    struct core_window_interop_vtbl **interop;
++    HWND hwnd = NULL;
++    HRESULT hr;
++
++    TRACE("iface %p, device %p, window %p, desc %p, output %p, swapchain %p.\n",
+             iface, device, window, desc, output, swapchain);
+ 
+-    return E_NOTIMPL;
++    if (!window)
++        return DXGI_ERROR_INVALID_CALL;
++
++    if (FAILED(hr = IUnknown_QueryInterface(window, &IID_ICoreWindowInterop_dxgi, (void **)&interop)))
++    {
++        WARN("Window %p does not implement ICoreWindowInterop, hr %#lx.\n", window, hr);
++        return DXGI_ERROR_INVALID_CALL;
++    }
++    hr = (*interop)->get_WindowHandle(interop, &hwnd);
++    (*interop)->Release(interop);
++    if (FAILED(hr) || !hwnd)
++    {
++        WARN("Failed to get the window handle, hr %#lx.\n", hr);
++        return DXGI_ERROR_INVALID_CALL;
++    }
++
++    FIXME("Creating swapchain for core window %p using HWND %p.\n", window, hwnd);
++    return dxgi_factory_CreateSwapChainForHwnd(iface, device, hwnd, desc, NULL, output, swapchain);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE dxgi_factory_GetSharedResourceAdapterLuid(IWineDXGIFactory *iface,

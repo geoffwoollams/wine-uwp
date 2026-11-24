@@ -1,0 +1,1629 @@
+Subject: twinapi.appcore: Windows.Gaming.XboxLive.Storage.GameSaveProvider kept in the package's LocalState
+
+diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
+index 20e95a7..b812e50 100644
+--- a/dlls/twinapi.appcore/Makefile.in
++++ b/dlls/twinapi.appcore/Makefile.in
+@@ -22,6 +22,7 @@ SOURCES = \
+ 	display_information.c \
+ 	display_request.c \
+ 	extended_execution.c \
++	game_save.c \
+ 	message_dialog.c \
+ 	hardware_identification.c \
+ 	main.c \
+diff --git a/dlls/twinapi.appcore/auth_probe.c b/dlls/twinapi.appcore/auth_probe.c
+index 0981881..90531ba 100644
+--- a/dlls/twinapi.appcore/auth_probe.c
++++ b/dlls/twinapi.appcore/auth_probe.c
+@@ -252,18 +252,6 @@ static HRESULT create_response(HSTRING token, void *account, void *error, void *
+     return S_OK;
+ }
+ 
+-/* GameSaveProviderGetResult: 6 Status, 7 Value */
+-static HRESULT WINAPI gsres_QI(void *p, REFIID iid, void **out) { *out = p; return S_OK; }
+-static ULONG WINAPI gsres_AddRef(void *p) { return 2; }
+-static ULONG WINAPI gsres_Release(void *p) { return 1; }
+-static HRESULT WINAPI gsres_GetIids(void *p, ULONG *c, IID **i) { return E_NOTIMPL; }
+-static HRESULT WINAPI gsres_GetRuntimeClassName(void *p, HSTRING *n) { return E_NOTIMPL; }
+-static HRESULT WINAPI gsres_GetTrustLevel(void *p, TrustLevel *l) { *l = BaseTrust; return S_OK; }
+-static HRESULT WINAPI gsres_Status(void *p, INT32 *v) { *v = (INT32)0x80004004; /* Abort: no Xbox Live save service offline */ return S_OK; }
+-static HRESULT WINAPI gsres_Value(void *p, void **v) { *v = NULL; return S_OK; }
+-static const void *const gsres_vtbl[] = { gsres_QI, gsres_AddRef, gsres_Release, gsres_GetIids, gsres_GetRuntimeClassName,
+-    gsres_GetTrustLevel, gsres_Status, gsres_Value };
+-
+ static const GUID IID_IWebSocket_local = { 0xf877396f, 0x99b1, 0x4e18, { 0xbc, 0x08, 0x85, 0x0c, 0x9a, 0xdf, 0x15, 0x6e } };
+ static const GUID IID_IMessageWebSocket_local = { 0x33727d08, 0x34d5, 0x4746, { 0xad, 0x7b, 0x8d, 0xde, 0x5b, 0xc2, 0xef, 0x88 } };
+ extern HRESULT failed_operation( HRESULT hr, void **out );
+@@ -303,10 +291,6 @@ static HRESULT make_probe(const WCHAR *cls, void **out)
+         case 7: return make_probe(L"WebSocketInformation", (void **)a); \
+         case 8: ((EventRegistrationToken *)b)->value = InterlockedIncrement(&ws_token); return S_OK; \
+         case 9: return S_OK; } } \
+-      if (!wcscmp(o->cls, L"GameSaveProvider") && (n == 6 || n == 7)) \
+-      { void *res = calloc(1, 16); FIXME("GameSaveProvider::GetForUserAsync slot %d -> offline failure\n", n); \
+-        if (!res) return E_OUTOFMEMORY; *(const void *const **)res = gsres_vtbl; \
+-        return completed_ptr_operation(res, (void **)(n == 6 ? c : c)); } \
+       if (!wcscmp(o->cls, L"WebTokenResponse")) \
+       { switch (n) { \
+         case 6: return create_response((HSTRING)a, NULL, NULL, (void **)b); \
+@@ -393,5 +377,4 @@ PFACTORY(launcher_factory, L"Windows.System.Launcher")
+ PFACTORY(web_account_factory, L"WebAccount")
+ PFACTORY(web_token_response_factory, L"WebTokenResponse")
+ PFACTORY(store_context_factory, L"StoreContext")
+-PFACTORY(game_save_factory, L"GameSaveProvider")
+ PFACTORY(message_websocket_factory, L"MessageWebSocket")
+diff --git a/dlls/twinapi.appcore/extended_execution.c b/dlls/twinapi.appcore/extended_execution.c
+index 0541470..3906e1c 100644
+--- a/dlls/twinapi.appcore/extended_execution.c
++++ b/dlls/twinapi.appcore/extended_execution.c
+@@ -127,6 +127,9 @@ struct async_op
+     BOOL is_ptr;
+     void *ptr_result;
+     HRESULT error;
++    BOOL owns_ptr;      /* ptr_result is an IUnknown the operation holds a reference to */
++    BOOL is_int64;
++    INT64 int64_result;
+ };
+ /* IAsyncOperationCompletedHandler<T>::Invoke(this, IAsyncOperation<T>*, AsyncStatus) is slot 3 */
+ struct completed_handler_vtbl
+@@ -163,6 +166,8 @@ static ULONG WINAPI op_Release(async_op *iface)
+     if (!ref)
+     {
+         if (iface->handler) IUnknown_Release(iface->handler);
++        iface->handler = NULL;
++        /* An owned result is kept too (GetResults may still be called): it goes with the operation. */
+         /* NOTE: intentionally leaked: callers have been seen releasing more often than they add-ref. */
+         iface->ref = 1000000;
+     }
+@@ -190,6 +195,8 @@ static HRESULT WINAPI op_GetResults(async_op *iface, INT32 *result)
+ {
+     TRACE("iface %p, result %p -> %d.\n", iface, result, iface->result);
+     if (iface->error) return iface->error;
++    if (iface->is_int64) { *(INT64 *)result = iface->int64_result; return S_OK; }
++    if (iface->owns_ptr && iface->ptr_result) IUnknown_AddRef((IUnknown *)iface->ptr_result);
+     if (iface->is_ptr) *(void **)result = iface->ptr_result; else *result = iface->result;
+     return S_OK;
+ }
+@@ -325,6 +332,27 @@ HRESULT completed_ptr_operation( void *ptr, void **out )
+     return S_OK;
+ }
+ 
++/* Completed IAsyncOperation<T*> keeping the caller's reference to obj; GetResults hands out new references. */
++HRESULT completed_object_operation( IUnknown *obj, void **out )
++{
++    HRESULT hr = completed_ptr_operation( obj, out );
++    if (SUCCEEDED(hr)) ((async_op *)*out)->owns_ptr = TRUE;
++    else if (obj) IUnknown_Release( obj );
++    return hr;
++}
++
++/* Completed IAsyncOperation<INT64> / IAsyncOperation<UINT64>. */
++HRESULT completed_int64_operation( INT64 result, void **out )
++{
++    HRESULT hr = completed_ptr_operation( NULL, out );
++    if (SUCCEEDED(hr))
++    {
++        ((async_op *)*out)->is_int64 = TRUE;
++        ((async_op *)*out)->int64_result = result;
++    }
++    return hr;
++}
++
+ /* An already-failed IAsyncOperation: the completion handler sees status Error and GetResults returns hr. */
+ HRESULT failed_operation( HRESULT hr, void **out )
+ {
+diff --git a/dlls/twinapi.appcore/game_save.c b/dlls/twinapi.appcore/game_save.c
+new file mode 100644
+index 0000000..d1815c2
+--- /dev/null
++++ b/dlls/twinapi.appcore/game_save.c
+@@ -0,0 +1,1479 @@
++/* Windows.Gaming.XboxLive.Storage: Xbox Live connected storage (GameSaveProvider), kept on the local disk.
++ *
++ * There is no Xbox Live save service, so containers live in the package's LocalState folder:
++ *   %LOCALAPPDATA%\Packages\<package family>\LocalState\XboxGameSaves\<service config id>\<container>\<blob>
++ * Container and blob names are stored with every character outside [A-Za-z0-9_-] written as %XX (UTF-16 code units
++ * as %uXXXX), so any name maps to one valid file name; files whose names start with '%' followed by a non-hex
++ * letter are this file's own metadata.  Updates are written to temporary files first and then moved into place.
++ * Nothing is synchronised anywhere: NeedsSync is always FALSE. */
++#include "private.h"
++#include "appmodel.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
++
++extern HRESULT completed_object_operation( IUnknown *obj, void **out );
++extern HRESULT completed_int_operation( INT32 result, void **out );
++extern HRESULT completed_int64_operation( INT64 result, void **out );
++
++/* GameSaveErrorStatus */
++#define GS_OK                       0
++#define GS_INVALID_CONTAINER_NAME   ((INT32)0x80830001)
++#define GS_NO_ACCESS                ((INT32)0x80830002)
++#define GS_OUT_OF_LOCAL_STORAGE     ((INT32)0x80830003)
++#define GS_PROVIDED_BUFFER_TOO_SMALL ((INT32)0x80830007)
++#define GS_BLOB_NOT_FOUND           ((INT32)0x80830008)
++
++#define GS_QUOTA (256 * 1024 * 1024)   /* the default connected storage quota per user and title */
++#define GS_MAX_NAME 256
++
++static const GUID IID_IGameSaveProviderStatics = { 0xd01d3ed0, 0x7b03, 0x449d, { 0x8c, 0xbd, 0x34, 0x02, 0x84, 0x2a, 0x10, 0x48 } };
++static const GUID IID_IGameSaveProvider = { 0x90a60394, 0x80fe, 0x4211, { 0x97, 0xf8, 0xa5, 0xde, 0x14, 0xdd, 0x95, 0xd2 } };
++static const GUID IID_IGameSaveProviderGetResult = { 0x3ab90816, 0xd393, 0x4d65, { 0xac, 0x16, 0x41, 0xc3, 0xe6, 0x7a, 0xb9, 0x45 } };
++static const GUID IID_IGameSaveContainer = { 0xc3c08f89, 0x563f, 0x4ecd, { 0x9c, 0x6f, 0x33, 0xfd, 0x0e, 0x32, 0x3d, 0x10 } };
++static const GUID IID_IGameSaveContainerInfo = { 0xb7e27300, 0x155d, 0x4bb4, { 0xb2, 0xba, 0x93, 0x03, 0x06, 0xf3, 0x91, 0xb5 } };
++static const GUID IID_IGameSaveContainerInfoGetResult = { 0xffc50d74, 0xc581, 0x4f9d, { 0x9e, 0x39, 0x30, 0xa1, 0x0c, 0x1e, 0x4c, 0x50 } };
++static const GUID IID_IGameSaveContainerInfoQuery = { 0x3c94e863, 0x6f80, 0x4327, { 0x93, 0x27, 0xff, 0xc1, 0x1a, 0xfd, 0x42, 0xb3 } };
++static const GUID IID_IGameSaveBlobInfo = { 0xadd38034, 0xbaf0, 0x4645, { 0xb6, 0xd0, 0x46, 0xed, 0xaf, 0xfb, 0x3c, 0x2b } };
++static const GUID IID_IGameSaveBlobInfoGetResult = { 0xc7578582, 0x3697, 0x42bf, { 0x98, 0x9c, 0x66, 0x5d, 0x92, 0x3b, 0x52, 0x31 } };
++static const GUID IID_IGameSaveBlobInfoQuery = { 0x9fdd74b2, 0xeeee, 0x447b, { 0xa9, 0xd2, 0x7f, 0x96, 0xc0, 0xf8, 0x32, 0x08 } };
++static const GUID IID_IGameSaveBlobGetResult = { 0x917281e0, 0x7201, 0x4953, { 0xaa, 0x2c, 0x40, 0x08, 0xf0, 0x3a, 0xef, 0x45 } };
++static const GUID IID_IGameSaveOperationResult = { 0xcf0f1a05, 0x24a0, 0x4582, { 0x9a, 0x55, 0xb1, 0xbb, 0xbb, 0x93, 0x88, 0xd8 } };
++static const GUID IID_IBuffer_local = { 0x905a0fe0, 0xbc53, 0x11df, { 0x8c, 0x49, 0x00, 0x1e, 0x4f, 0xc6, 0x86, 0xda } };
++static const GUID IID_IBufferByteAccess_local = { 0x905a0fef, 0xbc53, 0x11df, { 0x8c, 0x49, 0x00, 0x1e, 0x4f, 0xc6, 0x86, 0xda } };
++/* parameterized collections (pinterface IIDs) */
++static const GUID IID_IMapView_HSTRING_IBuffer = { 0x2cfeec4f, 0xe261, 0x5f4c, { 0xae, 0xe1, 0xc7, 0x85, 0x18, 0xe9, 0xd5, 0xb9 } };
++static const GUID IID_IKeyValuePair_HSTRING_IBuffer = { 0x9114f794, 0x2ceb, 0x5b03, { 0x9b, 0x22, 0x36, 0x88, 0x4e, 0x1f, 0x58, 0xb3 } };
++static const GUID IID_IIterable_IKeyValuePair_HSTRING_IBuffer = { 0x3c9ffa92, 0x5123, 0x5ac4, { 0xb1, 0x11, 0x03, 0xc2, 0x15, 0xf0, 0xc5, 0x1c } };
++static const GUID IID_IIterator_IKeyValuePair_HSTRING_IBuffer = { 0x790acb62, 0xc4b3, 0x57ea, { 0xa1, 0x52, 0x9e, 0x21, 0x93, 0x71, 0xc6, 0xdc } };
++static const GUID IID_IVectorView_GameSaveContainerInfo = { 0x9c490594, 0x0846, 0x50f5, { 0xb2, 0xef, 0xc6, 0xf0, 0x3e, 0xe6, 0x86, 0x8a } };
++static const GUID IID_IIterable_GameSaveContainerInfo = { 0x55e4d98f, 0x0889, 0x5c06, { 0xa8, 0x57, 0x7d, 0xd1, 0x68, 0xc2, 0xd8, 0x52 } };
++static const GUID IID_IIterator_GameSaveContainerInfo = { 0x0ecd9756, 0x3e0d, 0x523f, { 0xa5, 0x49, 0x2b, 0x65, 0x04, 0xdb, 0x52, 0x02 } };
++static const GUID IID_IVectorView_GameSaveBlobInfo = { 0xb9c466a0, 0x2a3f, 0x5f28, { 0xa1, 0xc1, 0x9c, 0xb1, 0x92, 0xf6, 0xc7, 0x86 } };
++static const GUID IID_IIterable_GameSaveBlobInfo = { 0xa7c456d7, 0xfa9f, 0x536f, { 0x8e, 0xd2, 0x45, 0x95, 0x45, 0x81, 0x1e, 0xd4 } };
++static const GUID IID_IIterator_GameSaveBlobInfo = { 0xaaaf545b, 0xf5e9, 0x5da6, { 0xaf, 0x70, 0x9d, 0x90, 0x4c, 0x7a, 0x4d, 0x37 } };
++
++/* Slot-call helpers for objects supplied by the app (collections, buffers). */
++typedef HRESULT (WINAPI *fn_out)( void *iface, void *out );
++typedef HRESULT (WINAPI *fn_qi)( void *iface, REFIID iid, void **out );
++typedef ULONG (WINAPI *fn_release)( void *iface );
++#define SLOT(obj, n) ((*(void ***)(obj))[n])
++static HRESULT call_qi( void *obj, REFIID iid, void **out ) { return ((fn_qi)SLOT( obj, 0 ))( obj, iid, out ); }
++static void call_release( void *obj ) { if (obj) ((fn_release)SLOT( obj, 2 ))( obj ); }
++static HRESULT call_out( void *obj, int slot, void *out ) { return ((fn_out)SLOT( obj, slot ))( obj, out ); }
++
++/* ---------------- common object base ---------------- */
++
++/* Every object here has up to two interfaces (main, and a second one such as IIterable) and one refcount. */
++struct gs_object
++{
++    const void *const *vtbl;
++    const void *const *vtbl2;
++    LONG ref;
++    const GUID *iid, *iid2, *iid3;   /* iid3 also answers with the main interface (e.g. IIterator) */
++    const WCHAR *class_name;
++    void (*destroy)( struct gs_object *obj );
++};
++
++static struct gs_object *obj_from_iface2( void *iface ) { return CONTAINING_RECORD( iface, struct gs_object, vtbl2 ); }
++
++static HRESULT obj_query_interface( struct gs_object *obj, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, obj->iid ) || (obj->iid3 && IsEqualGUID( iid, obj->iid3 )))
++        *out = &obj->vtbl;
++    else if (obj->iid2 && IsEqualGUID( iid, obj->iid2 ))
++        *out = &obj->vtbl2;
++    else
++    {
++        FIXME( "%s: %s not implemented, returning E_NOINTERFACE.\n", debugstr_w( obj->class_name ), debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    InterlockedIncrement( &obj->ref );
++    return S_OK;
++}
++static ULONG obj_release( struct gs_object *obj )
++{
++    ULONG ref = InterlockedDecrement( &obj->ref );
++    if (!ref) obj->destroy( obj );
++    return ref;
++}
++
++static HRESULT WINAPI base_QueryInterface( void *iface, REFIID iid, void **out ) { return obj_query_interface( iface, iid, out ); }
++static ULONG WINAPI base_AddRef( void *iface ) { return InterlockedIncrement( &((struct gs_object *)iface)->ref ); }
++static ULONG WINAPI base_Release( void *iface ) { return obj_release( iface ); }
++static HRESULT WINAPI base_GetIids( void *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI base_GetRuntimeClassName( void *iface, HSTRING *name )
++{
++    const WCHAR *class_name = ((struct gs_object *)iface)->class_name;
++    if (!class_name) return E_NOTIMPL;
++    return WindowsCreateString( class_name, wcslen( class_name ), name );
++}
++static HRESULT WINAPI base_GetTrustLevel( void *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++#define BASE base_QueryInterface, base_AddRef, base_Release, base_GetIids, base_GetRuntimeClassName, base_GetTrustLevel
++
++static HRESULT WINAPI base2_QueryInterface( void *iface, REFIID iid, void **out ) { return obj_query_interface( obj_from_iface2( iface ), iid, out ); }
++static ULONG WINAPI base2_AddRef( void *iface ) { return InterlockedIncrement( &obj_from_iface2( iface )->ref ); }
++static ULONG WINAPI base2_Release( void *iface ) { return obj_release( obj_from_iface2( iface ) ); }
++static HRESULT WINAPI base2_GetRuntimeClassName( void *iface, HSTRING *name ) { return base_GetRuntimeClassName( obj_from_iface2( iface ), name ); }
++#define BASE2 base2_QueryInterface, base2_AddRef, base2_Release, base_GetIids, base2_GetRuntimeClassName, base_GetTrustLevel
++
++static void *obj_alloc( size_t size, const void *const *vtbl, const GUID *iid, const WCHAR *class_name,
++                        void (*destroy)( struct gs_object * ) )
++{
++    struct gs_object *obj;
++    if (!(obj = calloc( 1, size ))) return NULL;
++    obj->vtbl = vtbl;
++    obj->ref = 1;
++    obj->iid = iid;
++    obj->class_name = class_name;
++    obj->destroy = destroy;
++    return obj;
++}
++
++/* ---------------- names and paths ---------------- */
++
++static BOOL plain_name_char( WCHAR c )
++{
++    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
++}
++
++/* Container / blob name -> file name; FALSE if the name is empty or too long. */
++static BOOL encode_name( const WCHAR *name, UINT32 len, WCHAR *out, UINT32 out_len )
++{
++    UINT32 i, pos = 0;
++
++    if (!len || len > GS_MAX_NAME) return FALSE;
++    for (i = 0; i < len; i++)
++    {
++        if (pos + 7 >= out_len) return FALSE;
++        if (plain_name_char( name[i] )) out[pos++] = name[i];
++        else if (name[i] < 0x100) pos += swprintf( out + pos, out_len - pos, L"%%%02X", name[i] );
++        else pos += swprintf( out + pos, out_len - pos, L"%%u%04X", name[i] );
++    }
++    out[pos] = 0;
++    return TRUE;
++}
++
++static int hex_value( WCHAR c )
++{
++    if (c >= '0' && c <= '9') return c - '0';
++    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
++    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
++    return -1;
++}
++
++/* File name -> name; FALSE for files that are not containers or blobs (metadata, temporary files). */
++static BOOL decode_name( const WCHAR *file, WCHAR *out, UINT32 out_len )
++{
++    UINT32 pos = 0;
++    int digits, i, value;
++
++    while (*file)
++    {
++        if (pos + 1 >= out_len) return FALSE;
++        if (*file != '%') { out[pos++] = *file++; continue; }
++        file++;
++        digits = 2;
++        if (*file == 'u') { digits = 4; file++; }
++        for (i = value = 0; i < digits; i++)
++        {
++            int v = hex_value( file[i] );
++            if (v < 0) return FALSE;
++            value = value * 16 + v;
++        }
++        file += digits;
++        out[pos++] = value;
++    }
++    out[pos] = 0;
++    return pos > 0;
++}
++
++static BOOL hstring_to_file_name( HSTRING name, WCHAR *out, UINT32 out_len )
++{
++    UINT32 len;
++    const WCHAR *str = WindowsGetStringRawBuffer( name, &len );
++    return encode_name( str, len, out, out_len );
++}
++
++static BOOL get_local_state( WCHAR *path, UINT32 len )
++{
++    WCHAR base[MAX_PATH], family[PACKAGE_FAMILY_NAME_MAX_LENGTH + 1];
++    UINT32 family_len = ARRAY_SIZE(family);
++    DWORD n;
++
++    if (GetCurrentPackageFamilyName( &family_len, family )) return FALSE;
++    n = GetEnvironmentVariableW( L"LOCALAPPDATA", base, MAX_PATH );
++    if (!n || n >= MAX_PATH)
++    {
++        n = GetEnvironmentVariableW( L"USERPROFILE", base, MAX_PATH );
++        if (!n || n >= MAX_PATH - 16) return FALSE;
++        wcscat( base, L"\\AppData\\Local" );
++    }
++    return swprintf( path, len, L"%s\\Packages\\%s\\LocalState", base, family ) > 0;
++}
++
++static void create_directories( const WCHAR *path )
++{
++    WCHAR buffer[MAX_PATH], *p;
++
++    if (wcslen( path ) >= MAX_PATH) return;
++    wcscpy( buffer, path );
++    for (p = buffer + 3; *p; p++)
++    {
++        if (*p != '\\') continue;
++        *p = 0;
++        CreateDirectoryW( buffer, NULL );
++        *p = '\\';
++    }
++    CreateDirectoryW( buffer, NULL );
++}
++
++static BOOL join_path( WCHAR *out, const WCHAR *dir, const WCHAR *file )
++{
++    return wcslen( dir ) + wcslen( file ) + 2 <= MAX_PATH && swprintf( out, MAX_PATH, L"%s\\%s", dir, file ) > 0;
++}
++
++static ULONGLONG file_size( const WIN32_FIND_DATAW *data ) { return ((ULONGLONG)data->nFileSizeHigh << 32) | data->nFileSizeLow; }
++
++/* A data file of a container (not metadata, not a directory). */
++static BOOL is_blob_file( const WIN32_FIND_DATAW *data, WCHAR *name, UINT32 name_len )
++{
++    return !(data->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && decode_name( data->cFileName, name, name_len );
++}
++
++/* ---------------- IBuffer ---------------- */
++
++struct buffer
++{
++    struct gs_object obj;   /* IBuffer, vtbl2: IBufferByteAccess */
++    UINT32 capacity, length;
++    BYTE *data;
++};
++
++static void buffer_destroy( struct gs_object *obj )
++{
++    struct buffer *buffer = CONTAINING_RECORD( obj, struct buffer, obj );
++    free( buffer->data );
++    free( buffer );
++}
++static HRESULT WINAPI buffer_get_Capacity( struct buffer *buffer, UINT32 *value ) { *value = buffer->capacity; return S_OK; }
++static HRESULT WINAPI buffer_get_Length( struct buffer *buffer, UINT32 *value ) { *value = buffer->length; return S_OK; }
++static HRESULT WINAPI buffer_put_Length( struct buffer *buffer, UINT32 value )
++{
++    if (value > buffer->capacity) return E_INVALIDARG;
++    buffer->length = value;
++    return S_OK;
++}
++static const void *const buffer_vtbl[] = { BASE, buffer_get_Capacity, buffer_get_Length, buffer_put_Length };
++
++/* IBufferByteAccess is an IUnknown interface: slot 3 Buffer */
++static HRESULT WINAPI byte_access_Buffer( void *iface, BYTE **value )
++{
++    *value = CONTAINING_RECORD( obj_from_iface2( iface ), struct buffer, obj )->data;
++    return S_OK;
++}
++static const void *const byte_access_vtbl[] = { base2_QueryInterface, base2_AddRef, base2_Release, byte_access_Buffer };
++
++static struct buffer *buffer_create( UINT32 size )
++{
++    struct buffer *buffer;
++
++    if (!(buffer = obj_alloc( sizeof(*buffer), buffer_vtbl, &IID_IBuffer_local, L"Windows.Storage.Streams.Buffer", buffer_destroy )))
++        return NULL;
++    buffer->obj.vtbl2 = byte_access_vtbl;
++    buffer->obj.iid2 = &IID_IBufferByteAccess_local;
++    if (!(buffer->data = malloc( size ? size : 1 ))) { free( buffer ); return NULL; }
++    buffer->capacity = buffer->length = size;
++    return buffer;
++}
++
++/* Data and length of an IBuffer supplied by the app. */
++static HRESULT buffer_bytes( void *buffer, BYTE **data, UINT32 *length, UINT32 *capacity )
++{
++    void *access;
++    HRESULT hr;
++
++    if (FAILED(hr = call_out( buffer, 7, length ))) return hr;              /* IBuffer::get_Length */
++    if (capacity && FAILED(hr = call_out( buffer, 6, capacity ))) return hr; /* IBuffer::get_Capacity */
++    if (FAILED(hr = call_qi( buffer, &IID_IBufferByteAccess_local, &access ))) return hr;
++    hr = call_out( access, 3, data );                                       /* IBufferByteAccess::Buffer */
++    call_release( access );
++    return hr;
++}
++
++/* ---------------- read-only collections we return ---------------- */
++
++/* IVectorView<T> + IIterable<T> over interface pointers or HSTRINGs. */
++struct vector
++{
++    struct gs_object obj;
++    BOOL strings;
++    UINT32 count;
++    void **items;
++    const GUID *iterator_iid;
++};
++struct iterator
++{
++    struct gs_object obj;
++    struct vector *vector;
++    UINT32 pos;
++};
++
++static void vector_destroy( struct gs_object *obj )
++{
++    struct vector *vector = CONTAINING_RECORD( obj, struct vector, obj );
++    UINT32 i;
++    for (i = 0; i < vector->count; i++)
++        if (vector->strings) WindowsDeleteString( vector->items[i] ); else call_release( vector->items[i] );
++    free( vector->items );
++    free( vector );
++}
++static HRESULT vector_item( struct vector *vector, UINT32 index, void **value )
++{
++    if (index >= vector->count) { *value = NULL; return E_BOUNDS; }
++    if (vector->strings) return WindowsDuplicateString( vector->items[index], (HSTRING *)value );
++    *value = vector->items[index];
++    base_AddRef( *value );
++    return S_OK;
++}
++static HRESULT WINAPI vector_GetAt( struct vector *vector, UINT32 index, void **value ) { return vector_item( vector, index, value ); }
++static HRESULT WINAPI vector_get_Size( struct vector *vector, UINT32 *value ) { *value = vector->count; return S_OK; }
++static HRESULT WINAPI vector_IndexOf( struct vector *vector, void *value, UINT32 *index, boolean *found )
++{
++    UINT32 i;
++    INT32 order;
++    for (i = 0; i < vector->count; i++)
++    {
++        if (vector->strings ? SUCCEEDED(WindowsCompareStringOrdinal( vector->items[i], value, &order )) && !order
++                            : vector->items[i] == value)
++        {
++            *index = i;
++            *found = TRUE;
++            return S_OK;
++        }
++    }
++    *index = 0;
++    *found = FALSE;
++    return S_OK;
++}
++static HRESULT WINAPI vector_GetMany( struct vector *vector, UINT32 start, UINT32 size, void **items, UINT32 *count )
++{
++    UINT32 i;
++    for (i = 0; i < size && start + i < vector->count; i++) vector_item( vector, start + i, &items[i] );
++    *count = i;
++    return S_OK;
++}
++static const void *const vector_vtbl[] = { BASE, vector_GetAt, vector_get_Size, vector_IndexOf, vector_GetMany };
++
++static void iterator_destroy( struct gs_object *obj )
++{
++    struct iterator *iterator = CONTAINING_RECORD( obj, struct iterator, obj );
++    obj_release( &iterator->vector->obj );
++    free( iterator );
++}
++static HRESULT WINAPI iterator_get_Current( struct iterator *it, void **value ) { return vector_item( it->vector, it->pos, value ); }
++static HRESULT WINAPI iterator_get_HasCurrent( struct iterator *it, boolean *value ) { *value = it->pos < it->vector->count; return S_OK; }
++static HRESULT WINAPI iterator_MoveNext( struct iterator *it, boolean *value )
++{
++    if (it->pos < it->vector->count) it->pos++;
++    *value = it->pos < it->vector->count;
++    return S_OK;
++}
++static HRESULT WINAPI iterator_GetMany( struct iterator *it, UINT32 size, void **items, UINT32 *count )
++{
++    vector_GetMany( it->vector, it->pos, size, items, count );
++    it->pos += *count;
++    return S_OK;
++}
++static const void *const iterator_vtbl[] = { BASE, iterator_get_Current, iterator_get_HasCurrent, iterator_MoveNext, iterator_GetMany };
++
++static HRESULT WINAPI vector_First( void *iface, void **value )
++{
++    struct vector *vector = CONTAINING_RECORD( obj_from_iface2( iface ), struct vector, obj );
++    struct iterator *it;
++
++    if (!(it = obj_alloc( sizeof(*it), iterator_vtbl, vector->iterator_iid, NULL, iterator_destroy ))) return E_OUTOFMEMORY;
++    it->vector = vector;
++    InterlockedIncrement( &vector->obj.ref );
++    *value = &it->obj.vtbl;
++    return S_OK;
++}
++static const void *const vector_iterable_vtbl[] = { BASE2, vector_First };
++
++/* Takes over items (references / strings) and the array. */
++static struct vector *vector_create( const GUID *view_iid, const GUID *iterable_iid, const GUID *iterator_iid,
++                                     BOOL strings, void **items, UINT32 count )
++{
++    struct vector *vector;
++    if (!(vector = obj_alloc( sizeof(*vector), vector_vtbl, view_iid, NULL, vector_destroy ))) return NULL;
++    vector->obj.vtbl2 = vector_iterable_vtbl;
++    vector->obj.iid2 = iterable_iid;
++    vector->iterator_iid = iterator_iid;
++    vector->strings = strings;
++    vector->items = items;
++    vector->count = count;
++    return vector;
++}
++
++/* IMapView<String, IBuffer> + IIterable<IKeyValuePair<String, IBuffer>>, for GetAsync results. */
++struct blob_map
++{
++    struct gs_object obj;
++    UINT32 count;
++    HSTRING *names;
++    struct buffer **buffers;
++};
++struct blob_pair
++{
++    struct gs_object obj;
++    struct blob_map *map;
++    UINT32 index;
++};
++struct blob_map_iterator
++{
++    struct gs_object obj;
++    struct blob_map *map;
++    UINT32 pos;
++};
++
++static void blob_map_destroy( struct gs_object *obj )
++{
++    struct blob_map *map = CONTAINING_RECORD( obj, struct blob_map, obj );
++    UINT32 i;
++    for (i = 0; i < map->count; i++)
++    {
++        WindowsDeleteString( map->names[i] );
++        obj_release( &map->buffers[i]->obj );
++    }
++    free( map->names );
++    free( map->buffers );
++    free( map );
++}
++static BOOL blob_map_find( struct blob_map *map, HSTRING key, UINT32 *index )
++{
++    INT32 order;
++    for (*index = 0; *index < map->count; (*index)++)
++        if (SUCCEEDED(WindowsCompareStringOrdinal( map->names[*index], key, &order )) && !order) return TRUE;
++    return FALSE;
++}
++static HRESULT WINAPI blob_map_Lookup( struct blob_map *map, HSTRING key, void **value )
++{
++    UINT32 index;
++    if (!blob_map_find( map, key, &index )) { *value = NULL; return E_BOUNDS; }
++    *value = &map->buffers[index]->obj.vtbl;
++    base_AddRef( *value );
++    return S_OK;
++}
++static HRESULT WINAPI blob_map_get_Size( struct blob_map *map, UINT32 *value ) { *value = map->count; return S_OK; }
++static HRESULT WINAPI blob_map_HasKey( struct blob_map *map, HSTRING key, boolean *found )
++{
++    UINT32 index;
++    *found = blob_map_find( map, key, &index );
++    return S_OK;
++}
++static HRESULT WINAPI blob_map_Split( struct blob_map *map, void **first, void **second ) { *first = *second = NULL; return S_OK; }
++static const void *const blob_map_vtbl[] = { BASE, blob_map_Lookup, blob_map_get_Size, blob_map_HasKey, blob_map_Split };
++
++static void blob_pair_destroy( struct gs_object *obj )
++{
++    struct blob_pair *pair = CONTAINING_RECORD( obj, struct blob_pair, obj );
++    obj_release( &pair->map->obj );
++    free( pair );
++}
++static HRESULT WINAPI blob_pair_get_Key( struct blob_pair *pair, HSTRING *value ) { return WindowsDuplicateString( pair->map->names[pair->index], value ); }
++static HRESULT WINAPI blob_pair_get_Value( struct blob_pair *pair, void **value )
++{
++    *value = &pair->map->buffers[pair->index]->obj.vtbl;
++    base_AddRef( *value );
++    return S_OK;
++}
++static const void *const blob_pair_vtbl[] = { BASE, blob_pair_get_Key, blob_pair_get_Value };
++
++static void blob_map_iterator_destroy( struct gs_object *obj )
++{
++    struct blob_map_iterator *it = CONTAINING_RECORD( obj, struct blob_map_iterator, obj );
++    obj_release( &it->map->obj );
++    free( it );
++}
++static HRESULT WINAPI blob_map_iterator_get_Current( struct blob_map_iterator *it, void **value )
++{
++    struct blob_pair *pair;
++
++    *value = NULL;
++    if (it->pos >= it->map->count) return E_BOUNDS;
++    if (!(pair = obj_alloc( sizeof(*pair), blob_pair_vtbl, &IID_IKeyValuePair_HSTRING_IBuffer, NULL, blob_pair_destroy )))
++        return E_OUTOFMEMORY;
++    pair->map = it->map;
++    pair->index = it->pos;
++    InterlockedIncrement( &it->map->obj.ref );
++    *value = &pair->obj.vtbl;
++    return S_OK;
++}
++static HRESULT WINAPI blob_map_iterator_get_HasCurrent( struct blob_map_iterator *it, boolean *value ) { *value = it->pos < it->map->count; return S_OK; }
++static HRESULT WINAPI blob_map_iterator_MoveNext( struct blob_map_iterator *it, boolean *value )
++{
++    if (it->pos < it->map->count) it->pos++;
++    *value = it->pos < it->map->count;
++    return S_OK;
++}
++static HRESULT WINAPI blob_map_iterator_GetMany( struct blob_map_iterator *it, UINT32 size, void **items, UINT32 *count )
++{
++    UINT32 i;
++    for (i = 0; i < size && it->pos < it->map->count; i++, it->pos++)
++        if (FAILED(blob_map_iterator_get_Current( it, &items[i] ))) break;
++    *count = i;
++    return S_OK;
++}
++static const void *const blob_map_iterator_vtbl[] = { BASE, blob_map_iterator_get_Current, blob_map_iterator_get_HasCurrent,
++    blob_map_iterator_MoveNext, blob_map_iterator_GetMany };
++
++static HRESULT WINAPI blob_map_First( void *iface, void **value )
++{
++    struct blob_map *map = CONTAINING_RECORD( obj_from_iface2( iface ), struct blob_map, obj );
++    struct blob_map_iterator *it;
++
++    if (!(it = obj_alloc( sizeof(*it), blob_map_iterator_vtbl, &IID_IIterator_IKeyValuePair_HSTRING_IBuffer, NULL,
++                          blob_map_iterator_destroy )))
++        return E_OUTOFMEMORY;
++    it->map = map;
++    InterlockedIncrement( &map->obj.ref );
++    *value = &it->obj.vtbl;
++    return S_OK;
++}
++static const void *const blob_map_iterable_vtbl[] = { BASE2, blob_map_First };
++
++static struct blob_map *blob_map_create(void)
++{
++    struct blob_map *map;
++    if (!(map = obj_alloc( sizeof(*map), blob_map_vtbl, &IID_IMapView_HSTRING_IBuffer, NULL, blob_map_destroy ))) return NULL;
++    map->obj.vtbl2 = blob_map_iterable_vtbl;
++    map->obj.iid2 = &IID_IIterable_IKeyValuePair_HSTRING_IBuffer;
++    return map;
++}
++static BOOL blob_map_add( struct blob_map *map, HSTRING name, struct buffer *buffer )
++{
++    HSTRING *names;
++    struct buffer **buffers;
++
++    if (!(names = realloc( map->names, (map->count + 1) * sizeof(*names) ))) return FALSE;
++    map->names = names;
++    if (!(buffers = realloc( map->buffers, (map->count + 1) * sizeof(*buffers) ))) return FALSE;
++    map->buffers = buffers;
++    if (FAILED(WindowsDuplicateString( name, &map->names[map->count] ))) return FALSE;
++    map->buffers[map->count++] = buffer;
++    return TRUE;
++}
++
++/* ---------------- result objects: Status (+ Value) ---------------- */
++
++struct result
++{
++    struct gs_object obj;
++    INT32 status;
++    IUnknown *value;
++};
++static void result_destroy( struct gs_object *obj )
++{
++    struct result *result = CONTAINING_RECORD( obj, struct result, obj );
++    if (result->value) IUnknown_Release( result->value );
++    free( result );
++}
++static HRESULT WINAPI result_get_Status( struct result *result, INT32 *value ) { *value = result->status; return S_OK; }
++static HRESULT WINAPI result_get_Value( struct result *result, IUnknown **value )
++{
++    if ((*value = result->value)) IUnknown_AddRef( *value );
++    return S_OK;
++}
++static const void *const result_vtbl[] = { BASE, result_get_Status, result_get_Value };
++
++/* A completed IAsyncOperation<result>; takes over the reference to value. */
++static HRESULT complete_with_result( const GUID *iid, const WCHAR *class_name, INT32 status, void *value, void **operation )
++{
++    struct result *result;
++
++    if (status) WARN( "%s status %#x.\n", debugstr_w( class_name ), status );
++    if (!(result = obj_alloc( sizeof(*result), result_vtbl, iid, class_name, result_destroy )))
++    {
++        call_release( value );
++        return E_OUTOFMEMORY;
++    }
++    result->status = status;
++    result->value = value;
++    return completed_object_operation( (IUnknown *)&result->obj.vtbl, operation );
++}
++static HRESULT complete_operation( INT32 status, void **operation )
++{
++    return complete_with_result( &IID_IGameSaveOperationResult, L"Windows.Gaming.XboxLive.Storage.GameSaveOperationResult",
++                                 status, NULL, operation );
++}
++
++/* ---------------- provider ---------------- */
++
++struct provider
++{
++    struct gs_object obj;
++    IUnknown *user;
++    WCHAR root[MAX_PATH];   /* ...\LocalState\XboxGameSaves\<scid> */
++};
++
++static void provider_destroy( struct gs_object *obj )
++{
++    struct provider *provider = CONTAINING_RECORD( obj, struct provider, obj );
++    if (provider->user) IUnknown_Release( provider->user );
++    free( provider );
++}
++
++/* Calls callback for every container directory (name decoded). */
++static void enum_containers( struct provider *provider, void (*callback)( void *ctx, const WCHAR *name, const WCHAR *dir ), void *ctx )
++{
++    WCHAR pattern[MAX_PATH], name[GS_MAX_NAME + 1], dir[MAX_PATH];
++    WIN32_FIND_DATAW data;
++    HANDLE find;
++
++    if (!join_path( pattern, provider->root, L"*" )) return;
++    if ((find = FindFirstFileW( pattern, &data )) == INVALID_HANDLE_VALUE) return;
++    do
++    {
++        if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !decode_name( data.cFileName, name, ARRAY_SIZE(name) )) continue;
++        if (join_path( dir, provider->root, data.cFileName )) callback( ctx, name, dir );
++    } while (FindNextFileW( find, &data ));
++    FindClose( find );
++}
++
++/* Total size of the blobs in a container, and the time of its newest blob. */
++static ULONGLONG container_size( const WCHAR *dir, FILETIME *modified, UINT32 *blobs )
++{
++    WCHAR pattern[MAX_PATH], name[GS_MAX_NAME + 1];
++    WIN32_FIND_DATAW data;
++    ULONGLONG size = 0;
++    HANDLE find;
++
++    if (modified) memset( modified, 0, sizeof(*modified) );
++    if (blobs) *blobs = 0;
++    if (!join_path( pattern, dir, L"*" )) return 0;
++    if ((find = FindFirstFileW( pattern, &data )) == INVALID_HANDLE_VALUE) return 0;
++    do
++    {
++        if (!is_blob_file( &data, name, ARRAY_SIZE(name) )) continue;
++        size += file_size( &data );
++        if (blobs) (*blobs)++;
++        if (modified && CompareFileTime( &data.ftLastWriteTime, modified ) > 0) *modified = data.ftLastWriteTime;
++    } while (FindNextFileW( find, &data ));
++    FindClose( find );
++    return size;
++}
++
++static void add_size( void *ctx, const WCHAR *name, const WCHAR *dir ) { *(ULONGLONG *)ctx += container_size( dir, NULL, NULL ); }
++
++/* ---------------- GameSaveContainerInfo / GameSaveBlobInfo ---------------- */
++
++struct container_info
++{
++    struct gs_object obj;
++    HSTRING name, display_name;
++    ULONGLONG size;
++    INT64 modified;
++};
++static void container_info_destroy( struct gs_object *obj )
++{
++    struct container_info *info = CONTAINING_RECORD( obj, struct container_info, obj );
++    WindowsDeleteString( info->name );
++    WindowsDeleteString( info->display_name );
++    free( info );
++}
++static HRESULT WINAPI container_info_get_Name( struct container_info *info, HSTRING *value ) { return WindowsDuplicateString( info->name, value ); }
++static HRESULT WINAPI container_info_get_TotalSize( struct container_info *info, UINT64 *value ) { *value = info->size; return S_OK; }
++static HRESULT WINAPI container_info_get_DisplayName( struct container_info *info, HSTRING *value ) { return WindowsDuplicateString( info->display_name, value ); }
++static HRESULT WINAPI container_info_get_LastModifiedTime( struct container_info *info, DateTime *value ) { value->UniversalTime = info->modified; return S_OK; }
++static HRESULT WINAPI container_info_get_NeedsSync( struct container_info *info, boolean *value ) { *value = FALSE; return S_OK; }
++static const void *const container_info_vtbl[] = { BASE, container_info_get_Name, container_info_get_TotalSize,
++    container_info_get_DisplayName, container_info_get_LastModifiedTime, container_info_get_NeedsSync };
++
++struct blob_info
++{
++    struct gs_object obj;
++    HSTRING name;
++    UINT32 size;
++};
++static void blob_info_destroy( struct gs_object *obj )
++{
++    struct blob_info *info = CONTAINING_RECORD( obj, struct blob_info, obj );
++    WindowsDeleteString( info->name );
++    free( info );
++}
++static HRESULT WINAPI blob_info_get_Name( struct blob_info *info, HSTRING *value ) { return WindowsDuplicateString( info->name, value ); }
++static HRESULT WINAPI blob_info_get_Size( struct blob_info *info, UINT32 *value ) { *value = info->size; return S_OK; }
++static const void *const blob_info_vtbl[] = { BASE, blob_info_get_Name, blob_info_get_Size };
++
++/* The display name is kept in "%display" (UTF-16, not a valid encoded name, so never a blob). */
++static const WCHAR display_name_file[] = L"%display";
++
++static HSTRING read_display_name( const WCHAR *dir )
++{
++    WCHAR path[MAX_PATH], buffer[GS_MAX_NAME + 1];
++    DWORD read = 0;
++    HSTRING str = NULL;
++    HANDLE file;
++
++    if (!join_path( path, dir, display_name_file )) return NULL;
++    file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++    if (file == INVALID_HANDLE_VALUE) return NULL;
++    if (ReadFile( file, buffer, sizeof(buffer) - sizeof(WCHAR), &read, NULL ))
++        WindowsCreateString( buffer, read / sizeof(WCHAR), &str );
++    CloseHandle( file );
++    return str;
++}
++
++/* ---------------- sorted lists for queries ---------------- */
++
++struct list_builder
++{
++    void **items;
++    UINT32 count, capacity;
++    const WCHAR *prefix;
++    UINT32 prefix_len;
++    BOOL failed;
++};
++
++static BOOL builder_matches( struct list_builder *builder, const WCHAR *name )
++{
++    return !builder->prefix_len || !wcsncmp( name, builder->prefix, builder->prefix_len );
++}
++static void builder_add( struct list_builder *builder, void *item )
++{
++    if (!item) { builder->failed = TRUE; return; }
++    if (builder->count == builder->capacity)
++    {
++        UINT32 capacity = builder->capacity ? builder->capacity * 2 : 8;
++        void **items = realloc( builder->items, capacity * sizeof(*items) );
++        if (!items) { builder->failed = TRUE; call_release( item ); return; }
++        builder->items = items;
++        builder->capacity = capacity;
++    }
++    builder->items[builder->count++] = item;
++}
++
++static int compare_item_names( const void *a, const void *b )
++{
++    /* container_info and blob_info both start with obj then name */
++    const struct blob_info *x = CONTAINING_RECORD( *(void *const *)a, struct blob_info, obj.vtbl );
++    const struct blob_info *y = CONTAINING_RECORD( *(void *const *)b, struct blob_info, obj.vtbl );
++    INT32 order = 0;
++    WindowsCompareStringOrdinal( x->name, y->name, &order );
++    return order;
++}
++
++/* Keeps items [start, start + max) (max 0: all) and builds the vector view. */
++static struct vector *builder_finish( struct list_builder *builder, UINT32 start, UINT32 max, const GUID *view_iid,
++                                      const GUID *iterable_iid, const GUID *iterator_iid )
++{
++    struct vector *vector;
++    UINT32 i, end;
++
++    qsort( builder->items, builder->count, sizeof(*builder->items), compare_item_names );
++    if (start > builder->count) start = builder->count;
++    end = max && max < builder->count - start ? start + max : builder->count;
++    for (i = 0; i < builder->count; i++)
++        if (i < start || i >= end) call_release( builder->items[i] );
++    if (start) memmove( builder->items, builder->items + start, (end - start) * sizeof(*builder->items) );
++    if (!(vector = vector_create( view_iid, iterable_iid, iterator_iid, FALSE, builder->items, end - start )))
++    {
++        for (i = 0; i < end - start; i++) call_release( builder->items[i] );
++        free( builder->items );
++    }
++    return vector;
++}
++
++/* ---------------- GameSaveContainerInfoQuery ---------------- */
++
++struct container_query
++{
++    struct gs_object obj;
++    struct provider *provider;
++    WCHAR prefix[GS_MAX_NAME + 1];
++};
++static void container_query_destroy( struct gs_object *obj )
++{
++    struct container_query *query = CONTAINING_RECORD( obj, struct container_query, obj );
++    obj_release( &query->provider->obj );
++    free( query );
++}
++
++static void add_container_info( void *ctx, const WCHAR *name, const WCHAR *dir )
++{
++    struct list_builder *builder = ctx;
++    struct container_info *info;
++    FILETIME modified;
++
++    if (!builder_matches( builder, name )) return;
++    if (!(info = obj_alloc( sizeof(*info), container_info_vtbl, &IID_IGameSaveContainerInfo,
++                            L"Windows.Gaming.XboxLive.Storage.GameSaveContainerInfo", container_info_destroy )))
++    {
++        builder->failed = TRUE;
++        return;
++    }
++    WindowsCreateString( name, wcslen( name ), &info->name );
++    info->display_name = read_display_name( dir );
++    info->size = container_size( dir, &modified, NULL );
++    info->modified = ((INT64)modified.dwHighDateTime << 32) | modified.dwLowDateTime;
++    builder_add( builder, &info->obj.vtbl );
++}
++
++static HRESULT container_query_run( struct container_query *query, UINT32 start, UINT32 max, void **operation )
++{
++    struct list_builder builder = { .prefix = query->prefix, .prefix_len = wcslen( query->prefix ) };
++    struct vector *vector;
++
++    enum_containers( query->provider, add_container_info, &builder );
++    vector = builder_finish( &builder, start, max, &IID_IVectorView_GameSaveContainerInfo, &IID_IIterable_GameSaveContainerInfo,
++                             &IID_IIterator_GameSaveContainerInfo );
++    if (!vector) return E_OUTOFMEMORY;
++    TRACE( "prefix %s -> %u containers.\n", debugstr_w( query->prefix ), vector->count );
++    return complete_with_result( &IID_IGameSaveContainerInfoGetResult, L"Windows.Gaming.XboxLive.Storage.GameSaveContainerInfoGetResult",
++                                 builder.failed ? GS_NO_ACCESS : GS_OK, &vector->obj.vtbl, operation );
++}
++static HRESULT WINAPI container_query_GetContainerInfoAsync( struct container_query *query, void **operation )
++{
++    return container_query_run( query, 0, 0, operation );
++}
++static HRESULT WINAPI container_query_GetContainerInfoWithIndexAndMaxAsync( struct container_query *query, UINT32 start, UINT32 max, void **operation )
++{
++    return container_query_run( query, start, max, operation );
++}
++static void count_container( void *ctx, const WCHAR *name, const WCHAR *dir )
++{
++    struct list_builder *builder = ctx;
++    if (builder_matches( builder, name )) builder->count++;
++}
++static HRESULT WINAPI container_query_GetItemCountAsync( struct container_query *query, void **operation )
++{
++    struct list_builder builder = { .prefix = query->prefix, .prefix_len = wcslen( query->prefix ) };
++    enum_containers( query->provider, count_container, &builder );
++    return completed_int_operation( builder.count, operation );
++}
++static const void *const container_query_vtbl[] = { BASE, container_query_GetContainerInfoAsync,
++    container_query_GetContainerInfoWithIndexAndMaxAsync, container_query_GetItemCountAsync };
++
++static HRESULT container_query_create( struct provider *provider, HSTRING prefix, void **value )
++{
++    struct container_query *query;
++    UINT32 len;
++    const WCHAR *str = WindowsGetStringRawBuffer( prefix, &len );
++
++    if (len > GS_MAX_NAME) return E_INVALIDARG;
++    if (!(query = obj_alloc( sizeof(*query), container_query_vtbl, &IID_IGameSaveContainerInfoQuery,
++                             L"Windows.Gaming.XboxLive.Storage.GameSaveContainerInfoQuery", container_query_destroy )))
++        return E_OUTOFMEMORY;
++    memcpy( query->prefix, str, len * sizeof(WCHAR) );
++    query->provider = provider;
++    InterlockedIncrement( &provider->obj.ref );
++    *value = &query->obj.vtbl;
++    return S_OK;
++}
++
++/* ---------------- GameSaveContainer ---------------- */
++
++struct container
++{
++    struct gs_object obj;
++    struct provider *provider;
++    HSTRING name;
++    BOOL valid;
++    WCHAR dir[MAX_PATH];
++};
++static void container_destroy( struct gs_object *obj )
++{
++    struct container *container = CONTAINING_RECORD( obj, struct container, obj );
++    obj_release( &container->provider->obj );
++    WindowsDeleteString( container->name );
++    free( container );
++}
++
++static HRESULT WINAPI container_get_Name( struct container *container, HSTRING *value ) { return WindowsDuplicateString( container->name, value ); }
++static HRESULT WINAPI container_get_Provider( struct container *container, void **value )
++{
++    *value = &container->provider->obj.vtbl;
++    base_AddRef( *value );
++    return S_OK;
++}
++
++static BOOL blob_path( struct container *container, HSTRING name, const WCHAR *prefix, WCHAR *path )
++{
++    WCHAR file[GS_MAX_NAME * 7 + 16];
++    if (!hstring_to_file_name( name, file + wcslen( prefix ), ARRAY_SIZE(file) - wcslen( prefix ) )) return FALSE;
++    memcpy( file, prefix, wcslen( prefix ) * sizeof(WCHAR) );
++    return join_path( path, container->dir, file );
++}
++
++static BOOL write_file( const WCHAR *path, const void *data, DWORD size )
++{
++    DWORD written = 0;
++    HANDLE file = CreateFileW( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
++    BOOL ret;
++
++    if (file == INVALID_HANDLE_VALUE) return FALSE;
++    ret = WriteFile( file, data, size, &written, NULL ) && written == size;
++    CloseHandle( file );
++    if (!ret) DeleteFileW( path );
++    return ret;
++}
++
++/* One pending write: a blob name and its data. */
++struct pending_write
++{
++    HSTRING name;
++    void *buffer;   /* the app's IBuffer, referenced */
++};
++
++/* Collects the (name, IBuffer) pairs of an IIterable<IKeyValuePair<String, T>>. */
++static HRESULT collect_pairs( void *collection, const GUID *iterable_iid, BOOL boxed, struct pending_write **out, UINT32 *count )
++{
++    void *iterable, *iterator, *pair, *value;
++    struct pending_write *writes = NULL, *grown;
++    boolean has = FALSE;
++    HRESULT hr;
++
++    *out = NULL;
++    *count = 0;
++    if (!collection) return S_OK;
++    if (FAILED(hr = call_qi( collection, iterable_iid, &iterable )))
++    {
++        WARN( "collection %p is not iterable, hr %#lx.\n", collection, hr );
++        return E_INVALIDARG;
++    }
++    hr = call_out( iterable, 6, &iterator );                                  /* IIterable::First */
++    call_release( iterable );
++    if (FAILED(hr)) return hr;
++    for (hr = call_out( iterator, 7, &has ); SUCCEEDED(hr) && has; hr = call_out( iterator, 8, &has ))
++    {
++        HSTRING name = NULL;
++        if (FAILED(hr = call_out( iterator, 6, &pair ))) break;               /* IIterator::get_Current */
++        hr = call_out( pair, 6, &name );                                      /* IKeyValuePair::get_Key */
++        if (SUCCEEDED(hr)) hr = call_out( pair, 7, &value );                  /* IKeyValuePair::get_Value */
++        call_release( pair );
++        if (SUCCEEDED(hr) && boxed && value)
++        {
++            void *buffer = NULL;
++            hr = call_qi( value, &IID_IBuffer_local, &buffer );
++            call_release( value );
++            value = buffer;
++            if (FAILED(hr)) WARN( "property set value for %s is not an IBuffer.\n", debugstr_hstring( name ) );
++        }
++        if (FAILED(hr) || !value || !(grown = realloc( writes, (*count + 1) * sizeof(*writes) )))
++        {
++            WindowsDeleteString( name );
++            if (SUCCEEDED(hr)) { call_release( value ); hr = value ? E_OUTOFMEMORY : E_INVALIDARG; }
++            break;
++        }
++        writes = grown;
++        writes[*count].name = name;
++        writes[(*count)++].buffer = value;
++    }
++    call_release( iterator );
++    *out = writes;
++    return hr;
++}
++
++static void free_pairs( struct pending_write *writes, UINT32 count )
++{
++    UINT32 i;
++    for (i = 0; i < count; i++)
++    {
++        WindowsDeleteString( writes[i].name );
++        call_release( writes[i].buffer );
++    }
++    free( writes );
++}
++
++/* Collects the strings of an IIterable<String> (NULL: none). */
++static HRESULT collect_strings( void *collection, HSTRING **out, UINT32 *count )
++{
++    void *iterable, *iterator;
++    HSTRING *names = NULL, *grown, name;
++    boolean has = FALSE;
++    HRESULT hr;
++
++    *out = NULL;
++    *count = 0;
++    if (!collection) return S_OK;
++    if (FAILED(hr = call_qi( collection, &IID_IIterable_HSTRING, &iterable ))) return E_INVALIDARG;
++    hr = call_out( iterable, 6, &iterator );
++    call_release( iterable );
++    if (FAILED(hr)) return hr;
++    for (hr = call_out( iterator, 7, &has ); SUCCEEDED(hr) && has; hr = call_out( iterator, 8, &has ))
++    {
++        if (FAILED(hr = call_out( iterator, 6, &name ))) break;
++        if (!(grown = realloc( names, (*count + 1) * sizeof(*names) ))) { WindowsDeleteString( name ); hr = E_OUTOFMEMORY; break; }
++        names = grown;
++        names[(*count)++] = name;
++    }
++    call_release( iterator );
++    *out = names;
++    return hr;
++}
++
++static void free_strings( HSTRING *names, UINT32 count )
++{
++    while (count--) WindowsDeleteString( names[count] );
++    free( names );
++}
++
++static INT32 submit_updates( struct container *container, struct pending_write *writes, UINT32 write_count,
++                             HSTRING *deletes, UINT32 delete_count, HSTRING display_name )
++{
++    WCHAR temp[MAX_PATH], path[MAX_PATH];
++    INT32 status = GS_OK;
++    UINT32 i, written;
++
++    if (!container->valid) return GS_INVALID_CONTAINER_NAME;
++    for (i = 0; i < write_count; i++)
++        if (!blob_path( container, writes[i].name, L"", path )) return GS_INVALID_CONTAINER_NAME;
++    create_directories( container->dir );
++
++    /* write everything to temporary files first, so a failure leaves the container as it was */
++    for (written = 0; written < write_count; written++)
++    {
++        BYTE *data;
++        UINT32 length;
++
++        if (FAILED(buffer_bytes( writes[written].buffer, &data, &length, NULL ))) { status = GS_NO_ACCESS; break; }
++        blob_path( container, writes[written].name, L"%tmp-", temp );
++        if (!write_file( temp, data, length )) { status = GS_OUT_OF_LOCAL_STORAGE; break; }
++    }
++    for (i = 0; i < written; i++)
++    {
++        blob_path( container, writes[i].name, L"%tmp-", temp );
++        if (status == GS_OK)
++        {
++            blob_path( container, writes[i].name, L"", path );
++            if (!MoveFileExW( temp, path, MOVEFILE_REPLACE_EXISTING )) status = GS_NO_ACCESS;
++        }
++        else DeleteFileW( temp );
++    }
++    if (status) return status;
++
++    for (i = 0; i < delete_count; i++)
++        if (blob_path( container, deletes[i], L"", path ) && !DeleteFileW( path ) && GetLastError() != ERROR_FILE_NOT_FOUND)
++            status = GS_NO_ACCESS;
++
++    if (display_name && WindowsGetStringLen( display_name ) && join_path( path, container->dir, display_name_file ))
++    {
++        UINT32 len;
++        const WCHAR *str = WindowsGetStringRawBuffer( display_name, &len );
++        write_file( path, str, min( len, GS_MAX_NAME ) * sizeof(WCHAR) );
++    }
++    TRACE( "container %s: %u written, %u deleted, status %#x.\n", debugstr_hstring( container->name ), write_count, delete_count, status );
++    return status;
++}
++
++static HRESULT WINAPI container_SubmitUpdatesAsync( struct container *container, void *blobs_to_write, void *blobs_to_delete,
++                                                    HSTRING display_name, void **operation )
++{
++    struct pending_write *writes;
++    HSTRING *deletes;
++    UINT32 write_count, delete_count;
++    HRESULT hr;
++    INT32 status;
++
++    TRACE( "container %s, write %p, delete %p, display name %s.\n", debugstr_hstring( container->name ), blobs_to_write,
++           blobs_to_delete, debugstr_hstring( display_name ) );
++    if (FAILED(hr = collect_pairs( blobs_to_write, &IID_IIterable_IKeyValuePair_HSTRING_IBuffer, FALSE, &writes, &write_count )))
++        return hr;
++    if (FAILED(hr = collect_strings( blobs_to_delete, &deletes, &delete_count )))
++    {
++        free_pairs( writes, write_count );
++        return hr;
++    }
++    status = submit_updates( container, writes, write_count, deletes, delete_count, display_name );
++    free_pairs( writes, write_count );
++    free_strings( deletes, delete_count );
++    return complete_operation( status, operation );
++}
++
++static HRESULT WINAPI container_SubmitPropertySetUpdatesAsync( struct container *container, void *blobs_to_write, void *blobs_to_delete,
++                                                               HSTRING display_name, void **operation )
++{
++    struct pending_write *writes;
++    HSTRING *deletes;
++    UINT32 write_count, delete_count;
++    HRESULT hr;
++    INT32 status;
++
++    TRACE( "container %s, write %p, delete %p.\n", debugstr_hstring( container->name ), blobs_to_write, blobs_to_delete );
++    if (FAILED(hr = collect_pairs( blobs_to_write, &IID_IIterable_IKeyValuePair_HSTRING_IInspectable, TRUE, &writes, &write_count )))
++        return hr;
++    if (FAILED(hr = collect_strings( blobs_to_delete, &deletes, &delete_count )))
++    {
++        free_pairs( writes, write_count );
++        return hr;
++    }
++    status = submit_updates( container, writes, write_count, deletes, delete_count, display_name );
++    free_pairs( writes, write_count );
++    free_strings( deletes, delete_count );
++    return complete_operation( status, operation );
++}
++
++static INT32 read_blob( struct container *container, HSTRING name, BYTE **data, DWORD *size )
++{
++    WCHAR path[MAX_PATH];
++    LARGE_INTEGER file_size;
++    HANDLE file;
++    DWORD read = 0;
++
++    *data = NULL;
++    *size = 0;
++    if (!container->valid) return GS_INVALID_CONTAINER_NAME;
++    if (!blob_path( container, name, L"", path )) return GS_BLOB_NOT_FOUND;
++    file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++    if (file == INVALID_HANDLE_VALUE) return GS_BLOB_NOT_FOUND;
++    if (!GetFileSizeEx( file, &file_size ) || file_size.QuadPart > GS_QUOTA ||
++        !(*data = malloc( file_size.QuadPart ? file_size.QuadPart : 1 )) ||
++        !ReadFile( file, *data, file_size.QuadPart, &read, NULL ) || read != file_size.QuadPart)
++    {
++        CloseHandle( file );
++        free( *data );
++        *data = NULL;
++        return GS_NO_ACCESS;
++    }
++    CloseHandle( file );
++    *size = read;
++    return GS_OK;
++}
++
++/* ReadAsync: reads blobs into the app's buffers. */
++static HRESULT WINAPI container_ReadAsync( struct container *container, void *blobs_to_read, void **operation )
++{
++    struct pending_write *reads;
++    INT32 status = GS_OK;
++    UINT32 i, count;
++    HRESULT hr;
++
++    TRACE( "container %s, blobs %p.\n", debugstr_hstring( container->name ), blobs_to_read );
++    if (!blobs_to_read) return E_INVALIDARG;
++    if (FAILED(hr = collect_pairs( blobs_to_read, &IID_IIterable_IKeyValuePair_HSTRING_IBuffer, FALSE, &reads, &count ))) return hr;
++    for (i = 0; i < count && status == GS_OK; i++)
++    {
++        BYTE *data, *target;
++        UINT32 length, capacity;
++        DWORD size;
++
++        status = read_blob( container, reads[i].name, &data, &size );
++        TRACE( "blob %s: status %#x, %lu bytes.\n", debugstr_hstring( reads[i].name ), status, size );
++        if (status) break;
++        if (FAILED(buffer_bytes( reads[i].buffer, &target, &length, &capacity ))) status = GS_NO_ACCESS;
++        else if (capacity < size) status = GS_PROVIDED_BUFFER_TOO_SMALL;
++        else
++        {
++            memcpy( target, data, size );
++            call_out( reads[i].buffer, 8, (void *)(UINT_PTR)size );          /* IBuffer::put_Length */
++        }
++        free( data );
++    }
++    free_pairs( reads, count );
++    return complete_operation( status, operation );
++}
++
++/* Names of all blobs in the container (for GetAsync without a list). */
++static HRESULT all_blob_names( struct container *container, HSTRING **out, UINT32 *count )
++{
++    WCHAR pattern[MAX_PATH], name[GS_MAX_NAME + 1];
++    WIN32_FIND_DATAW data;
++    HSTRING *names = NULL, *grown;
++    HANDLE find;
++
++    *out = NULL;
++    *count = 0;
++    if (!container->valid || !join_path( pattern, container->dir, L"*" )) return S_OK;
++    if ((find = FindFirstFileW( pattern, &data )) == INVALID_HANDLE_VALUE) return S_OK;
++    do
++    {
++        if (!is_blob_file( &data, name, ARRAY_SIZE(name) )) continue;
++        if (!(grown = realloc( names, (*count + 1) * sizeof(*names) ))) break;
++        names = grown;
++        if (SUCCEEDED(WindowsCreateString( name, wcslen( name ), &names[*count] ))) (*count)++;
++    } while (FindNextFileW( find, &data ));
++    FindClose( find );
++    *out = names;
++    return S_OK;
++}
++
++/* GetAsync: returns the blobs' data in a new map. */
++static HRESULT WINAPI container_GetAsync( struct container *container, void *blobs_to_read, void **operation )
++{
++    struct blob_map *map;
++    HSTRING *names;
++    UINT32 i, count;
++    INT32 status = GS_OK;
++    HRESULT hr;
++
++    TRACE( "container %s, blobs %p.\n", debugstr_hstring( container->name ), blobs_to_read );
++    hr = blobs_to_read ? collect_strings( blobs_to_read, &names, &count ) : all_blob_names( container, &names, &count );
++    if (FAILED(hr)) return hr;
++    if (!(map = blob_map_create()))
++    {
++        free_strings( names, count );
++        return E_OUTOFMEMORY;
++    }
++    for (i = 0; i < count && status == GS_OK; i++)
++    {
++        struct buffer *buffer;
++        BYTE *data;
++        DWORD size;
++
++        if ((status = read_blob( container, names[i], &data, &size ))) break;
++        if (!(buffer = buffer_create( size ))) status = GS_NO_ACCESS;
++        else
++        {
++            memcpy( buffer->data, data, size );
++            if (!blob_map_add( map, names[i], buffer )) { obj_release( &buffer->obj ); status = GS_NO_ACCESS; }
++        }
++        free( data );
++    }
++    free_strings( names, count );
++    if (status)
++    {
++        obj_release( &map->obj );
++        map = NULL;
++    }
++    return complete_with_result( &IID_IGameSaveBlobGetResult, L"Windows.Gaming.XboxLive.Storage.GameSaveBlobGetResult",
++                                 status, map ? &map->obj.vtbl : NULL, operation );
++}
++
++/* ---- GameSaveBlobInfoQuery ---- */
++struct blob_query
++{
++    struct gs_object obj;
++    struct container *container;
++    WCHAR prefix[GS_MAX_NAME + 1];
++};
++static void blob_query_destroy( struct gs_object *obj )
++{
++    struct blob_query *query = CONTAINING_RECORD( obj, struct blob_query, obj );
++    obj_release( &query->container->obj );
++    free( query );
++}
++
++static void blob_query_collect( struct blob_query *query, struct list_builder *builder, BOOL count_only )
++{
++    WCHAR pattern[MAX_PATH], name[GS_MAX_NAME + 1];
++    WIN32_FIND_DATAW data;
++    struct blob_info *info;
++    HANDLE find;
++
++    builder->prefix = query->prefix;
++    builder->prefix_len = wcslen( query->prefix );
++    if (!query->container->valid || !join_path( pattern, query->container->dir, L"*" )) return;
++    if ((find = FindFirstFileW( pattern, &data )) == INVALID_HANDLE_VALUE) return;
++    do
++    {
++        if (!is_blob_file( &data, name, ARRAY_SIZE(name) ) || !builder_matches( builder, name )) continue;
++        if (count_only) { builder->count++; continue; }
++        if ((info = obj_alloc( sizeof(*info), blob_info_vtbl, &IID_IGameSaveBlobInfo, L"Windows.Gaming.XboxLive.Storage.GameSaveBlobInfo",
++                               blob_info_destroy )))
++        {
++            WindowsCreateString( name, wcslen( name ), &info->name );
++            info->size = min( file_size( &data ), 0xffffffff );
++        }
++        builder_add( builder, info ? &info->obj.vtbl : NULL );
++    } while (FindNextFileW( find, &data ));
++    FindClose( find );
++}
++
++static HRESULT blob_query_run( struct blob_query *query, UINT32 start, UINT32 max, void **operation )
++{
++    struct list_builder builder = { 0 };
++    struct vector *vector;
++
++    blob_query_collect( query, &builder, FALSE );
++    if (!(vector = builder_finish( &builder, start, max, &IID_IVectorView_GameSaveBlobInfo, &IID_IIterable_GameSaveBlobInfo,
++                                   &IID_IIterator_GameSaveBlobInfo )))
++        return E_OUTOFMEMORY;
++    TRACE( "container %s prefix %s -> %u blobs.\n", debugstr_hstring( query->container->name ), debugstr_w( query->prefix ), vector->count );
++    return complete_with_result( &IID_IGameSaveBlobInfoGetResult, L"Windows.Gaming.XboxLive.Storage.GameSaveBlobInfoGetResult",
++                                 builder.failed ? GS_NO_ACCESS : GS_OK, &vector->obj.vtbl, operation );
++}
++static HRESULT WINAPI blob_query_GetBlobInfoAsync( struct blob_query *query, void **operation ) { return blob_query_run( query, 0, 0, operation ); }
++static HRESULT WINAPI blob_query_GetBlobInfoWithIndexAndMaxAsync( struct blob_query *query, UINT32 start, UINT32 max, void **operation )
++{
++    return blob_query_run( query, start, max, operation );
++}
++static HRESULT WINAPI blob_query_GetItemCountAsync( struct blob_query *query, void **operation )
++{
++    struct list_builder builder = { 0 };
++    blob_query_collect( query, &builder, TRUE );
++    return completed_int_operation( builder.count, operation );
++}
++static const void *const blob_query_vtbl[] = { BASE, blob_query_GetBlobInfoAsync, blob_query_GetBlobInfoWithIndexAndMaxAsync,
++    blob_query_GetItemCountAsync };
++
++static HRESULT WINAPI container_CreateBlobInfoQuery( struct container *container, HSTRING prefix, void **value )
++{
++    struct blob_query *query;
++    UINT32 len;
++    const WCHAR *str = WindowsGetStringRawBuffer( prefix, &len );
++
++    if (len > GS_MAX_NAME) return E_INVALIDARG;
++    if (!(query = obj_alloc( sizeof(*query), blob_query_vtbl, &IID_IGameSaveBlobInfoQuery,
++                             L"Windows.Gaming.XboxLive.Storage.GameSaveBlobInfoQuery", blob_query_destroy )))
++        return E_OUTOFMEMORY;
++    memcpy( query->prefix, str, len * sizeof(WCHAR) );
++    query->container = container;
++    InterlockedIncrement( &container->obj.ref );
++    *value = &query->obj.vtbl;
++    return S_OK;
++}
++
++static const void *const container_vtbl[] = { BASE, container_get_Name, container_get_Provider, container_SubmitUpdatesAsync,
++    container_ReadAsync, container_GetAsync, container_SubmitPropertySetUpdatesAsync, container_CreateBlobInfoQuery };
++
++/* ---------------- GameSaveProvider ---------------- */
++
++static HRESULT WINAPI provider_get_User( struct provider *provider, IUnknown **value )
++{
++    if ((*value = provider->user)) IUnknown_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI provider_CreateContainer( struct provider *provider, HSTRING name, void **value )
++{
++    WCHAR file[GS_MAX_NAME * 7 + 1];
++    struct container *container;
++
++    TRACE( "provider %p, name %s.\n", provider, debugstr_hstring( name ) );
++    if (!(container = obj_alloc( sizeof(*container), container_vtbl, &IID_IGameSaveContainer,
++                                 L"Windows.Gaming.XboxLive.Storage.GameSaveContainer", container_destroy )))
++        return E_OUTOFMEMORY;
++    container->provider = provider;
++    InterlockedIncrement( &provider->obj.ref );
++    WindowsDuplicateString( name, &container->name );
++    /* an invalid name gives a container whose operations fail with InvalidContainerName */
++    container->valid = hstring_to_file_name( name, file, ARRAY_SIZE(file) ) && join_path( container->dir, provider->root, file );
++    if (!container->valid) WARN( "invalid container name %s.\n", debugstr_hstring( name ) );
++    *value = &container->obj.vtbl;
++    return S_OK;
++}
++
++static HRESULT WINAPI provider_DeleteContainerAsync( struct provider *provider, HSTRING name, void **operation )
++{
++    WCHAR file[GS_MAX_NAME * 7 + 1], dir[MAX_PATH], pattern[MAX_PATH], path[MAX_PATH];
++    WIN32_FIND_DATAW data;
++    INT32 status = GS_OK;
++    HANDLE find;
++
++    TRACE( "provider %p, name %s.\n", provider, debugstr_hstring( name ) );
++    if (!hstring_to_file_name( name, file, ARRAY_SIZE(file) ) || !join_path( dir, provider->root, file ) ||
++        !join_path( pattern, dir, L"*" ))
++        return complete_operation( GS_INVALID_CONTAINER_NAME, operation );
++    if ((find = FindFirstFileW( pattern, &data )) != INVALID_HANDLE_VALUE)
++    {
++        do
++        {
++            if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
++            if (!join_path( path, dir, data.cFileName ) || !DeleteFileW( path )) status = GS_NO_ACCESS;
++        } while (FindNextFileW( find, &data ));
++        FindClose( find );
++    }
++    if (!RemoveDirectoryW( dir ) && GetLastError() != ERROR_FILE_NOT_FOUND && GetLastError() != ERROR_PATH_NOT_FOUND)
++        status = GS_NO_ACCESS;
++    return complete_operation( status, operation );
++}
++
++static HRESULT WINAPI provider_CreateContainerInfoQuery( struct provider *provider, void **value )
++{
++    return container_query_create( provider, NULL, value );
++}
++static HRESULT WINAPI provider_CreateContainerInfoQueryWithName( struct provider *provider, HSTRING prefix, void **value )
++{
++    return container_query_create( provider, prefix, value );
++}
++static HRESULT WINAPI provider_GetRemainingBytesInQuotaAsync( struct provider *provider, void **operation )
++{
++    ULONGLONG used = 0;
++    enum_containers( provider, add_size, &used );
++    TRACE( "provider %p: %s bytes used.\n", provider, wine_dbgstr_longlong( used ) );
++    return completed_int64_operation( used < GS_QUOTA ? GS_QUOTA - used : 0, operation );
++}
++static HRESULT WINAPI provider_get_ContainersChangedSinceLastSync( struct provider *provider, void **value )
++{
++    struct vector *vector;
++    if (!(vector = vector_create( &IID_IVectorView_HSTRING, &IID_IIterable_HSTRING, &IID_IIterator_HSTRING, TRUE, NULL, 0 )))
++        return E_OUTOFMEMORY;
++    *value = &vector->obj.vtbl;
++    return S_OK;
++}
++static const void *const provider_vtbl[] = { BASE, provider_get_User, provider_CreateContainer, provider_DeleteContainerAsync,
++    provider_CreateContainerInfoQuery, provider_CreateContainerInfoQueryWithName, provider_GetRemainingBytesInQuotaAsync,
++    provider_get_ContainersChangedSinceLastSync };
++
++/* ---------------- IGameSaveProviderStatics ---------------- */
++
++static HRESULT WINAPI statics_GetForUserAsync( void *iface, IUnknown *user, HSTRING scid, void **operation )
++{
++    WCHAR local_state[MAX_PATH], file[GS_MAX_NAME * 7 + 1];
++    struct provider *provider;
++
++    TRACE( "user %p, service config id %s.\n", user, debugstr_hstring( scid ) );
++    if (!get_local_state( local_state, ARRAY_SIZE(local_state) ))
++    {
++        WARN( "no package identity: no LocalState folder for game saves.\n" );
++        return complete_with_result( &IID_IGameSaveProviderGetResult, L"Windows.Gaming.XboxLive.Storage.GameSaveProviderGetResult",
++                                     GS_NO_ACCESS, NULL, operation );
++    }
++    if (!(provider = obj_alloc( sizeof(*provider), provider_vtbl, &IID_IGameSaveProvider,
++                                L"Windows.Gaming.XboxLive.Storage.GameSaveProvider", provider_destroy )))
++        return E_OUTOFMEMORY;
++    if ((provider->user = user)) IUnknown_AddRef( user );
++    if (!hstring_to_file_name( scid, file, ARRAY_SIZE(file) )) wcscpy( file, L"default" );
++    if (swprintf( provider->root, MAX_PATH, L"%s\\XboxGameSaves\\%s", local_state, file ) < 0)
++    {
++        obj_release( &provider->obj );
++        return E_INVALIDARG;
++    }
++    FIXME( "Xbox Live connected storage is kept locally in %s.\n", debugstr_w( provider->root ) );
++    return complete_with_result( &IID_IGameSaveProviderGetResult, L"Windows.Gaming.XboxLive.Storage.GameSaveProviderGetResult",
++                                 GS_OK, &provider->obj.vtbl, operation );
++}
++
++static HRESULT WINAPI statics_QueryInterface( void *iface, REFIID iid, void **out );
++static ULONG WINAPI statics_AddRef( void *iface ) { return 2; }
++static ULONG WINAPI statics_Release( void *iface ) { return 1; }
++static HRESULT WINAPI statics_GetRuntimeClassName( void *iface, HSTRING *name ) { return E_NOTIMPL; }
++static const void *const statics_vtbl[] = { statics_QueryInterface, statics_AddRef, statics_Release, base_GetIids,
++    statics_GetRuntimeClassName, base_GetTrustLevel, statics_GetForUserAsync, statics_GetForUserAsync /* GetSyncOnDemandForUserAsync */ };
++static struct { const void *const *vtbl; } statics = { statics_vtbl };
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s.\n", iface, debugstr_guid( iid ) );
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = iface;
++    else if (IsEqualGUID( iid, &IID_IGameSaveProviderStatics ))
++        *out = &statics;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++static HRESULT WINAPI statics_QueryInterface( void *iface, REFIID iid, void **out )
++{
++    return factory_QueryInterface( game_save_provider_factory, iid, out );
++}
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance ) { return E_NOTIMPL; }
++static const IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface, factory_AddRef, factory_Release,
++    factory_GetIids, factory_GetRuntimeClassName, factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++static IActivationFactory factory = { &factory_vtbl };
++IActivationFactory *game_save_provider_factory = &factory;
+diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
+index 34a20c6..838f41e 100644
+--- a/dlls/twinapi.appcore/main.c
++++ b/dlls/twinapi.appcore/main.c
+@@ -156,7 +156,7 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+     else if (!wcscmp( buffer, L"Windows.ApplicationModel.Store.CurrentApp" ))
+         IActivationFactory_QueryInterface( current_app_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, L"Windows.Gaming.XboxLive.Storage.GameSaveProvider" ))
+-        IActivationFactory_QueryInterface( game_save_factory, &IID_IActivationFactory, (void **)factory );
++        IActivationFactory_QueryInterface( game_save_provider_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, L"Windows.Networking.Sockets.MessageWebSocket" ))
+         IActivationFactory_QueryInterface( message_websocket_factory, &IID_IActivationFactory, (void **)factory );
+ 
+diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
+index 0bc7cdc..f7ccfb4 100644
+--- a/dlls/twinapi.appcore/private.h
++++ b/dlls/twinapi.appcore/private.h
+@@ -59,10 +59,11 @@ extern void core_cursor_init(void);
+ extern IActivationFactory *message_dialog_factory;
+ extern void message_dialog_init(void);
+ extern IActivationFactory *hardware_identification_factory;
+-extern IActivationFactory *web_token_manager_factory, *web_token_request_factory, *web_account_provider_factory, *user_picker_factory, *system_user_factory, *launcher_factory, *web_account_factory, *web_token_response_factory, *thread_pool_timer_factory, *user_statics_factory, *store_context_real_factory, *game_save_factory, *message_websocket_factory, *store_context_factory, *logging_options_factory, *logging_fields_factory, *push_manager_factory, *logging_channel_factory, *loggingchanneloptions_factory, *loggingactivity_factory, *loggingsession_factory, *asynccausalitytracer_factory;
++extern IActivationFactory *web_token_manager_factory, *web_token_request_factory, *web_account_provider_factory, *user_picker_factory, *system_user_factory, *launcher_factory, *web_account_factory, *web_token_response_factory, *thread_pool_timer_factory, *user_statics_factory, *store_context_real_factory, *message_websocket_factory, *store_context_factory, *logging_options_factory, *logging_fields_factory, *push_manager_factory, *logging_channel_factory, *loggingchanneloptions_factory, *loggingactivity_factory, *loggingsession_factory, *asynccausalitytracer_factory;
+ extern IActivationFactory *core_window_factory;
+ extern IActivationFactory *current_app_factory;
+ extern IActivationFactory *display_request_factory;
++extern IActivationFactory *game_save_provider_factory;
+ extern void core_window_factory_init(void);
+ extern void core_application_init(void);
+ extern IActivationFactory *client_device_information_factory;

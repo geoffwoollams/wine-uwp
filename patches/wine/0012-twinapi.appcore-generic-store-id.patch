@@ -1,0 +1,56 @@
+Subject: twinapi.appcore: no hard-coded Store ID (WINE_APP_STORE_ID overrides the empty default)
+
+diff --git a/dlls/twinapi.appcore/store.c b/dlls/twinapi.appcore/store.c
+index d6a4467..b964ef7 100644
+--- a/dlls/twinapi.appcore/store.c
++++ b/dlls/twinapi.appcore/store.c
+@@ -25,8 +25,8 @@ struct product
+ static struct product products[MAX_PRODUCTS];
+ static UINT32 product_count;
+ static INIT_ONCE store_once = INIT_ONCE_STATIC_INIT;
+-/* TODO: Store IDs are not in the package manifest; this is the Store ID of the only app tested so far (Halo Wars 2). */
+-static WCHAR app_store_id[24] = L"9NBLGGH5WMKM";
++/* The app's Store ID (e.g. 9NBLGGH5WMKM) is not in the package manifest, so it is empty unless WINE_APP_STORE_ID is set. */
++static WCHAR app_store_id[24];
+ extern const void *const product_vtbl[];
+ extern const void *const license_obj_vtbl[];
+ extern const void *const pmap_view_vtbl[];
+@@ -39,6 +39,20 @@ static BOOL CALLBACK init_store(INIT_ONCE *once, void *param, void **ctx)
+ }
+ static void store_init(void) { InitOnceExecuteOnce(&store_once, init_store, NULL, NULL); }
+ 
++static const WCHAR *store_app_id(void)
++{
++    static WCHAR env_id[24];
++    static BOOL from_env;
++
++    store_init();
++    if (!from_env && GetEnvironmentVariableW( L"WINE_APP_STORE_ID", env_id, ARRAY_SIZE(env_id) ) - 1 < ARRAY_SIZE(env_id) - 1)
++    {
++        TRACE( "Store ID %s from WINE_APP_STORE_ID.\n", debugstr_w( env_id ) );
++        from_env = TRUE;
++    }
++    return from_env ? env_id : app_store_id;
++}
++
+ /* ---------------- common slot helpers ---------------- */
+ static HRESULT WINAPI o_QI(void *o, REFIID iid, void **out) { TRACE("obj %p iid %s\n", o, debugstr_guid(iid)); *out = o; return S_OK; }
+ static ULONG WINAPI o_AddRef(void *o) { return 2; }
+@@ -159,7 +173,7 @@ const void *const license_obj_vtbl[] = { BASE, lic_SkuStoreId, lic_IsActive, lic
+ 
+ /* ---------------- StoreAppLicense ---------------- */
+ static struct obj app_license_obj;
+-static HRESULT WINAPI al_SkuStoreId(void *o, HSTRING *v) { store_init(); return str_out(app_store_id, v); }
++static HRESULT WINAPI al_SkuStoreId(void *o, HSTRING *v) { return str_out(store_app_id(), v); }
+ static HRESULT WINAPI al_True(void *o, boolean *v) { *v = TRUE; return S_OK; }
+ static HRESULT WINAPI al_False(void *o, boolean *v) { *v = FALSE; return S_OK; }
+ static HRESULT WINAPI al_Expiration(void *o, INT64 *v) { *v = 0x7fffffffffffffffLL; return S_OK; }
+@@ -222,7 +236,7 @@ static HRESULT WINAPI pres_Product(void *o, void **v)
+ {
+     store_init();
+     app_product.lpVtbl = product_vtbl;
+-    wcscpy(app_product.store_id, app_store_id);
++    wcscpy(app_product.store_id, store_app_id());
+     app_display_name(app_product.name, ARRAY_SIZE(app_product.name));
+     wcscpy(app_product.kind, L"Game");
+     *v = &app_product;

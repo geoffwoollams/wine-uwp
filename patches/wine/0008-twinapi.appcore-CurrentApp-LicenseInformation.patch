@@ -1,0 +1,340 @@
+Subject: twinapi.appcore: Windows.ApplicationModel.Store.CurrentApp (licensed base app, no add-on licences)
+
+diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
+index 0db52f0..e6a3e2b 100644
+--- a/dlls/twinapi.appcore/Makefile.in
++++ b/dlls/twinapi.appcore/Makefile.in
+@@ -9,6 +9,7 @@ SOURCES = \
+ 	classes.idl \
+ 	auth_probe.c \
+ 	client_device_information.c \
++	current_app.c \
+ 	core_gen.c \
+ 	core_input_gen.c \
+ 	sink.c \
+diff --git a/dlls/twinapi.appcore/current_app.c b/dlls/twinapi.appcore/current_app.c
+new file mode 100644
+index 0000000..84cfb6d
+--- /dev/null
++++ b/dlls/twinapi.appcore/current_app.c
+@@ -0,0 +1,295 @@
++/* Windows.ApplicationModel.Store.CurrentApp: the older (Windows 8.1-era) licensing API.
++ *
++ * Wine has no Store client, so this reports what Windows reports for an installed, fully licensed app while offline:
++ * the app licence is active and not a trial, and there are no add-on (in-app product) licences.  Purchases, listings
++ * and receipts need the Store service and fail as they do offline. */
++#include "private.h"
++#include "appmodel.h"
++#include "roapi.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
++
++extern HRESULT completed_ptr_operation( void *ptr, void **out );
++extern HRESULT failed_operation( HRESULT hr, void **out );
++
++#define STORE_E_OFFLINE ((HRESULT)0x80072ee7) /* WININET_E_NAME_NOT_RESOLVED: what the Store APIs fail with offline */
++
++static const GUID IID_ICurrentApp = { 0xd52dc065, 0xda3f, 0x4685, { 0x99, 0x5e, 0x9b, 0x48, 0x2e, 0xb5, 0xe6, 0x03 } };
++static const GUID IID_ICurrentAppWithConsumables = { 0x844e0071, 0x9e4f, 0x4f79, { 0x99, 0x5a, 0x5f, 0x91, 0x17, 0x2e, 0x6c, 0xef } };
++static const GUID IID_ICurrentAppStaticsWithFiltering = { 0xd36d6542, 0x9085, 0x438e, { 0x97, 0xba, 0xa2, 0x5c, 0x97, 0x6b, 0xe2, 0xfd } };
++static const GUID IID_ICurrentApp2Statics = { 0xdf4e6e2d, 0x3171, 0x4ad3, { 0x86, 0x14, 0x2c, 0x61, 0x24, 0x43, 0x73, 0xcb } };
++static const GUID IID_ILicenseInformation = { 0x8eb7dc30, 0xf170, 0x4ed5, { 0x8e, 0x21, 0x15, 0x16, 0xda, 0x3f, 0xd3, 0x67 } };
++/* IMapView<String, ProductLicense>, IIterable<IKeyValuePair<String, ProductLicense>> and its IIterator */
++static const GUID IID_IMapView_ProductLicense = { 0xd6434f65, 0xdd84, 0x534c, { 0xb5, 0x79, 0xcc, 0x10, 0xd6, 0x9e, 0xc3, 0x0a } };
++static const GUID IID_IIterable_ProductLicensePair = { 0xffe05002, 0x6e65, 0x5001, { 0xa7, 0x52, 0x9b, 0x27, 0xed, 0x3e, 0x28, 0x39 } };
++static const GUID IID_IIterator_ProductLicensePair = { 0x3f3c06e6, 0x593f, 0x557a, { 0x8e, 0x3c, 0x45, 0x51, 0x3a, 0xc0, 0x1f, 0x7c } };
++
++/* All objects here are static singletons: reference counting is a no-op. */
++struct iface { const void *const *lpVtbl; };
++
++static ULONG WINAPI static_AddRef( void *iface ) { return 2; }
++static ULONG WINAPI static_Release( void *iface ) { return 1; }
++static HRESULT WINAPI static_GetIids( void *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI static_GetTrustLevel( void *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static BOOL is_base_iid( REFIID iid )
++{
++    return IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject );
++}
++
++static HRESULT class_name( const WCHAR *name, HSTRING *out ) { return WindowsCreateString( name, wcslen( name ), out ); }
++
++/* ---- empty IMapView<String, ProductLicense> (+ IIterable, IIterator) ---- */
++static struct iface empty_view, empty_iterable, empty_iterator;
++
++static HRESULT WINAPI empty_QueryInterface( void *iface, REFIID iid, void **out )
++{
++    if (is_base_iid( iid ) && iface == &empty_view) *out = &empty_view;
++    else if (IsEqualGUID( iid, &IID_IMapView_ProductLicense )) *out = &empty_view;
++    else if (IsEqualGUID( iid, &IID_IIterable_ProductLicensePair )) *out = &empty_iterable;
++    else if (is_base_iid( iid ) || IsEqualGUID( iid, &IID_IIterator_ProductLicensePair )) *out = iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++static HRESULT WINAPI empty_GetRuntimeClassName( void *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI view_Lookup( void *iface, HSTRING key, void **value ) { *value = NULL; return E_BOUNDS; }
++static HRESULT WINAPI view_get_Size( void *iface, UINT32 *size ) { *size = 0; return S_OK; }
++static HRESULT WINAPI view_HasKey( void *iface, HSTRING key, boolean *found ) { *found = FALSE; return S_OK; }
++static HRESULT WINAPI view_Split( void *iface, void **first, void **second ) { *first = *second = NULL; return S_OK; }
++static HRESULT WINAPI iterable_First( void *iface, void **iterator ) { *iterator = &empty_iterator; return S_OK; }
++static HRESULT WINAPI iterator_get_Current( void *iface, void **value ) { *value = NULL; return E_BOUNDS; }
++static HRESULT WINAPI iterator_get_HasCurrent( void *iface, boolean *value ) { *value = FALSE; return S_OK; }
++static HRESULT WINAPI iterator_MoveNext( void *iface, boolean *value ) { *value = FALSE; return S_OK; }
++static HRESULT WINAPI iterator_GetMany( void *iface, UINT32 size, void **items, UINT32 *count ) { *count = 0; return S_OK; }
++
++#define EMPTY_BASE empty_QueryInterface, static_AddRef, static_Release, static_GetIids, empty_GetRuntimeClassName, static_GetTrustLevel
++static const void *const empty_view_vtbl[] = { EMPTY_BASE, view_Lookup, view_get_Size, view_HasKey, view_Split };
++static const void *const empty_iterable_vtbl[] = { EMPTY_BASE, iterable_First };
++static const void *const empty_iterator_vtbl[] = { EMPTY_BASE, iterator_get_Current, iterator_get_HasCurrent, iterator_MoveNext, iterator_GetMany };
++static struct iface empty_view = { empty_view_vtbl };
++static struct iface empty_iterable = { empty_iterable_vtbl };
++static struct iface empty_iterator = { empty_iterator_vtbl };
++
++/* ---- LicenseInformation ---- */
++static struct iface license_information;
++
++static HRESULT WINAPI license_QueryInterface( void *iface, REFIID iid, void **out )
++{
++    if (is_base_iid( iid ) || IsEqualGUID( iid, &IID_ILicenseInformation ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static HRESULT WINAPI license_GetRuntimeClassName( void *iface, HSTRING *name )
++{
++    return class_name( L"Windows.ApplicationModel.Store.LicenseInformation", name );
++}
++static HRESULT WINAPI license_get_ProductLicenses( void *iface, void **value )
++{
++    TRACE( "iface %p -> no add-on licences.\n", iface );
++    *value = &empty_view;
++    return S_OK;
++}
++static HRESULT WINAPI license_get_IsActive( void *iface, boolean *value ) { *value = TRUE; return S_OK; }
++static HRESULT WINAPI license_get_IsTrial( void *iface, boolean *value ) { *value = FALSE; return S_OK; }
++static HRESULT WINAPI license_get_ExpirationDate( void *iface, DateTime *value )
++{
++    value->UniversalTime = 0x7fffffffffffffffLL; /* a full licence does not expire */
++    return S_OK;
++}
++static HRESULT WINAPI license_add_LicenseChanged( void *iface, void *handler, EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p: the licence never changes.\n", iface, handler );
++    token->value = 1;
++    return S_OK;
++}
++static HRESULT WINAPI license_remove_LicenseChanged( void *iface, EventRegistrationToken token ) { return S_OK; }
++
++static const void *const license_vtbl[] =
++{
++    license_QueryInterface, static_AddRef, static_Release, static_GetIids, license_GetRuntimeClassName, static_GetTrustLevel,
++    license_get_ProductLicenses, license_get_IsActive, license_get_IsTrial, license_get_ExpirationDate,
++    license_add_LicenseChanged, license_remove_LicenseChanged,
++};
++static struct iface license_information = { license_vtbl };
++
++/* ---- CurrentApp statics: ICurrentApp, ICurrentAppWithConsumables, ICurrentAppStaticsWithFiltering, ICurrentApp2Statics ---- */
++struct current_app
++{
++    IActivationFactory IActivationFactory_iface;
++    struct iface ICurrentApp_iface;
++    struct iface ICurrentAppWithConsumables_iface;
++    struct iface ICurrentAppStaticsWithFiltering_iface;
++    struct iface ICurrentApp2Statics_iface;
++};
++static struct current_app current_app;
++
++static HRESULT current_app_qi( REFIID iid, void **out )
++{
++    if (is_base_iid( iid ) || IsEqualGUID( iid, &IID_IActivationFactory )) *out = &current_app.IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_ICurrentApp )) *out = &current_app.ICurrentApp_iface;
++    else if (IsEqualGUID( iid, &IID_ICurrentAppWithConsumables )) *out = &current_app.ICurrentAppWithConsumables_iface;
++    else if (IsEqualGUID( iid, &IID_ICurrentAppStaticsWithFiltering )) *out = &current_app.ICurrentAppStaticsWithFiltering_iface;
++    else if (IsEqualGUID( iid, &IID_ICurrentApp2Statics )) *out = &current_app.ICurrentApp2Statics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++static HRESULT WINAPI statics_QueryInterface( void *iface, REFIID iid, void **out ) { return current_app_qi( iid, out ); }
++static HRESULT WINAPI statics_GetRuntimeClassName( void *iface, HSTRING *name ) { return E_NOTIMPL; }
++#define STATICS_BASE statics_QueryInterface, static_AddRef, static_Release, static_GetIids, statics_GetRuntimeClassName, static_GetTrustLevel
++
++static HRESULT WINAPI current_app_get_LicenseInformation( void *iface, void **value )
++{
++    TRACE( "iface %p -> licensed, not a trial.\n", iface );
++    *value = &license_information;
++    return S_OK;
++}
++static HRESULT WINAPI current_app_get_LinkUri( void *iface, IUriRuntimeClass **value )
++{
++    static const WCHAR prefix[] = L"ms-windows-store://pdp/?PFN=";
++    WCHAR uri[ARRAY_SIZE(prefix) + PACKAGE_FAMILY_NAME_MAX_LENGTH + 1];
++    IUriRuntimeClassFactory *factory;
++    UINT32 len = PACKAGE_FAMILY_NAME_MAX_LENGTH + 1;
++    HSTRING str;
++    HRESULT hr;
++
++    *value = NULL;
++    wcscpy( uri, prefix );
++    if (GetCurrentPackageFamilyName( &len, uri + wcslen( prefix ) )) return HRESULT_FROM_WIN32( APPMODEL_ERROR_NO_PACKAGE );
++    if (FAILED(hr = WindowsCreateString( RuntimeClass_Windows_Foundation_Uri, wcslen( RuntimeClass_Windows_Foundation_Uri ), &str ))) return hr;
++    hr = RoGetActivationFactory( str, &IID_IUriRuntimeClassFactory, (void **)&factory );
++    WindowsDeleteString( str );
++    if (FAILED(hr)) return hr;
++    if (SUCCEEDED(hr = WindowsCreateString( uri, wcslen( uri ), &str )))
++    {
++        hr = IUriRuntimeClassFactory_CreateUri( factory, str, value );
++        WindowsDeleteString( str );
++    }
++    IUriRuntimeClassFactory_Release( factory );
++    return hr;
++}
++static HRESULT WINAPI current_app_get_AppId( void *iface, GUID *value )
++{
++    FIXME( "iface %p: no Store app ID offline, returning GUID_NULL.\n", iface );
++    memset( value, 0, sizeof(*value) );
++    return S_OK;
++}
++static HRESULT WINAPI current_app_RequestAppPurchaseAsync( void *iface, boolean receipt, void **operation )
++{
++    HSTRING empty = NULL;
++    FIXME( "iface %p, receipt %d: the app is already licensed, no receipt offline.\n", iface, receipt );
++    return completed_ptr_operation( empty, operation );
++}
++static HRESULT WINAPI current_app_RequestProductPurchaseAsync( void *iface, HSTRING product, boolean receipt, void **operation )
++{
++    FIXME( "iface %p, product %s: purchases need the Store.\n", iface, debugstr_hstring( product ) );
++    return failed_operation( STORE_E_OFFLINE, operation );
++}
++static HRESULT WINAPI current_app_LoadListingInformationAsync( void *iface, void **operation )
++{
++    FIXME( "iface %p: no Store listing offline.\n", iface );
++    return failed_operation( STORE_E_OFFLINE, operation );
++}
++static HRESULT WINAPI current_app_GetAppReceiptAsync( void *iface, void **operation )
++{
++    FIXME( "iface %p: no Store receipt offline.\n", iface );
++    return failed_operation( STORE_E_OFFLINE, operation );
++}
++static HRESULT WINAPI current_app_GetProductReceiptAsync( void *iface, HSTRING product, void **operation )
++{
++    FIXME( "iface %p, product %s: no Store receipt offline.\n", iface, debugstr_hstring( product ) );
++    return failed_operation( STORE_E_OFFLINE, operation );
++}
++static const void *const current_app_vtbl[] =
++{
++    STATICS_BASE,
++    current_app_get_LicenseInformation, current_app_get_LinkUri, current_app_get_AppId,
++    current_app_RequestAppPurchaseAsync, current_app_RequestProductPurchaseAsync, current_app_LoadListingInformationAsync,
++    current_app_GetAppReceiptAsync, current_app_GetProductReceiptAsync,
++};
++
++static HRESULT WINAPI consumables_ReportConsumableFulfillmentAsync( void *iface, HSTRING product, GUID transaction, void **operation )
++{
++    FIXME( "iface %p, product %s: no consumables offline.\n", iface, debugstr_hstring( product ) );
++    return failed_operation( STORE_E_OFFLINE, operation );
++}
++static HRESULT WINAPI consumables_RequestProductPurchaseWithResultsAsync( void *iface, HSTRING product, void **operation )
++{
++    return current_app_RequestProductPurchaseAsync( iface, product, FALSE, operation );
++}
++static HRESULT WINAPI consumables_RequestProductPurchaseWithDisplayPropertiesAsync( void *iface, HSTRING product, HSTRING offer,
++                                                                                     void *properties, void **operation )
++{
++    return current_app_RequestProductPurchaseAsync( iface, product, FALSE, operation );
++}
++static HRESULT WINAPI consumables_GetUnfulfilledConsumablesAsync( void *iface, void **operation )
++{
++    FIXME( "iface %p: no consumables offline.\n", iface );
++    return failed_operation( STORE_E_OFFLINE, operation );
++}
++static const void *const consumables_vtbl[] =
++{
++    STATICS_BASE,
++    consumables_ReportConsumableFulfillmentAsync, consumables_RequestProductPurchaseWithResultsAsync,
++    consumables_RequestProductPurchaseWithDisplayPropertiesAsync, consumables_GetUnfulfilledConsumablesAsync,
++};
++
++static HRESULT WINAPI filtering_LoadListingInformationByProductIdsAsync( void *iface, void *ids, void **operation )
++{
++    return current_app_LoadListingInformationAsync( iface, operation );
++}
++static HRESULT WINAPI filtering_LoadListingInformationByKeywordsAsync( void *iface, void *keywords, void **operation )
++{
++    return current_app_LoadListingInformationAsync( iface, operation );
++}
++static HRESULT WINAPI filtering_ReportProductFulfillment( void *iface, HSTRING product )
++{
++    FIXME( "iface %p, product %s: no add-ons offline.\n", iface, debugstr_hstring( product ) );
++    return S_OK;
++}
++static const void *const filtering_vtbl[] =
++{
++    STATICS_BASE,
++    filtering_LoadListingInformationByProductIdsAsync, filtering_LoadListingInformationByKeywordsAsync,
++    filtering_ReportProductFulfillment,
++};
++
++static HRESULT WINAPI app2_GetCustomerIdAsync( void *iface, HSTRING ticket, HSTRING user, void **operation )
++{
++    FIXME( "iface %p: no Store customer ID offline.\n", iface );
++    return failed_operation( STORE_E_OFFLINE, operation );
++}
++static const void *const app2_vtbl[] = { STATICS_BASE, app2_GetCustomerIdAsync, app2_GetCustomerIdAsync };
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out ) { return current_app_qi( iid, out ); }
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance ) { return E_NOTIMPL; }
++static const IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface, factory_AddRef, factory_Release, factory_GetIids, factory_GetRuntimeClassName,
++    factory_GetTrustLevel, factory_ActivateInstance,
++};
++
++static struct current_app current_app =
++{
++    { &factory_vtbl }, { current_app_vtbl }, { consumables_vtbl }, { filtering_vtbl }, { app2_vtbl },
++};
++IActivationFactory *current_app_factory = &current_app.IActivationFactory_iface;
+diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
+index 9f3db77..0e0f620 100644
+--- a/dlls/twinapi.appcore/main.c
++++ b/dlls/twinapi.appcore/main.c
+@@ -150,6 +150,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( push_manager_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, L"Windows.Services.Store.StoreContext" ))
+         IActivationFactory_QueryInterface( store_context_real_factory, &IID_IActivationFactory, (void **)factory );
++    else if (!wcscmp( buffer, L"Windows.ApplicationModel.Store.CurrentApp" ))
++        IActivationFactory_QueryInterface( current_app_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, L"Windows.Gaming.XboxLive.Storage.GameSaveProvider" ))
+         IActivationFactory_QueryInterface( game_save_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, L"Windows.Networking.Sockets.MessageWebSocket" ))
+diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
+index 250a597..5df5a0d 100644
+--- a/dlls/twinapi.appcore/private.h
++++ b/dlls/twinapi.appcore/private.h
+@@ -61,6 +61,7 @@ extern void message_dialog_init(void);
+ extern IActivationFactory *hardware_identification_factory;
+ extern IActivationFactory *web_token_manager_factory, *web_token_request_factory, *web_account_provider_factory, *user_picker_factory, *system_user_factory, *launcher_factory, *web_account_factory, *web_token_response_factory, *thread_pool_timer_factory, *user_statics_factory, *store_context_real_factory, *game_save_factory, *message_websocket_factory, *store_context_factory, *logging_options_factory, *logging_fields_factory, *push_manager_factory, *logging_channel_factory, *loggingchanneloptions_factory, *loggingactivity_factory, *loggingsession_factory, *asynccausalitytracer_factory;
+ extern IActivationFactory *core_window_factory;
++extern IActivationFactory *current_app_factory;
+ extern void core_window_factory_init(void);
+ extern void core_application_init(void);
+ extern IActivationFactory *client_device_information_factory;

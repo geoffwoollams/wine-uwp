@@ -1,0 +1,12 @@
+# build outputs and sources fetched by the scripts
+/build/
+# logs and local-only files
+*.log
+/logs/
+/local-only/
+*.crash.txt
+# editor swap files
+*.kate-swp
+*.swp
+*~
+dist/

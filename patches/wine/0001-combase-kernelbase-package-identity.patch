@@ -1,0 +1,361 @@
+Subject: combase, kernelbase: package identity from AppxManifest.xml and missing RoFailFast/RoUnregister entry points
+
+diff --git a/dlls/combase/combase.spec b/dlls/combase/combase.spec
+index 9018b01..0651251 100644
+--- a/dlls/combase/combase.spec
++++ b/dlls/combase/combase.spec
+@@ -290,7 +290,7 @@
+ @ stdcall RoActivateInstance(ptr ptr)
+ @ stub RoCaptureErrorContext
+ @ stub RoClearError
+-@ stub RoFailFastWithErrorContext
++@ stdcall RoFailFastWithErrorContext(long)
+ @ stub RoFreeParameterizedTypeExtra
+ @ stub RoGetActivatableClassRegistration
+ @ stdcall RoGetActivationFactory(ptr ptr ptr)
+@@ -318,7 +318,7 @@
+ @ stub RoTransformError
+ @ stub RoTransformErrorW
+ @ stdcall RoUninitialize()
+-@ stub RoUnregisterForApartmentShutdown
++@ stdcall RoUnregisterForApartmentShutdown(ptr)
+ @ stub SetCleanupFlag
+ @ stdcall SetErrorInfo(long ptr)
+ @ stdcall SetRestrictedErrorInfo(ptr)
+diff --git a/dlls/combase/roapi.c b/dlls/combase/roapi.c
+index a88181a..e55913a 100644
+--- a/dlls/combase/roapi.c
++++ b/dlls/combase/roapi.c
+@@ -437,6 +437,24 @@ void WINAPI RoFailFastWithErrorContextInternal2(HRESULT error, ULONG exception_c
+     RaiseFailFastException(NULL, NULL, 0);
+ }
+ 
++/***********************************************************************
++ *      RoFailFastWithErrorContext (combase.@)
++ */
++void WINAPI RoFailFastWithErrorContext(HRESULT error)
++{
++    ERR("fail fast requested, error %#lx.\n", error);
++    RaiseFailFastException(NULL, NULL, 0);
++}
++
++/***********************************************************************
++ *      RoUnregisterForApartmentShutdown (combase.@)
++ */
++HRESULT WINAPI RoUnregisterForApartmentShutdown(APARTMENT_SHUTDOWN_REGISTRATION_COOKIE cookie)
++{
++    FIXME("(%p): stub\n", cookie);
++    return S_OK;
++}
++
+ /***********************************************************************
+  *      RoGetApartmentIdentifier (combase.@)
+  */
+diff --git a/dlls/kernelbase/version.c b/dlls/kernelbase/version.c
+index d3399bc..8951268 100644
+--- a/dlls/kernelbase/version.c
++++ b/dlls/kernelbase/version.c
+@@ -1547,13 +1547,183 @@ BOOL WINAPI GetVersionExW( OSVERSIONINFOW *info )
+     return TRUE;
+ }
+ 
++/* Package identity of the current process.
++ *
++ * Wine has no real packaged-process support. As a prototype for UWP games, the identity is taken from an
++ * AppxManifest.xml sitting in the directory of the main executable (the layout of an unpacked/loose app package). */
++typedef struct
++{
++    UINT32 reserved;
++    UINT32 flags;
++    WCHAR *path;
++    WCHAR *packageFullName;
++    WCHAR *packageFamilyName;
++    PACKAGE_ID packageId;
++}
++WINE_PACKAGE_INFO;
++
++static struct
++{
++    INIT_ONCE once;
++    BOOL valid;
++    WCHAR path[MAX_PATH];
++    WCHAR name[128];
++    WCHAR publisher[256];
++    WCHAR publisher_id[16];
++    WCHAR family[160];
++    WCHAR full[256];
++    WCHAR app_user_model_id[200];
++    UINT32 arch;
++    PACKAGE_VERSION version;
++}
++current_package = { INIT_ONCE_STATIC_INIT };
++
++static BOOL manifest_attr( const char *tag, const char *attr, WCHAR *out, UINT32 out_len )
++{
++    char pattern[64];
++    const char *p, *end;
++
++    snprintf( pattern, sizeof(pattern), " %s=\"", attr );
++    if (!(p = strstr( tag, pattern ))) return FALSE;
++    p += strlen( pattern );
++    if (!(end = strchr( p, '"' ))) return FALSE;
++    if ((UINT32)(end - p) >= out_len) return FALSE;
++    while (p < end) *out++ = (unsigned char)*p++;
++    *out = 0;
++    return TRUE;
++}
++
++static BOOL CALLBACK init_current_package( INIT_ONCE *once, void *param, void **context )
++{
++    static const char ms_publisher[] = "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US";
++    WCHAR manifest_path[MAX_PATH], arch_str[32], version_str[64], app_id[64] = L"App", *p;
++    char *data = NULL, *identity, *tag_end, *app;
++    LARGE_INTEGER size;
++    HANDLE file;
++    DWORD len;
++    char narrow_pub[256];
++    UINT32 i;
++
++    len = GetModuleFileNameW( NULL, manifest_path, MAX_PATH );
++    if (!len || len >= MAX_PATH) return TRUE;
++    if (!(p = wcsrchr( manifest_path, '\\' ))) return TRUE;
++    p[1] = 0;
++    wcscpy( current_package.path, manifest_path );
++    p[0] = 0; /* path without trailing separator */
++    wcscpy( current_package.path, manifest_path );
++    p[0] = '\\';
++    wcscat( manifest_path, L"AppxManifest.xml" );
++
++    file = CreateFileW( manifest_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++    if (file == INVALID_HANDLE_VALUE) return TRUE;
++    if (!GetFileSizeEx( file, &size ) || size.QuadPart > 1024 * 1024 || !(data = HeapAlloc( GetProcessHeap(), 0, size.QuadPart + 1 )))
++    {
++        CloseHandle( file );
++        return TRUE;
++    }
++    if (!ReadFile( file, data, size.QuadPart, &len, NULL )) len = 0;
++    CloseHandle( file );
++    data[len] = 0;
++
++    if (!(identity = strstr( data, "<Identity " ))) goto done;
++    if (!(tag_end = strchr( identity, '>' ))) goto done;
++    *tag_end = 0;
++
++    if (!manifest_attr( identity, "Name", current_package.name, ARRAY_SIZE(current_package.name) )) goto done;
++    if (!manifest_attr( identity, "Publisher", current_package.publisher, ARRAY_SIZE(current_package.publisher) )) goto done;
++    if (!manifest_attr( identity, "Version", version_str, ARRAY_SIZE(version_str) )) goto done;
++    if (!manifest_attr( identity, "ProcessorArchitecture", arch_str, ARRAY_SIZE(arch_str) )) wcscpy( arch_str, L"neutral" );
++
++    {
++        WCHAR *q = version_str;
++        current_package.version.Major = wcstoul( q, &q, 10 );
++        if (*q == '.') current_package.version.Minor = wcstoul( q + 1, &q, 10 );
++        if (*q == '.') current_package.version.Build = wcstoul( q + 1, &q, 10 );
++        if (*q == '.') current_package.version.Revision = wcstoul( q + 1, &q, 10 );
++    }
++    current_package.arch = !wcsicmp( arch_str, L"x64" ) ? PROCESSOR_ARCHITECTURE_AMD64 :
++                           !wcsicmp( arch_str, L"x86" ) ? PROCESSOR_ARCHITECTURE_INTEL :
++                           !wcsicmp( arch_str, L"arm" ) ? PROCESSOR_ARCHITECTURE_ARM :
++                           !wcsicmp( arch_str, L"arm64" ) ? PROCESSOR_ARCHITECTURE_ARM64 : PROCESSOR_ARCHITECTURE_NEUTRAL;
++
++    /* TODO: the real publisher id is a base32 encoding of a SHA-256 hash of the publisher string. */
++    for (i = 0; current_package.publisher[i] && i < sizeof(narrow_pub) - 1; i++) narrow_pub[i] = (char)current_package.publisher[i];
++    narrow_pub[i] = 0;
++    wcscpy( current_package.publisher_id, !strcmp( narrow_pub, ms_publisher ) ? L"8wekyb3d8bbwe" : L"0000000000000" );
++
++    swprintf( current_package.family, ARRAY_SIZE(current_package.family), L"%s_%s", current_package.name, current_package.publisher_id );
++    swprintf( current_package.full, ARRAY_SIZE(current_package.full), L"%s_%s_%s__%s", current_package.name, version_str,
++              arch_str, current_package.publisher_id );
++
++    if ((app = strstr( tag_end + 1, "<Application " )) && (tag_end = strchr( app, '>' )))
++    {
++        *tag_end = 0;
++        manifest_attr( app, "Id", app_id, ARRAY_SIZE(app_id) );
++    }
++    swprintf( current_package.app_user_model_id, ARRAY_SIZE(current_package.app_user_model_id), L"%s!%s",
++              current_package.family, app_id );
++    current_package.valid = TRUE;
++    TRACE( "package %s, family %s, path %s\n", debugstr_w(current_package.full), debugstr_w(current_package.family),
++           debugstr_w(current_package.path) );
++done:
++    HeapFree( GetProcessHeap(), 0, data );
++    return TRUE;
++}
++
++static BOOL get_current_package(void)
++{
++    InitOnceExecuteOnce( &current_package.once, init_current_package, NULL, NULL );
++    return current_package.valid;
++}
++
++static LONG return_package_string( const WCHAR *str, UINT32 *length, WCHAR *buffer )
++{
++    UINT32 needed = wcslen( str ) + 1;
++
++    if (!length) return ERROR_INVALID_PARAMETER;
++    if (*length < needed || !buffer)
++    {
++        *length = needed;
++        return ERROR_INSUFFICIENT_BUFFER;
++    }
++    memcpy( buffer, str, needed * sizeof(WCHAR) );
++    *length = needed;
++    return ERROR_SUCCESS;
++}
++
++/* Layout used for PACKAGE_ID results: the struct followed by the strings it points to. */
++static UINT32 package_id_size(void)
++{
++    return sizeof(PACKAGE_ID) + (wcslen( current_package.name ) + wcslen( current_package.publisher ) +
++                                 wcslen( current_package.publisher_id ) + 3) * sizeof(WCHAR);
++}
++
++static void fill_package_id( PACKAGE_ID *id )
++{
++    WCHAR *str = (WCHAR *)(id + 1);
++
++    memset( id, 0, sizeof(*id) );
++    id->processorArchitecture = current_package.arch;
++    id->version = current_package.version;
++    id->name = str;
++    wcscpy( str, current_package.name );
++    str += wcslen( str ) + 1;
++    id->publisher = str;
++    wcscpy( str, current_package.publisher );
++    str += wcslen( str ) + 1;
++    id->resourceId = str - 1; /* empty string: points at the terminator of the previous string */
++    id->publisherId = str;
++    wcscpy( str, current_package.publisher_id );
++}
++
+ /***********************************************************************
+  *         GetCurrentApplicationUserModelId   (kernelbase.@)
+  */
+ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentApplicationUserModelId( UINT32 *length, WCHAR *id )
+ {
+-    FIXME( "(%p %p): stub\n", length, id );
+-    return APPMODEL_ERROR_NO_APPLICATION;
++    TRACE( "(%p %p)\n", length, id );
++    if (!get_current_package()) return APPMODEL_ERROR_NO_APPLICATION;
++    return return_package_string( current_package.app_user_model_id, length, id );
+ }
+ 
+ /***********************************************************************
+@@ -1561,8 +1731,9 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentApplicationUserModelId( UINT32 *le
+  */
+ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageFamilyName( UINT32 *length, WCHAR *name )
+ {
+-    FIXME( "(%p %p): stub\n", length, name );
+-    return APPMODEL_ERROR_NO_PACKAGE;
++    TRACE( "(%p %p)\n", length, name );
++    if (!get_current_package()) return APPMODEL_ERROR_NO_PACKAGE;
++    return return_package_string( current_package.family, length, name );
+ }
+ 
+ 
+@@ -1571,8 +1742,9 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageFamilyName( UINT32 *length,
+  */
+ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageFullName( UINT32 *length, WCHAR *name )
+ {
+-    FIXME( "(%p %p): stub\n", length, name );
+-    return APPMODEL_ERROR_NO_PACKAGE;
++    TRACE( "(%p %p)\n", length, name );
++    if (!get_current_package()) return APPMODEL_ERROR_NO_PACKAGE;
++    return return_package_string( current_package.full, length, name );
+ }
+ 
+ 
+@@ -1581,8 +1753,20 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageFullName( UINT32 *length, W
+  */
+ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageId( UINT32 *len, BYTE *buffer )
+ {
+-    FIXME( "(%p %p): stub\n", len, buffer );
+-    return APPMODEL_ERROR_NO_PACKAGE;
++    UINT32 size;
++
++    TRACE( "(%p %p)\n", len, buffer );
++    if (!get_current_package()) return APPMODEL_ERROR_NO_PACKAGE;
++    if (!len) return ERROR_INVALID_PARAMETER;
++    size = package_id_size();
++    if (*len < size || !buffer)
++    {
++        *len = size;
++        return ERROR_INSUFFICIENT_BUFFER;
++    }
++    fill_package_id( (PACKAGE_ID *)buffer );
++    *len = size;
++    return ERROR_SUCCESS;
+ }
+ 
+ /***********************************************************************
+@@ -1590,8 +1774,38 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageId( UINT32 *len, BYTE *buff
+  */
+ LONG WINAPI GetCurrentPackageInfo( const UINT32 flags, UINT32 *buffer_size, BYTE *buffer, UINT32 *count )
+ {
+-    FIXME( "(%#x %p %p %p): stub\n", flags, buffer_size, buffer, count );
+-    return APPMODEL_ERROR_NO_PACKAGE;
++    UINT32 size;
++    WINE_PACKAGE_INFO *info;
++    WCHAR *str;
++
++    TRACE( "(%#x %p %p %p)\n", flags, buffer_size, buffer, count );
++    if (!get_current_package()) return APPMODEL_ERROR_NO_PACKAGE;
++    if (!buffer_size) return ERROR_INVALID_PARAMETER;
++
++    size = sizeof(*info) + package_id_size() + (wcslen( current_package.path ) + wcslen( current_package.full ) +
++                                                wcslen( current_package.family ) + 3) * sizeof(WCHAR);
++    if (count) *count = 1;
++    if (*buffer_size < size || !buffer)
++    {
++        *buffer_size = size;
++        return ERROR_INSUFFICIENT_BUFFER;
++    }
++
++    info = (WINE_PACKAGE_INFO *)buffer;
++    memset( info, 0, sizeof(*info) );
++    info->flags = 0x10; /* PACKAGE_PROPERTY_BUNDLE? kept non-zero but harmless: PACKAGE_FILTER_HEAD-ish */
++    fill_package_id( &info->packageId );
++    str = (WCHAR *)((BYTE *)(info + 1) + package_id_size());
++    info->path = str;
++    wcscpy( str, current_package.path );
++    str += wcslen( str ) + 1;
++    info->packageFullName = str;
++    wcscpy( str, current_package.full );
++    str += wcslen( str ) + 1;
++    info->packageFamilyName = str;
++    wcscpy( str, current_package.family );
++    *buffer_size = size;
++    return ERROR_SUCCESS;
+ }
+ 
+ /***********************************************************************
+@@ -1599,8 +1813,9 @@ LONG WINAPI GetCurrentPackageInfo( const UINT32 flags, UINT32 *buffer_size, BYTE
+  */
+ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackagePath( UINT32 *length, WCHAR *path )
+ {
+-    FIXME( "(%p %p): stub\n", length, path );
+-    return APPMODEL_ERROR_NO_PACKAGE;
++    TRACE( "(%p %p)\n", length, path );
++    if (!get_current_package()) return APPMODEL_ERROR_NO_PACKAGE;
++    return return_package_string( current_package.path, length, path );
+ }
+ 
+ 
+diff --git a/include/appmodel.h b/include/appmodel.h
+index 8c219e8..5bc734d 100644
+--- a/include/appmodel.h
++++ b/include/appmodel.h
+@@ -90,6 +90,13 @@ LONG WINAPI AppPolicyGetShowDeveloperDiagnostic(HANDLE token, AppPolicyShowDevel
+ LONG WINAPI AppPolicyGetThreadInitializationType(HANDLE token, AppPolicyThreadInitializationType *policy);
+ LONG WINAPI AppPolicyGetWindowingModel(HANDLE processToken, AppPolicyWindowingModel *policy);
+ LONG WINAPI PackageIdFromFullName(const WCHAR *full_name, UINT32 flags, UINT32 *buffer_length, BYTE *buffer);
++LONG WINAPI GetCurrentPackageId(UINT32 *buffer_length, BYTE *buffer);
++LONG WINAPI GetCurrentPackageFullName(UINT32 *length, WCHAR *name);
++LONG WINAPI GetCurrentPackageFamilyName(UINT32 *length, WCHAR *name);
++LONG WINAPI GetCurrentPackagePath(UINT32 *length, WCHAR *path);
++
++#define PACKAGE_FULL_NAME_MAX_LENGTH    127
++#define PACKAGE_FAMILY_NAME_MAX_LENGTH  64
+ 
+ #if defined(__cplusplus)
+ }

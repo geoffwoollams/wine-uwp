@@ -1,0 +1,1263 @@
+Subject: windows.web, windows.devices.enumeration, windows.networking.*: JSON/XML, device watcher and host name support
+
+diff --git a/dlls/windows.devices.enumeration/main.c b/dlls/windows.devices.enumeration/main.c
+index 081260d..5f82a08 100644
+--- a/dlls/windows.devices.enumeration/main.c
++++ b/dlls/windows.devices.enumeration/main.c
+@@ -225,27 +225,29 @@ static HRESULT WINAPI device_watcher_remove_Added( IDeviceWatcher *iface, EventR
+ static HRESULT WINAPI device_watcher_add_Updated( IDeviceWatcher *iface, ITypedEventHandler_DeviceWatcher_DeviceInformationUpdate *handler,
+                                                   EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, handler %p, token %p stub!\n", iface, handler, token );
++    FIXME( "iface %p, handler %p, token %p semi-stub!\n", iface, handler, token );
++    token->value = 0x1001;
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI device_watcher_remove_Updated( IDeviceWatcher *iface, EventRegistrationToken token )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    FIXME( "iface %p, token %#I64x semi-stub!\n", iface, token.value );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI device_watcher_add_Removed( IDeviceWatcher *iface, ITypedEventHandler_DeviceWatcher_DeviceInformationUpdate *handler,
+                                                   EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, handler %p, token %p stub!\n", iface, handler, token );
+-    return E_NOTIMPL;
++    FIXME( "iface %p, handler %p, token %p semi-stub!\n", iface, handler, token );
++    token->value = 0x1002;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI device_watcher_remove_Removed( IDeviceWatcher *iface, EventRegistrationToken token )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    FIXME( "iface %p, token %#I64x semi-stub!\n", iface, token.value );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI device_watcher_add_EnumerationCompleted( IDeviceWatcher *iface, ITypedEventHandler_DeviceWatcher_IInspectable *handler,
+@@ -839,8 +841,28 @@ static HRESULT WINAPI device_statics_CreateWatcher( IDeviceInformationStatics *i
+ 
+ static HRESULT WINAPI device_statics_CreateWatcherDeviceClass( IDeviceInformationStatics *iface, DeviceClass class, IDeviceWatcher **watcher )
+ {
+-    FIXME( "iface %p, class %d, watcher %p stub!\n", iface, class, watcher );
+-    return E_NOTIMPL;
++    static const WCHAR *render = L"System.Devices.InterfaceClassGuid:=\"{E6327CAD-DCEC-4949-AE8A-991E976A79D2}\"";
++    static const WCHAR *capture = L"System.Devices.InterfaceClassGuid:=\"{2EEF81BE-33FA-4800-9670-1CD474972C3F}\"";
++    const WCHAR *aqs = NULL;
++    HSTRING filter = NULL;
++    HRESULT hr;
++
++    TRACE( "iface %p, class %d, watcher %p\n", iface, class, watcher );
++
++    switch (class)
++    {
++    case DeviceClass_All: break;
++    case DeviceClass_AudioCapture: aqs = capture; break;
++    case DeviceClass_AudioRender: aqs = render; break;
++    default:
++        FIXME( "class %d not implemented.\n", class );
++        return E_NOTIMPL;
++    }
++
++    if (aqs && FAILED(hr = WindowsCreateString( aqs, wcslen( aqs ), &filter ))) return hr;
++    hr = IDeviceInformationStatics_CreateWatcherAqsFilterAndAdditionalProperties( iface, filter, NULL, watcher );
++    WindowsDeleteString( filter );
++    return hr;
+ }
+ 
+ static HRESULT WINAPI device_statics_CreateWatcherAqsFilter( IDeviceInformationStatics *iface, HSTRING filter, IDeviceWatcher **watcher )
+@@ -896,13 +918,62 @@ static HRESULT WINAPI device_statics2_CreateFromIdAsync( IDeviceInformationStati
+     return E_NOTIMPL;
+ }
+ 
++static HRESULT find_all_async_type( IDeviceInformationStatics *iface, HSTRING filter, IIterable_HSTRING *additional_properties,
++                                    DEV_OBJECT_TYPE object_type, IAsyncOperation_DeviceInformationCollection **op )
++{
++    const DEVPROPCOMPKEY device_iface_default_props[] = {
++        { DEVPKEY_DeviceInterface_Enabled, DEVPROP_STORE_SYSTEM, NULL },
++        { DEVPKEY_Device_InstanceId, DEVPROP_STORE_SYSTEM, NULL },
++    };
++    DEVPROPCOMPKEY *prop_keys = NULL;
++    struct aqs_expr *expr = NULL;
++    ULONG prop_keys_len = 0;
++    IUnknown *params;
++    HRESULT hr;
++
++    TRACE( "iface %p, aqs %s, additional_properties %p, op %p\n", iface, debugstr_hstring(filter), additional_properties, op );
++
++    if (FAILED(hr = devpropcompkeys_init( &prop_keys, &prop_keys_len, device_iface_default_props, ARRAY_SIZE( device_iface_default_props ) ))) goto failed;
++    if (additional_properties && FAILED(hr = devpropcompkeys_append_names( &prop_keys, &prop_keys_len, additional_properties ))) goto failed;
++    if (FAILED(hr = aqs_parse_query(WindowsGetStringRawBuffer( filter, NULL ), &expr, NULL ))) goto failed;
++    if (FAILED(hr = devquery_params_create( object_type, expr, prop_keys, prop_keys_len, &params ))) goto failed;
++
++    hr = async_operation_inspectable_create( &IID_IAsyncOperation_DeviceInformationCollection, (IUnknown *)iface, params, find_all_async,
++                                             (IAsyncOperation_IInspectable **)op );
++    IUnknown_Release( params );
++    return hr;
++
++failed:
++    free( prop_keys );
++    free_aqs_expr( expr );
++    return hr;
++}
++
+ static HRESULT WINAPI device_statics2_FindAllAsync( IDeviceInformationStatics2 *iface, HSTRING filter,
+                                                     IIterable_HSTRING *additional_properties, DeviceInformationKind kind,
+                                                     IAsyncOperation_DeviceInformationCollection **async_operation )
+ {
+-    FIXME( "iface %p, filter %s, additional_properties %p, kind %u, async_operation %p stub!\n",
++    static const DEV_OBJECT_TYPE kind_type[] = {
++        DevObjectTypeUnknown, DevObjectTypeDeviceInterfaceDisplay, DevObjectTypeDeviceContainerDisplay, DevObjectTypeDevice,
++        DevObjectTypeDeviceInterfaceClass, DevObjectTypeAEP, DevObjectTypeAEPContainer, DevObjectTypeAEPService,
++        DevObjectTypeDevicePanel,
++    };
++    HSTRING empty = NULL;
++    HRESULT hr;
++
++    TRACE( "iface %p, filter %s, additional_properties %p, kind %u, async_operation %p\n",
+             iface, debugstr_hstring( filter ), additional_properties, kind, async_operation );
+-    return E_NOTIMPL;
++
++    if (kind >= ARRAY_SIZE( kind_type ) || kind_type[kind] == DevObjectTypeUnknown)
++    {
++        FIXME( "kind %u not implemented.\n", kind );
++        return E_NOTIMPL;
++    }
++    if (!filter && FAILED(hr = WindowsCreateString( L"", 0, &empty ))) return hr;
++    hr = find_all_async_type( (IDeviceInformationStatics *)iface, filter ? filter : empty, additional_properties,
++                              kind_type[kind], async_operation );
++    WindowsDeleteString( empty );
++    return hr;
+ }
+ 
+ static const char *debugstr_DeviceInformationKind( DeviceInformationKind kind )
+diff --git a/dlls/windows.networking.connectivity/Makefile.in b/dlls/windows.networking.connectivity/Makefile.in
+index f7fa3cb..32fe5bf 100644
+--- a/dlls/windows.networking.connectivity/Makefile.in
++++ b/dlls/windows.networking.connectivity/Makefile.in
+@@ -1,8 +1,9 @@
+ MODULE        = windows.networking.connectivity.dll
+-IMPORTS       = combase
++IMPORTS       = combase iphlpapi ws2_32
+ EXTRAIDLFLAGS = -DDO_NO_IMPORTS
+ 
+ SOURCES = \
+ 	classes.idl \
++	hostnames.c \
+ 	main.c \
+ 	network_information.c
+diff --git a/dlls/windows.networking.connectivity/hostnames.c b/dlls/windows.networking.connectivity/hostnames.c
+new file mode 100644
+index 0000000..6b7bc07
+--- /dev/null
++++ b/dlls/windows.networking.connectivity/hostnames.c
+@@ -0,0 +1,195 @@
++/* IVectorView<HostName*> of the local host's IPv4 addresses (and its computer name). */
++#include "private.h"
++#include "winsock2.h"
++#include "iphlpapi.h"
++#include "roapi.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(connectivity);
++
++#define MAX_NAMES 32
++
++struct hostnames
++{
++    IVectorView_HostName IVectorView_HostName_iface;
++    IIterable_HostName IIterable_HostName_iface;
++    UINT32 count;
++    IHostName *items[MAX_NAMES];
++};
++static struct hostnames hostnames_obj;
++
++struct names_iter { IIterator_HostName IIterator_HostName_iface; UINT32 pos; };
++
++/* ---- iterator ---- */
++static inline struct names_iter *iter_from( IIterator_HostName *iface ) { return CONTAINING_RECORD( iface, struct names_iter, IIterator_HostName_iface ); }
++static HRESULT WINAPI it_QueryInterface( IIterator_HostName *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IIterator_HostName ))
++    { *out = iface; IIterator_HostName_AddRef( iface ); return S_OK; }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI it_AddRef( IIterator_HostName *iface ) { return 2; }
++static ULONG WINAPI it_Release( IIterator_HostName *iface ) { return 1; }
++static HRESULT WINAPI it_GetIids( IIterator_HostName *iface, ULONG *c, IID **i ) { return E_NOTIMPL; }
++static HRESULT WINAPI it_GetRuntimeClassName( IIterator_HostName *iface, HSTRING *n ) { return E_NOTIMPL; }
++static HRESULT WINAPI it_GetTrustLevel( IIterator_HostName *iface, TrustLevel *l ) { *l = BaseTrust; return S_OK; }
++static HRESULT WINAPI it_get_Current( IIterator_HostName *iface, IHostName **v )
++{
++    struct names_iter *it = iter_from( iface );
++    if (it->pos >= hostnames_obj.count) { *v = NULL; return E_BOUNDS; }
++    *v = hostnames_obj.items[it->pos];
++    IHostName_AddRef( *v );
++    return S_OK;
++}
++static HRESULT WINAPI it_get_HasCurrent( IIterator_HostName *iface, boolean *v ) { *v = iter_from( iface )->pos < hostnames_obj.count; return S_OK; }
++static HRESULT WINAPI it_MoveNext( IIterator_HostName *iface, boolean *v )
++{
++    struct names_iter *it = iter_from( iface );
++    if (it->pos < hostnames_obj.count) it->pos++;
++    *v = it->pos < hostnames_obj.count;
++    return S_OK;
++}
++static HRESULT WINAPI it_GetMany( IIterator_HostName *iface, UINT32 size, IHostName **items, UINT32 *actual )
++{
++    struct names_iter *it = iter_from( iface );
++    UINT32 n = 0;
++    while (n < size && it->pos < hostnames_obj.count)
++    {
++        items[n] = hostnames_obj.items[it->pos++];
++        IHostName_AddRef( items[n++] );
++    }
++    *actual = n;
++    return S_OK;
++}
++static const IIterator_HostNameVtbl it_vtbl = { it_QueryInterface, it_AddRef, it_Release, it_GetIids, it_GetRuntimeClassName,
++    it_GetTrustLevel, it_get_Current, it_get_HasCurrent, it_MoveNext, it_GetMany };
++
++/* ---- IIterable ---- */
++static HRESULT WINAPI iter_QueryInterface( IIterable_HostName *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IIterable_HostName ))
++    { *out = &hostnames_obj.IIterable_HostName_iface; return S_OK; }
++    if (IsEqualGUID( iid, &IID_IVectorView_HostName )) { *out = &hostnames_obj.IVectorView_HostName_iface; return S_OK; }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI iter_AddRef( IIterable_HostName *iface ) { return 2; }
++static ULONG WINAPI iter_Release( IIterable_HostName *iface ) { return 1; }
++static HRESULT WINAPI iter_GetIids( IIterable_HostName *iface, ULONG *c, IID **i ) { return E_NOTIMPL; }
++static HRESULT WINAPI iter_GetRuntimeClassName( IIterable_HostName *iface, HSTRING *n ) { return E_NOTIMPL; }
++static HRESULT WINAPI iter_GetTrustLevel( IIterable_HostName *iface, TrustLevel *l ) { *l = BaseTrust; return S_OK; }
++static HRESULT WINAPI iter_First( IIterable_HostName *iface, IIterator_HostName **value )
++{
++    struct names_iter *it = calloc( 1, sizeof(*it) );
++    if (!it) return E_OUTOFMEMORY;
++    it->IIterator_HostName_iface.lpVtbl = &it_vtbl;
++    *value = &it->IIterator_HostName_iface;
++    return S_OK;
++}
++static const IIterable_HostNameVtbl iter_vtbl = { iter_QueryInterface, iter_AddRef, iter_Release, iter_GetIids,
++    iter_GetRuntimeClassName, iter_GetTrustLevel, iter_First };
++
++/* ---- IVectorView ---- */
++static HRESULT WINAPI vv_QueryInterface( IVectorView_HostName *iface, REFIID iid, void **out )
++{ return iter_QueryInterface( &hostnames_obj.IIterable_HostName_iface, iid, out ); }
++static ULONG WINAPI vv_AddRef( IVectorView_HostName *iface ) { return 2; }
++static ULONG WINAPI vv_Release( IVectorView_HostName *iface ) { return 1; }
++static HRESULT WINAPI vv_GetIids( IVectorView_HostName *iface, ULONG *c, IID **i ) { return E_NOTIMPL; }
++static HRESULT WINAPI vv_GetRuntimeClassName( IVectorView_HostName *iface, HSTRING *n ) { return E_NOTIMPL; }
++static HRESULT WINAPI vv_GetTrustLevel( IVectorView_HostName *iface, TrustLevel *l ) { *l = BaseTrust; return S_OK; }
++static HRESULT WINAPI vv_GetAt( IVectorView_HostName *iface, UINT32 index, IHostName **value )
++{
++    if (index >= hostnames_obj.count) { *value = NULL; return E_BOUNDS; }
++    *value = hostnames_obj.items[index];
++    IHostName_AddRef( *value );
++    return S_OK;
++}
++static HRESULT WINAPI vv_get_Size( IVectorView_HostName *iface, UINT32 *value ) { *value = hostnames_obj.count; return S_OK; }
++static HRESULT WINAPI vv_IndexOf( IVectorView_HostName *iface, IHostName *element, UINT32 *index, BOOLEAN *found )
++{
++    UINT32 i;
++    *found = FALSE; *index = 0;
++    for (i = 0; i < hostnames_obj.count; i++) if (hostnames_obj.items[i] == element) { *index = i; *found = TRUE; break; }
++    return S_OK;
++}
++static HRESULT WINAPI vv_GetMany( IVectorView_HostName *iface, UINT32 start, UINT32 size, IHostName **items, UINT32 *actual )
++{
++    UINT32 n = 0;
++    while (n < size && start + n < hostnames_obj.count)
++    {
++        items[n] = hostnames_obj.items[start + n];
++        IHostName_AddRef( items[n++] );
++    }
++    *actual = n;
++    return S_OK;
++}
++static const IVectorView_HostNameVtbl vv_vtbl = { vv_QueryInterface, vv_AddRef, vv_Release, vv_GetIids, vv_GetRuntimeClassName,
++    vv_GetTrustLevel, vv_GetAt, vv_get_Size, vv_IndexOf, vv_GetMany };
++
++static void add_name( IHostNameFactory *factory, const WCHAR *name )
++{
++    HSTRING str;
++    IHostName *host;
++
++    if (hostnames_obj.count >= MAX_NAMES) return;
++    if (FAILED(WindowsCreateString( name, wcslen( name ), &str ))) return;
++    if (SUCCEEDED(IHostNameFactory_CreateHostName( factory, str, &host ))) hostnames_obj.items[hostnames_obj.count++] = host;
++    WindowsDeleteString( str );
++}
++
++static INIT_ONCE names_once = INIT_ONCE_STATIC_INIT;
++
++static BOOL CALLBACK init_names( INIT_ONCE *once, void *param, void **ctx )
++{
++    IHostNameFactory *factory;
++    IP_ADAPTER_ADDRESSES *addrs = NULL, *a;
++    IP_ADAPTER_UNICAST_ADDRESS *u;
++    ULONG size = 0;
++    HSTRING cls;
++    WCHAR buf[64];
++    DWORD len;
++
++    /* Reporting real addresses makes some titles start their own network layer, which does not work yet:
++     * keep the list empty unless explicitly requested. */
++    if (!GetEnvironmentVariableW( L"WINE_REPORT_HOSTNAMES", NULL, 0 )) return TRUE;
++
++    WindowsCreateString( L"Windows.Networking.HostName", 27, &cls );
++    if (FAILED(RoGetActivationFactory( cls, &IID_IHostNameFactory, (void **)&factory ))) { WindowsDeleteString( cls ); return TRUE; }
++    WindowsDeleteString( cls );
++
++    if (GetAdaptersAddresses( AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, NULL, NULL, &size ) == ERROR_BUFFER_OVERFLOW
++        && (addrs = malloc( size )) &&
++        GetAdaptersAddresses( AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, NULL, addrs, &size ) == NO_ERROR)
++    {
++        for (a = addrs; a; a = a->Next)
++        {
++            if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
++            for (u = a->FirstUnicastAddress; u; u = u->Next)
++            {
++                struct sockaddr_in *sin = (struct sockaddr_in *)u->Address.lpSockaddr;
++                if (u->Address.lpSockaddr->sa_family != AF_INET) continue;
++                swprintf( buf, ARRAY_SIZE(buf), L"%u.%u.%u.%u", sin->sin_addr.S_un.S_un_b.s_b1, sin->sin_addr.S_un.S_un_b.s_b2,
++                          sin->sin_addr.S_un.S_un_b.s_b3, sin->sin_addr.S_un.S_un_b.s_b4 );
++                add_name( factory, buf );
++            }
++        }
++    }
++    free( addrs );
++    len = ARRAY_SIZE(buf);
++    if (GetComputerNameW( buf, &len )) add_name( factory, buf );
++    IHostNameFactory_Release( factory );
++    TRACE( "reporting %u host names.\n", hostnames_obj.count );
++    return TRUE;
++}
++
++HRESULT local_hostnames_create( IVectorView_HostName **out )
++{
++    InitOnceExecuteOnce( &names_once, init_names, NULL, NULL );
++    hostnames_obj.IVectorView_HostName_iface.lpVtbl = &vv_vtbl;
++    hostnames_obj.IIterable_HostName_iface.lpVtbl = &iter_vtbl;
++    *out = &hostnames_obj.IVectorView_HostName_iface;
++    return S_OK;
++}
+diff --git a/dlls/windows.networking.connectivity/network_information.c b/dlls/windows.networking.connectivity/network_information.c
+index fa041fc..27f78a2 100644
+--- a/dlls/windows.networking.connectivity/network_information.c
++++ b/dlls/windows.networking.connectivity/network_information.c
+@@ -465,10 +465,12 @@ static HRESULT WINAPI network_information_statics_GetLanIdentifiers( INetworkInf
+     return E_NOTIMPL;
+ }
+ 
++extern HRESULT local_hostnames_create( IVectorView_HostName **out );
++
+ static HRESULT WINAPI network_information_statics_GetHostNames( INetworkInformationStatics *iface, IVectorView_HostName **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p: reporting local host names.\n", iface, value );
++    return local_hostnames_create( value );
+ }
+ 
+ static HRESULT WINAPI network_information_statics_GetProxyConfigurationAsync( INetworkInformationStatics *iface, IUriRuntimeClass *uri, IAsyncOperation_ProxyConfiguration **value )
+diff --git a/dlls/windows.networking.hostname/hostname.c b/dlls/windows.networking.hostname/hostname.c
+index b77186a..5423ee8 100644
+--- a/dlls/windows.networking.hostname/hostname.c
++++ b/dlls/windows.networking.hostname/hostname.c
+@@ -193,8 +193,10 @@ static HRESULT WINAPI hostname_GetTrustLevel( IHostName *iface, TrustLevel *trus
+ 
+ static HRESULT WINAPI hostname_get_IPInformation( IHostName *iface, IIPInformation **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    /* TODO: network adapter / prefix length for IP address names. */
++    FIXME( "iface %p, value %p semi-stub: no IP information.\n", iface, value );
++    *value = NULL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI hostname_get_RawName( IHostName *iface, HSTRING *value )
+@@ -209,25 +211,40 @@ static HRESULT WINAPI hostname_get_RawName( IHostName *iface, HSTRING *value )
+ 
+ static HRESULT WINAPI hostname_get_DisplayName( IHostName *iface, HSTRING *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    return hostname_get_RawName( iface, value );
+ }
+ 
+ static HRESULT WINAPI hostname_get_CanonicalName( IHostName *iface, HSTRING *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    /* Canonical form is the lower-case raw name for domain names and the raw text for addresses. */
++    return hostname_get_RawName( iface, value );
+ }
+ 
+ static HRESULT WINAPI hostname_get_Type( IHostName *iface, HostNameType *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct hostname *impl = impl_from_IHostName( iface );
++    const WCHAR *name = WindowsGetStringRawBuffer( impl->raw_name, NULL ), *p;
++    BOOL digits_dots = name && *name;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_INVALIDARG;
++    if (name && wcschr( name, ':' )) { *value = HostNameType_Ipv6; return S_OK; }
++    for (p = name; p && *p; p++) if (!(*p >= '0' && *p <= '9') && *p != '.') digits_dots = FALSE;
++    *value = digits_dots ? HostNameType_Ipv4 : HostNameType_DomainName;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI hostname_IsEqual( IHostName *iface, IHostName *name, boolean *equal )
+ {
+-    FIXME( "iface %p, name %p, equal %p stub!\n", iface, name, equal );
++    TRACE( "iface %p, name %p, equal %p.\n", iface, name, equal );
++    if (!name || !equal) return E_INVALIDARG;
++    {
++        struct hostname *other = impl_from_IHostName( name ), *impl = impl_from_IHostName( iface );
++        INT32 cmp = 1;
++        WindowsCompareStringOrdinal( impl->raw_name, other->raw_name, &cmp );
++        *equal = !cmp;
++        return S_OK;
++    }
+     return E_NOTIMPL;
+ }
+ 
+diff --git a/dlls/windows.web/Makefile.in b/dlls/windows.web/Makefile.in
+index ebcf7bb..e1cfff4 100644
+--- a/dlls/windows.web/Makefile.in
++++ b/dlls/windows.web/Makefile.in
+@@ -3,6 +3,8 @@ IMPORTS = combase
+ 
+ SOURCES = \
+ 	classes.idl \
++	json_gen.c \
+ 	json_object.c \
+ 	json_value.c \
+-	main.c
++	main.c \
++	xml_probe.c
+diff --git a/dlls/windows.web/json_gen.c b/dlls/windows.web/json_gen.c
+new file mode 100644
+index 0000000..21baff5
+--- /dev/null
++++ b/dlls/windows.web/json_gen.c
+@@ -0,0 +1,644 @@
++/* in-memory Windows.Data.Json implementation. */
++#include "private.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(web);
++
++struct jnode
++{
++    IJsonValue IJsonValue_iface;
++    IJsonObject IJsonObject_iface;
++    IJsonArray IJsonArray_iface;
++    LONG ref;
++    JsonValueType type;
++    HSTRING str;
++    double num;
++    boolean boolean_value;
++    UINT32 count, capacity;
++    HSTRING *keys;          /* objects only */
++    struct jnode **items;   /* objects and arrays */
++};
++
++static HRESULT jnode_qi(struct jnode *impl, REFIID iid, void **out)
++{
++    TRACE("%p, %s, %p.\n", impl, debugstr_guid(iid), out);
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IJsonValue))
++        *out = &impl->IJsonValue_iface;
++    else if (impl->type == JsonValueType_Object && IsEqualGUID(iid, &IID_IJsonObject))
++        *out = &impl->IJsonObject_iface;
++    else if (impl->type == JsonValueType_Array && IsEqualGUID(iid, &IID_IJsonArray))
++        *out = &impl->IJsonArray_iface;
++    else
++    {
++        FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    InterlockedIncrement(&impl->ref);
++    return S_OK;
++}
++static ULONG jnode_addref(struct jnode *impl) { return InterlockedIncrement(&impl->ref); }
++static ULONG jnode_release(struct jnode *impl)
++{
++    ULONG ref = InterlockedDecrement(&impl->ref);
++    UINT32 i;
++
++    if (!ref)
++    {
++        WindowsDeleteString(impl->str);
++        for (i = 0; i < impl->count; i++)
++        {
++            if (impl->keys) WindowsDeleteString(impl->keys[i]);
++            jnode_release(impl->items[i]);
++        }
++        free(impl->keys);
++        free(impl->items);
++        free(impl);
++    }
++    return ref;
++}
++
++static struct jnode *jnode_create(JsonValueType type);
++
++static HRESULT jnode_add(struct jnode *parent, HSTRING key, struct jnode *child);
++static HRESULT jnode_stringify(struct jnode *n, HSTRING *out);
++
++/* ---- IJsonValue on jnode ---- */
++static inline struct jnode *impl_from_jvalue(IJsonValue *iface)
++{ return CONTAINING_RECORD(iface, struct jnode, IJsonValue_iface); }
++
++static HRESULT WINAPI jvalue_QueryInterface(IJsonValue *iface, REFIID iid, void **out)
++{ return jnode_qi(impl_from_jvalue(iface), iid, out); }
++static ULONG WINAPI jvalue_AddRef(IJsonValue *iface)
++{ return jnode_addref(impl_from_jvalue(iface)); }
++static ULONG WINAPI jvalue_Release(IJsonValue *iface)
++{ return jnode_release(impl_from_jvalue(iface)); }
++static HRESULT WINAPI jvalue_GetIids(IJsonValue *iface, ULONG *count, IID **iids)
++{ FIXME("iface %p stub!\n", iface); return E_NOTIMPL; }
++static HRESULT WINAPI jvalue_GetRuntimeClassName(IJsonValue *iface, HSTRING *name)
++{ FIXME("iface %p stub!\n", iface); return E_NOTIMPL; }
++static HRESULT WINAPI jvalue_GetTrustLevel(IJsonValue *iface, TrustLevel *level)
++{ *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI jvalue_get_ValueType(IJsonValue *iface, __x_ABI_CWindows_CData_CJson_CJsonValueType *value)
++{
++    struct jnode *impl __attribute__((unused)) = impl_from_jvalue(iface);
++    *value = impl->type;
++    return S_OK;
++}
++
++static HRESULT WINAPI jvalue_Stringify(IJsonValue *iface, HSTRING *value)
++{
++    struct jnode *impl __attribute__((unused)) = impl_from_jvalue(iface);
++    return jnode_stringify(impl, value);
++}
++
++static HRESULT WINAPI jvalue_GetString(IJsonValue *iface, HSTRING *value)
++{
++    struct jnode *impl __attribute__((unused)) = impl_from_jvalue(iface);
++    if (impl->type != JsonValueType_String) return E_ILLEGAL_METHOD_CALL;
++    return WindowsDuplicateString(impl->str, value);
++}
++
++static HRESULT WINAPI jvalue_GetNumber(IJsonValue *iface, DOUBLE *value)
++{
++    struct jnode *impl __attribute__((unused)) = impl_from_jvalue(iface);
++    if (impl->type != JsonValueType_Number) return E_ILLEGAL_METHOD_CALL;
++    *value = impl->num;
++    return S_OK;
++}
++
++static HRESULT WINAPI jvalue_GetBoolean(IJsonValue *iface, boolean *value)
++{
++    struct jnode *impl __attribute__((unused)) = impl_from_jvalue(iface);
++    if (impl->type != JsonValueType_Boolean) return E_ILLEGAL_METHOD_CALL;
++    *value = impl->boolean_value;
++    return S_OK;
++}
++
++static HRESULT WINAPI jvalue_GetArray(IJsonValue *iface, __x_ABI_CWindows_CData_CJson_CIJsonArray **value)
++{
++    struct jnode *impl __attribute__((unused)) = impl_from_jvalue(iface);
++    if (impl->type != JsonValueType_Array) return E_ILLEGAL_METHOD_CALL;
++    *value = &impl->IJsonArray_iface;
++    jnode_addref(impl);
++    return S_OK;
++}
++
++static HRESULT WINAPI jvalue_GetObject(IJsonValue *iface, __x_ABI_CWindows_CData_CJson_CIJsonObject **value)
++{
++    struct jnode *impl __attribute__((unused)) = impl_from_jvalue(iface);
++    if (impl->type != JsonValueType_Object) return E_ILLEGAL_METHOD_CALL;
++    *value = &impl->IJsonObject_iface;
++    jnode_addref(impl);
++    return S_OK;
++}
++
++static const IJsonValueVtbl jvalue_vtbl =
++{
++    jvalue_QueryInterface,
++    jvalue_AddRef,
++    jvalue_Release,
++    jvalue_GetIids,
++    jvalue_GetRuntimeClassName,
++    jvalue_GetTrustLevel,
++    jvalue_get_ValueType,
++    jvalue_Stringify,
++    jvalue_GetString,
++    jvalue_GetNumber,
++    jvalue_GetBoolean,
++    jvalue_GetArray,
++    jvalue_GetObject,
++};
++
++
++static int find_key(struct jnode *impl, HSTRING name)
++{
++    UINT32 i;
++    INT32 cmp;
++
++    for (i = 0; i < impl->count; i++)
++        if (SUCCEEDED(WindowsCompareStringOrdinal(impl->keys[i], name, &cmp)) && !cmp) return i;
++    return -1;
++}
++static HRESULT get_named(struct jnode *impl, HSTRING name, JsonValueType type, struct jnode **out)
++{
++    int idx = find_key(impl, name);
++    if (idx < 0) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
++    if (impl->items[idx]->type != type) return E_ILLEGAL_METHOD_CALL;
++    *out = impl->items[idx];
++    return S_OK;
++}
++static HRESULT get_at(struct jnode *impl, UINT32 index, JsonValueType type, struct jnode **out)
++{
++    if (index >= impl->count) return E_BOUNDS;
++    if (impl->items[index]->type != type) return E_ILLEGAL_METHOD_CALL;
++    *out = impl->items[index];
++    return S_OK;
++}
++
++/* ---- IJsonObject on jnode ---- */
++static inline struct jnode *impl_from_jobject(IJsonObject *iface)
++{ return CONTAINING_RECORD(iface, struct jnode, IJsonObject_iface); }
++
++static HRESULT WINAPI jobject_QueryInterface(IJsonObject *iface, REFIID iid, void **out)
++{ return jnode_qi(impl_from_jobject(iface), iid, out); }
++static ULONG WINAPI jobject_AddRef(IJsonObject *iface)
++{ return jnode_addref(impl_from_jobject(iface)); }
++static ULONG WINAPI jobject_Release(IJsonObject *iface)
++{ return jnode_release(impl_from_jobject(iface)); }
++static HRESULT WINAPI jobject_GetIids(IJsonObject *iface, ULONG *count, IID **iids)
++{ FIXME("iface %p stub!\n", iface); return E_NOTIMPL; }
++static HRESULT WINAPI jobject_GetRuntimeClassName(IJsonObject *iface, HSTRING *name)
++{ FIXME("iface %p stub!\n", iface); return E_NOTIMPL; }
++static HRESULT WINAPI jobject_GetTrustLevel(IJsonObject *iface, TrustLevel *level)
++{ *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI jobject_GetNamedValue(IJsonObject *iface, HSTRING name, __x_ABI_CWindows_CData_CJson_CIJsonValue **value)
++{
++    struct jnode *impl __attribute__((unused)) = impl_from_jobject(iface);
++    int idx = find_key(impl, name);
++    TRACE("name %s.\n", debugstr_hstring(name));
++    if (idx < 0) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
++    *value = &impl->items[idx]->IJsonValue_iface;
++    jnode_addref(impl->items[idx]);
++    return S_OK;
++}
++
++static HRESULT WINAPI jobject_SetNamedValue(IJsonObject *iface, HSTRING name, __x_ABI_CWindows_CData_CJson_CIJsonValue *value)
++{
++    struct jnode *impl __attribute__((unused)) = impl_from_jobject(iface);
++    int idx = find_key(impl, name);
++    struct jnode *node = CONTAINING_RECORD(value, struct jnode, IJsonValue_iface);
++    TRACE("name %s, value %p.\n", debugstr_hstring(name), value);
++    if (idx >= 0)
++    {
++        jnode_release(impl->items[idx]);
++        impl->items[idx] = node;
++        jnode_addref(node);
++        return S_OK;
++    }
++    return jnode_add(impl, name, node);
++}
++
++static HRESULT WINAPI jobject_GetNamedObject(IJsonObject *iface, HSTRING name, __x_ABI_CWindows_CData_CJson_CIJsonObject **value)
++{
++    struct jnode *impl __attribute__((unused)) = impl_from_jobject(iface);
++    struct jnode *n;
++    HRESULT hr = get_named(impl, name, JsonValueType_Object, &n);
++    TRACE("name %s.\n", debugstr_hstring(name));
++    if (FAILED(hr)) return hr;
++    *value = &n->IJsonObject_iface;
++    jnode_addref(n);
++    return S_OK;
++}
++
++static HRESULT WINAPI jobject_GetNamedArray(IJsonObject *iface, HSTRING name, __x_ABI_CWindows_CData_CJson_CIJsonArray **value)
++{
++    struct jnode *impl __attribute__((unused)) = impl_from_jobject(iface);
++    struct jnode *n;
++    HRESULT hr = get_named(impl, name, JsonValueType_Array, &n);
++    if (FAILED(hr)) return hr;
++    *value = &n->IJsonArray_iface;
++    jnode_addref(n);
++    return S_OK;
++}
++
++static HRESULT WINAPI jobject_GetNamedString(IJsonObject *iface, HSTRING name, HSTRING *value)
++{
++    struct jnode *impl __attribute__((unused)) = impl_from_jobject(iface);
++    struct jnode *n;
++    HRESULT hr = get_named(impl, name, JsonValueType_String, &n);
++    TRACE("name %s.\n", debugstr_hstring(name));
++    if (FAILED(hr)) return hr;
++    return WindowsDuplicateString(n->str, value);
++}
++
++static HRESULT WINAPI jobject_GetNamedNumber(IJsonObject *iface, HSTRING name, DOUBLE *value)
++{
++    struct jnode *impl __attribute__((unused)) = impl_from_jobject(iface);
++    struct jnode *n;
++    HRESULT hr = get_named(impl, name, JsonValueType_Number, &n);
++    if (FAILED(hr)) return hr;
++    *value = n->num;
++    return S_OK;
++}
++
++static HRESULT WINAPI jobject_GetNamedBoolean(IJsonObject *iface, HSTRING name, boolean *value)
++{
++    struct jnode *impl __attribute__((unused)) = impl_from_jobject(iface);
++    struct jnode *n;
++    HRESULT hr = get_named(impl, name, JsonValueType_Boolean, &n);
++    if (FAILED(hr)) return hr;
++    *value = n->boolean_value;
++    return S_OK;
++}
++
++static const IJsonObjectVtbl jobject_vtbl =
++{
++    jobject_QueryInterface,
++    jobject_AddRef,
++    jobject_Release,
++    jobject_GetIids,
++    jobject_GetRuntimeClassName,
++    jobject_GetTrustLevel,
++    jobject_GetNamedValue,
++    jobject_SetNamedValue,
++    jobject_GetNamedObject,
++    jobject_GetNamedArray,
++    jobject_GetNamedString,
++    jobject_GetNamedNumber,
++    jobject_GetNamedBoolean,
++};
++
++/* ---- IJsonArray on jnode ---- */
++static inline struct jnode *impl_from_jarray(IJsonArray *iface)
++{ return CONTAINING_RECORD(iface, struct jnode, IJsonArray_iface); }
++
++static HRESULT WINAPI jarray_QueryInterface(IJsonArray *iface, REFIID iid, void **out)
++{ return jnode_qi(impl_from_jarray(iface), iid, out); }
++static ULONG WINAPI jarray_AddRef(IJsonArray *iface)
++{ return jnode_addref(impl_from_jarray(iface)); }
++static ULONG WINAPI jarray_Release(IJsonArray *iface)
++{ return jnode_release(impl_from_jarray(iface)); }
++static HRESULT WINAPI jarray_GetIids(IJsonArray *iface, ULONG *count, IID **iids)
++{ FIXME("iface %p stub!\n", iface); return E_NOTIMPL; }
++static HRESULT WINAPI jarray_GetRuntimeClassName(IJsonArray *iface, HSTRING *name)
++{ FIXME("iface %p stub!\n", iface); return E_NOTIMPL; }
++static HRESULT WINAPI jarray_GetTrustLevel(IJsonArray *iface, TrustLevel *level)
++{ *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI jarray_GetObjectAt(IJsonArray *iface, UINT32 index, __x_ABI_CWindows_CData_CJson_CIJsonObject **value)
++{
++    struct jnode *impl __attribute__((unused)) = impl_from_jarray(iface);
++    struct jnode *n;
++    HRESULT hr = get_at(impl, index, JsonValueType_Object, &n);
++    if (FAILED(hr)) return hr;
++    *value = &n->IJsonObject_iface;
++    jnode_addref(n);
++    return S_OK;
++}
++
++static HRESULT WINAPI jarray_GetArrayAt(IJsonArray *iface, UINT32 index, __x_ABI_CWindows_CData_CJson_CIJsonArray **value)
++{
++    struct jnode *impl __attribute__((unused)) = impl_from_jarray(iface);
++    struct jnode *n;
++    HRESULT hr = get_at(impl, index, JsonValueType_Array, &n);
++    if (FAILED(hr)) return hr;
++    *value = &n->IJsonArray_iface;
++    jnode_addref(n);
++    return S_OK;
++}
++
++static HRESULT WINAPI jarray_GetStringAt(IJsonArray *iface, UINT32 index, HSTRING *value)
++{
++    struct jnode *impl __attribute__((unused)) = impl_from_jarray(iface);
++    struct jnode *n;
++    HRESULT hr = get_at(impl, index, JsonValueType_String, &n);
++    if (FAILED(hr)) return hr;
++    return WindowsDuplicateString(n->str, value);
++}
++
++static HRESULT WINAPI jarray_GetNumberAt(IJsonArray *iface, UINT32 index, DOUBLE *value)
++{
++    struct jnode *impl __attribute__((unused)) = impl_from_jarray(iface);
++    struct jnode *n;
++    HRESULT hr = get_at(impl, index, JsonValueType_Number, &n);
++    if (FAILED(hr)) return hr;
++    *value = n->num;
++    return S_OK;
++}
++
++static HRESULT WINAPI jarray_GetBooleanAt(IJsonArray *iface, UINT32 index, boolean *value)
++{
++    struct jnode *impl __attribute__((unused)) = impl_from_jarray(iface);
++    struct jnode *n;
++    HRESULT hr = get_at(impl, index, JsonValueType_Boolean, &n);
++    if (FAILED(hr)) return hr;
++    *value = n->boolean_value;
++    return S_OK;
++}
++
++static const IJsonArrayVtbl jarray_vtbl =
++{
++    jarray_QueryInterface,
++    jarray_AddRef,
++    jarray_Release,
++    jarray_GetIids,
++    jarray_GetRuntimeClassName,
++    jarray_GetTrustLevel,
++    jarray_GetObjectAt,
++    jarray_GetArrayAt,
++    jarray_GetStringAt,
++    jarray_GetNumberAt,
++    jarray_GetBooleanAt,
++};
++
++
++static struct jnode *jnode_create(JsonValueType type)
++{
++    struct jnode *n;
++
++    if (!(n = calloc(1, sizeof(*n)))) return NULL;
++    n->IJsonValue_iface.lpVtbl = &jvalue_vtbl;
++    n->IJsonObject_iface.lpVtbl = &jobject_vtbl;
++    n->IJsonArray_iface.lpVtbl = &jarray_vtbl;
++    n->ref = 1;
++    n->type = type;
++    return n;
++}
++
++static HRESULT jnode_add(struct jnode *parent, HSTRING key, struct jnode *child)
++{
++    if (parent->count == parent->capacity)
++    {
++        UINT32 cap = parent->capacity ? parent->capacity * 2 : 8;
++        struct jnode **items = realloc(parent->items, cap * sizeof(*items));
++        HSTRING *keys = parent->keys;
++
++        if (!items) return E_OUTOFMEMORY;
++        parent->items = items;
++        if (parent->type == JsonValueType_Object)
++        {
++            if (!(keys = realloc(parent->keys, cap * sizeof(*keys)))) return E_OUTOFMEMORY;
++            parent->keys = keys;
++        }
++        parent->capacity = cap;
++    }
++    if (parent->type == JsonValueType_Object)
++    {
++        HRESULT hr = WindowsDuplicateString(key, &parent->keys[parent->count]);
++        if (FAILED(hr)) return hr;
++    }
++    parent->items[parent->count++] = child;
++    jnode_addref(child);
++    return S_OK;
++}
++
++/* ---- stringify ---- */
++struct sbuf { WCHAR *data; size_t len, cap; };
++static void sb_append(struct sbuf *sb, const WCHAR *s, size_t n)
++{
++    if (sb->len + n + 1 > sb->cap)
++    {
++        size_t cap = max(sb->cap * 2, sb->len + n + 64);
++        WCHAR *d = realloc(sb->data, cap * sizeof(WCHAR));
++        if (!d) return;
++        sb->data = d;
++        sb->cap = cap;
++    }
++    memcpy(sb->data + sb->len, s, n * sizeof(WCHAR));
++    sb->len += n;
++    sb->data[sb->len] = 0;
++}
++static void sb_string(struct sbuf *sb, const WCHAR *s)
++{
++    sb_append(sb, L"\"", 1);
++    for (; *s; s++)
++    {
++        switch (*s)
++        {
++        case '"': sb_append(sb, L"\\\"", 2); break;
++        case '\\': sb_append(sb, L"\\\\", 2); break;
++        case '\n': sb_append(sb, L"\\n", 2); break;
++        case '\r': sb_append(sb, L"\\r", 2); break;
++        case '\t': sb_append(sb, L"\\t", 2); break;
++        default: sb_append(sb, s, 1);
++        }
++    }
++    sb_append(sb, L"\"", 1);
++}
++static void jnode_write(struct jnode *n, struct sbuf *sb)
++{
++    WCHAR tmp[64];
++    UINT32 i;
++
++    switch (n->type)
++    {
++    case JsonValueType_Null: sb_append(sb, L"null", 4); break;
++    case JsonValueType_Boolean: if (n->boolean_value) sb_append(sb, L"true", 4); else sb_append(sb, L"false", 5); break;
++    case JsonValueType_Number:
++        swprintf(tmp, ARRAY_SIZE(tmp), L"%.17g", n->num);
++        sb_append(sb, tmp, wcslen(tmp));
++        break;
++    case JsonValueType_String: sb_string(sb, WindowsGetStringRawBuffer(n->str, NULL)); break;
++    case JsonValueType_Array:
++        sb_append(sb, L"[", 1);
++        for (i = 0; i < n->count; i++) { if (i) sb_append(sb, L",", 1); jnode_write(n->items[i], sb); }
++        sb_append(sb, L"]", 1);
++        break;
++    case JsonValueType_Object:
++        sb_append(sb, L"{", 1);
++        for (i = 0; i < n->count; i++)
++        {
++            if (i) sb_append(sb, L",", 1);
++            sb_string(sb, WindowsGetStringRawBuffer(n->keys[i], NULL));
++            sb_append(sb, L":", 1);
++            jnode_write(n->items[i], sb);
++        }
++        sb_append(sb, L"}", 1);
++        break;
++    }
++}
++static HRESULT jnode_stringify(struct jnode *n, HSTRING *out)
++{
++    struct sbuf sb = { 0 };
++    HRESULT hr;
++
++    jnode_write(n, &sb);
++    hr = WindowsCreateString(sb.data ? sb.data : L"", sb.len, out);
++    free(sb.data);
++    return hr;
++}
++
++/* ---- parser ---- */
++static const WCHAR *skip_ws(const WCHAR *p) { while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++; return p; }
++
++static struct jnode *parse_value(const WCHAR **pp, int depth);
++
++static BOOL parse_string(const WCHAR **pp, WCHAR **out)
++{
++    const WCHAR *p = *pp + 1;
++    WCHAR *buf = malloc((wcslen(p) + 1) * sizeof(WCHAR)), *w = buf;
++
++    if (!buf) return FALSE;
++    while (*p && *p != '"')
++    {
++        if (*p == '\\')
++        {
++            p++;
++            switch (*p)
++            {
++            case 'n': *w++ = '\n'; break;
++            case 'r': *w++ = '\r'; break;
++            case 't': *w++ = '\t'; break;
++            case 'b': *w++ = '\b'; break;
++            case 'f': *w++ = '\f'; break;
++            case 'u':
++            {
++                WCHAR *end;
++                WCHAR hex[5] = { p[1], p[2], p[3], p[4], 0 };
++                *w++ = (WCHAR)wcstoul(hex, &end, 16);
++                p += 4;
++                break;
++            }
++            case 0: free(buf); return FALSE;
++            default: *w++ = *p;
++            }
++            p++;
++        }
++        else *w++ = *p++;
++    }
++    if (*p != '"') { free(buf); return FALSE; }
++    *w = 0;
++    *pp = p + 1;
++    *out = buf;
++    return TRUE;
++}
++
++static struct jnode *parse_value(const WCHAR **pp, int depth)
++{
++    const WCHAR *p = skip_ws(*pp);
++    struct jnode *n = NULL;
++
++    if (depth > 64) return NULL;
++    if (*p == '{')
++    {
++        n = jnode_create(JsonValueType_Object);
++        p = skip_ws(p + 1);
++        if (*p == '}') { *pp = p + 1; return n; }
++        for (;;)
++        {
++            WCHAR *key;
++            HSTRING hkey;
++            struct jnode *child;
++
++            p = skip_ws(p);
++            if (*p != '"' || !parse_string(&p, &key)) goto fail;
++            WindowsCreateString(key, wcslen(key), &hkey);
++            free(key);
++            p = skip_ws(p);
++            if (*p != ':') { WindowsDeleteString(hkey); goto fail; }
++            p++;
++            if (!(child = parse_value(&p, depth + 1))) { WindowsDeleteString(hkey); goto fail; }
++            jnode_add(n, hkey, child);
++            jnode_release(child);
++            WindowsDeleteString(hkey);
++            p = skip_ws(p);
++            if (*p == ',') { p++; continue; }
++            if (*p == '}') { p++; break; }
++            goto fail;
++        }
++    }
++    else if (*p == '[')
++    {
++        n = jnode_create(JsonValueType_Array);
++        p = skip_ws(p + 1);
++        if (*p == ']') { *pp = p + 1; return n; }
++        for (;;)
++        {
++            struct jnode *child;
++            if (!(child = parse_value(&p, depth + 1))) goto fail;
++            jnode_add(n, NULL, child);
++            jnode_release(child);
++            p = skip_ws(p);
++            if (*p == ',') { p++; continue; }
++            if (*p == ']') { p++; break; }
++            goto fail;
++        }
++    }
++    else if (*p == '"')
++    {
++        WCHAR *s;
++        if (!parse_string(&p, &s)) return NULL;
++        n = jnode_create(JsonValueType_String);
++        WindowsCreateString(s, wcslen(s), &n->str);
++        free(s);
++    }
++    else if (!wcsncmp(p, L"true", 4)) { n = jnode_create(JsonValueType_Boolean); n->boolean_value = TRUE; p += 4; }
++    else if (!wcsncmp(p, L"false", 5)) { n = jnode_create(JsonValueType_Boolean); p += 5; }
++    else if (!wcsncmp(p, L"null", 4)) { n = jnode_create(JsonValueType_Null); p += 4; }
++    else if (*p == '-' || (*p >= '0' && *p <= '9'))
++    {
++        WCHAR *end;
++        double d = wcstod(p, &end);
++        if (end == p) return NULL;
++        n = jnode_create(JsonValueType_Number);
++        n->num = d;
++        p = end;
++    }
++    else return NULL;
++
++    if (!n) return NULL;
++    *pp = p;
++    return n;
++fail:
++    if (n) jnode_release(n);
++    return NULL;
++}
++
++HRESULT json_parse_object(HSTRING input, IJsonObject **out, boolean *ok)
++{
++    const WCHAR *p = WindowsGetStringRawBuffer(input, NULL);
++    struct jnode *n = p ? parse_value(&p, 0) : NULL;
++
++    *out = NULL;
++    if (n && skip_ws(p)[0] == 0 && n->type == JsonValueType_Object)
++    {
++        *out = &n->IJsonObject_iface;
++        if (ok) *ok = TRUE;
++        return S_OK;
++    }
++    if (n) jnode_release(n);
++    if (ok) { *ok = FALSE; return S_OK; }
++    return E_INVALIDARG;
++}
++
++HRESULT json_object_create(IJsonObject **out)
++{
++    struct jnode *n = jnode_create(JsonValueType_Object);
++    if (!n) return E_OUTOFMEMORY;
++    *out = &n->IJsonObject_iface;
++    return S_OK;
++}
+diff --git a/dlls/windows.web/json_object.c b/dlls/windows.web/json_object.c
+index 38c8992..bc8f222 100644
+--- a/dlls/windows.web/json_object.c
++++ b/dlls/windows.web/json_object.c
+@@ -163,6 +163,22 @@ static inline struct json_object_statics *impl_from_IActivationFactory( IActivat
+     return CONTAINING_RECORD( iface, struct json_object_statics, IActivationFactory_iface );
+ }
+ 
++static const GUID IID_IJsonObjectStatics_probe = { 0x2289f159, 0x54de, 0x45d8, { 0xab, 0xcc, 0x22, 0x60, 0x3f, 0xa0, 0x66, 0xa0 } };
++struct json_statics_probe_obj { const void *const *lpVtbl; };
++static HRESULT WINAPI jsp_QI(void *iface, REFIID iid, void **out) { *out = iface; return S_OK; }
++static ULONG WINAPI jsp_AddRef(void *iface) { return 2; }
++static ULONG WINAPI jsp_Release(void *iface) { return 1; }
++static HRESULT WINAPI jsp_GetIids(void *iface, ULONG *c, IID **i) { return E_NOTIMPL; }
++static HRESULT WINAPI jsp_GetRuntimeClassName(void *iface, HSTRING *n) { return E_NOTIMPL; }
++static HRESULT WINAPI jsp_GetTrustLevel(void *iface, TrustLevel *l) { *l = BaseTrust; return S_OK; }
++static HRESULT WINAPI jsp_Parse(void *iface, HSTRING input, void **out)
++{ TRACE("JsonObject::Parse %s\n", debugstr_hstring(input)); return json_parse_object(input, (IJsonObject **)out, NULL); }
++static HRESULT WINAPI jsp_TryParse(void *iface, HSTRING input, void **out, boolean *ok)
++{ TRACE("JsonObject::TryParse %s\n", debugstr_hstring(input)); return json_parse_object(input, (IJsonObject **)out, ok); }
++static const void *const jsp_vtbl[] = { jsp_QI, jsp_AddRef, jsp_Release, jsp_GetIids, jsp_GetRuntimeClassName,
++    jsp_GetTrustLevel, jsp_Parse, jsp_TryParse };
++static struct json_statics_probe_obj json_statics_probe = { jsp_vtbl };
++
+ static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
+ {
+     struct json_object_statics *impl = impl_from_IActivationFactory( iface );
+@@ -179,6 +195,12 @@ static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID
+         return S_OK;
+     }
+ 
++    if (IsEqualGUID( iid, &IID_IJsonObjectStatics_probe ))
++    {
++        *out = &json_statics_probe;
++        return S_OK;
++    }
++
+     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+     *out = NULL;
+     return E_NOINTERFACE;
+@@ -220,18 +242,10 @@ static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLev
+ 
+ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+ {
+-    struct json_object *impl;
+-
+     TRACE( "iface %p, instance %p.\n", iface, instance );
+ 
+     *instance = NULL;
+-    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+-
+-    impl->IJsonObject_iface.lpVtbl = &json_object_statics_vtbl;
+-    impl->ref = 1;
+-
+-    *instance = (IInspectable *)&impl->IJsonObject_iface;
+-    return S_OK;
++    return json_object_create( (IJsonObject **)instance );
+ }
+ 
+ static const struct IActivationFactoryVtbl factory_vtbl =
+diff --git a/dlls/windows.web/main.c b/dlls/windows.web/main.c
+index 60e95fd..74aecd6 100644
+--- a/dlls/windows.web/main.c
++++ b/dlls/windows.web/main.c
+@@ -43,6 +43,9 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+     if (!wcscmp( buffer, RuntimeClass_Windows_Data_Json_JsonValue ))
+         IActivationFactory_QueryInterface( json_value_factory, &IID_IActivationFactory, (void **)factory );
+ 
++    if (!wcscmp( buffer, L"Windows.Data.Xml.Dom.XmlDocument" ))
++        IActivationFactory_QueryInterface( xml_document_factory, &IID_IActivationFactory, (void **)factory );
++
+     if (*factory) return S_OK;
+     return CLASS_E_CLASSNOTAVAILABLE;
+ }
+diff --git a/dlls/windows.web/private.h b/dlls/windows.web/private.h
+index d5f0e76..c71f028 100644
+--- a/dlls/windows.web/private.h
++++ b/dlls/windows.web/private.h
+@@ -37,6 +37,9 @@
+ #include "windows.data.json.h"
+ 
+ extern IActivationFactory *json_object_factory;
++extern HRESULT json_parse_object( HSTRING input, IJsonObject **out, boolean *ok );
++extern HRESULT json_object_create( IJsonObject **out );
++extern IActivationFactory *xml_document_factory;
+ extern IActivationFactory *json_value_factory;
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+diff --git a/dlls/windows.web/xml_probe.c b/dlls/windows.web/xml_probe.c
+new file mode 100644
+index 0000000..4f64e1f
+--- /dev/null
++++ b/dlls/windows.web/xml_probe.c
+@@ -0,0 +1,66 @@
++/* Temporary probe for Windows.Data.Xml.Dom.XmlDocument: logs interface IIDs and slot numbers called. */
++#include "private.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(web);
++
++struct probe { const void *const *lpVtbl; GUID iid; };
++extern const void *const xml_probe_vtbl[];
++
++static const GUID IID_IXmlDocumentIO_probe = { 0x6cd0e74e, 0xee65, 0x4489, { 0x9e, 0xbf, 0xca, 0x43, 0xe8, 0x7e, 0xba, 0x63 } };
++#define P(n) static HRESULT WINAPI xp##n(struct probe *iface, void *a, void *b, void *c) \
++    { if (n == 6 && IsEqualGUID(&iface->iid, &IID_IXmlDocumentIO_probe)) \
++      { FIXME("XmlDocumentIO::LoadXml %s\n", debugstr_hstring(a)); return S_OK; } \
++      FIXME("XML iface %s slot %d (a=%p b=%p c=%p)\n", debugstr_guid(&iface->iid), n, a, b, c); \
++      return E_NOTIMPL; }
++P(6) P(7) P(8) P(9) P(10) P(11) P(12) P(13) P(14) P(15) P(16) P(17) P(18) P(19) P(20) P(21) P(22) P(23) P(24) P(25)
++P(26) P(27) P(28) P(29) P(30) P(31) P(32) P(33) P(34) P(35) P(36) P(37) P(38) P(39)
++
++static HRESULT WINAPI xp_QI(struct probe *iface, REFIID iid, void **out)
++{
++    struct probe *p;
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) || IsEqualGUID(iid, &IID_IAgileObject))
++    { *out = iface; return S_OK; }
++    FIXME("XML probing interface %s.\n", debugstr_guid(iid));
++    if (!(p = calloc(1, sizeof(*p)))) return E_OUTOFMEMORY;
++    p->lpVtbl = xml_probe_vtbl;
++    p->iid = *iid;
++    *out = p;
++    return S_OK;
++}
++static ULONG WINAPI xp_AddRef(struct probe *iface) { return 2; }
++static ULONG WINAPI xp_Release(struct probe *iface) { return 1; }
++static HRESULT WINAPI xp_GetIids(struct probe *iface, ULONG *c, IID **i) { return E_NOTIMPL; }
++static HRESULT WINAPI xp_GetRuntimeClassName(struct probe *iface, HSTRING *n) { return E_NOTIMPL; }
++static HRESULT WINAPI xp_GetTrustLevel(struct probe *iface, TrustLevel *l) { *l = BaseTrust; return S_OK; }
++
++const void *const xml_probe_vtbl[] = { xp_QI, xp_AddRef, xp_Release, xp_GetIids, xp_GetRuntimeClassName, xp_GetTrustLevel,
++    xp6, xp7, xp8, xp9, xp10, xp11, xp12, xp13, xp14, xp15, xp16, xp17, xp18, xp19, xp20, xp21, xp22, xp23, xp24, xp25,
++    xp26, xp27, xp28, xp29, xp30, xp31, xp32, xp33, xp34, xp35, xp36, xp37, xp38, xp39 };
++
++static struct probe doc_obj = { xml_probe_vtbl };
++
++static HRESULT WINAPI xf_QI(IActivationFactory *iface, REFIID iid, void **out)
++{
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IActivationFactory))
++    { *out = iface; return S_OK; }
++    FIXME("XML factory: %s not implemented.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI xf_AddRef(IActivationFactory *iface) { return 2; }
++static ULONG WINAPI xf_Release(IActivationFactory *iface) { return 1; }
++static HRESULT WINAPI xf_GetIids(IActivationFactory *iface, ULONG *c, IID **i) { return E_NOTIMPL; }
++static HRESULT WINAPI xf_GetRuntimeClassName(IActivationFactory *iface, HSTRING *n) { return E_NOTIMPL; }
++static HRESULT WINAPI xf_GetTrustLevel(IActivationFactory *iface, TrustLevel *l) { *l = BaseTrust; return S_OK; }
++static HRESULT WINAPI xf_ActivateInstance(IActivationFactory *iface, IInspectable **i)
++{
++    FIXME("XmlDocument ActivateInstance\n");
++    *i = (IInspectable *)&doc_obj;
++    return S_OK;
++}
++static const IActivationFactoryVtbl xf_vtbl = { xf_QI, xf_AddRef, xf_Release, xf_GetIids, xf_GetRuntimeClassName,
++    xf_GetTrustLevel, xf_ActivateInstance };
++static IActivationFactory xf_obj = { &xf_vtbl };
++IActivationFactory *xml_document_factory = &xf_obj;

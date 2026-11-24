@@ -1,0 +1,273 @@
+Subject: msxml3: offline IXMLHTTPRequest2 (FreeThreadedXMLHTTP60) that reports network errors
+
+diff --git a/dlls/msxml3/Makefile.in b/dlls/msxml3/Makefile.in
+index 78cf5b2..21132d2 100644
+--- a/dlls/msxml3/Makefile.in
++++ b/dlls/msxml3/Makefile.in
+@@ -16,6 +16,7 @@ SOURCES = \
+ 	entityref.c \
+ 	factory.c \
+ 	httprequest.c \
++	httprequest2.c \
+ 	main.c \
+ 	msxml3_v1.idl \
+ 	mxnamespace.c \
+diff --git a/dlls/msxml3/factory.c b/dlls/msxml3/factory.c
+index 5847752..d3ba32b 100644
+--- a/dlls/msxml3/factory.c
++++ b/dlls/msxml3/factory.c
+@@ -299,6 +299,9 @@ static ClassFactory xmlviewcf = { { &ClassFactoryVtbl }, XMLView_create };
+ /******************************************************************
+  *		DllGetClassObject (MSXML3.@)
+  */
++static const GUID clsid_free_threaded_xmlhttp60 =
++    { 0x88d96a09, 0xf192, 0x11d4, { 0xa6, 0x5f, 0x00, 0x40, 0x96, 0x32, 0x51, 0xe5 } };
++
+ HRESULT WINAPI DllGetClassObject( REFCLSID rclsid, REFIID riid, void **ppv )
+ {
+     IClassFactory *cf = NULL;
+@@ -351,6 +354,11 @@ HRESULT WINAPI DllGetClassObject( REFCLSID rclsid, REFIID riid, void **ppv )
+     {
+         cf = &httpreqcf.IClassFactory_iface;
+     }
++    else if( IsEqualGUID( rclsid, &clsid_free_threaded_xmlhttp60 ) )
++    {
++        extern IClassFactory httpreq2cf;
++        cf = &httpreq2cf;
++    }
+     else if( IsEqualCLSID( rclsid, &CLSID_ServerXMLHTTP ) ||
+              IsEqualCLSID( rclsid, &CLSID_ServerXMLHTTP30 ) ||
+              IsEqualCLSID( rclsid, &CLSID_ServerXMLHTTP40 ) ||
+diff --git a/dlls/msxml3/httprequest2.c b/dlls/msxml3/httprequest2.c
+new file mode 100644
+index 0000000..b637a25
+--- /dev/null
++++ b/dlls/msxml3/httprequest2.c
+@@ -0,0 +1,227 @@
++/*
++ * IXMLHTTPRequest2 (FreeThreadedXMLHTTP60 / XMLHTTP60 request object).
++ *
++ * Prototype: this implementation performs no network access. Open() records the callback; Send() reports a
++ * network error through IXMLHTTPRequest2Callback::OnError() from a worker thread, as an unreachable server would.
++ * It lets applications that use IXMLHTTPRequest2 for optional online services run in an offline mode.
++ */
++
++#define COBJMACROS
++
++#include <stdarg.h>
++#include "windef.h"
++#include "winbase.h"
++#include "ole2.h"
++#include "wininet.h"
++#include "msxml6.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(msxml);
++
++static const GUID iid_ixmlhttprequest2 = /* {e5d37dc0-552a-4d52-9cc0-a14d546fbd04} */
++    { 0xe5d37dc0, 0x552a, 0x4d52, { 0x9c, 0xc0, 0xa1, 0x4d, 0x54, 0x6f, 0xbd, 0x04 } };
++
++struct httprequest2
++{
++    IXMLHTTPRequest2 IXMLHTTPRequest2_iface;
++    LONG ref;
++    IXMLHTTPRequest2Callback *callback;
++    WCHAR *url;
++};
++
++static inline struct httprequest2 *impl_from_IXMLHTTPRequest2( IXMLHTTPRequest2 *iface )
++{
++    return CONTAINING_RECORD( iface, struct httprequest2, IXMLHTTPRequest2_iface );
++}
++
++static HRESULT WINAPI httprequest2_QueryInterface( IXMLHTTPRequest2 *iface, REFIID riid, void **ppv )
++{
++    struct httprequest2 *request = impl_from_IXMLHTTPRequest2( iface );
++
++    TRACE( "%p, %s, %p.\n", iface, debugstr_guid(riid), ppv );
++
++    if (IsEqualGUID( riid, &IID_IUnknown ) || IsEqualGUID( riid, &iid_ixmlhttprequest2 ))
++    {
++        *ppv = &request->IXMLHTTPRequest2_iface;
++        IXMLHTTPRequest2_AddRef( *ppv );
++        return S_OK;
++    }
++    FIXME( "interface %s not implemented.\n", debugstr_guid(riid) );
++    *ppv = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI httprequest2_AddRef( IXMLHTTPRequest2 *iface )
++{
++    struct httprequest2 *request = impl_from_IXMLHTTPRequest2( iface );
++    return InterlockedIncrement( &request->ref );
++}
++
++static ULONG WINAPI httprequest2_Release( IXMLHTTPRequest2 *iface )
++{
++    struct httprequest2 *request = impl_from_IXMLHTTPRequest2( iface );
++    ULONG ref = InterlockedDecrement( &request->ref );
++
++    if (!ref)
++    {
++        if (request->callback) IXMLHTTPRequest2Callback_Release( request->callback );
++        free( request->url );
++        free( request );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI httprequest2_Open( IXMLHTTPRequest2 *iface, const WCHAR *method, const WCHAR *url,
++        IXMLHTTPRequest2Callback *callback, const WCHAR *username, const WCHAR *password,
++        const WCHAR *proxy_username, const WCHAR *proxy_password )
++{
++    struct httprequest2 *request = impl_from_IXMLHTTPRequest2( iface );
++
++    TRACE( "%p, %s, %s, %p.\n", iface, debugstr_w(method), debugstr_w(url), callback );
++
++    if (!method || !url) return E_INVALIDARG;
++    if (request->callback) IXMLHTTPRequest2Callback_Release( request->callback );
++    if ((request->callback = callback)) IXMLHTTPRequest2Callback_AddRef( callback );
++    free( request->url );
++    request->url = wcsdup( url );
++    return S_OK;
++}
++
++static DWORD CALLBACK report_error( void *arg )
++{
++    struct httprequest2 *request = arg;
++    IXMLHTTPRequest2Callback *callback = request->callback;
++
++    if (callback)
++    {
++        IXMLHTTPRequest2Callback_AddRef( callback );
++        IXMLHTTPRequest2Callback_OnError( callback, &request->IXMLHTTPRequest2_iface,
++                                          WININET_E_NAME_NOT_RESOLVED );
++        IXMLHTTPRequest2Callback_Release( callback );
++    }
++    IXMLHTTPRequest2_Release( &request->IXMLHTTPRequest2_iface );
++    return 0;
++}
++
++static HRESULT WINAPI httprequest2_Send( IXMLHTTPRequest2 *iface, ISequentialStream *body, ULONGLONG length )
++{
++    struct httprequest2 *request = impl_from_IXMLHTTPRequest2( iface );
++
++    FIXME( "%p, %p, %I64u: no network access, reporting an error for %s.\n", iface, body, length, debugstr_w(request->url) );
++
++    if (!request->callback) return E_FAIL;
++    IXMLHTTPRequest2_AddRef( iface );
++    if (!QueueUserWorkItem( report_error, request, WT_EXECUTEDEFAULT ))
++    {
++        IXMLHTTPRequest2_Release( iface );
++        return HRESULT_FROM_WIN32( GetLastError() );
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI httprequest2_Abort( IXMLHTTPRequest2 *iface ) { return S_OK; }
++
++static HRESULT WINAPI httprequest2_SetCookie( IXMLHTTPRequest2 *iface, const XHR_COOKIE *cookie, DWORD *state )
++{
++    TRACE( "%p, %p, %p.\n", iface, cookie, state );
++    if (state) *state = 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI httprequest2_SetCustomResponseStream( IXMLHTTPRequest2 *iface, ISequentialStream *stream )
++{ return S_OK; }
++
++static HRESULT WINAPI httprequest2_SetProperty( IXMLHTTPRequest2 *iface, XHR_PROPERTY property, ULONGLONG value )
++{
++    TRACE( "%p, %d, %I64u.\n", iface, property, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI httprequest2_SetRequestHeader( IXMLHTTPRequest2 *iface, const WCHAR *header, const WCHAR *value )
++{
++    TRACE( "%p, %s, %s.\n", iface, debugstr_w(header), debugstr_w(value) );
++    return S_OK;
++}
++
++static HRESULT WINAPI httprequest2_GetAllResponseHeaders( IXMLHTTPRequest2 *iface, WCHAR **headers )
++{
++    *headers = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI httprequest2_GetCookie( IXMLHTTPRequest2 *iface, const WCHAR *url, const WCHAR *name, DWORD flags,
++        ULONG *count, XHR_COOKIE **cookies )
++{
++    *count = 0;
++    *cookies = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI httprequest2_GetResponseHeader( IXMLHTTPRequest2 *iface, const WCHAR *header, WCHAR **value )
++{
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static const IXMLHTTPRequest2Vtbl httprequest2_vtbl =
++{
++    httprequest2_QueryInterface,
++    httprequest2_AddRef,
++    httprequest2_Release,
++    httprequest2_Open,
++    httprequest2_Send,
++    httprequest2_Abort,
++    httprequest2_SetCookie,
++    httprequest2_SetCustomResponseStream,
++    httprequest2_SetProperty,
++    httprequest2_SetRequestHeader,
++    httprequest2_GetAllResponseHeaders,
++    httprequest2_GetCookie,
++    httprequest2_GetResponseHeader,
++};
++
++static HRESULT httprequest2_create( void **obj )
++{
++    struct httprequest2 *request;
++
++    if (!(request = calloc( 1, sizeof(*request) ))) return E_OUTOFMEMORY;
++    request->IXMLHTTPRequest2_iface.lpVtbl = &httprequest2_vtbl;
++    request->ref = 1;
++    *obj = &request->IXMLHTTPRequest2_iface;
++    return S_OK;
++}
++
++/* ---- class factory ---- */
++static HRESULT WINAPI httpreq2cf_QueryInterface( IClassFactory *iface, REFIID riid, void **obj )
++{
++    if (IsEqualGUID( riid, &IID_IUnknown ) || IsEqualGUID( riid, &IID_IClassFactory ))
++    {
++        *obj = iface;
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI httpreq2cf_AddRef( IClassFactory *iface ) { return 2; }
++static ULONG WINAPI httpreq2cf_Release( IClassFactory *iface ) { return 1; }
++static HRESULT WINAPI httpreq2cf_CreateInstance( IClassFactory *iface, IUnknown *outer, REFIID riid, void **obj )
++{
++    IXMLHTTPRequest2 *request;
++    HRESULT hr;
++
++    TRACE( "%p, %p, %s, %p.\n", iface, outer, debugstr_guid(riid), obj );
++    *obj = NULL;
++    if (outer) return CLASS_E_NOAGGREGATION;
++    if (FAILED(hr = httprequest2_create( (void **)&request ))) return hr;
++    hr = IXMLHTTPRequest2_QueryInterface( request, riid, obj );
++    IXMLHTTPRequest2_Release( request );
++    return hr;
++}
++static HRESULT WINAPI httpreq2cf_LockServer( IClassFactory *iface, BOOL lock ) { return S_OK; }
++
++static const IClassFactoryVtbl httpreq2cf_vtbl =
++{
++    httpreq2cf_QueryInterface, httpreq2cf_AddRef, httpreq2cf_Release,
++    httpreq2cf_CreateInstance, httpreq2cf_LockServer,
++};
++IClassFactory httpreq2cf = { &httpreq2cf_vtbl };
