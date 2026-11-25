@@ -1,0 +1,4542 @@
+Subject: windows.ui.xaml: measure/arrange layout, StackPanel, Grid, Border, Button with Click and pointer input (milestone 2)
+
+diff --git a/dlls/windows.ui.xaml/Makefile.in b/dlls/windows.ui.xaml/Makefile.in
+index 64373a4..f783238 100644
+--- a/dlls/windows.ui.xaml/Makefile.in
++++ b/dlls/windows.ui.xaml/Makefile.in
+@@ -3,10 +3,15 @@ IMPORTS = combase user32 gdi32
+ 
+ SOURCES = \
+ 	application.c \
++	border.c \
+ 	brush.c \
++	button.c \
+ 	classes.idl \
++	collection.c \
+ 	color_helper.c \
++	definitions.c \
+ 	element.c \
+ 	main.c \
++	panel.c \
+ 	text_block.c \
+ 	window.c
+diff --git a/dlls/windows.ui.xaml/border.c b/dlls/windows.ui.xaml/border.c
+new file mode 100644
+index 0000000..b9d944b
+--- /dev/null
++++ b/dlls/windows.ui.xaml/border.c
+@@ -0,0 +1,341 @@
++/* WinRT Windows.UI.Xaml.Controls.Border implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <math.h>
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++struct border
++{
++    struct xaml_element element;
++    IBorder IBorder_iface;
++    IBrush *background, *border_brush;
++    Thickness border_thickness, padding;
++    CornerRadius corner_radius;
++    IUIElement *child;
++};
++
++static inline struct border *impl_from_element( struct xaml_element *element )
++{
++    return CONTAINING_RECORD( element, struct border, element );
++}
++
++static struct xaml_element *border_child( struct border *impl )
++{
++    return impl->child ? element_from_iinspectable( (IInspectable *)impl->child ) : NULL;
++}
++
++static HRESULT border_query_interface( struct xaml_element *element, REFIID iid, void **out )
++{
++    struct border *impl = impl_from_element( element );
++
++    if (!IsEqualGUID( iid, &IID_IBorder )) return E_NOINTERFACE;
++    *out = &impl->IBorder_iface;
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static void border_measure( struct xaml_element *element, struct layout_context *ctx, float avail_width,
++                            float avail_height, float *width, float *height )
++{
++    struct border *impl = impl_from_element( element );
++    const Thickness *b = &impl->border_thickness, *p = &impl->padding;
++    float extra_width = b->Left + b->Right + p->Left + p->Right, extra_height = b->Top + b->Bottom + p->Top + p->Bottom;
++    struct xaml_element *child = border_child( impl );
++
++    *width = extra_width;
++    *height = extra_height;
++    if (!child) return;
++    element_measure( child, ctx, max( 0.0f, avail_width - extra_width ), max( 0.0f, avail_height - extra_height ) );
++    *width += child->desired_width;
++    *height += child->desired_height;
++}
++
++static void border_arrange( struct xaml_element *element, struct layout_context *ctx )
++{
++    struct border *impl = impl_from_element( element );
++    const Thickness *b = &impl->border_thickness, *p = &impl->padding;
++    const struct layout_rect *r = &element->bounds;
++    struct xaml_element *child = border_child( impl );
++
++    if (!child) return;
++    element_arrange( child, ctx, r->x + b->Left + p->Left, r->y + b->Top + p->Top,
++                     max( 0.0f, r->width - b->Left - b->Right - p->Left - p->Right ),
++                     max( 0.0f, r->height - b->Top - b->Bottom - p->Top - p->Bottom ) );
++}
++
++static void border_render( struct xaml_element *element, struct layout_context *ctx )
++{
++    struct border *impl = impl_from_element( element );
++    struct xaml_element *child = border_child( impl );
++
++    element_fill( ctx, &element->bounds, impl->background );
++    element_frame( ctx, &element->bounds, &impl->border_thickness, impl->border_brush );
++    if (child) element_render( child, ctx );
++}
++
++static UINT32 border_child_count( struct xaml_element *element )
++{
++    return border_child( impl_from_element( element ) ) ? 1 : 0;
++}
++
++static struct xaml_element *border_child_at( struct xaml_element *element, UINT32 index )
++{
++    return border_child( impl_from_element( element ) );
++}
++
++static BOOL border_hit_self( struct xaml_element *element, float x, float y )
++{
++    struct border *impl = impl_from_element( element );
++    return impl->background || impl->border_brush;
++}
++
++static void border_destroy( struct xaml_element *element )
++{
++    struct border *impl = impl_from_element( element );
++    struct xaml_element *child = border_child( impl );
++
++    if (child && child->parent == element) element_set_parent( child, NULL );
++    if (impl->child) IUIElement_Release( impl->child );
++    if (impl->background) IBrush_Release( impl->background );
++    if (impl->border_brush) IBrush_Release( impl->border_brush );
++    free( impl );
++}
++
++static const struct element_ops border_ops =
++{
++    .query_interface = border_query_interface,
++    .measure = border_measure,
++    .arrange = border_arrange,
++    .render = border_render,
++    .child_count = border_child_count,
++    .child_at = border_child_at,
++    .hit_self = border_hit_self,
++    .destroy = border_destroy,
++};
++
++static void set_brush( IBrush **slot, IBrush *value )
++{
++    if (value) IBrush_AddRef( value );
++    if (*slot) IBrush_Release( *slot );
++    *slot = value;
++    window_invalidate();
++}
++
++DEFINE_IINSPECTABLE_( border_iface, IBorder, struct border, impl_from_IBorder, IBorder_iface, impl->element.outer )
++
++static HRESULT WINAPI border_iface_get_BorderBrush( IBorder *iface, IBrush **value )
++{
++    if ((*value = impl_from_IBorder( iface )->border_brush)) IBrush_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI border_iface_put_BorderBrush( IBorder *iface, IBrush *value )
++{
++    set_brush( &impl_from_IBorder( iface )->border_brush, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI border_iface_get_BorderThickness( IBorder *iface, Thickness *value )
++{
++    *value = impl_from_IBorder( iface )->border_thickness;
++    return S_OK;
++}
++
++static HRESULT WINAPI border_iface_put_BorderThickness( IBorder *iface, Thickness value )
++{
++    impl_from_IBorder( iface )->border_thickness = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI border_iface_get_Background( IBorder *iface, IBrush **value )
++{
++    if ((*value = impl_from_IBorder( iface )->background)) IBrush_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI border_iface_put_Background( IBorder *iface, IBrush *value )
++{
++    set_brush( &impl_from_IBorder( iface )->background, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI border_iface_get_CornerRadius( IBorder *iface, CornerRadius *value )
++{
++    *value = impl_from_IBorder( iface )->corner_radius;
++    return S_OK;
++}
++
++static HRESULT WINAPI border_iface_put_CornerRadius( IBorder *iface, CornerRadius value )
++{
++    FIXME( "iface %p: corners are drawn square.\n", iface );
++    impl_from_IBorder( iface )->corner_radius = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI border_iface_get_Padding( IBorder *iface, Thickness *value )
++{
++    *value = impl_from_IBorder( iface )->padding;
++    return S_OK;
++}
++
++static HRESULT WINAPI border_iface_put_Padding( IBorder *iface, Thickness value )
++{
++    impl_from_IBorder( iface )->padding = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI border_iface_get_Child( IBorder *iface, IUIElement **value )
++{
++    if ((*value = impl_from_IBorder( iface )->child)) IUIElement_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI border_iface_put_Child( IBorder *iface, IUIElement *value )
++{
++    struct border *impl = impl_from_IBorder( iface );
++    struct xaml_element *old = border_child( impl ), *child = NULL;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (value && !(child = element_from_iinspectable( (IInspectable *)value ))) return E_INVALIDARG;
++    if (child && child->parent && child->parent != &impl->element) return E_INVALIDARG;
++    if (value) IUIElement_AddRef( value );
++    if (old && old->parent == &impl->element) element_set_parent( old, NULL );
++    if (impl->child) IUIElement_Release( impl->child );
++    impl->child = value;
++    if (child) element_set_parent( child, &impl->element );
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI border_iface_get_ChildTransitions(IBorder *iface, __FIVector_1_Windows__CUI__CXaml__CMedia__CAnimation__CTransition **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI border_iface_put_ChildTransitions(IBorder *iface, __FIVector_1_Windows__CUI__CXaml__CMedia__CAnimation__CTransition *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static const struct IBorderVtbl border_iface_vtbl =
++{
++    border_iface_QueryInterface,
++    border_iface_AddRef,
++    border_iface_Release,
++    /* IInspectable methods */
++    border_iface_GetIids,
++    border_iface_GetRuntimeClassName,
++    border_iface_GetTrustLevel,
++    /* IBorder methods */
++    border_iface_get_BorderBrush,
++    border_iface_put_BorderBrush,
++    border_iface_get_BorderThickness,
++    border_iface_put_BorderThickness,
++    border_iface_get_Background,
++    border_iface_put_Background,
++    border_iface_get_CornerRadius,
++    border_iface_put_CornerRadius,
++    border_iface_get_Padding,
++    border_iface_put_Padding,
++    border_iface_get_Child,
++    border_iface_put_Child,
++    border_iface_get_ChildTransitions,
++    border_iface_put_ChildTransitions
++};
++
++static HRESULT border_create( IInspectable **out )
++{
++    struct border *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    element_init( &impl->element, &border_ops, RuntimeClass_Windows_UI_Xaml_Controls_Border, NULL );
++    impl->IBorder_iface.lpVtbl = &border_iface_vtbl;
++    *out = (IInspectable *)&impl->IBorder_iface;
++    TRACE( "created %p.\n", *out );
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    return 2;
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    return 1;
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++    return border_create( instance );
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++static IActivationFactory border_statics = { &factory_vtbl };
++IActivationFactory *border_factory = &border_statics;
+diff --git a/dlls/windows.ui.xaml/button.c b/dlls/windows.ui.xaml/button.c
+new file mode 100644
+index 0000000..5d515de
+--- /dev/null
++++ b/dlls/windows.ui.xaml/button.c
+@@ -0,0 +1,980 @@
++/* WinRT Windows.UI.Xaml.Controls.Button implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <math.h>
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* There are no control templates yet (milestone 4), so Button draws the Windows 10 default look itself: a filled
++ * rectangle with a 2 px border and its content centred, with the Normal / PointerOver / Pressed / Disabled colours
++ * of the light and dark themes. Content is a UIElement, or anything else shown as text (strings, IStringable). */
++
++struct button
++{
++    struct xaml_element element;
++    IButton IButton_iface;
++    IButtonBase IButtonBase_iface;
++    IContentControl IContentControl_iface;
++    IControl IControl_iface;
++
++    IInspectable *content;
++    struct xaml_element *content_element;   /* content, when it is a UIElement */
++    HSTRING content_text;         /* when the content isn't a UIElement */
++    IBrush *background, *foreground, *border_brush;
++    Thickness border_thickness, padding;
++    double font_size;
++    FontWeight font_weight;
++    FontStyle font_style;
++    HorizontalAlignment content_horizontal;
++    VerticalAlignment content_vertical;
++    boolean enabled, pointer_over, pressed, captured;
++    ClickMode click_mode;
++    struct event_list click;
++};
++
++static inline struct button *impl_from_element( struct xaml_element *element )
++{
++    return CONTAINING_RECORD( element, struct button, element );
++}
++
++static struct xaml_element *button_content_element( struct button *impl )
++{
++    return impl->content_element;
++}
++
++static void button_text_format( struct button *impl, struct text_format *format )
++{
++    format->font_size = impl->font_size;
++    format->weight = impl->font_weight.Weight;
++    format->italic = impl->font_style != FontStyle_Normal;
++    format->wrap = FALSE;
++    format->alignment = TextAlignment_Center;
++}
++
++static HRESULT button_query_interface( struct xaml_element *element, REFIID iid, void **out )
++{
++    struct button *impl = impl_from_element( element );
++
++    if (IsEqualGUID( iid, &IID_IButton )) *out = &impl->IButton_iface;
++    else if (IsEqualGUID( iid, &IID_IButtonBase )) *out = &impl->IButtonBase_iface;
++    else if (IsEqualGUID( iid, &IID_IContentControl )) *out = &impl->IContentControl_iface;
++    else if (IsEqualGUID( iid, &IID_IControl )) *out = &impl->IControl_iface;
++    else return E_NOINTERFACE;
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static void button_measure( struct xaml_element *element, struct layout_context *ctx, float avail_width,
++                            float avail_height, float *width, float *height )
++{
++    struct button *impl = impl_from_element( element );
++    const Thickness *b = &impl->border_thickness, *p = &impl->padding;
++    float extra_width = b->Left + b->Right + p->Left + p->Right, extra_height = b->Top + b->Bottom + p->Top + p->Bottom;
++    struct xaml_element *child = button_content_element( impl );
++    struct text_format format;
++
++    *width = *height = 0;
++    if (child)
++    {
++        element_measure( child, ctx, max( 0.0f, avail_width - extra_width ), max( 0.0f, avail_height - extra_height ) );
++        *width = child->desired_width;
++        *height = child->desired_height;
++    }
++    else if (impl->content_text)
++    {
++        button_text_format( impl, &format );
++        text_measure( ctx, &format, impl->content_text, INFINITY, width, height );
++    }
++    *width += extra_width;
++    *height += extra_height;
++}
++
++static void button_inner_rect( struct button *impl, struct layout_rect *rect )
++{
++    const Thickness *b = &impl->border_thickness, *p = &impl->padding;
++    const struct layout_rect *r = &impl->element.bounds;
++
++    rect->x = r->x + b->Left + p->Left;
++    rect->y = r->y + b->Top + p->Top;
++    rect->width = max( 0.0f, r->width - b->Left - b->Right - p->Left - p->Right );
++    rect->height = max( 0.0f, r->height - b->Top - b->Bottom - p->Top - p->Bottom );
++}
++
++static void button_arrange( struct xaml_element *element, struct layout_context *ctx )
++{
++    struct button *impl = impl_from_element( element );
++    struct xaml_element *child = button_content_element( impl );
++    struct layout_rect inner;
++    float x, y, w, h;
++
++    if (!child) return;
++    button_inner_rect( impl, &inner );
++    /* the content presenter: Stretch fills, otherwise the content's desired size placed by the content alignment */
++    w = impl->content_horizontal == HorizontalAlignment_Stretch ? inner.width : min( inner.width, child->desired_width );
++    h = impl->content_vertical == VerticalAlignment_Stretch ? inner.height : min( inner.height, child->desired_height );
++    switch (impl->content_horizontal)
++    {
++    case HorizontalAlignment_Left: x = inner.x; break;
++    case HorizontalAlignment_Right: x = inner.x + inner.width - w; break;
++    default: x = inner.x + (inner.width - w) / 2; break;
++    }
++    switch (impl->content_vertical)
++    {
++    case VerticalAlignment_Top: y = inner.y; break;
++    case VerticalAlignment_Bottom: y = inner.y + inner.height - h; break;
++    default: y = inner.y + (inner.height - h) / 2; break;
++    }
++    element_arrange( child, ctx, x, y, w, h );
++}
++
++static BOOL brush_colorref( IBrush *brush, COLORREF *color )
++{
++    Color c;
++
++    if (!brush || !brush_get_color( brush, &c ) || !c.A) return FALSE;
++    *color = RGB( c.R, c.G, c.B );
++    return TRUE;
++}
++
++static void button_render( struct xaml_element *element, struct layout_context *ctx )
++{
++    struct button *impl = impl_from_element( element );
++    struct xaml_element *child = button_content_element( impl );
++    /* Windows 10 theme colours, as #33/#66 black or white over the page background */
++    COLORREF base_low = ctx->dark ? RGB(51, 51, 51) : RGB(204, 204, 204);
++    COLORREF base_medium_low = ctx->dark ? RGB(102, 102, 102) : RGB(153, 153, 153);
++    COLORREF text = ctx->foreground, background = base_low, border = 0;
++    BOOL has_background = TRUE, has_border = FALSE;
++    struct text_format format;
++    struct layout_rect inner;
++    COLORREF saved;
++
++    if (!impl->enabled)
++        text = base_medium_low;
++    else if (impl->pressed)
++        background = base_medium_low;
++    else if (impl->pointer_over)
++    {
++        border = base_medium_low;
++        has_border = TRUE;
++    }
++    else
++    {
++        /* Normal state: the app's own brushes, if set */
++        if (impl->background) has_background = brush_colorref( impl->background, &background );
++        if (impl->border_brush) has_border = brush_colorref( impl->border_brush, &border );
++    }
++    if (impl->enabled && impl->foreground) brush_colorref( impl->foreground, &text );
++
++    if (has_background) element_fill_color( ctx, &element->bounds, background );
++    if (has_border) element_frame_color( ctx, &element->bounds, &impl->border_thickness, border );
++
++    if (child)
++    {
++        saved = ctx->foreground;
++        ctx->foreground = text;   /* inherited by a TextBlock content */
++        element_render( child, ctx );
++        ctx->foreground = saved;
++    }
++    else if (impl->content_text)
++    {
++        button_inner_rect( impl, &inner );
++        button_text_format( impl, &format );
++        text_draw( ctx, &format, impl->content_text, &inner, text );
++    }
++}
++
++static UINT32 button_child_count( struct xaml_element *element )
++{
++    return button_content_element( impl_from_element( element ) ) ? 1 : 0;
++}
++
++static struct xaml_element *button_child_at( struct xaml_element *element, UINT32 index )
++{
++    return button_content_element( impl_from_element( element ) );
++}
++
++static BOOL button_hit_self( struct xaml_element *element, float x, float y )
++{
++    return TRUE;
++}
++
++static void button_raise_click( struct button *impl )
++{
++    IRoutedEventArgs *args;
++    IUnknown **handlers;
++    UINT32 i, count = impl->click.count;
++
++    TRACE( "button %p clicked, %u handler slots.\n", impl, count );
++
++    if (!count || !(handlers = calloc( count, sizeof(*handlers) ))) return;
++    for (i = 0; i < count; i++) if ((handlers[i] = impl->click.handlers[i])) IUnknown_AddRef( handlers[i] );
++    if (SUCCEEDED(routed_event_args_create( impl->element.outer, &args )))
++    {
++        for (i = 0; i < count; i++)
++        {
++            HRESULT hr;
++            if (!handlers[i]) continue;
++            hr = IRoutedEventHandler_Invoke( (IRoutedEventHandler *)handlers[i], impl->element.outer, args );
++            if (FAILED(hr)) WARN( "Click handler %p failed, hr %#lx.\n", handlers[i], hr );
++        }
++        IRoutedEventArgs_Release( args );
++    }
++    for (i = 0; i < count; i++) if (handlers[i]) IUnknown_Release( handlers[i] );
++    free( handlers );
++}
++
++static void button_pointer( struct xaml_element *element, UINT msg, float x, float y )
++{
++    struct button *impl = impl_from_element( element );
++    const struct layout_rect *b = &element->bounds;
++    BOOL inside = x >= b->x && y >= b->y && x < b->x + b->width && y < b->y + b->height;
++
++    switch (msg)
++    {
++    case WM_MOUSEMOVE:
++        if (!impl->pointer_over && inside) impl->pointer_over = TRUE;
++        if (impl->captured) impl->pressed = inside;
++        break;
++    case WM_MOUSELEAVE:
++        impl->pointer_over = FALSE;
++        if (impl->captured) impl->pressed = FALSE;
++        break;
++    case WM_LBUTTONDOWN:
++        if (!impl->enabled) return;
++        impl->captured = impl->pressed = TRUE;
++        if (impl->click_mode == ClickMode_Press) button_raise_click( impl );
++        break;
++    case WM_LBUTTONUP:
++        if (!impl->captured) return;
++        impl->captured = impl->pressed = FALSE;
++        impl->pointer_over = inside;
++        window_invalidate();
++        if (inside && impl->enabled && impl->click_mode == ClickMode_Release) button_raise_click( impl );
++        break;
++    case WM_CAPTURECHANGED:
++        impl->captured = impl->pressed = FALSE;
++        break;
++    }
++    window_invalidate();
++}
++
++static void button_destroy( struct xaml_element *element )
++{
++    struct button *impl = impl_from_element( element );
++    struct xaml_element *child = button_content_element( impl );
++
++    if (child && child->parent == element) element_set_parent( child, NULL );
++    if (impl->content) IInspectable_Release( impl->content );
++    WindowsDeleteString( impl->content_text );
++    if (impl->background) IBrush_Release( impl->background );
++    if (impl->foreground) IBrush_Release( impl->foreground );
++    if (impl->border_brush) IBrush_Release( impl->border_brush );
++    event_list_clear( &impl->click );
++    free( impl );
++}
++
++static const struct element_ops button_ops =
++{
++    .query_interface = button_query_interface,
++    .measure = button_measure,
++    .arrange = button_arrange,
++    .render = button_render,
++    .child_count = button_child_count,
++    .child_at = button_child_at,
++    .hit_self = button_hit_self,
++    .pointer = button_pointer,
++    .destroy = button_destroy,
++};
++
++static void set_brush( IBrush **slot, IBrush *value )
++{
++    if (value) IBrush_AddRef( value );
++    if (*slot) IBrush_Release( *slot );
++    *slot = value;
++    window_invalidate();
++}
++
++static void get_brush( IBrush *brush, IBrush **value )
++{
++    if ((*value = brush)) IBrush_AddRef( brush );
++}
++
++/* text for non-UIElement content: strings, IStringable, or the runtime class name like Windows does */
++static HSTRING content_to_text( IInspectable *content )
++{
++    IPropertyValue *value;
++    IStringable *stringable;
++    PropertyType type;
++    HSTRING text = NULL;
++
++    if (SUCCEEDED(IInspectable_QueryInterface( content, &IID_IPropertyValue, (void **)&value )))
++    {
++        if (SUCCEEDED(IPropertyValue_get_Type( value, &type )) && type == PropertyType_String)
++            IPropertyValue_GetString( value, &text );
++        else FIXME( "property value of type %d shown as nothing.\n", type );
++        IPropertyValue_Release( value );
++    }
++    else if (SUCCEEDED(IInspectable_QueryInterface( content, &IID_IStringable, (void **)&stringable )))
++    {
++        IStringable_ToString( stringable, &text );
++        IStringable_Release( stringable );
++    }
++    else IInspectable_GetRuntimeClassName( content, &text );
++    return text;
++}
++
++/* IButton has no methods of its own */
++
++DEFINE_IINSPECTABLE_( button_iface, IButton, struct button, impl_from_IButton, IButton_iface, impl->element.outer )
++
++static const struct IButtonVtbl button_iface_vtbl =
++{
++    button_iface_QueryInterface,
++    button_iface_AddRef,
++    button_iface_Release,
++    /* IInspectable methods */
++    button_iface_GetIids,
++    button_iface_GetRuntimeClassName,
++    button_iface_GetTrustLevel,
++};
++
++/* IButtonBase */
++
++DEFINE_IINSPECTABLE_( button_base, IButtonBase, struct button, impl_from_IButtonBase, IButtonBase_iface, impl->element.outer )
++
++static HRESULT WINAPI button_base_get_ClickMode( IButtonBase *iface, ClickMode *value )
++{
++    *value = impl_from_IButtonBase( iface )->click_mode;
++    return S_OK;
++}
++
++static HRESULT WINAPI button_base_put_ClickMode( IButtonBase *iface, ClickMode value )
++{
++    if (value == ClickMode_Hover) FIXME( "ClickMode.Hover is treated as Release.\n" );
++    impl_from_IButtonBase( iface )->click_mode = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI button_base_get_IsPointerOver( IButtonBase *iface, boolean *value )
++{
++    *value = impl_from_IButtonBase( iface )->pointer_over;
++    return S_OK;
++}
++
++static HRESULT WINAPI button_base_get_IsPressed( IButtonBase *iface, boolean *value )
++{
++    *value = impl_from_IButtonBase( iface )->pressed;
++    return S_OK;
++}
++
++static HRESULT WINAPI button_base_add_Click( IButtonBase *iface, IRoutedEventHandler *handler, EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return event_list_add( &impl_from_IButtonBase( iface )->click, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI button_base_remove_Click( IButtonBase *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IButtonBase( iface )->click, token );
++}
++
++static HRESULT WINAPI button_base_get_Command(IButtonBase *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CICommand **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI button_base_put_Command(IButtonBase *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CICommand *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI button_base_get_CommandParameter(IButtonBase *iface, IInspectable **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI button_base_put_CommandParameter(IButtonBase *iface, IInspectable *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static const struct IButtonBaseVtbl button_base_vtbl =
++{
++    button_base_QueryInterface,
++    button_base_AddRef,
++    button_base_Release,
++    /* IInspectable methods */
++    button_base_GetIids,
++    button_base_GetRuntimeClassName,
++    button_base_GetTrustLevel,
++    /* IButtonBase methods */
++    button_base_get_ClickMode,
++    button_base_put_ClickMode,
++    button_base_get_IsPointerOver,
++    button_base_get_IsPressed,
++    button_base_get_Command,
++    button_base_put_Command,
++    button_base_get_CommandParameter,
++    button_base_put_CommandParameter,
++    button_base_add_Click,
++    button_base_remove_Click
++};
++
++/* IContentControl */
++
++DEFINE_IINSPECTABLE_( content_control, IContentControl, struct button, impl_from_IContentControl, IContentControl_iface,
++                      impl->element.outer )
++
++static HRESULT WINAPI content_control_get_Content( IContentControl *iface, IInspectable **value )
++{
++    if ((*value = impl_from_IContentControl( iface )->content)) IInspectable_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI content_control_put_Content( IContentControl *iface, IInspectable *value )
++{
++    struct button *impl = impl_from_IContentControl( iface );
++    struct xaml_element *old = button_content_element( impl ), *child;
++    IUIElement *uielement;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (old && old->parent == &impl->element) element_set_parent( old, NULL );
++    if (value) IInspectable_AddRef( value );
++    if (impl->content) IInspectable_Release( impl->content );
++    impl->content = value;
++    impl->content_element = NULL;
++    WindowsDeleteString( impl->content_text );
++    impl->content_text = NULL;
++    if (value && SUCCEEDED(IInspectable_QueryInterface( value, &IID_IUIElement, (void **)&uielement )))
++    {
++        IUIElement_Release( uielement );
++        impl->content_element = element_from_iinspectable( value );
++    }
++    if ((child = impl->content_element)) element_set_parent( child, &impl->element );
++    else if (value) impl->content_text = content_to_text( value );
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI content_control_get_ContentTemplate(IContentControl *iface, __x_ABI_CWindows_CUI_CXaml_CIDataTemplate **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_control_put_ContentTemplate(IContentControl *iface, __x_ABI_CWindows_CUI_CXaml_CIDataTemplate *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_control_get_ContentTemplateSelector(IContentControl *iface, __x_ABI_CWindows_CUI_CXaml_CControls_CIDataTemplateSelector **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_control_put_ContentTemplateSelector(IContentControl *iface, __x_ABI_CWindows_CUI_CXaml_CControls_CIDataTemplateSelector *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_control_get_ContentTransitions(IContentControl *iface, __FIVector_1_Windows__CUI__CXaml__CMedia__CAnimation__CTransition **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_control_put_ContentTransitions(IContentControl *iface, __FIVector_1_Windows__CUI__CXaml__CMedia__CAnimation__CTransition *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static const struct IContentControlVtbl content_control_vtbl =
++{
++    content_control_QueryInterface,
++    content_control_AddRef,
++    content_control_Release,
++    /* IInspectable methods */
++    content_control_GetIids,
++    content_control_GetRuntimeClassName,
++    content_control_GetTrustLevel,
++    /* IContentControl methods */
++    content_control_get_Content,
++    content_control_put_Content,
++    content_control_get_ContentTemplate,
++    content_control_put_ContentTemplate,
++    content_control_get_ContentTemplateSelector,
++    content_control_put_ContentTemplateSelector,
++    content_control_get_ContentTransitions,
++    content_control_put_ContentTransitions
++};
++
++/* IControl */
++
++DEFINE_IINSPECTABLE_( control, IControl, struct button, impl_from_IControl, IControl_iface, impl->element.outer )
++
++static HRESULT WINAPI control_get_FontSize( IControl *iface, DOUBLE *value )
++{
++    *value = impl_from_IControl( iface )->font_size;
++    return S_OK;
++}
++
++static HRESULT WINAPI control_put_FontSize( IControl *iface, DOUBLE value )
++{
++    if (!(value > 0)) return E_INVALIDARG;
++    impl_from_IControl( iface )->font_size = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI control_get_FontWeight( IControl *iface, FontWeight *value )
++{
++    *value = impl_from_IControl( iface )->font_weight;
++    return S_OK;
++}
++
++static HRESULT WINAPI control_put_FontWeight( IControl *iface, FontWeight value )
++{
++    impl_from_IControl( iface )->font_weight = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI control_get_FontStyle( IControl *iface, FontStyle *value )
++{
++    *value = impl_from_IControl( iface )->font_style;
++    return S_OK;
++}
++
++static HRESULT WINAPI control_put_FontStyle( IControl *iface, FontStyle value )
++{
++    impl_from_IControl( iface )->font_style = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI control_get_Foreground( IControl *iface, IBrush **value )
++{
++    get_brush( impl_from_IControl( iface )->foreground, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI control_put_Foreground( IControl *iface, IBrush *value )
++{
++    set_brush( &impl_from_IControl( iface )->foreground, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI control_get_IsEnabled( IControl *iface, boolean *value )
++{
++    *value = impl_from_IControl( iface )->enabled;
++    return S_OK;
++}
++
++static HRESULT WINAPI control_put_IsEnabled( IControl *iface, boolean value )
++{
++    struct button *impl = impl_from_IControl( iface );
++
++    TRACE( "iface %p, value %d.\n", iface, value );
++    impl->enabled = value;
++    if (!value) impl->pressed = impl->captured = FALSE;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI control_get_Padding( IControl *iface, Thickness *value )
++{
++    *value = impl_from_IControl( iface )->padding;
++    return S_OK;
++}
++
++static HRESULT WINAPI control_put_Padding( IControl *iface, Thickness value )
++{
++    impl_from_IControl( iface )->padding = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI control_get_HorizontalContentAlignment( IControl *iface, HorizontalAlignment *value )
++{
++    *value = impl_from_IControl( iface )->content_horizontal;
++    return S_OK;
++}
++
++static HRESULT WINAPI control_put_HorizontalContentAlignment( IControl *iface, HorizontalAlignment value )
++{
++    impl_from_IControl( iface )->content_horizontal = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI control_get_VerticalContentAlignment( IControl *iface, VerticalAlignment *value )
++{
++    *value = impl_from_IControl( iface )->content_vertical;
++    return S_OK;
++}
++
++static HRESULT WINAPI control_put_VerticalContentAlignment( IControl *iface, VerticalAlignment value )
++{
++    impl_from_IControl( iface )->content_vertical = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI control_get_Background( IControl *iface, IBrush **value )
++{
++    get_brush( impl_from_IControl( iface )->background, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI control_put_Background( IControl *iface, IBrush *value )
++{
++    set_brush( &impl_from_IControl( iface )->background, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI control_get_BorderThickness( IControl *iface, Thickness *value )
++{
++    *value = impl_from_IControl( iface )->border_thickness;
++    return S_OK;
++}
++
++static HRESULT WINAPI control_put_BorderThickness( IControl *iface, Thickness value )
++{
++    impl_from_IControl( iface )->border_thickness = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI control_get_BorderBrush( IControl *iface, IBrush **value )
++{
++    get_brush( impl_from_IControl( iface )->border_brush, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI control_put_BorderBrush( IControl *iface, IBrush *value )
++{
++    set_brush( &impl_from_IControl( iface )->border_brush, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI control_ApplyTemplate( IControl *iface, boolean *value )
++{
++    *value = FALSE;  /* nothing to apply: the look is built in */
++    return S_OK;
++}
++
++static HRESULT WINAPI control_get_FontFamily(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIFontFamily **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI control_put_FontFamily(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIFontFamily *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI control_get_FontStretch(IControl *iface, __x_ABI_CWindows_CUI_CText_CFontStretch *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI control_put_FontStretch(IControl *iface, __x_ABI_CWindows_CUI_CText_CFontStretch value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI control_get_CharacterSpacing(IControl *iface, INT32 *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI control_put_CharacterSpacing(IControl *iface, INT32 value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI control_get_IsTabStop(IControl *iface, boolean *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI control_put_IsTabStop(IControl *iface, boolean value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI control_get_TabIndex(IControl *iface, INT32 *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI control_put_TabIndex(IControl *iface, INT32 value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI control_get_TabNavigation(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CKeyboardNavigationMode *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI control_put_TabNavigation(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CKeyboardNavigationMode value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI control_get_Template(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CControls_CIControlTemplate **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI control_put_Template(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CControls_CIControlTemplate *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI control_get_FocusState(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CFocusState *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI control_add_IsEnabledChanged(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyPropertyChangedEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI control_remove_IsEnabledChanged(IControl *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI control_Focus(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CFocusState value, boolean *result)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static const struct IControlVtbl control_vtbl =
++{
++    control_QueryInterface,
++    control_AddRef,
++    control_Release,
++    /* IInspectable methods */
++    control_GetIids,
++    control_GetRuntimeClassName,
++    control_GetTrustLevel,
++    /* IControl methods */
++    control_get_FontSize,
++    control_put_FontSize,
++    control_get_FontFamily,
++    control_put_FontFamily,
++    control_get_FontWeight,
++    control_put_FontWeight,
++    control_get_FontStyle,
++    control_put_FontStyle,
++    control_get_FontStretch,
++    control_put_FontStretch,
++    control_get_CharacterSpacing,
++    control_put_CharacterSpacing,
++    control_get_Foreground,
++    control_put_Foreground,
++    control_get_IsTabStop,
++    control_put_IsTabStop,
++    control_get_IsEnabled,
++    control_put_IsEnabled,
++    control_get_TabIndex,
++    control_put_TabIndex,
++    control_get_TabNavigation,
++    control_put_TabNavigation,
++    control_get_Template,
++    control_put_Template,
++    control_get_Padding,
++    control_put_Padding,
++    control_get_HorizontalContentAlignment,
++    control_put_HorizontalContentAlignment,
++    control_get_VerticalContentAlignment,
++    control_put_VerticalContentAlignment,
++    control_get_Background,
++    control_put_Background,
++    control_get_BorderThickness,
++    control_put_BorderThickness,
++    control_get_BorderBrush,
++    control_put_BorderBrush,
++    control_get_FocusState,
++    control_add_IsEnabledChanged,
++    control_remove_IsEnabledChanged,
++    control_ApplyTemplate,
++    control_Focus
++};
++
++static HRESULT button_create( IInspectable *outer, IInspectable **inner, void **value )
++{
++    struct button *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    element_init( &impl->element, &button_ops, RuntimeClass_Windows_UI_Xaml_Controls_Button, outer );
++    impl->IButton_iface.lpVtbl = &button_iface_vtbl;
++    impl->IButtonBase_iface.lpVtbl = &button_base_vtbl;
++    impl->IContentControl_iface.lpVtbl = &content_control_vtbl;
++    impl->IControl_iface.lpVtbl = &control_vtbl;
++    /* the default Button style */
++    impl->element.horizontal_alignment = HorizontalAlignment_Left;
++    impl->element.vertical_alignment = VerticalAlignment_Center;
++    impl->border_thickness.Left = impl->border_thickness.Top = impl->border_thickness.Right = impl->border_thickness.Bottom = 2;
++    impl->padding.Left = 8;
++    impl->padding.Top = 4;
++    impl->padding.Right = 8;
++    impl->padding.Bottom = 5;
++    impl->font_size = 14.0;
++    impl->font_weight.Weight = 400;
++    impl->content_horizontal = HorizontalAlignment_Center;
++    impl->content_vertical = VerticalAlignment_Center;
++    impl->enabled = TRUE;
++    impl->click_mode = ClickMode_Release;
++    TRACE( "created %p, outer %p.\n", impl, outer );
++    return element_compose( &impl->element, outer, inner, &impl->IButton_iface, value );
++}
++
++struct button_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IButtonFactory IButtonFactory_iface;
++};
++
++static inline struct button_statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct button_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct button_statics *impl = impl_from_IActivationFactory( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IButtonFactory ))
++        *out = &impl->IButtonFactory_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    return 2;
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    return 1;
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++    return button_create( NULL, NULL, (void **)instance );
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( button_factory_iface, IButtonFactory, struct button_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI button_factory_iface_CreateInstance( IButtonFactory *iface, IInspectable *outer, IInspectable **inner,
++                                                           IButton **value )
++{
++    TRACE( "iface %p, outer %p, inner %p, value %p.\n", iface, outer, inner, value );
++    return button_create( outer, inner, (void **)value );
++}
++
++static const struct IButtonFactoryVtbl button_factory_iface_vtbl =
++{
++    button_factory_iface_QueryInterface,
++    button_factory_iface_AddRef,
++    button_factory_iface_Release,
++    /* IInspectable methods */
++    button_factory_iface_GetIids,
++    button_factory_iface_GetRuntimeClassName,
++    button_factory_iface_GetTrustLevel,
++    /* IButtonFactory methods */
++    button_factory_iface_CreateInstance,
++};
++
++static struct button_statics button_statics = { {&factory_vtbl}, {&button_factory_iface_vtbl} };
++IActivationFactory *button_factory = &button_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/classes.idl b/dlls/windows.ui.xaml/classes.idl
+index 2807511..4e52448 100644
+--- a/dlls/windows.ui.xaml/classes.idl
++++ b/dlls/windows.ui.xaml/classes.idl
+@@ -34,6 +34,12 @@ namespace Windows.UI.Xaml {
+ }
+ 
+ namespace Windows.UI.Xaml.Controls {
++    runtimeclass Border;
++    runtimeclass Button;
++    runtimeclass ColumnDefinition;
++    runtimeclass Grid;
++    runtimeclass RowDefinition;
++    runtimeclass StackPanel;
+     runtimeclass TextBlock;
+ }
+ 
+diff --git a/dlls/windows.ui.xaml/collection.c b/dlls/windows.ui.xaml/collection.c
+new file mode 100644
+index 0000000..b02af4d
+--- /dev/null
++++ b/dlls/windows.ui.xaml/collection.c
+@@ -0,0 +1,648 @@
++/* WinRT IVector<T *> collections for Windows.UI.Xaml (Panel.Children, Grid.RowDefinitions, ...)
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* IVector<T *> for any interface T has the same layout as IVector<IInspectable *>, so one implementation serves
++ * all of them; only the IIDs differ. Views and iterators work on a snapshot of the items. */
++
++struct items
++{
++    IInspectable **items;
++    UINT32 count;
++};
++
++static void items_release( struct items *items )
++{
++    UINT32 i;
++    for (i = 0; i < items->count; i++) IInspectable_Release( items->items[i] );
++    free( items->items );
++}
++
++static HRESULT items_index_of( const struct items *items, IInspectable *element, UINT32 *index, BOOLEAN *found )
++{
++    UINT32 i;
++
++    for (i = 0; i < items->count; i++)
++    {
++        if (items->items[i] == element)
++        {
++            *index = i;
++            *found = TRUE;
++            return S_OK;
++        }
++    }
++    *index = 0;
++    *found = FALSE;
++    return S_OK;
++}
++
++static HRESULT items_get_many( const struct items *items, UINT32 start, UINT32 size, IInspectable **out, UINT32 *count )
++{
++    UINT32 i;
++
++    *count = 0;
++    if (start > items->count) return E_BOUNDS;
++    for (i = start; i < items->count && *count < size; i++)
++    {
++        out[(*count)++] = items->items[i];
++        IInspectable_AddRef( items->items[i] );
++    }
++    return S_OK;
++}
++
++/* iterator */
++
++struct iterator
++{
++    IIterator_IInspectable IIterator_IInspectable_iface;
++    LONG ref;
++    const struct vector_iids *iids;
++    struct items items;
++    UINT32 index;
++};
++
++static inline struct iterator *impl_from_IIterator_IInspectable( IIterator_IInspectable *iface )
++{
++    return CONTAINING_RECORD( iface, struct iterator, IIterator_IInspectable_iface );
++}
++
++static HRESULT WINAPI iterator_QueryInterface( IIterator_IInspectable *iface, REFIID iid, void **out )
++{
++    struct iterator *impl = impl_from_IIterator_IInspectable( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, impl->iids->iterator ))
++    {
++        *out = iface;
++        IIterator_IInspectable_AddRef( iface );
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI iterator_AddRef( IIterator_IInspectable *iface )
++{
++    return InterlockedIncrement( &impl_from_IIterator_IInspectable( iface )->ref );
++}
++
++static ULONG WINAPI iterator_Release( IIterator_IInspectable *iface )
++{
++    struct iterator *impl = impl_from_IIterator_IInspectable( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        items_release( &impl->items );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI iterator_GetIids( IIterator_IInspectable *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI iterator_GetRuntimeClassName( IIterator_IInspectable *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI iterator_GetTrustLevel( IIterator_IInspectable *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI iterator_get_Current( IIterator_IInspectable *iface, IInspectable **value )
++{
++    struct iterator *impl = impl_from_IIterator_IInspectable( iface );
++
++    if (impl->index >= impl->items.count) return E_BOUNDS;
++    *value = impl->items.items[impl->index];
++    IInspectable_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI iterator_get_HasCurrent( IIterator_IInspectable *iface, boolean *value )
++{
++    struct iterator *impl = impl_from_IIterator_IInspectable( iface );
++    *value = impl->index < impl->items.count;
++    return S_OK;
++}
++
++static HRESULT WINAPI iterator_MoveNext( IIterator_IInspectable *iface, boolean *value )
++{
++    struct iterator *impl = impl_from_IIterator_IInspectable( iface );
++
++    if (impl->index < impl->items.count) impl->index++;
++    *value = impl->index < impl->items.count;
++    return S_OK;
++}
++
++static HRESULT WINAPI iterator_GetMany( IIterator_IInspectable *iface, UINT32 size, IInspectable **items, UINT32 *count )
++{
++    struct iterator *impl = impl_from_IIterator_IInspectable( iface );
++    HRESULT hr = items_get_many( &impl->items, impl->index, size, items, count );
++    if (SUCCEEDED(hr)) impl->index += *count;
++    return hr;
++}
++
++static const struct IIterator_IInspectableVtbl iterator_vtbl =
++{
++    iterator_QueryInterface,
++    iterator_AddRef,
++    iterator_Release,
++    /* IInspectable methods */
++    iterator_GetIids,
++    iterator_GetRuntimeClassName,
++    iterator_GetTrustLevel,
++    /* IIterator<T> methods */
++    iterator_get_Current,
++    iterator_get_HasCurrent,
++    iterator_MoveNext,
++    iterator_GetMany,
++};
++
++static HRESULT items_copy( const struct items *src, struct items *dst )
++{
++    UINT32 i;
++
++    dst->count = 0;
++    if (!(dst->items = calloc( max( 1, src->count ), sizeof(*dst->items) ))) return E_OUTOFMEMORY;
++    for (i = 0; i < src->count; i++)
++    {
++        dst->items[i] = src->items[i];
++        IInspectable_AddRef( dst->items[i] );
++    }
++    dst->count = src->count;
++    return S_OK;
++}
++
++static HRESULT iterator_create( const struct vector_iids *iids, const struct items *items, IIterator_IInspectable **out )
++{
++    struct iterator *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IIterator_IInspectable_iface.lpVtbl = &iterator_vtbl;
++    impl->ref = 1;
++    impl->iids = iids;
++    if (FAILED(items_copy( items, &impl->items )))
++    {
++        free( impl );
++        return E_OUTOFMEMORY;
++    }
++    *out = &impl->IIterator_IInspectable_iface;
++    return S_OK;
++}
++
++/* view */
++
++struct view
++{
++    IVectorView_IInspectable IVectorView_IInspectable_iface;
++    IIterable_IInspectable IIterable_IInspectable_iface;
++    LONG ref;
++    const struct vector_iids *iids;
++    struct items items;
++};
++
++static inline struct view *impl_from_IVectorView_IInspectable( IVectorView_IInspectable *iface )
++{
++    return CONTAINING_RECORD( iface, struct view, IVectorView_IInspectable_iface );
++}
++
++static HRESULT WINAPI view_QueryInterface( IVectorView_IInspectable *iface, REFIID iid, void **out )
++{
++    struct view *impl = impl_from_IVectorView_IInspectable( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, impl->iids->view ))
++        *out = &impl->IVectorView_IInspectable_iface;
++    else if (IsEqualGUID( iid, impl->iids->iterable ))
++        *out = &impl->IIterable_IInspectable_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI view_AddRef( IVectorView_IInspectable *iface )
++{
++    return InterlockedIncrement( &impl_from_IVectorView_IInspectable( iface )->ref );
++}
++
++static ULONG WINAPI view_Release( IVectorView_IInspectable *iface )
++{
++    struct view *impl = impl_from_IVectorView_IInspectable( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        items_release( &impl->items );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI view_GetIids( IVectorView_IInspectable *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI view_GetRuntimeClassName( IVectorView_IInspectable *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI view_GetTrustLevel( IVectorView_IInspectable *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI view_GetAt( IVectorView_IInspectable *iface, UINT32 index, IInspectable **value )
++{
++    struct view *impl = impl_from_IVectorView_IInspectable( iface );
++
++    if (index >= impl->items.count) return E_BOUNDS;
++    *value = impl->items.items[index];
++    IInspectable_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI view_get_Size( IVectorView_IInspectable *iface, UINT32 *value )
++{
++    *value = impl_from_IVectorView_IInspectable( iface )->items.count;
++    return S_OK;
++}
++
++static HRESULT WINAPI view_IndexOf( IVectorView_IInspectable *iface, IInspectable *element, UINT32 *index, BOOLEAN *found )
++{
++    return items_index_of( &impl_from_IVectorView_IInspectable( iface )->items, element, index, found );
++}
++
++static HRESULT WINAPI view_GetMany( IVectorView_IInspectable *iface, UINT32 start, UINT32 size, IInspectable **items,
++                                    UINT32 *count )
++{
++    return items_get_many( &impl_from_IVectorView_IInspectable( iface )->items, start, size, items, count );
++}
++
++static const struct IVectorView_IInspectableVtbl view_vtbl =
++{
++    view_QueryInterface,
++    view_AddRef,
++    view_Release,
++    /* IInspectable methods */
++    view_GetIids,
++    view_GetRuntimeClassName,
++    view_GetTrustLevel,
++    /* IVectorView<T> methods */
++    view_GetAt,
++    view_get_Size,
++    view_IndexOf,
++    view_GetMany,
++};
++
++DEFINE_IINSPECTABLE_( view_iterable, IIterable_IInspectable, struct view, view_from_IIterable, IIterable_IInspectable_iface,
++                      &impl->IVectorView_IInspectable_iface )
++
++static HRESULT WINAPI view_iterable_First( IIterable_IInspectable *iface, IIterator_IInspectable **value )
++{
++    struct view *impl = view_from_IIterable( iface );
++    return iterator_create( impl->iids, &impl->items, value );
++}
++
++static const struct IIterable_IInspectableVtbl view_iterable_vtbl =
++{
++    view_iterable_QueryInterface,
++    view_iterable_AddRef,
++    view_iterable_Release,
++    /* IInspectable methods */
++    view_iterable_GetIids,
++    view_iterable_GetRuntimeClassName,
++    view_iterable_GetTrustLevel,
++    /* IIterable<T> methods */
++    view_iterable_First,
++};
++
++/* vector */
++
++struct vector
++{
++    IVector_IInspectable IVector_IInspectable_iface;
++    IIterable_IInspectable IIterable_IInspectable_iface;
++    LONG ref;
++    const struct vector_iids *iids;
++    const struct vector_callbacks *callbacks;
++    void *owner;
++    struct items items;
++    UINT32 capacity;
++};
++
++static const struct IVector_IInspectableVtbl vector_vtbl;
++
++static inline struct vector *impl_from_IVector_IInspectable( IVector_IInspectable *iface )
++{
++    return CONTAINING_RECORD( iface, struct vector, IVector_IInspectable_iface );
++}
++
++static struct vector *vector_from_iinspectable( IInspectable *object )
++{
++    IVector_IInspectable *iface = (IVector_IInspectable *)object;
++    return iface->lpVtbl == &vector_vtbl ? impl_from_IVector_IInspectable( iface ) : NULL;
++}
++
++static HRESULT WINAPI vector_QueryInterface( IVector_IInspectable *iface, REFIID iid, void **out )
++{
++    struct vector *impl = impl_from_IVector_IInspectable( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, impl->iids->vector ))
++        *out = &impl->IVector_IInspectable_iface;
++    else if (IsEqualGUID( iid, impl->iids->iterable ))
++        *out = &impl->IIterable_IInspectable_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI vector_AddRef( IVector_IInspectable *iface )
++{
++    return InterlockedIncrement( &impl_from_IVector_IInspectable( iface )->ref );
++}
++
++static ULONG WINAPI vector_Release( IVector_IInspectable *iface )
++{
++    struct vector *impl = impl_from_IVector_IInspectable( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        vector_detach( (IInspectable *)iface );
++        items_release( &impl->items );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI vector_GetIids( IVector_IInspectable *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI vector_GetRuntimeClassName( IVector_IInspectable *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI vector_GetTrustLevel( IVector_IInspectable *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI vector_GetAt( IVector_IInspectable *iface, UINT32 index, IInspectable **value )
++{
++    struct vector *impl = impl_from_IVector_IInspectable( iface );
++
++    if (index >= impl->items.count) return E_BOUNDS;
++    *value = impl->items.items[index];
++    IInspectable_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI vector_get_Size( IVector_IInspectable *iface, UINT32 *value )
++{
++    *value = impl_from_IVector_IInspectable( iface )->items.count;
++    return S_OK;
++}
++
++static HRESULT WINAPI vector_GetView( IVector_IInspectable *iface, IVectorView_IInspectable **value )
++{
++    struct vector *impl = impl_from_IVector_IInspectable( iface );
++    struct view *view;
++
++    if (!(view = calloc( 1, sizeof(*view) ))) return E_OUTOFMEMORY;
++    view->IVectorView_IInspectable_iface.lpVtbl = &view_vtbl;
++    view->IIterable_IInspectable_iface.lpVtbl = &view_iterable_vtbl;
++    view->ref = 1;
++    view->iids = impl->iids;
++    if (FAILED(items_copy( &impl->items, &view->items )))
++    {
++        free( view );
++        return E_OUTOFMEMORY;
++    }
++    *value = &view->IVectorView_IInspectable_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI vector_IndexOf( IVector_IInspectable *iface, IInspectable *element, UINT32 *index, BOOLEAN *found )
++{
++    return items_index_of( &impl_from_IVector_IInspectable( iface )->items, element, index, found );
++}
++
++static HRESULT WINAPI vector_InsertAt( IVector_IInspectable *iface, UINT32 index, IInspectable *value )
++{
++    struct vector *impl = impl_from_IVector_IInspectable( iface );
++    IInspectable **items;
++    HRESULT hr;
++
++    TRACE( "iface %p, index %u, value %p.\n", iface, index, value );
++
++    if (!value) return E_INVALIDARG;
++    if (index > impl->items.count) return E_BOUNDS;
++    if (impl->owner && impl->callbacks->inserted && FAILED(hr = impl->callbacks->inserted( impl->owner, value ))) return hr;
++    if (impl->items.count == impl->capacity)
++    {
++        UINT32 capacity = max( 4, impl->capacity * 2 );
++        if (!(items = realloc( impl->items.items, capacity * sizeof(*items) ))) return E_OUTOFMEMORY;
++        impl->items.items = items;
++        impl->capacity = capacity;
++    }
++    memmove( impl->items.items + index + 1, impl->items.items + index, (impl->items.count - index) * sizeof(*items) );
++    impl->items.items[index] = value;
++    IInspectable_AddRef( value );
++    impl->items.count++;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI vector_RemoveAt( IVector_IInspectable *iface, UINT32 index )
++{
++    struct vector *impl = impl_from_IVector_IInspectable( iface );
++    IInspectable *item;
++
++    TRACE( "iface %p, index %u.\n", iface, index );
++
++    if (index >= impl->items.count) return E_BOUNDS;
++    item = impl->items.items[index];
++    impl->items.count--;
++    memmove( impl->items.items + index, impl->items.items + index + 1, (impl->items.count - index) * sizeof(item) );
++    if (impl->owner && impl->callbacks->removed) impl->callbacks->removed( impl->owner, item );
++    IInspectable_Release( item );
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI vector_SetAt( IVector_IInspectable *iface, UINT32 index, IInspectable *value )
++{
++    struct vector *impl = impl_from_IVector_IInspectable( iface );
++    HRESULT hr;
++
++    if (index >= impl->items.count) return E_BOUNDS;
++    if (FAILED(hr = vector_RemoveAt( iface, index ))) return hr;
++    return vector_InsertAt( iface, index, value );
++}
++
++static HRESULT WINAPI vector_Append( IVector_IInspectable *iface, IInspectable *value )
++{
++    return vector_InsertAt( iface, impl_from_IVector_IInspectable( iface )->items.count, value );
++}
++
++static HRESULT WINAPI vector_RemoveAtEnd( IVector_IInspectable *iface )
++{
++    struct vector *impl = impl_from_IVector_IInspectable( iface );
++
++    if (!impl->items.count) return E_BOUNDS;
++    return vector_RemoveAt( iface, impl->items.count - 1 );
++}
++
++static HRESULT WINAPI vector_Clear( IVector_IInspectable *iface )
++{
++    struct vector *impl = impl_from_IVector_IInspectable( iface );
++
++    while (impl->items.count) vector_RemoveAt( iface, impl->items.count - 1 );
++    return S_OK;
++}
++
++static HRESULT WINAPI vector_GetMany( IVector_IInspectable *iface, UINT32 start, UINT32 size, IInspectable **items,
++                                      UINT32 *count )
++{
++    return items_get_many( &impl_from_IVector_IInspectable( iface )->items, start, size, items, count );
++}
++
++static HRESULT WINAPI vector_ReplaceAll( IVector_IInspectable *iface, UINT32 count, IInspectable **items )
++{
++    HRESULT hr = S_OK;
++    UINT32 i;
++
++    vector_Clear( iface );
++    for (i = 0; i < count && SUCCEEDED(hr); i++) hr = vector_Append( iface, items[i] );
++    return hr;
++}
++
++static const struct IVector_IInspectableVtbl vector_vtbl =
++{
++    vector_QueryInterface,
++    vector_AddRef,
++    vector_Release,
++    /* IInspectable methods */
++    vector_GetIids,
++    vector_GetRuntimeClassName,
++    vector_GetTrustLevel,
++    /* IVector<T> methods */
++    vector_GetAt,
++    vector_get_Size,
++    vector_GetView,
++    vector_IndexOf,
++    vector_SetAt,
++    vector_InsertAt,
++    vector_RemoveAt,
++    vector_Append,
++    vector_RemoveAtEnd,
++    vector_Clear,
++    vector_GetMany,
++    vector_ReplaceAll,
++};
++
++DEFINE_IINSPECTABLE_( vector_iterable, IIterable_IInspectable, struct vector, vector_from_IIterable, IIterable_IInspectable_iface,
++                      &impl->IVector_IInspectable_iface )
++
++static HRESULT WINAPI vector_iterable_First( IIterable_IInspectable *iface, IIterator_IInspectable **value )
++{
++    struct vector *impl = vector_from_IIterable( iface );
++    return iterator_create( impl->iids, &impl->items, value );
++}
++
++static const struct IIterable_IInspectableVtbl vector_iterable_vtbl =
++{
++    vector_iterable_QueryInterface,
++    vector_iterable_AddRef,
++    vector_iterable_Release,
++    /* IInspectable methods */
++    vector_iterable_GetIids,
++    vector_iterable_GetRuntimeClassName,
++    vector_iterable_GetTrustLevel,
++    /* IIterable<T> methods */
++    vector_iterable_First,
++};
++
++HRESULT vector_create( const struct vector_iids *iids, const struct vector_callbacks *callbacks, void *owner,
++                       IInspectable **out )
++{
++    struct vector *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IVector_IInspectable_iface.lpVtbl = &vector_vtbl;
++    impl->IIterable_IInspectable_iface.lpVtbl = &vector_iterable_vtbl;
++    impl->ref = 1;
++    impl->iids = iids;
++    impl->callbacks = callbacks;
++    impl->owner = owner;
++    *out = (IInspectable *)&impl->IVector_IInspectable_iface;
++    return S_OK;
++}
++
++UINT32 vector_size( IInspectable *object )
++{
++    struct vector *impl = vector_from_iinspectable( object );
++    return impl ? impl->items.count : 0;
++}
++
++IInspectable *vector_get( IInspectable *object, UINT32 index )
++{
++    struct vector *impl = vector_from_iinspectable( object );
++    return impl && index < impl->items.count ? impl->items.items[index] : NULL;
++}
++
++void vector_detach( IInspectable *object )
++{
++    struct vector *impl = vector_from_iinspectable( object );
++    UINT32 i;
++
++    if (!impl || !impl->owner) return;
++    if (impl->callbacks->removed)
++        for (i = 0; i < impl->items.count; i++) impl->callbacks->removed( impl->owner, impl->items.items[i] );
++    impl->owner = NULL;
++}
+diff --git a/dlls/windows.ui.xaml/definitions.c b/dlls/windows.ui.xaml/definitions.c
+new file mode 100644
+index 0000000..d23c6d2
+--- /dev/null
++++ b/dlls/windows.ui.xaml/definitions.c
+@@ -0,0 +1,486 @@
++/* WinRT Windows.UI.Xaml.Controls.RowDefinition and ColumnDefinition
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <math.h>
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* One object type serves both RowDefinition and ColumnDefinition; "column" says which interface it is. */
++
++struct definition
++{
++    IRowDefinition IRowDefinition_iface;
++    IColumnDefinition IColumnDefinition_iface;
++    IDependencyObject IDependencyObject_iface;
++    LONG ref;
++    BOOL column;
++    GridLength length;
++    double min, max, actual;
++};
++
++static const struct IRowDefinitionVtbl row_vtbl;
++static const struct IColumnDefinitionVtbl column_vtbl;
++
++static IInspectable *definition_iinspectable( struct definition *def )
++{
++    return def->column ? (IInspectable *)&def->IColumnDefinition_iface : (IInspectable *)&def->IRowDefinition_iface;
++}
++
++static struct definition *definition_from_iinspectable( IInspectable *object )
++{
++    IRowDefinition *row = (IRowDefinition *)object;
++    IColumnDefinition *column = (IColumnDefinition *)object;
++
++    if (row->lpVtbl == &row_vtbl) return CONTAINING_RECORD( row, struct definition, IRowDefinition_iface );
++    if (column->lpVtbl == &column_vtbl) return CONTAINING_RECORD( column, struct definition, IColumnDefinition_iface );
++    return NULL;
++}
++
++static HRESULT definition_query_interface( struct definition *def, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, def->column ? &IID_IColumnDefinition : &IID_IRowDefinition ))
++        *out = definition_iinspectable( def );
++    else if (IsEqualGUID( iid, &IID_IDependencyObject ))
++        *out = &def->IDependencyObject_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG definition_release( struct definition *def )
++{
++    ULONG ref = InterlockedDecrement( &def->ref );
++    if (!ref) free( def );
++    return ref;
++}
++
++/* IRowDefinition */
++
++static inline struct definition *impl_from_IRowDefinition( IRowDefinition *iface )
++{
++    return CONTAINING_RECORD( iface, struct definition, IRowDefinition_iface );
++}
++
++static HRESULT WINAPI row_QueryInterface( IRowDefinition *iface, REFIID iid, void **out )
++{
++    return definition_query_interface( impl_from_IRowDefinition( iface ), iid, out );
++}
++
++static ULONG WINAPI row_AddRef( IRowDefinition *iface )
++{
++    return InterlockedIncrement( &impl_from_IRowDefinition( iface )->ref );
++}
++
++static ULONG WINAPI row_Release( IRowDefinition *iface )
++{
++    return definition_release( impl_from_IRowDefinition( iface ) );
++}
++
++static HRESULT WINAPI row_GetIids( IRowDefinition *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI row_GetRuntimeClassName( IRowDefinition *iface, HSTRING *class_name )
++{
++    const WCHAR *name = RuntimeClass_Windows_UI_Xaml_Controls_RowDefinition;
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI row_GetTrustLevel( IRowDefinition *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI row_get_Height( IRowDefinition *iface, GridLength *value )
++{
++    *value = impl_from_IRowDefinition( iface )->length;
++    return S_OK;
++}
++
++static HRESULT WINAPI row_put_Height( IRowDefinition *iface, GridLength value )
++{
++    TRACE( "iface %p, value %f/%d.\n", iface, value.Value, value.GridUnitType );
++    impl_from_IRowDefinition( iface )->length = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI row_get_MaxHeight( IRowDefinition *iface, DOUBLE *value )
++{
++    *value = impl_from_IRowDefinition( iface )->max;
++    return S_OK;
++}
++
++static HRESULT WINAPI row_put_MaxHeight( IRowDefinition *iface, DOUBLE value )
++{
++    impl_from_IRowDefinition( iface )->max = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI row_get_MinHeight( IRowDefinition *iface, DOUBLE *value )
++{
++    *value = impl_from_IRowDefinition( iface )->min;
++    return S_OK;
++}
++
++static HRESULT WINAPI row_put_MinHeight( IRowDefinition *iface, DOUBLE value )
++{
++    impl_from_IRowDefinition( iface )->min = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI row_get_ActualHeight( IRowDefinition *iface, DOUBLE *value )
++{
++    *value = impl_from_IRowDefinition( iface )->actual;
++    return S_OK;
++}
++
++static const struct IRowDefinitionVtbl row_vtbl =
++{
++    row_QueryInterface,
++    row_AddRef,
++    row_Release,
++    /* IInspectable methods */
++    row_GetIids,
++    row_GetRuntimeClassName,
++    row_GetTrustLevel,
++    /* IRowDefinition methods */
++    row_get_Height,
++    row_put_Height,
++    row_get_MaxHeight,
++    row_put_MaxHeight,
++    row_get_MinHeight,
++    row_put_MinHeight,
++    row_get_ActualHeight,
++};
++
++/* IColumnDefinition */
++
++static inline struct definition *impl_from_IColumnDefinition( IColumnDefinition *iface )
++{
++    return CONTAINING_RECORD( iface, struct definition, IColumnDefinition_iface );
++}
++
++static HRESULT WINAPI column_QueryInterface( IColumnDefinition *iface, REFIID iid, void **out )
++{
++    return definition_query_interface( impl_from_IColumnDefinition( iface ), iid, out );
++}
++
++static ULONG WINAPI column_AddRef( IColumnDefinition *iface )
++{
++    return InterlockedIncrement( &impl_from_IColumnDefinition( iface )->ref );
++}
++
++static ULONG WINAPI column_Release( IColumnDefinition *iface )
++{
++    return definition_release( impl_from_IColumnDefinition( iface ) );
++}
++
++static HRESULT WINAPI column_GetIids( IColumnDefinition *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI column_GetRuntimeClassName( IColumnDefinition *iface, HSTRING *class_name )
++{
++    const WCHAR *name = RuntimeClass_Windows_UI_Xaml_Controls_ColumnDefinition;
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI column_GetTrustLevel( IColumnDefinition *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI column_get_Width( IColumnDefinition *iface, GridLength *value )
++{
++    *value = impl_from_IColumnDefinition( iface )->length;
++    return S_OK;
++}
++
++static HRESULT WINAPI column_put_Width( IColumnDefinition *iface, GridLength value )
++{
++    TRACE( "iface %p, value %f/%d.\n", iface, value.Value, value.GridUnitType );
++    impl_from_IColumnDefinition( iface )->length = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI column_get_MaxWidth( IColumnDefinition *iface, DOUBLE *value )
++{
++    *value = impl_from_IColumnDefinition( iface )->max;
++    return S_OK;
++}
++
++static HRESULT WINAPI column_put_MaxWidth( IColumnDefinition *iface, DOUBLE value )
++{
++    impl_from_IColumnDefinition( iface )->max = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI column_get_MinWidth( IColumnDefinition *iface, DOUBLE *value )
++{
++    *value = impl_from_IColumnDefinition( iface )->min;
++    return S_OK;
++}
++
++static HRESULT WINAPI column_put_MinWidth( IColumnDefinition *iface, DOUBLE value )
++{
++    impl_from_IColumnDefinition( iface )->min = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI column_get_ActualWidth( IColumnDefinition *iface, DOUBLE *value )
++{
++    *value = impl_from_IColumnDefinition( iface )->actual;
++    return S_OK;
++}
++
++static const struct IColumnDefinitionVtbl column_vtbl =
++{
++    column_QueryInterface,
++    column_AddRef,
++    column_Release,
++    /* IInspectable methods */
++    column_GetIids,
++    column_GetRuntimeClassName,
++    column_GetTrustLevel,
++    /* IColumnDefinition methods */
++    column_get_Width,
++    column_put_Width,
++    column_get_MaxWidth,
++    column_put_MaxWidth,
++    column_get_MinWidth,
++    column_put_MinWidth,
++    column_get_ActualWidth,
++};
++
++static inline struct definition *impl_from_IDependencyObject( IDependencyObject *iface )
++{
++    return CONTAINING_RECORD( iface, struct definition, IDependencyObject_iface );
++}
++
++static HRESULT WINAPI definition_dependency_object_QueryInterface( IDependencyObject *iface, REFIID iid, void **out )
++{
++    return definition_query_interface( impl_from_IDependencyObject( iface ), iid, out );
++}
++
++static ULONG WINAPI definition_dependency_object_AddRef( IDependencyObject *iface )
++{
++    return InterlockedIncrement( &impl_from_IDependencyObject( iface )->ref );
++}
++
++static ULONG WINAPI definition_dependency_object_Release( IDependencyObject *iface )
++{
++    return definition_release( impl_from_IDependencyObject( iface ) );
++}
++
++static HRESULT WINAPI definition_dependency_object_GetIids( IDependencyObject *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI definition_dependency_object_GetRuntimeClassName( IDependencyObject *iface, HSTRING *class_name )
++{
++    return IInspectable_GetRuntimeClassName( definition_iinspectable( impl_from_IDependencyObject( iface ) ), class_name );
++}
++
++static HRESULT WINAPI definition_dependency_object_GetTrustLevel( IDependencyObject *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI definition_dependency_object_GetValue(IDependencyObject *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp, IInspectable **result)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI definition_dependency_object_SetValue(IDependencyObject *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp, IInspectable *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI definition_dependency_object_ClearValue(IDependencyObject *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI definition_dependency_object_ReadLocalValue(IDependencyObject *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp, IInspectable **result)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI definition_dependency_object_GetAnimationBaseValue(IDependencyObject *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp, IInspectable **result)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI definition_dependency_object_get_Dispatcher(IDependencyObject *iface, __x_ABI_CWindows_CUI_CCore_CICoreDispatcher **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static const struct IDependencyObjectVtbl definition_dependency_object_vtbl =
++{
++    definition_dependency_object_QueryInterface,
++    definition_dependency_object_AddRef,
++    definition_dependency_object_Release,
++    /* IInspectable methods */
++    definition_dependency_object_GetIids,
++    definition_dependency_object_GetRuntimeClassName,
++    definition_dependency_object_GetTrustLevel,
++    /* IDependencyObject methods */
++    definition_dependency_object_GetValue,
++    definition_dependency_object_SetValue,
++    definition_dependency_object_ClearValue,
++    definition_dependency_object_ReadLocalValue,
++    definition_dependency_object_GetAnimationBaseValue,
++    definition_dependency_object_get_Dispatcher
++};
++
++/* activation factories */
++
++struct definition_factory
++{
++    IActivationFactory IActivationFactory_iface;
++    BOOL column;
++};
++
++static inline struct definition_factory *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct definition_factory, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    return 2;
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    return 1;
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    struct definition_factory *impl = impl_from_IActivationFactory( iface );
++    struct definition *def;
++
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++
++    if (!(def = calloc( 1, sizeof(*def) ))) return E_OUTOFMEMORY;
++    def->IRowDefinition_iface.lpVtbl = &row_vtbl;
++    def->IColumnDefinition_iface.lpVtbl = &column_vtbl;
++    def->IDependencyObject_iface.lpVtbl = &definition_dependency_object_vtbl;
++    def->ref = 1;
++    def->column = impl->column;
++    def->length.Value = 1.0;
++    def->length.GridUnitType = GridUnitType_Star;
++    def->max = INFINITY;
++    *instance = definition_iinspectable( def );
++    return S_OK;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++static struct definition_factory row_factory = { {&factory_vtbl}, FALSE };
++static struct definition_factory column_factory = { {&factory_vtbl}, TRUE };
++
++IActivationFactory *row_definition_factory = &row_factory.IActivationFactory_iface;
++IActivationFactory *column_definition_factory = &column_factory.IActivationFactory_iface;
++
++/* for Grid layout: the length of a definition from a RowDefinitionCollection or ColumnDefinitionCollection item */
++BOOL definition_get( IInspectable *object, GridLength *length, double *min, double *max )
++{
++    struct definition *def = definition_from_iinspectable( object );
++
++    if (!def) return FALSE;
++    *length = def->length;
++    *min = def->min;
++    *max = def->max;
++    return TRUE;
++}
++
++void definition_set_actual( IInspectable *object, double actual )
++{
++    struct definition *def = definition_from_iinspectable( object );
++    if (def) def->actual = actual;
++}
+diff --git a/dlls/windows.ui.xaml/element.c b/dlls/windows.ui.xaml/element.c
+index 5fecd9e..a147293 100644
+--- a/dlls/windows.ui.xaml/element.c
++++ b/dlls/windows.ui.xaml/element.c
+@@ -24,36 +24,25 @@
+ WINE_DEFAULT_DEBUG_CHANNEL(xaml);
+ 
+ /* Every element shares this IUIElement/IFrameworkElement/IDependencyObject implementation; the class adds its own
+- * interfaces through ops->query_interface. Milestone 1 only has a single content element per window, so layout is
+- * "measure, then align inside the window". */
++ * interfaces through ops->query_interface. Elements can be aggregated (an app's class deriving from Grid, Button,
++ * ...): the public interfaces delegate to the outer object, IInspectable_inner is the non-delegating one.
++ * Layout is the usual two passes: element_measure computes desired sizes bottom-up, element_arrange places
++ * elements top-down, then element_render draws them. */
+ 
+-static inline struct xaml_element *impl_from_IUIElement( IUIElement *iface )
++static inline struct xaml_element *impl_from_inner( IInspectable *iface )
+ {
+-    return CONTAINING_RECORD( iface, struct xaml_element, IUIElement_iface );
++    return CONTAINING_RECORD( iface, struct xaml_element, IInspectable_inner );
+ }
+ 
+-static const IUIElementVtbl uielement_vtbl;
+-
+-struct xaml_element *element_from_iinspectable( IInspectable *object )
++static HRESULT WINAPI inner_QueryInterface( IInspectable *iface, REFIID iid, void **out )
+ {
+-    IUIElement *uielement;
+-    struct xaml_element *element;
+-
+-    if (!object || FAILED(IInspectable_QueryInterface( object, &IID_IUIElement, (void **)&uielement ))) return NULL;
+-    element = uielement->lpVtbl == &uielement_vtbl ? impl_from_IUIElement( uielement ) : NULL;
+-    IUIElement_Release( uielement );
+-    if (!element) FIXME( "element %p is not one of ours.\n", object );
+-    return element;
+-}
+-
+-static HRESULT WINAPI uielement_QueryInterface( IUIElement *iface, REFIID iid, void **out )
+-{
+-    struct xaml_element *impl = impl_from_IUIElement( iface );
++    struct xaml_element *impl = impl_from_inner( iface );
+ 
+     TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
+ 
+-    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+-        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IUIElement ))
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ))
++        *out = &impl->IInspectable_inner;
++    else if (IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IUIElement ))
+         *out = &impl->IUIElement_iface;
+     else if (IsEqualGUID( iid, &IID_IFrameworkElement ))
+         *out = &impl->IFrameworkElement_iface;
+@@ -72,17 +61,17 @@ static HRESULT WINAPI uielement_QueryInterface( IUIElement *iface, REFIID iid, v
+     return S_OK;
+ }
+ 
+-static ULONG WINAPI uielement_AddRef( IUIElement *iface )
++static ULONG WINAPI inner_AddRef( IInspectable *iface )
+ {
+-    struct xaml_element *impl = impl_from_IUIElement( iface );
++    struct xaml_element *impl = impl_from_inner( iface );
+     ULONG ref = InterlockedIncrement( &impl->ref );
+     TRACE( "iface %p, ref %lu.\n", iface, ref );
+     return ref;
+ }
+ 
+-static ULONG WINAPI uielement_Release( IUIElement *iface )
++static ULONG WINAPI inner_Release( IInspectable *iface )
+ {
+-    struct xaml_element *impl = impl_from_IUIElement( iface );
++    struct xaml_element *impl = impl_from_inner( iface );
+     ULONG ref = InterlockedDecrement( &impl->ref );
+ 
+     TRACE( "iface %p, ref %lu.\n", iface, ref );
+@@ -95,24 +84,65 @@ static ULONG WINAPI uielement_Release( IUIElement *iface )
+     return ref;
+ }
+ 
+-static HRESULT WINAPI uielement_GetIids( IUIElement *iface, ULONG *iid_count, IID **iids )
++static HRESULT WINAPI inner_GetIids( IInspectable *iface, ULONG *iid_count, IID **iids )
+ {
+     FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
+     return E_NOTIMPL;
+ }
+ 
+-static HRESULT WINAPI uielement_GetRuntimeClassName( IUIElement *iface, HSTRING *class_name )
++static HRESULT WINAPI inner_GetRuntimeClassName( IInspectable *iface, HSTRING *class_name )
+ {
+-    struct xaml_element *impl = impl_from_IUIElement( iface );
++    struct xaml_element *impl = impl_from_inner( iface );
+     return WindowsCreateString( impl->class_name, wcslen( impl->class_name ), class_name );
+ }
+ 
+-static HRESULT WINAPI uielement_GetTrustLevel( IUIElement *iface, TrustLevel *trust_level )
++static HRESULT WINAPI inner_GetTrustLevel( IInspectable *iface, TrustLevel *trust_level )
+ {
+     *trust_level = BaseTrust;
+     return S_OK;
+ }
+ 
++static const struct IInspectableVtbl inner_vtbl =
++{
++    inner_QueryInterface,
++    inner_AddRef,
++    inner_Release,
++    /* IInspectable methods */
++    inner_GetIids,
++    inner_GetRuntimeClassName,
++    inner_GetTrustLevel,
++};
++
++DEFINE_IINSPECTABLE_( uielement, IUIElement, struct xaml_element, impl_from_IUIElement, IUIElement_iface, impl->outer )
++
++static HRESULT WINAPI uielement_get_DesiredSize( IUIElement *iface, Size *value )
++{
++    struct xaml_element *impl = impl_from_IUIElement( iface );
++    value->Width = impl->desired_width;
++    value->Height = impl->desired_height;
++    return S_OK;
++}
++
++static HRESULT WINAPI uielement_get_RenderSize( IUIElement *iface, Size *value )
++{
++    struct xaml_element *impl = impl_from_IUIElement( iface );
++    value->Width = impl->bounds.width;
++    value->Height = impl->bounds.height;
++    return S_OK;
++}
++
++static HRESULT WINAPI uielement_get_IsHitTestVisible( IUIElement *iface, boolean *value )
++{
++    *value = impl_from_IUIElement( iface )->hit_test_visible;
++    return S_OK;
++}
++
++static HRESULT WINAPI uielement_put_IsHitTestVisible( IUIElement *iface, boolean value )
++{
++    impl_from_IUIElement( iface )->hit_test_visible = value;
++    return S_OK;
++}
++
+ static HRESULT WINAPI uielement_get_Visibility( IUIElement *iface, Visibility *value )
+ {
+     *value = impl_from_IUIElement( iface )->visibility;
+@@ -158,12 +188,6 @@ static HRESULT WINAPI uielement_UpdateLayout( IUIElement *iface )
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI uielement_get_DesiredSize(IUIElement *iface, __x_ABI_CWindows_CFoundation_CSize *value)
+-{
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
+-}
+-
+ static HRESULT WINAPI uielement_get_AllowDrop(IUIElement *iface, boolean *value)
+ {
+     FIXME("iface %p stub!\n", iface);
+@@ -224,24 +248,6 @@ static HRESULT WINAPI uielement_put_RenderTransformOrigin(IUIElement *iface, __x
+     return E_NOTIMPL;
+ }
+ 
+-static HRESULT WINAPI uielement_get_IsHitTestVisible(IUIElement *iface, boolean *value)
+-{
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI uielement_put_IsHitTestVisible(IUIElement *iface, boolean value)
+-{
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI uielement_get_RenderSize(IUIElement *iface, __x_ABI_CWindows_CFoundation_CSize *value)
+-{
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
+-}
+-
+ static HRESULT WINAPI uielement_get_UseLayoutRounding(IUIElement *iface, boolean *value)
+ {
+     FIXME("iface %p stub!\n", iface);
+@@ -800,7 +806,8 @@ static const struct IUIElementVtbl uielement_vtbl =
+     uielement_UpdateLayout
+ };
+ 
+-DEFINE_IINSPECTABLE(framework_element, IFrameworkElement, struct xaml_element, IUIElement_iface)
++DEFINE_IINSPECTABLE_( framework_element, IFrameworkElement, struct xaml_element, impl_from_IFrameworkElement,
++                      IFrameworkElement_iface, impl->outer )
+ 
+ static HRESULT WINAPI framework_element_get_Width( IFrameworkElement *iface, DOUBLE *value )
+ {
+@@ -828,6 +835,18 @@ static HRESULT WINAPI framework_element_put_Height( IFrameworkElement *iface, DO
+     return S_OK;
+ }
+ 
++static HRESULT WINAPI framework_element_get_ActualWidth( IFrameworkElement *iface, DOUBLE *value )
++{
++    *value = impl_from_IFrameworkElement( iface )->bounds.width;
++    return S_OK;
++}
++
++static HRESULT WINAPI framework_element_get_ActualHeight( IFrameworkElement *iface, DOUBLE *value )
++{
++    *value = impl_from_IFrameworkElement( iface )->bounds.height;
++    return S_OK;
++}
++
+ static HRESULT WINAPI framework_element_get_Margin( IFrameworkElement *iface, Thickness *value )
+ {
+     *value = impl_from_IFrameworkElement( iface )->margin;
+@@ -879,6 +898,13 @@ static HRESULT WINAPI framework_element_put_Name( IFrameworkElement *iface, HSTR
+     return WindowsDuplicateString( value, &impl->name );
+ }
+ 
++static HRESULT WINAPI framework_element_get_Parent( IFrameworkElement *iface, IDependencyObject **value )
++{
++    struct xaml_element *impl = impl_from_IFrameworkElement( iface );
++
++    if ((*value = impl->parent ? &impl->parent->IDependencyObject_iface : NULL)) IDependencyObject_AddRef( *value );
++    return S_OK;
++}
+ 
+ static HRESULT WINAPI framework_element_get_Triggers(IFrameworkElement *iface, __FIVector_1_Windows__CUI__CXaml__CTriggerBase **value)
+ {
+@@ -922,18 +948,6 @@ static HRESULT WINAPI framework_element_put_Language(IFrameworkElement *iface, H
+     return E_NOTIMPL;
+ }
+ 
+-static HRESULT WINAPI framework_element_get_ActualWidth(IFrameworkElement *iface, DOUBLE *value)
+-{
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI framework_element_get_ActualHeight(IFrameworkElement *iface, DOUBLE *value)
+-{
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
+-}
+-
+ static HRESULT WINAPI framework_element_get_MinWidth(IFrameworkElement *iface, DOUBLE *value)
+ {
+     FIXME("iface %p stub!\n", iface);
+@@ -1012,12 +1026,6 @@ static HRESULT WINAPI framework_element_put_Style(IFrameworkElement *iface, __x_
+     return E_NOTIMPL;
+ }
+ 
+-static HRESULT WINAPI framework_element_get_Parent(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyObject **value)
+-{
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
+-}
+-
+ static HRESULT WINAPI framework_element_get_FlowDirection(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CFlowDirection *value)
+ {
+     FIXME("iface %p stub!\n", iface);
+@@ -1205,11 +1213,26 @@ static const struct IDependencyObjectVtbl element_dependency_object_vtbl =
+     element_dependency_object_get_Dispatcher
+ };
+ 
+-void element_init( struct xaml_element *element, const struct element_ops *ops, const WCHAR *class_name )
++struct xaml_element *element_from_iinspectable( IInspectable *object )
++{
++    IUIElement *uielement;
++    struct xaml_element *element;
++
++    if (!object || FAILED(IInspectable_QueryInterface( object, &IID_IUIElement, (void **)&uielement ))) return NULL;
++    element = uielement->lpVtbl == &uielement_vtbl ? impl_from_IUIElement( uielement ) : NULL;
++    IUIElement_Release( uielement );
++    if (!element) FIXME( "element %p is not one of ours.\n", object );
++    return element;
++}
++
++void element_init( struct xaml_element *element, const struct element_ops *ops, const WCHAR *class_name,
++                   IInspectable *outer )
+ {
+     element->IUIElement_iface.lpVtbl = &uielement_vtbl;
+     element->IFrameworkElement_iface.lpVtbl = &framework_element_vtbl;
+     element->IDependencyObject_iface.lpVtbl = &element_dependency_object_vtbl;
++    element->IInspectable_inner.lpVtbl = &inner_vtbl;
++    element->outer = outer ? outer : &element->IInspectable_inner;
+     element->ref = 1;
+     element->ops = ops;
+     element->class_name = class_name;
+@@ -1218,46 +1241,349 @@ void element_init( struct xaml_element *element, const struct element_ops *ops,
+     element->vertical_alignment = VerticalAlignment_Stretch;
+     element->visibility = Visibility_Visible;
+     element->opacity = 1.0;
++    element->hit_test_visible = TRUE;
++    element->row_span = element->column_span = 1;
+ }
+ 
+-/* Measure the element, then place it inside bounds (physical pixels) by its margin, size and alignment. */
+-void element_layout_and_render( struct xaml_element *element, struct layout_context *ctx, const RECT *bounds )
++/* Hand out a new element the way a composable factory's CreateInstance does: iface is the class's default
++ * interface. Without an outer object, value owns our reference; with one, inner does and value is counted on
++ * the outer object. */
++HRESULT element_compose( struct xaml_element *element, IInspectable *outer, IInspectable **inner, void *iface,
++                         void **value )
++{
++    if (outer)
++    {
++        if (!inner) return E_INVALIDARG;
++        *inner = &element->IInspectable_inner;
++        *value = iface;
++        IInspectable_AddRef( (IInspectable *)iface );
++    }
++    else
++    {
++        if (inner) *inner = NULL;
++        *value = iface;
++    }
++    return S_OK;
++}
++
++void element_set_parent( struct xaml_element *child, struct xaml_element *parent )
++{
++    if (child) child->parent = parent;
++    window_invalidate();
++}
++
++void element_measure( struct xaml_element *element, struct layout_context *ctx, float avail_width, float avail_height )
+ {
+-    float scale = ctx->scale, avail_w, avail_h, w, h, x, y;
+     const Thickness *m = &element->margin;
+-    RECT rect;
++    float width, height, content_width, content_height;
+ 
+-    if (element->visibility != Visibility_Visible) return;
++    if (element->visibility != Visibility_Visible)
++    {
++        element->desired_width = element->desired_height = 0;
++        return;
++    }
++
++    content_width = max( 0.0f, avail_width - m->Left - m->Right );
++    content_height = max( 0.0f, avail_height - m->Top - m->Bottom );
++    if (!isnan( element->width )) content_width = element->width;
++    if (!isnan( element->height )) content_height = element->height;
++    element->ops->measure( element, ctx, content_width, content_height, &width, &height );
++    if (!isnan( element->width )) width = element->width;
++    if (!isnan( element->height )) height = element->height;
++
++    element->desired_width = min( avail_width, width + m->Left + m->Right );
++    element->desired_height = min( avail_height, height + m->Top + m->Bottom );
++    TRACE( "%s desired %.1fx%.1f (available %.1fx%.1f).\n", debugstr_w(element->class_name), element->desired_width,
++           element->desired_height, avail_width, avail_height );
++}
+ 
+-    avail_w = max( 0.0f, (bounds->right - bounds->left) / scale - m->Left - m->Right );
+-    avail_h = max( 0.0f, (bounds->bottom - bounds->top) / scale - m->Top - m->Bottom );
+-    if (!isnan( element->width )) avail_w = min( avail_w, element->width );
+-    if (!isnan( element->height )) avail_h = min( avail_h, element->height );
+-    element->ops->measure( element, ctx, avail_w, avail_h, &w, &h );
+-    if (!isnan( element->width )) w = element->width;
+-    else if (element->horizontal_alignment == HorizontalAlignment_Stretch) w = avail_w;
+-    if (!isnan( element->height )) h = element->height;
+-    else if (element->vertical_alignment == VerticalAlignment_Stretch) h = avail_h;
+-    w = min( w, avail_w );
+-    h = min( h, avail_h );
++void element_arrange( struct xaml_element *element, struct layout_context *ctx, float x, float y, float width, float height )
++{
++    const Thickness *m = &element->margin;
++    float avail_width, avail_height, final_width, final_height, desired_width, desired_height;
++
++    if (element->visibility != Visibility_Visible)
++    {
++        element->bounds.x = x;
++        element->bounds.y = y;
++        element->bounds.width = element->bounds.height = 0;
++        return;
++    }
++
++    avail_width = max( 0.0f, width - m->Left - m->Right );
++    avail_height = max( 0.0f, height - m->Top - m->Bottom );
++    desired_width = max( 0.0f, element->desired_width - m->Left - m->Right );
++    desired_height = max( 0.0f, element->desired_height - m->Top - m->Bottom );
++
++    if (!isnan( element->width )) final_width = element->width;
++    else if (element->horizontal_alignment == HorizontalAlignment_Stretch) final_width = avail_width;
++    else final_width = min( desired_width, avail_width );
++    if (!isnan( element->height )) final_height = element->height;
++    else if (element->vertical_alignment == VerticalAlignment_Stretch) final_height = avail_height;
++    else final_height = min( desired_height, avail_height );
+ 
+     switch (element->horizontal_alignment)
+     {
+-    case HorizontalAlignment_Center: x = m->Left + (avail_w - w) / 2; break;
+-    case HorizontalAlignment_Right: x = m->Left + avail_w - w; break;
+-    default: x = m->Left; break;
++    case HorizontalAlignment_Left: element->bounds.x = x + m->Left; break;
++    case HorizontalAlignment_Right: element->bounds.x = x + m->Left + avail_width - final_width; break;
++    default: element->bounds.x = x + m->Left + (avail_width - final_width) / 2; break;  /* Center, or a sized Stretch */
+     }
+     switch (element->vertical_alignment)
+     {
+-    case VerticalAlignment_Center: y = m->Top + (avail_h - h) / 2; break;
+-    case VerticalAlignment_Bottom: y = m->Top + avail_h - h; break;
+-    default: y = m->Top; break;
++    case VerticalAlignment_Top: element->bounds.y = y + m->Top; break;
++    case VerticalAlignment_Bottom: element->bounds.y = y + m->Top + avail_height - final_height; break;
++    default: element->bounds.y = y + m->Top + (avail_height - final_height) / 2; break;
++    }
++    element->bounds.width = final_width;
++    element->bounds.height = final_height;
++    TRACE( "%s arranged at %.1f,%.1f %.1fx%.1f.\n", debugstr_w(element->class_name), element->bounds.x, element->bounds.y,
++           final_width, final_height );
++
++    if (element->ops->arrange) element->ops->arrange( element, ctx );
++}
++
++void element_render( struct xaml_element *element, struct layout_context *ctx )
++{
++    if (element->visibility != Visibility_Visible) return;
++    element->ops->render( element, ctx );
++}
++
++struct xaml_element *element_hit_test( struct xaml_element *element, float x, float y )
++{
++    const struct layout_rect *b = &element->bounds;
++    struct xaml_element *hit;
++    UINT32 i;
++
++    if (element->visibility != Visibility_Visible || !element->hit_test_visible) return NULL;
++    if (element->ops->child_count)
++    {
++        for (i = element->ops->child_count( element ); i > 0; i--)
++        {
++            struct xaml_element *child = element->ops->child_at( element, i - 1 );
++            if (child && (hit = element_hit_test( child, x, y ))) return hit;
++        }
++    }
++    if (x >= b->x && y >= b->y && x < b->x + b->width && y < b->y + b->height &&
++        element->ops->hit_self && element->ops->hit_self( element, x, y ))
++        return element;
++    return NULL;
++}
++
++void element_device_rect( const struct layout_rect *rect, struct layout_context *ctx, RECT *out )
++{
++    out->left = lroundf( rect->x * ctx->scale );
++    out->top = lroundf( rect->y * ctx->scale );
++    out->right = lroundf( (rect->x + rect->width) * ctx->scale );
++    out->bottom = lroundf( (rect->y + rect->height) * ctx->scale );
++}
++
++void element_fill_color( struct layout_context *ctx, const struct layout_rect *rect, COLORREF color )
++{
++    HBRUSH brush = CreateSolidBrush( color );
++    RECT r;
++
++    element_device_rect( rect, ctx, &r );
++    FillRect( ctx->hdc, &r, brush );
++    DeleteObject( brush );
++}
++
++void element_fill( struct layout_context *ctx, const struct layout_rect *rect, IBrush *brush )
++{
++    Color c;
++
++    if (!brush || !brush_get_color( brush, &c ) || !c.A) return;
++    element_fill_color( ctx, rect, RGB( c.R, c.G, c.B ) );
++}
++
++void element_frame_color( struct layout_context *ctx, const struct layout_rect *rect, const Thickness *t, COLORREF color )
++{
++    struct layout_rect side;
++
++    side = *rect;
++    side.height = min( (float)t->Top, rect->height );
++    element_fill_color( ctx, &side, color );
++    side.y = rect->y + rect->height - min( (float)t->Bottom, rect->height );
++    side.height = min( (float)t->Bottom, rect->height );
++    element_fill_color( ctx, &side, color );
++    side = *rect;
++    side.width = min( (float)t->Left, rect->width );
++    element_fill_color( ctx, &side, color );
++    side.x = rect->x + rect->width - min( (float)t->Right, rect->width );
++    side.width = min( (float)t->Right, rect->width );
++    element_fill_color( ctx, &side, color );
++}
++
++void element_frame( struct layout_context *ctx, const struct layout_rect *rect, const Thickness *t, IBrush *brush )
++{
++    Color c;
++
++    if (!brush || !brush_get_color( brush, &c ) || !c.A) return;
++    element_frame_color( ctx, rect, t, RGB( c.R, c.G, c.B ) );
++}
++
++/* text */
++
++static HFONT text_create_font( struct layout_context *ctx, const struct text_format *format )
++{
++    LOGFONTW lf = {0};
++
++    lf.lfHeight = -lround( format->font_size * ctx->scale );
++    lf.lfWeight = format->weight ? format->weight : FW_NORMAL;
++    lf.lfItalic = format->italic;
++    lf.lfCharSet = DEFAULT_CHARSET;
++    lf.lfQuality = ANTIALIASED_QUALITY;
++    wcscpy( lf.lfFaceName, L"Segoe UI" );  /* XAML's default; GDI substitutes when it isn't installed */
++    return CreateFontIndirectW( &lf );
++}
++
++static UINT text_flags( const struct text_format *format )
++{
++    UINT flags = DT_NOPREFIX;
++
++    flags |= format->wrap ? DT_WORDBREAK : DT_SINGLELINE;
++    switch (format->alignment)
++    {
++    case TextAlignment_Center: flags |= DT_CENTER; break;
++    case TextAlignment_Right: flags |= DT_RIGHT; break;
++    default: flags |= DT_LEFT; break;
+     }
++    return flags;
++}
+ 
+-    rect.left = bounds->left + lroundf( x * scale );
+-    rect.top = bounds->top + lroundf( y * scale );
+-    rect.right = rect.left + lroundf( w * scale );
+-    rect.bottom = rect.top + lroundf( h * scale );
+-    TRACE( "%s at %s.\n", debugstr_w(element->class_name), wine_dbgstr_rect(&rect) );
+-    element->ops->render( element, ctx, &rect );
++void text_measure( struct layout_context *ctx, const struct text_format *format, HSTRING text, float avail_width,
++                   float *width, float *height )
++{
++    UINT32 len;
++    const WCHAR *str = WindowsGetStringRawBuffer( text, &len );
++    RECT rect = { 0, 0, lroundf( min( avail_width, 1e6f ) * ctx->scale ), 0 };
++    HFONT font = text_create_font( ctx, format ), old;
++    TEXTMETRICW tm;
++
++    old = SelectObject( ctx->hdc, font );
++    if (len) DrawTextW( ctx->hdc, str, len, &rect, text_flags( format ) | DT_CALCRECT );
++    else
++    {
++        GetTextMetricsW( ctx->hdc, &tm );
++        rect.right = 0;
++        rect.bottom = tm.tmHeight;
++    }
++    SelectObject( ctx->hdc, old );
++    DeleteObject( font );
++
++    *width = rect.right / ctx->scale;
++    *height = rect.bottom / ctx->scale;
++}
++
++void text_draw( struct layout_context *ctx, const struct text_format *format, HSTRING text, const struct layout_rect *rect,
++                COLORREF color )
++{
++    UINT32 len;
++    const WCHAR *str = WindowsGetStringRawBuffer( text, &len );
++    HFONT font, old;
++    RECT r;
++
++    if (!len) return;
++    element_device_rect( rect, ctx, &r );
++    font = text_create_font( ctx, format );
++    old = SelectObject( ctx->hdc, font );
++    SetTextColor( ctx->hdc, color );
++    SetBkMode( ctx->hdc, TRANSPARENT );
++    DrawTextW( ctx->hdc, str, len, &r, text_flags( format ) | DT_NOCLIP );
++    SelectObject( ctx->hdc, old );
++    DeleteObject( font );
++}
++
++/* RoutedEventArgs, as passed to Click handlers */
++
++struct routed_event_args
++{
++    IRoutedEventArgs IRoutedEventArgs_iface;
++    LONG ref;
++    IInspectable *source;
++};
++
++static inline struct routed_event_args *impl_from_IRoutedEventArgs( IRoutedEventArgs *iface )
++{
++    return CONTAINING_RECORD( iface, struct routed_event_args, IRoutedEventArgs_iface );
++}
++
++static HRESULT WINAPI args_QueryInterface( IRoutedEventArgs *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IRoutedEventArgs ))
++    {
++        *out = iface;
++        IRoutedEventArgs_AddRef( iface );
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI args_AddRef( IRoutedEventArgs *iface )
++{
++    return InterlockedIncrement( &impl_from_IRoutedEventArgs( iface )->ref );
++}
++
++static ULONG WINAPI args_Release( IRoutedEventArgs *iface )
++{
++    struct routed_event_args *impl = impl_from_IRoutedEventArgs( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        if (impl->source) IInspectable_Release( impl->source );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI args_GetIids( IRoutedEventArgs *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI args_GetRuntimeClassName( IRoutedEventArgs *iface, HSTRING *class_name )
++{
++    const WCHAR *name = RuntimeClass_Windows_UI_Xaml_RoutedEventArgs;
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI args_GetTrustLevel( IRoutedEventArgs *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI args_get_OriginalSource( IRoutedEventArgs *iface, IInspectable **value )
++{
++    struct routed_event_args *impl = impl_from_IRoutedEventArgs( iface );
++    if ((*value = impl->source)) IInspectable_AddRef( *value );
++    return S_OK;
++}
++
++static const struct IRoutedEventArgsVtbl args_vtbl =
++{
++    args_QueryInterface,
++    args_AddRef,
++    args_Release,
++    /* IInspectable methods */
++    args_GetIids,
++    args_GetRuntimeClassName,
++    args_GetTrustLevel,
++    /* IRoutedEventArgs methods */
++    args_get_OriginalSource,
++};
++
++HRESULT routed_event_args_create( IInspectable *source, IRoutedEventArgs **out )
++{
++    struct routed_event_args *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IRoutedEventArgs_iface.lpVtbl = &args_vtbl;
++    impl->ref = 1;
++    if ((impl->source = source)) IInspectable_AddRef( source );
++    *out = &impl->IRoutedEventArgs_iface;
++    return S_OK;
+ }
+diff --git a/dlls/windows.ui.xaml/main.c b/dlls/windows.ui.xaml/main.c
+index e8da556..d18227e 100644
+--- a/dlls/windows.ui.xaml/main.c
++++ b/dlls/windows.ui.xaml/main.c
+@@ -40,6 +40,18 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( text_block_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_SolidColorBrush ))
+         IActivationFactory_QueryInterface( solid_color_brush_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_StackPanel ))
++        IActivationFactory_QueryInterface( stack_panel_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Grid ))
++        IActivationFactory_QueryInterface( grid_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Border ))
++        IActivationFactory_QueryInterface( border_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Button ))
++        IActivationFactory_QueryInterface( button_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_RowDefinition ))
++        IActivationFactory_QueryInterface( row_definition_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ColumnDefinition ))
++        IActivationFactory_QueryInterface( column_definition_factory, &IID_IActivationFactory, (void **)factory );
+ 
+     if (*factory) return S_OK;
+     return CLASS_E_CLASSNOTAVAILABLE;
+diff --git a/dlls/windows.ui.xaml/panel.c b/dlls/windows.ui.xaml/panel.c
+new file mode 100644
+index 0000000..a13adae
+--- /dev/null
++++ b/dlls/windows.ui.xaml/panel.c
+@@ -0,0 +1,870 @@
++/* WinRT Windows.UI.Xaml.Controls Panel, StackPanel and Grid implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <math.h>
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* StackPanel and Grid share one object type; kind says which. Children live in a UIElementCollection. */
++
++enum panel_kind
++{
++    PANEL_STACK,
++    PANEL_GRID,
++};
++
++struct panel
++{
++    struct xaml_element element;
++    IPanel IPanel_iface;
++    IStackPanel IStackPanel_iface;
++    IGrid IGrid_iface;
++    enum panel_kind kind;
++    IInspectable *children;   /* IVector<UIElement *> */
++    IBrush *background;
++    Orientation orientation;
++    IInspectable *rows, *columns;   /* IVector<RowDefinition *>, IVector<ColumnDefinition *> (Grid) */
++    float *track_content[2];        /* Grid: content size of each column [0] and row [1], from measure */
++    UINT32 track_count[2];
++};
++
++const struct vector_iids uielement_collection_iids =
++{
++    &IID___FIVector_1_Windows__CUI__CXaml__CUIElement,
++    &IID___FIVectorView_1_Windows__CUI__CXaml__CUIElement,
++    &IID___FIIterable_1_Windows__CUI__CXaml__CUIElement,
++    &IID___FIIterator_1_Windows__CUI__CXaml__CUIElement,
++    &IID_IUIElement,
++};
++
++static const struct vector_iids row_collection_iids =
++{
++    &IID___FIVector_1_Windows__CUI__CXaml__CControls__CRowDefinition,
++    &IID___FIVectorView_1_Windows__CUI__CXaml__CControls__CRowDefinition,
++    &IID___FIIterable_1_Windows__CUI__CXaml__CControls__CRowDefinition,
++    &IID___FIIterator_1_Windows__CUI__CXaml__CControls__CRowDefinition,
++    &IID_IRowDefinition,
++};
++
++static const struct vector_iids column_collection_iids =
++{
++    &IID___FIVector_1_Windows__CUI__CXaml__CControls__CColumnDefinition,
++    &IID___FIVectorView_1_Windows__CUI__CXaml__CControls__CColumnDefinition,
++    &IID___FIIterable_1_Windows__CUI__CXaml__CControls__CColumnDefinition,
++    &IID___FIIterator_1_Windows__CUI__CXaml__CControls__CColumnDefinition,
++    &IID_IColumnDefinition,
++};
++
++static inline struct panel *impl_from_element( struct xaml_element *element )
++{
++    return CONTAINING_RECORD( element, struct panel, element );
++}
++
++/* children collection callbacks */
++
++static HRESULT children_inserted( void *owner, IInspectable *item )
++{
++    struct xaml_element *child = element_from_iinspectable( item );
++
++    if (!child) return E_INVALIDARG;
++    if (child->parent)
++    {
++        WARN( "element %p already has a parent.\n", item );
++        return E_INVALIDARG;
++    }
++    element_set_parent( child, owner );
++    return S_OK;
++}
++
++static void children_removed( void *owner, IInspectable *item )
++{
++    struct xaml_element *child = element_from_iinspectable( item );
++    if (child && child->parent == owner) element_set_parent( child, NULL );
++}
++
++static const struct vector_callbacks children_callbacks = { children_inserted, children_removed };
++
++static HRESULT definitions_inserted( void *owner, IInspectable *item )
++{
++    GridLength length;
++    double min, max;
++    return definition_get( item, &length, &min, &max ) ? S_OK : E_INVALIDARG;
++}
++
++static void definitions_removed( void *owner, IInspectable *item )
++{
++}
++
++static const struct vector_callbacks definitions_callbacks = { definitions_inserted, definitions_removed };
++
++static struct xaml_element *panel_child( struct panel *impl, UINT32 index )
++{
++    return element_from_iinspectable( vector_get( impl->children, index ) );
++}
++
++/* StackPanel layout */
++
++static void stack_measure( struct panel *impl, struct layout_context *ctx, float avail_width, float avail_height,
++                           float *width, float *height )
++{
++    BOOL vertical = impl->orientation == Orientation_Vertical;
++    UINT32 i, count = vector_size( impl->children );
++    struct xaml_element *child;
++
++    *width = *height = 0;
++    for (i = 0; i < count; i++)
++    {
++        if (!(child = panel_child( impl, i ))) continue;
++        if (vertical)
++        {
++            element_measure( child, ctx, avail_width, INFINITY );
++            *width = max( *width, child->desired_width );
++            *height += child->desired_height;
++        }
++        else
++        {
++            element_measure( child, ctx, INFINITY, avail_height );
++            *width += child->desired_width;
++            *height = max( *height, child->desired_height );
++        }
++    }
++}
++
++static void stack_arrange( struct panel *impl, struct layout_context *ctx )
++{
++    BOOL vertical = impl->orientation == Orientation_Vertical;
++    UINT32 i, count = vector_size( impl->children );
++    const struct layout_rect *b = &impl->element.bounds;
++    float offset = 0;
++    struct xaml_element *child;
++
++    for (i = 0; i < count; i++)
++    {
++        if (!(child = panel_child( impl, i ))) continue;
++        if (vertical)
++        {
++            element_arrange( child, ctx, b->x, b->y + offset, b->width, child->desired_height );
++            offset += child->desired_height;
++        }
++        else
++        {
++            element_arrange( child, ctx, b->x + offset, b->y, child->desired_width, b->height );
++            offset += child->desired_width;
++        }
++    }
++}
++
++/* Grid layout. Tracks (columns, then rows) are Pixel, Auto or Star. Measure: Pixel tracks take their size, Auto
++ * tracks the largest child that sits only in Auto/Pixel tracks, Star tracks share what is left of the available
++ * size by weight. The Grid's desired size uses the Star tracks' content, so a non-stretched Grid sizes to its
++ * content. Arrange shares the final size the same way. Columns are resolved first so that children know their
++ * width when the rows are measured. */
++
++struct track
++{
++    GridUnitType type;
++    double value;     /* pixels or star weight */
++    double min, max;
++    float size;
++    float content;    /* largest content (Auto), or content per star unit times weight (Star) */
++    float offset;
++};
++
++static void child_cell( struct xaml_element *child, BOOL rows, UINT32 count, UINT32 *start, UINT32 *span )
++{
++    INT32 index = rows ? child->row : child->column, n = rows ? child->row_span : child->column_span;
++
++    *start = min( (UINT32)max( 0, index ), count - 1 );
++    *span = min( (UINT32)max( 1, n ), count - *start );
++}
++
++static struct track *grid_tracks( struct panel *impl, BOOL rows, UINT32 *count )
++{
++    IInspectable *defs = rows ? impl->rows : impl->columns;
++    UINT32 i, n = vector_size( defs );
++    struct track *tracks;
++    GridLength length;
++
++    *count = max( 1, n );
++    if (!(tracks = calloc( *count, sizeof(*tracks) ))) return NULL;
++    tracks[0].type = GridUnitType_Star;
++    tracks[0].value = 1.0;
++    tracks[0].max = INFINITY;
++    for (i = 0; i < n; i++)
++    {
++        definition_get( vector_get( defs, i ), &length, &tracks[i].min, &tracks[i].max );
++        tracks[i].type = length.GridUnitType;
++        tracks[i].value = length.GridUnitType == GridUnitType_Auto ? 0 : max( 0.0, length.Value );
++        if (tracks[i].type == GridUnitType_Pixel) tracks[i].size = tracks[i].content = tracks[i].value;
++    }
++    return tracks;
++}
++
++static float tracks_span_size( const struct track *tracks, UINT32 start, UINT32 span, BOOL *has_star, BOOL *has_auto )
++{
++    float size = 0;
++    UINT32 i;
++
++    if (has_star) *has_star = FALSE;
++    if (has_auto) *has_auto = FALSE;
++    for (i = start; i < start + span; i++)
++    {
++        size += tracks[i].size;
++        if (tracks[i].type == GridUnitType_Star && has_star) *has_star = TRUE;
++        if (tracks[i].type == GridUnitType_Auto && has_auto) *has_auto = TRUE;
++    }
++    return size;
++}
++
++/* share avail between the star tracks by weight; with avail INFINITY, use their content */
++static void tracks_resolve_stars( struct track *tracks, UINT32 count, float avail )
++{
++    float fixed = 0, weights = 0, unit = 0;
++    UINT32 i;
++
++    for (i = 0; i < count; i++)
++    {
++        if (tracks[i].type == GridUnitType_Star) weights += tracks[i].value;
++        else fixed += tracks[i].size;
++    }
++    if (weights <= 0) return;
++    if (isinf( avail ))
++    {
++        for (i = 0; i < count; i++)
++            if (tracks[i].type == GridUnitType_Star && tracks[i].value > 0)
++                unit = max( unit, tracks[i].content / tracks[i].value );
++    }
++    else unit = max( 0.0f, avail - fixed ) / weights;
++    for (i = 0; i < count; i++)
++        if (tracks[i].type == GridUnitType_Star)
++            tracks[i].size = min( tracks[i].max, max( tracks[i].min, unit * tracks[i].value ) );
++}
++
++static float tracks_total( const struct track *tracks, UINT32 count, BOOL content )
++{
++    float total = 0, unit = 0, weights = 0;
++    UINT32 i;
++
++    for (i = 0; i < count; i++)
++    {
++        if (tracks[i].type == GridUnitType_Star && content)
++        {
++            weights += tracks[i].value;
++            if (tracks[i].value > 0) unit = max( unit, tracks[i].content / tracks[i].value );
++        }
++        else total += tracks[i].size;
++    }
++    return total + unit * weights;
++}
++
++/* measure the children for one dimension and size its Auto tracks; cross holds the other dimension's sizes */
++static void grid_size_tracks( struct panel *impl, struct layout_context *ctx, BOOL rows, struct track *tracks, UINT32 count,
++                              struct track *cross, UINT32 cross_count, float avail )
++{
++    UINT32 i, n = vector_size( impl->children ), start, span, cstart, cspan, j;
++    struct xaml_element *child;
++    BOOL star, autos;
++    float cross_size, size, desired;
++
++    /* Auto tracks: children that sit in no Star track of this dimension */
++    for (i = 0; i < n; i++)
++    {
++        if (!(child = panel_child( impl, i ))) continue;
++        child_cell( child, rows, count, &start, &span );
++        tracks_span_size( tracks, start, span, &star, &autos );
++        if (star) continue;
++        child_cell( child, !rows, cross_count, &cstart, &cspan );
++        cross_size = cross ? tracks_span_size( cross, cstart, cspan, NULL, NULL ) : INFINITY;
++        size = autos ? INFINITY : tracks_span_size( tracks, start, span, NULL, NULL );
++        if (rows) element_measure( child, ctx, cross_size, size );
++        else element_measure( child, ctx, size, INFINITY );
++        desired = rows ? child->desired_height : child->desired_width;
++        /* grow the last Auto track of the span by what the child needs beyond the span's current size */
++        size = tracks_span_size( tracks, start, span, NULL, NULL );
++        for (j = start + span; j > start; j--)
++        {
++            if (tracks[j - 1].type != GridUnitType_Auto) continue;
++            if (desired > size) tracks[j - 1].size += desired - size;
++            tracks[j - 1].content = tracks[j - 1].size;
++            break;
++        }
++    }
++
++    /* Star tracks: content per star unit, from children that sit in a single Star track */
++    for (i = 0; i < n; i++)
++    {
++        if (!(child = panel_child( impl, i ))) continue;
++        child_cell( child, rows, count, &start, &span );
++        if (span != 1 || tracks[start].type != GridUnitType_Star) continue;
++        child_cell( child, !rows, cross_count, &cstart, &cspan );
++        cross_size = cross ? tracks_span_size( cross, cstart, cspan, NULL, NULL ) : INFINITY;
++        if (rows) element_measure( child, ctx, cross_size, INFINITY );
++        else element_measure( child, ctx, INFINITY, INFINITY );
++        desired = rows ? child->desired_height : child->desired_width;
++        tracks[start].content = max( tracks[start].content, desired );
++    }
++    tracks_resolve_stars( tracks, count, avail );
++}
++
++static void grid_measure( struct panel *impl, struct layout_context *ctx, float avail_width, float avail_height,
++                          float *width, float *height )
++{
++    UINT32 ncols, nrows, i, n = vector_size( impl->children ), cs, cn, rs, rn;
++    struct track *cols = grid_tracks( impl, FALSE, &ncols ), *rows = grid_tracks( impl, TRUE, &nrows );
++    struct xaml_element *child;
++
++    *width = *height = 0;
++    if (!cols || !rows) goto done;
++
++    grid_size_tracks( impl, ctx, FALSE, cols, ncols, NULL, nrows, avail_width );
++    grid_size_tracks( impl, ctx, TRUE, rows, nrows, cols, ncols, avail_height );
++
++    /* final measure of every child in its cell */
++    for (i = 0; i < n; i++)
++    {
++        if (!(child = panel_child( impl, i ))) continue;
++        child_cell( child, FALSE, ncols, &cs, &cn );
++        child_cell( child, TRUE, nrows, &rs, &rn );
++        element_measure( child, ctx, tracks_span_size( cols, cs, cn, NULL, NULL ), tracks_span_size( rows, rs, rn, NULL, NULL ) );
++    }
++
++    *width = tracks_total( cols, ncols, TRUE );
++    *height = tracks_total( rows, nrows, TRUE );
++
++    /* keep the content sizes for arrange */
++    for (i = 0; i < 2; i++) free( impl->track_content[i] );
++    impl->track_content[0] = calloc( ncols, sizeof(float) );
++    impl->track_content[1] = calloc( nrows, sizeof(float) );
++    impl->track_count[0] = ncols;
++    impl->track_count[1] = nrows;
++    for (i = 0; i < ncols && impl->track_content[0]; i++) impl->track_content[0][i] = cols[i].size;
++    for (i = 0; i < nrows && impl->track_content[1]; i++) impl->track_content[1][i] = rows[i].size;
++
++done:
++    free( cols );
++    free( rows );
++}
++
++static void grid_arrange( struct panel *impl, struct layout_context *ctx )
++{
++    UINT32 ncols, nrows, i, n = vector_size( impl->children ), cs, cn, rs, rn;
++    struct track *cols = grid_tracks( impl, FALSE, &ncols ), *rows = grid_tracks( impl, TRUE, &nrows );
++    const struct layout_rect *b = &impl->element.bounds;
++    struct xaml_element *child;
++    float offset;
++
++    if (!cols || !rows) goto done;
++    for (i = 0; i < ncols; i++)
++        if (cols[i].type == GridUnitType_Auto && impl->track_content[0] && ncols == impl->track_count[0])
++            cols[i].size = impl->track_content[0][i];
++    for (i = 0; i < nrows; i++)
++        if (rows[i].type == GridUnitType_Auto && impl->track_content[1] && nrows == impl->track_count[1])
++            rows[i].size = impl->track_content[1][i];
++    tracks_resolve_stars( cols, ncols, b->width );
++    tracks_resolve_stars( rows, nrows, b->height );
++
++    for (i = 0, offset = 0; i < ncols; offset += cols[i++].size)
++    {
++        cols[i].offset = offset;
++        if (impl->columns && i < vector_size( impl->columns ))
++            definition_set_actual( vector_get( impl->columns, i ), cols[i].size );
++    }
++    for (i = 0, offset = 0; i < nrows; offset += rows[i++].size)
++    {
++        rows[i].offset = offset;
++        if (impl->rows && i < vector_size( impl->rows ))
++            definition_set_actual( vector_get( impl->rows, i ), rows[i].size );
++    }
++
++    for (i = 0; i < n; i++)
++    {
++        if (!(child = panel_child( impl, i ))) continue;
++        child_cell( child, FALSE, ncols, &cs, &cn );
++        child_cell( child, TRUE, nrows, &rs, &rn );
++        element_arrange( child, ctx, b->x + cols[cs].offset, b->y + rows[rs].offset,
++                         tracks_span_size( cols, cs, cn, NULL, NULL ), tracks_span_size( rows, rs, rn, NULL, NULL ) );
++    }
++
++done:
++    free( cols );
++    free( rows );
++}
++
++/* element ops */
++
++static HRESULT panel_query_interface( struct xaml_element *element, REFIID iid, void **out )
++{
++    struct panel *impl = impl_from_element( element );
++
++    if (IsEqualGUID( iid, &IID_IPanel )) *out = &impl->IPanel_iface;
++    else if (impl->kind == PANEL_STACK && IsEqualGUID( iid, &IID_IStackPanel )) *out = &impl->IStackPanel_iface;
++    else if (impl->kind == PANEL_GRID && IsEqualGUID( iid, &IID_IGrid )) *out = &impl->IGrid_iface;
++    else return E_NOINTERFACE;
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static void panel_measure( struct xaml_element *element, struct layout_context *ctx, float avail_width,
++                           float avail_height, float *width, float *height )
++{
++    struct panel *impl = impl_from_element( element );
++
++    if (impl->kind == PANEL_STACK) stack_measure( impl, ctx, avail_width, avail_height, width, height );
++    else grid_measure( impl, ctx, avail_width, avail_height, width, height );
++}
++
++static void panel_arrange( struct xaml_element *element, struct layout_context *ctx )
++{
++    struct panel *impl = impl_from_element( element );
++
++    if (impl->kind == PANEL_STACK) stack_arrange( impl, ctx );
++    else grid_arrange( impl, ctx );
++}
++
++static void panel_render( struct xaml_element *element, struct layout_context *ctx )
++{
++    struct panel *impl = impl_from_element( element );
++    UINT32 i, count = vector_size( impl->children );
++    struct xaml_element *child;
++
++    element_fill( ctx, &element->bounds, impl->background );
++    for (i = 0; i < count; i++) if ((child = panel_child( impl, i ))) element_render( child, ctx );
++}
++
++static UINT32 panel_child_count( struct xaml_element *element )
++{
++    return vector_size( impl_from_element( element )->children );
++}
++
++static struct xaml_element *panel_child_at( struct xaml_element *element, UINT32 index )
++{
++    return panel_child( impl_from_element( element ), index );
++}
++
++static BOOL panel_hit_self( struct xaml_element *element, float x, float y )
++{
++    /* a panel takes the pointer only where it has a background, even a transparent one */
++    return impl_from_element( element )->background != NULL;
++}
++
++static void panel_destroy( struct xaml_element *element )
++{
++    struct panel *impl = impl_from_element( element );
++
++    vector_detach( impl->children );
++    IInspectable_Release( impl->children );
++    if (impl->rows) IInspectable_Release( impl->rows );
++    if (impl->columns) IInspectable_Release( impl->columns );
++    if (impl->background) IBrush_Release( impl->background );
++    free( impl->track_content[0] );
++    free( impl->track_content[1] );
++    free( impl );
++}
++
++static const struct element_ops panel_ops =
++{
++    .query_interface = panel_query_interface,
++    .measure = panel_measure,
++    .arrange = panel_arrange,
++    .render = panel_render,
++    .child_count = panel_child_count,
++    .child_at = panel_child_at,
++    .hit_self = panel_hit_self,
++    .destroy = panel_destroy,
++};
++
++/* IPanel */
++
++DEFINE_IINSPECTABLE_( panel_iface, IPanel, struct panel, impl_from_IPanel, IPanel_iface, impl->element.outer )
++
++static HRESULT WINAPI panel_iface_get_Children( IPanel *iface, __FIVector_1_Windows__CUI__CXaml__CUIElement **value )
++{
++    struct panel *impl = impl_from_IPanel( iface );
++    *value = (__FIVector_1_Windows__CUI__CXaml__CUIElement *)impl->children;
++    IInspectable_AddRef( impl->children );
++    return S_OK;
++}
++
++static HRESULT WINAPI panel_iface_get_Background( IPanel *iface, IBrush **value )
++{
++    struct panel *impl = impl_from_IPanel( iface );
++    if ((*value = impl->background)) IBrush_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI panel_iface_put_Background( IPanel *iface, IBrush *value )
++{
++    struct panel *impl = impl_from_IPanel( iface );
++
++    if (value) IBrush_AddRef( value );
++    if (impl->background) IBrush_Release( impl->background );
++    impl->background = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI panel_iface_get_IsItemsHost( IPanel *iface, boolean *value )
++{
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI panel_iface_get_ChildrenTransitions(IPanel *iface, __FIVector_1_Windows__CUI__CXaml__CMedia__CAnimation__CTransition **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI panel_iface_put_ChildrenTransitions(IPanel *iface, __FIVector_1_Windows__CUI__CXaml__CMedia__CAnimation__CTransition *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static const struct IPanelVtbl panel_iface_vtbl =
++{
++    panel_iface_QueryInterface,
++    panel_iface_AddRef,
++    panel_iface_Release,
++    /* IInspectable methods */
++    panel_iface_GetIids,
++    panel_iface_GetRuntimeClassName,
++    panel_iface_GetTrustLevel,
++    /* IPanel methods */
++    panel_iface_get_Children,
++    panel_iface_get_Background,
++    panel_iface_put_Background,
++    panel_iface_get_IsItemsHost,
++    panel_iface_get_ChildrenTransitions,
++    panel_iface_put_ChildrenTransitions
++};
++
++/* IStackPanel */
++
++DEFINE_IINSPECTABLE_( stack_panel_iface, IStackPanel, struct panel, impl_from_IStackPanel, IStackPanel_iface, impl->element.outer )
++
++static HRESULT WINAPI stack_panel_iface_get_AreScrollSnapPointsRegular( IStackPanel *iface, boolean *value )
++{
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI stack_panel_iface_put_AreScrollSnapPointsRegular( IStackPanel *iface, boolean value )
++{
++    FIXME( "iface %p, value %d stub!\n", iface, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI stack_panel_iface_get_Orientation( IStackPanel *iface, Orientation *value )
++{
++    *value = impl_from_IStackPanel( iface )->orientation;
++    return S_OK;
++}
++
++static HRESULT WINAPI stack_panel_iface_put_Orientation( IStackPanel *iface, Orientation value )
++{
++    impl_from_IStackPanel( iface )->orientation = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static const struct IStackPanelVtbl stack_panel_iface_vtbl =
++{
++    stack_panel_iface_QueryInterface,
++    stack_panel_iface_AddRef,
++    stack_panel_iface_Release,
++    /* IInspectable methods */
++    stack_panel_iface_GetIids,
++    stack_panel_iface_GetRuntimeClassName,
++    stack_panel_iface_GetTrustLevel,
++    /* IStackPanel methods */
++    stack_panel_iface_get_AreScrollSnapPointsRegular,
++    stack_panel_iface_put_AreScrollSnapPointsRegular,
++    stack_panel_iface_get_Orientation,
++    stack_panel_iface_put_Orientation,
++};
++
++/* IGrid */
++
++DEFINE_IINSPECTABLE_( grid_iface, IGrid, struct panel, impl_from_IGrid, IGrid_iface, impl->element.outer )
++
++static HRESULT WINAPI grid_iface_get_RowDefinitions( IGrid *iface, __FIVector_1_Windows__CUI__CXaml__CControls__CRowDefinition **value )
++{
++    struct panel *impl = impl_from_IGrid( iface );
++    *value = (__FIVector_1_Windows__CUI__CXaml__CControls__CRowDefinition *)impl->rows;
++    IInspectable_AddRef( impl->rows );
++    return S_OK;
++}
++
++static HRESULT WINAPI grid_iface_get_ColumnDefinitions( IGrid *iface, __FIVector_1_Windows__CUI__CXaml__CControls__CColumnDefinition **value )
++{
++    struct panel *impl = impl_from_IGrid( iface );
++    *value = (__FIVector_1_Windows__CUI__CXaml__CControls__CColumnDefinition *)impl->columns;
++    IInspectable_AddRef( impl->columns );
++    return S_OK;
++}
++
++static const struct IGridVtbl grid_iface_vtbl =
++{
++    grid_iface_QueryInterface,
++    grid_iface_AddRef,
++    grid_iface_Release,
++    /* IInspectable methods */
++    grid_iface_GetIids,
++    grid_iface_GetRuntimeClassName,
++    grid_iface_GetTrustLevel,
++    /* IGrid methods */
++    grid_iface_get_RowDefinitions,
++    grid_iface_get_ColumnDefinitions,
++};
++
++static HRESULT panel_create( enum panel_kind kind, IInspectable *outer, IInspectable **inner, void **value )
++{
++    struct panel *impl;
++    HRESULT hr;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    element_init( &impl->element, &panel_ops, kind == PANEL_STACK ? RuntimeClass_Windows_UI_Xaml_Controls_StackPanel
++                                                                   : RuntimeClass_Windows_UI_Xaml_Controls_Grid, outer );
++    impl->IPanel_iface.lpVtbl = &panel_iface_vtbl;
++    impl->IStackPanel_iface.lpVtbl = &stack_panel_iface_vtbl;
++    impl->IGrid_iface.lpVtbl = &grid_iface_vtbl;
++    impl->kind = kind;
++    impl->orientation = Orientation_Vertical;
++    if (FAILED(hr = vector_create( &uielement_collection_iids, &children_callbacks, &impl->element, &impl->children )))
++        goto failed;
++    if (kind == PANEL_GRID)
++    {
++        if (FAILED(hr = vector_create( &row_collection_iids, &definitions_callbacks, impl, &impl->rows ))) goto failed;
++        if (FAILED(hr = vector_create( &column_collection_iids, &definitions_callbacks, impl, &impl->columns ))) goto failed;
++    }
++    TRACE( "created %s %p, outer %p.\n", debugstr_w(impl->element.class_name), impl, outer );
++    return element_compose( &impl->element, outer, inner,
++                            kind == PANEL_STACK ? (void *)&impl->IStackPanel_iface : (void *)&impl->IGrid_iface, value );
++
++failed:
++    if (impl->children) IInspectable_Release( impl->children );
++    if (impl->rows) IInspectable_Release( impl->rows );
++    free( impl );
++    return hr;
++}
++
++/* activation factories: IActivationFactory plus the composable IStackPanelFactory / IGridFactory, and IGridStatics */
++
++struct panel_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IStackPanelFactory IStackPanelFactory_iface;
++    IGridFactory IGridFactory_iface;
++    IGridStatics IGridStatics_iface;
++    enum panel_kind kind;
++};
++
++static inline struct panel_statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct panel_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct panel_statics *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (impl->kind == PANEL_STACK && IsEqualGUID( iid, &IID_IStackPanelFactory ))
++        *out = &impl->IStackPanelFactory_iface;
++    else if (impl->kind == PANEL_GRID && IsEqualGUID( iid, &IID_IGridFactory ))
++        *out = &impl->IGridFactory_iface;
++    else if (impl->kind == PANEL_GRID && IsEqualGUID( iid, &IID_IGridStatics ))
++        *out = &impl->IGridStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    return 2;
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    return 1;
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++    return panel_create( impl_from_IActivationFactory( iface )->kind, NULL, NULL, (void **)instance );
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( stack_factory, IStackPanelFactory, struct panel_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI stack_factory_CreateInstance( IStackPanelFactory *iface, IInspectable *outer, IInspectable **inner,
++                                                    IStackPanel **value )
++{
++    TRACE( "iface %p, outer %p, inner %p, value %p.\n", iface, outer, inner, value );
++    return panel_create( PANEL_STACK, outer, inner, (void **)value );
++}
++
++static const struct IStackPanelFactoryVtbl stack_factory_vtbl =
++{
++    stack_factory_QueryInterface,
++    stack_factory_AddRef,
++    stack_factory_Release,
++    /* IInspectable methods */
++    stack_factory_GetIids,
++    stack_factory_GetRuntimeClassName,
++    stack_factory_GetTrustLevel,
++    /* IStackPanelFactory methods */
++    stack_factory_CreateInstance,
++};
++
++DEFINE_IINSPECTABLE( grid_factory_iface, IGridFactory, struct panel_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI grid_factory_iface_CreateInstance( IGridFactory *iface, IInspectable *outer, IInspectable **inner,
++                                                         IGrid **value )
++{
++    TRACE( "iface %p, outer %p, inner %p, value %p.\n", iface, outer, inner, value );
++    return panel_create( PANEL_GRID, outer, inner, (void **)value );
++}
++
++static const struct IGridFactoryVtbl grid_factory_iface_vtbl =
++{
++    grid_factory_iface_QueryInterface,
++    grid_factory_iface_AddRef,
++    grid_factory_iface_Release,
++    /* IInspectable methods */
++    grid_factory_iface_GetIids,
++    grid_factory_iface_GetRuntimeClassName,
++    grid_factory_iface_GetTrustLevel,
++    /* IGridFactory methods */
++    grid_factory_iface_CreateInstance,
++};
++
++DEFINE_IINSPECTABLE( grid_statics, IGridStatics, struct panel_statics, IActivationFactory_iface )
++
++static struct xaml_element *attached_target( IFrameworkElement *element )
++{
++    return element_from_iinspectable( (IInspectable *)element );
++}
++
++#define GRID_ATTACHED( Name, field ) \
++static HRESULT WINAPI grid_statics_get_##Name##Property( IGridStatics *iface, IDependencyProperty **value ) \
++{ \
++    FIXME( "iface %p: no DependencyProperty objects yet.\n", iface ); \
++    *value = NULL; \
++    return E_NOTIMPL; \
++} \
++static HRESULT WINAPI grid_statics_Get##Name( IGridStatics *iface, IFrameworkElement *element, INT32 *value ) \
++{ \
++    struct xaml_element *target = attached_target( element ); \
++    if (!target) return E_INVALIDARG; \
++    *value = target->field; \
++    return S_OK; \
++} \
++static HRESULT WINAPI grid_statics_Set##Name( IGridStatics *iface, IFrameworkElement *element, INT32 value ) \
++{ \
++    struct xaml_element *target = attached_target( element ); \
++    TRACE( "iface %p, element %p, value %d.\n", iface, element, value ); \
++    if (!target) return E_INVALIDARG; \
++    target->field = value; \
++    window_invalidate(); \
++    return S_OK; \
++}
++
++GRID_ATTACHED( Row, row )
++GRID_ATTACHED( Column, column )
++GRID_ATTACHED( RowSpan, row_span )
++GRID_ATTACHED( ColumnSpan, column_span )
++
++static const struct IGridStaticsVtbl grid_statics_vtbl =
++{
++    grid_statics_QueryInterface,
++    grid_statics_AddRef,
++    grid_statics_Release,
++    /* IInspectable methods */
++    grid_statics_GetIids,
++    grid_statics_GetRuntimeClassName,
++    grid_statics_GetTrustLevel,
++    /* IGridStatics methods */
++    grid_statics_get_RowProperty,
++    grid_statics_GetRow,
++    grid_statics_SetRow,
++    grid_statics_get_ColumnProperty,
++    grid_statics_GetColumn,
++    grid_statics_SetColumn,
++    grid_statics_get_RowSpanProperty,
++    grid_statics_GetRowSpan,
++    grid_statics_SetRowSpan,
++    grid_statics_get_ColumnSpanProperty,
++    grid_statics_GetColumnSpan,
++    grid_statics_SetColumnSpan,
++};
++
++static struct panel_statics stack_statics =
++{
++    {&factory_vtbl}, {&stack_factory_vtbl}, {&grid_factory_iface_vtbl}, {&grid_statics_vtbl}, PANEL_STACK
++};
++
++static struct panel_statics grid_statics =
++{
++    {&factory_vtbl}, {&stack_factory_vtbl}, {&grid_factory_iface_vtbl}, {&grid_statics_vtbl}, PANEL_GRID
++};
++
++IActivationFactory *stack_panel_factory = &stack_statics.IActivationFactory_iface;
++IActivationFactory *grid_factory = &grid_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index b7bc292..f10d56d 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -49,6 +49,7 @@
+ #define WIDL_using_Windows_UI_Text
+ #define WIDL_using_Windows_UI_Xaml
+ #define WIDL_using_Windows_UI_Xaml_Controls
++#define WIDL_using_Windows_UI_Xaml_Controls_Primitives
+ #define WIDL_using_Windows_UI_Xaml_Media
+ #include "windows.ui.xaml.h"
+ 
+@@ -57,6 +58,12 @@ extern IActivationFactory *application_factory;
+ extern IActivationFactory *window_factory;
+ extern IActivationFactory *text_block_factory;
+ extern IActivationFactory *solid_color_brush_factory;
++extern IActivationFactory *stack_panel_factory;
++extern IActivationFactory *grid_factory;
++extern IActivationFactory *border_factory;
++extern IActivationFactory *button_factory;
++extern IActivationFactory *row_definition_factory;
++extern IActivationFactory *column_definition_factory;
+ 
+ /* event handler lists (handlers are kept, tokens are indices + 1) */
+ struct event_list
+@@ -76,11 +83,32 @@ IApplicationOverrides *application_get_overrides(void);
+ HRESULT window_create_for_core_window( ICoreWindow *core_window );
+ void window_destroy_current(void);
+ 
+-/* elements: one retained tree, laid out and drawn with GDI */
++/* collections: one IVector<T *> implementation for any interface-pointer element type T */
++struct vector_iids
++{
++    const IID *vector;
++    const IID *view;
++    const IID *iterable;
++    const IID *iterator;
++    const IID *element;    /* interface stored in the vector */
++};
++struct vector_callbacks
++{
++    HRESULT (*inserted)( void *owner, IInspectable *item );   /* may refuse the item */
++    void (*removed)( void *owner, IInspectable *item );
++};
++HRESULT vector_create( const struct vector_iids *iids, const struct vector_callbacks *callbacks, void *owner,
++                       IInspectable **out );
++UINT32 vector_size( IInspectable *vector );
++IInspectable *vector_get( IInspectable *vector, UINT32 index );   /* no reference added */
++void vector_detach( IInspectable *vector );                       /* owner is going away */
++
++/* elements: one retained tree, measured, arranged and drawn with GDI; sizes are in view pixels */
+ struct layout_context
+ {
+     HDC hdc;
+     float scale;         /* physical pixels per view pixel */
++    BOOL dark;           /* application theme */
+     COLORREF foreground; /* inherited text colour */
+ };
+ 
+@@ -88,34 +116,91 @@ struct xaml_element;
+ struct element_ops
+ {
+     HRESULT (*query_interface)( struct xaml_element *element, REFIID iid, void **out );
++    /* size of the element's content (inside its margin) for the available size; may be INFINITY */
+     void (*measure)( struct xaml_element *element, struct layout_context *ctx, float avail_width, float avail_height,
+                      float *width, float *height );
+-    void (*render)( struct xaml_element *element, struct layout_context *ctx, const RECT *rect );
++    /* place children inside element->bounds (optional) */
++    void (*arrange)( struct xaml_element *element, struct layout_context *ctx );
++    /* draw the element, then its children with element_render */
++    void (*render)( struct xaml_element *element, struct layout_context *ctx );
++    /* children, for hit-testing (optional) */
++    UINT32 (*child_count)( struct xaml_element *element );
++    struct xaml_element *(*child_at)( struct xaml_element *element, UINT32 index );
++    /* whether the element itself takes pointer input at all (optional; default: no) */
++    BOOL (*hit_self)( struct xaml_element *element, float x, float y );
++    /* pointer input for elements that handle it (optional) */
++    void (*pointer)( struct xaml_element *element, UINT msg, float x, float y );
+     void (*destroy)( struct xaml_element *element );
+ };
+ 
++struct layout_rect
++{
++    float x, y, width, height;
++};
++
+ struct xaml_element
+ {
+     IUIElement IUIElement_iface;
+     IFrameworkElement IFrameworkElement_iface;
+     IDependencyObject IDependencyObject_iface;
++    IInspectable IInspectable_inner;  /* non-delegating */
++    IInspectable *outer;              /* the controlling object, or &IInspectable_inner */
+     LONG ref;
+     const struct element_ops *ops;
+     const WCHAR *class_name;
++    struct xaml_element *parent;      /* not referenced */
+ 
+-    /* FrameworkElement layout properties, in view pixels; NAN means Auto */
++    /* FrameworkElement layout properties; NAN means Auto */
+     double width, height;
+     Thickness margin;
+     HorizontalAlignment horizontal_alignment;
+     VerticalAlignment vertical_alignment;
+     Visibility visibility;
+     double opacity;
++    boolean hit_test_visible;
+     HSTRING name;
++    INT32 row, column, row_span, column_span;  /* Grid attached properties */
++
++    /* layout results */
++    float desired_width, desired_height;  /* including margin */
++    struct layout_rect bounds;            /* arranged, excluding margin, window coordinates */
+ };
+ 
+-void element_init( struct xaml_element *element, const struct element_ops *ops, const WCHAR *class_name );
++void element_init( struct xaml_element *element, const struct element_ops *ops, const WCHAR *class_name,
++                   IInspectable *outer );
++HRESULT element_compose( struct xaml_element *element, IInspectable *outer, IInspectable **inner, void *iface,
++                         void **value );
+ struct xaml_element *element_from_iinspectable( IInspectable *object );
+-void element_layout_and_render( struct xaml_element *element, struct layout_context *ctx, const RECT *bounds );
++void element_set_parent( struct xaml_element *child, struct xaml_element *parent );
++void element_measure( struct xaml_element *element, struct layout_context *ctx, float avail_width, float avail_height );
++void element_arrange( struct xaml_element *element, struct layout_context *ctx, float x, float y, float width, float height );
++void element_render( struct xaml_element *element, struct layout_context *ctx );
++struct xaml_element *element_hit_test( struct xaml_element *element, float x, float y );
++void element_device_rect( const struct layout_rect *rect, struct layout_context *ctx, RECT *out );
++void element_fill( struct layout_context *ctx, const struct layout_rect *rect, IBrush *brush );
++void element_frame( struct layout_context *ctx, const struct layout_rect *rect, const Thickness *thickness, IBrush *brush );
++void element_fill_color( struct layout_context *ctx, const struct layout_rect *rect, COLORREF color );
++void element_frame_color( struct layout_context *ctx, const struct layout_rect *rect, const Thickness *thickness,
++                          COLORREF color );
++BOOL definition_get( IInspectable *object, GridLength *length, double *min, double *max );
++void definition_set_actual( IInspectable *object, double actual );
++HRESULT routed_event_args_create( IInspectable *source, IRoutedEventArgs **out );
++extern const struct vector_iids uielement_collection_iids;
++
++/* text drawing shared by TextBlock and Button */
++struct text_format
++{
++    double font_size;
++    UINT16 weight;
++    BOOL italic;
++    BOOL wrap;
++    TextAlignment alignment;
++};
++void text_measure( struct layout_context *ctx, const struct text_format *format, HSTRING text, float avail_width,
++                   float *width, float *height );
++void text_draw( struct layout_context *ctx, const struct text_format *format, HSTRING text, const struct layout_rect *rect,
++                COLORREF color );
++
+ void window_invalidate(void);
+ BOOL brush_get_color( IBrush *brush, Color *color );
+ 
+diff --git a/dlls/windows.ui.xaml/text_block.c b/dlls/windows.ui.xaml/text_block.c
+index fb8974d..9cf6111 100644
+--- a/dlls/windows.ui.xaml/text_block.c
++++ b/dlls/windows.ui.xaml/text_block.c
+@@ -402,32 +402,13 @@ static HRESULT text_block_query_interface( struct xaml_element *element, REFIID
+     return E_NOINTERFACE;
+ }
+ 
+-static HFONT text_block_create_font( struct text_block *impl, float scale )
++static void text_block_format( struct text_block *impl, struct text_format *format )
+ {
+-    LOGFONTW lf = {0};
+-
+-    lf.lfHeight = -lround( impl->font_size * scale );
+-    lf.lfWeight = impl->font_weight.Weight ? impl->font_weight.Weight : FW_NORMAL;
+-    lf.lfItalic = impl->font_style != FontStyle_Normal;
+-    lf.lfCharSet = DEFAULT_CHARSET;
+-    lf.lfQuality = ANTIALIASED_QUALITY;
+-    wcscpy( lf.lfFaceName, L"Segoe UI" );  /* XAML's default; GDI substitutes when it isn't installed */
+-    return CreateFontIndirectW( &lf );
+-}
+-
+-static UINT text_block_draw_flags( struct text_block *impl )
+-{
+-    UINT flags = DT_NOPREFIX;
+-
+-    if (impl->wrapping != TextWrapping_NoWrap) flags |= DT_WORDBREAK;
+-    else flags |= DT_SINGLELINE;
+-    switch (impl->alignment)
+-    {
+-    case TextAlignment_Center: flags |= DT_CENTER; break;
+-    case TextAlignment_Right: flags |= DT_RIGHT; break;
+-    default: flags |= DT_LEFT; break;
+-    }
+-    return flags;
++    format->font_size = impl->font_size;
++    format->weight = impl->font_weight.Weight;
++    format->italic = impl->font_style != FontStyle_Normal;
++    format->wrap = impl->wrapping != TextWrapping_NoWrap;
++    format->alignment = impl->alignment;
+ }
+ 
+ static void text_block_measure( struct xaml_element *element, struct layout_context *ctx, float avail_width,
+@@ -435,56 +416,39 @@ static void text_block_measure( struct xaml_element *element, struct layout_cont
+ {
+     struct text_block *impl = impl_from_element( element );
+     const Thickness *p = &impl->padding;
+-    UINT32 len;
+-    const WCHAR *text = WindowsGetStringRawBuffer( impl->text, &len );
+-    RECT rect = { 0, 0, lroundf( max( 0.0f, avail_width - p->Left - p->Right ) * ctx->scale ), 0 };
+-    HFONT font = text_block_create_font( impl, ctx->scale ), old;
+-
+-    old = SelectObject( ctx->hdc, font );
+-    if (len) DrawTextW( ctx->hdc, text, len, &rect, text_block_draw_flags( impl ) | DT_CALCRECT );
+-    else
+-    {
+-        TEXTMETRICW tm;
+-        GetTextMetricsW( ctx->hdc, &tm );
+-        rect.right = 0;
+-        rect.bottom = tm.tmHeight;
+-    }
+-    SelectObject( ctx->hdc, old );
+-    DeleteObject( font );
++    struct text_format format;
+ 
+-    *width = rect.right / ctx->scale + p->Left + p->Right;
+-    *height = rect.bottom / ctx->scale + p->Top + p->Bottom;
++    text_block_format( impl, &format );
++    text_measure( ctx, &format, impl->text, max( 0.0f, avail_width - p->Left - p->Right ), width, height );
++    *width += p->Left + p->Right;
++    *height += p->Top + p->Bottom;
+ }
+ 
+-static void text_block_render( struct xaml_element *element, struct layout_context *ctx, const RECT *bounds )
++static void text_block_render( struct xaml_element *element, struct layout_context *ctx )
+ {
+     struct text_block *impl = impl_from_element( element );
+     const Thickness *p = &impl->padding;
++    struct layout_rect rect = element->bounds;
++    struct text_format format;
+     COLORREF color = ctx->foreground;
+-    UINT32 len;
+-    const WCHAR *text = WindowsGetStringRawBuffer( impl->text, &len );
+-    RECT rect = *bounds;
+-    HFONT font, old;
+     Color c;
+ 
+-    if (!len) return;
+     if (impl->foreground)
+     {
+         if (!brush_get_color( impl->foreground, &c ) || !c.A) return;
+         color = RGB( c.R, c.G, c.B );
+     }
+-    rect.left += lround( p->Left * ctx->scale );
+-    rect.top += lround( p->Top * ctx->scale );
+-    rect.right -= lround( p->Right * ctx->scale );
+-    rect.bottom -= lround( p->Bottom * ctx->scale );
++    rect.x += p->Left;
++    rect.y += p->Top;
++    rect.width = max( 0.0f, rect.width - p->Left - p->Right );
++    rect.height = max( 0.0f, rect.height - p->Top - p->Bottom );
++    text_block_format( impl, &format );
++    text_draw( ctx, &format, impl->text, &rect, color );
++}
+ 
+-    font = text_block_create_font( impl, ctx->scale );
+-    old = SelectObject( ctx->hdc, font );
+-    SetTextColor( ctx->hdc, color );
+-    SetBkMode( ctx->hdc, TRANSPARENT );
+-    DrawTextW( ctx->hdc, text, len, &rect, text_block_draw_flags( impl ) | DT_NOCLIP );
+-    SelectObject( ctx->hdc, old );
+-    DeleteObject( font );
++static BOOL text_block_hit_self( struct xaml_element *element, float x, float y )
++{
++    return TRUE;
+ }
+ 
+ static void text_block_destroy( struct xaml_element *element )
+@@ -498,10 +462,11 @@ static void text_block_destroy( struct xaml_element *element )
+ 
+ static const struct element_ops text_block_ops =
+ {
+-    text_block_query_interface,
+-    text_block_measure,
+-    text_block_render,
+-    text_block_destroy,
++    .query_interface = text_block_query_interface,
++    .measure = text_block_measure,
++    .render = text_block_render,
++    .hit_self = text_block_hit_self,
++    .destroy = text_block_destroy,
+ };
+ 
+ static HRESULT text_block_create( IInspectable **out )
+@@ -509,7 +474,7 @@ static HRESULT text_block_create( IInspectable **out )
+     struct text_block *impl;
+ 
+     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+-    element_init( &impl->element, &text_block_ops, RuntimeClass_Windows_UI_Xaml_Controls_TextBlock );
++    element_init( &impl->element, &text_block_ops, RuntimeClass_Windows_UI_Xaml_Controls_TextBlock, NULL );
+     impl->ITextBlock_iface.lpVtbl = &text_block_iface_vtbl;
+     impl->font_size = 14.0;
+     impl->font_weight.Weight = 400;
+diff --git a/dlls/windows.ui.xaml/window.c b/dlls/windows.ui.xaml/window.c
+index 8d12620..b9852e9 100644
+--- a/dlls/windows.ui.xaml/window.c
++++ b/dlls/windows.ui.xaml/window.c
+@@ -32,6 +32,9 @@ struct xaml_window
+     HWND hwnd;
+     WNDPROC old_proc;
+     IUIElement *content;
++    struct xaml_element *hover;     /* element under the pointer that takes pointer input (referenced) */
++    struct xaml_element *captured;  /* element that got the button press (referenced) */
++    BOOL tracking;
+     struct event_list activated, closed, size_changed, visibility_changed;
+ };
+ 
+@@ -58,9 +61,27 @@ void window_invalidate(void)
+     if (current_window && current_window->hwnd) InvalidateRect( current_window->hwnd, NULL, FALSE );
+ }
+ 
++static void window_layout( struct xaml_window *window, struct layout_context *ctx, HDC hdc )
++{
++    struct xaml_element *element;
++    RECT client;
++    float width, height;
++
++    GetClientRect( window->hwnd, &client );
++    ctx->hdc = hdc;
++    ctx->scale = view_scale();
++    ctx->dark = application_theme() == ApplicationTheme_Dark;
++    ctx->foreground = ctx->dark ? RGB(255, 255, 255) : RGB(0, 0, 0);
++    if (!window->content || !(element = element_from_iinspectable( (IInspectable *)window->content ))) return;
++
++    width = client.right / ctx->scale;
++    height = client.bottom / ctx->scale;
++    element_measure( element, ctx, width, height );
++    element_arrange( element, ctx, 0, 0, width, height );
++}
++
+ static void window_paint( struct xaml_window *window )
+ {
+-    BOOL dark = application_theme() == ApplicationTheme_Dark;
+     struct xaml_element *element;
+     struct layout_context ctx;
+     PAINTSTRUCT ps;
+@@ -75,17 +96,12 @@ static void window_paint( struct xaml_window *window )
+     bitmap = CreateCompatibleBitmap( hdc, max( 1, client.right ), max( 1, client.bottom ) );
+     old = SelectObject( mem, bitmap );
+ 
+-    background = CreateSolidBrush( dark ? RGB(0, 0, 0) : RGB(255, 255, 255) );
++    window_layout( window, &ctx, mem );
++    background = CreateSolidBrush( ctx.dark ? RGB(0, 0, 0) : RGB(255, 255, 255) );
+     FillRect( mem, &client, background );
+     DeleteObject( background );
+-
+     if (window->content && (element = element_from_iinspectable( (IInspectable *)window->content )))
+-    {
+-        ctx.hdc = mem;
+-        ctx.scale = view_scale();
+-        ctx.foreground = dark ? RGB(255, 255, 255) : RGB(0, 0, 0);
+-        element_layout_and_render( element, &ctx, &client );
+-    }
++        element_render( element, &ctx );
+ 
+     BitBlt( hdc, 0, 0, client.right, client.bottom, mem, 0, 0, SRCCOPY );
+     SelectObject( mem, old );
+@@ -94,6 +110,68 @@ static void window_paint( struct xaml_window *window )
+     EndPaint( window->hwnd, &ps );
+ }
+ 
++static void set_element_ref( struct xaml_element **slot, struct xaml_element *element )
++{
++    if (element) IUIElement_AddRef( &element->IUIElement_iface );
++    if (*slot) IUIElement_Release( &(*slot)->IUIElement_iface );
++    *slot = element;
++}
++
++/* the element that should get pointer input at x,y: the deepest hit element or its nearest ancestor that takes it */
++static struct xaml_element *pointer_target( struct xaml_window *window, float x, float y )
++{
++    struct xaml_element *element;
++
++    if (!window->content || !(element = element_from_iinspectable( (IInspectable *)window->content ))) return NULL;
++    for (element = element_hit_test( element, x, y ); element; element = element->parent)
++        if (element->ops->pointer) return element;
++    return NULL;
++}
++
++static void window_pointer( struct xaml_window *window, UINT msg, LPARAM lparam )
++{
++    float scale = view_scale(), x = (short)LOWORD( lparam ) / scale, y = (short)HIWORD( lparam ) / scale;
++    struct xaml_element *target = msg == WM_MOUSELEAVE ? NULL : pointer_target( window, x, y );
++
++    if (msg == WM_MOUSEMOVE && !window->tracking)
++    {
++        TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, window->hwnd, 0 };
++        window->tracking = TrackMouseEvent( &tme );
++    }
++    if (msg == WM_MOUSELEAVE) window->tracking = FALSE;
++
++    if (target != window->hover)
++    {
++        if (window->hover) window->hover->ops->pointer( window->hover, WM_MOUSELEAVE, x, y );
++        set_element_ref( &window->hover, target );
++        if (target) TRACE( "pointer over %s.\n", debugstr_w(target->class_name) );
++    }
++
++    switch (msg)
++    {
++    case WM_MOUSEMOVE:
++        if (window->captured) window->captured->ops->pointer( window->captured, WM_MOUSEMOVE, x, y );
++        if (target && target != window->captured) target->ops->pointer( target, WM_MOUSEMOVE, x, y );
++        break;
++    case WM_LBUTTONDOWN:
++        if (!target) break;
++        set_element_ref( &window->captured, target );
++        SetCapture( window->hwnd );
++        target->ops->pointer( target, WM_LBUTTONDOWN, x, y );
++        break;
++    case WM_LBUTTONUP:
++        if ((target = window->captured))
++        {
++            IUIElement_AddRef( &target->IUIElement_iface );
++            set_element_ref( &window->captured, NULL );
++            if (GetCapture() == window->hwnd) ReleaseCapture();
++            target->ops->pointer( target, WM_LBUTTONUP, x, y );  /* may run app code (Click) */
++            IUIElement_Release( &target->IUIElement_iface );
++        }
++        break;
++    }
++}
++
+ static LRESULT CALLBACK window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
+ {
+     struct xaml_window *window = current_window;
+@@ -110,6 +188,21 @@ static LRESULT CALLBACK window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM
+     case WM_SIZE:
+         InvalidateRect( hwnd, NULL, FALSE );
+         break;
++    case WM_MOUSEMOVE:
++    case WM_LBUTTONDOWN:
++    case WM_LBUTTONUP:
++    case WM_MOUSELEAVE:
++        window_pointer( window, msg, lparam );
++        break;
++    case WM_CAPTURECHANGED:
++        if (window->captured && (HWND)lparam != hwnd)
++        {
++            struct xaml_element *element = window->captured;
++            window->captured = NULL;
++            element->ops->pointer( element, WM_CAPTURECHANGED, 0, 0 );
++            IUIElement_Release( &element->IUIElement_iface );
++        }
++        break;
+     }
+     return CallWindowProcW( window->old_proc, hwnd, msg, wparam, lparam );
+ }
+@@ -160,6 +253,8 @@ static ULONG WINAPI window_Release( IWindow *iface )
+         if (impl->hwnd && impl->old_proc && IsWindow( impl->hwnd ))
+             SetWindowLongPtrW( impl->hwnd, GWLP_WNDPROC, (LONG_PTR)impl->old_proc );
+         if (impl->content) IUIElement_Release( impl->content );
++        set_element_ref( &impl->hover, NULL );
++        set_element_ref( &impl->captured, NULL );
+         event_list_clear( &impl->activated );
+         event_list_clear( &impl->closed );
+         event_list_clear( &impl->size_changed );

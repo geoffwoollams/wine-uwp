@@ -13,6 +13,10 @@ patches/wine/0014 was made with --have pointing at a wine-11.0 + 0001-0013 inclu
 Windows.UI.Xaml.Application Windows.UI.Xaml.ApplicationInitializationCallbackParams Windows.UI.Xaml.Window
 Windows.UI.Xaml.UIElement Windows.UI.Xaml.FrameworkElement Windows.UI.Xaml.Controls.TextBlock
 Windows.UI.Xaml.Media.Brush Windows.UI.Xaml.Media.SolidColorBrush; the output's first lines list the imports it needs.
+patches/wine/0017 is the extra output, with --have pointing at a tree that has 0014 applied, of those types plus
+Windows.UI.Xaml.Controls.Panel StackPanel Grid Border Button Primitives.ButtonBase ContentControl Control
+UIElementCollection RowDefinition ColumnDefinition RowDefinitionCollection ColumnDefinitionCollection and
+Windows.UI.Xaml.RoutedEventArgs (each with its full namespace).
 """
 import struct, sys, collections
 
