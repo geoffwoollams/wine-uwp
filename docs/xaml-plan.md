@@ -152,3 +152,45 @@ Out of scope for milestone 1: layout beyond a single content element, any input 
 - Fonts: XAML asks for "Segoe UI"; without it installed, GDI substitutes a sans-serif face, so metrics differ from Windows.
 - Only fresh prefixes were tested. An existing prefix gets the new class registrations when Wine updates it on the next start (`wine.inf` changes on install), or after `wineboot -u`.
 - Found in passing, since fixed: the host's `ICoreWindowInterop` (and the dxgi/DXVK patches that call it) used an IInspectable-shaped vtable with `get_WindowHandle` at slot 6. The real interface derives from IUnknown (slot 3), so third-party code using the real layout would have called the wrong method. Patches 0002 and 0004 and the DXVK patch now use the IUnknown layout. XAML finds the HWND by window class, so it never depended on this.
+
+## 8. Milestone 2: layout, panels, Border, Button and pointer input (patches 0017-0018)
+
+**What was built:**
+
+- **0017 include:** a further ~1,400 lines of generated IDL. It covers `Controls.Panel`, `StackPanel`, `Grid`, `Border`, `Button`, `Primitives.ButtonBase`, `ContentControl`, `Control`, `UIElementCollection`, `RowDefinition`/`ColumnDefinition` and their collections, and `RoutedEventArgs`. All 252 interface IIDs in the regenerated header match `Windows.winmd`.
+- **0018 windows.ui.xaml:**
+  - Every element can now be aggregated: the public interfaces delegate to an outer object, with a non-delegating inner. The composable factories (`IGridFactory`, `IStackPanelFactory`, `IButtonFactory`) accept an outer object, which `Page`/`UserControl` subclasses will need in milestone 3.
+  - Layout is a real two-pass `Measure`/`Arrange` over a retained tree with parent links. It handles `Width`/`Height`, `Margin`, alignment and `Visibility.Collapsed`, and reports `ActualWidth`/`ActualHeight`, `DesiredSize` and `RenderSize`.
+  - New elements:
+    - `StackPanel`: vertical and horizontal.
+    - `Grid`: Pixel, Auto and Star rows and columns, weighted stars, `Row`/`Column`/`RowSpan`/`ColumnSpan` through `IGridStatics`, and `ActualHeight`/`ActualWidth` on the definitions. Stars share the available space, but the Grid's desired size is its content, as in Windows.
+    - `Border`: background, border, padding, child.
+    - `Button`: string or element content, the Windows 10 light/dark Normal/PointerOver/Pressed/Disabled looks, padding 8,4,8,5, a 2 px border, `ClickMode`, `IsEnabled`, `IsPointerOver`/`IsPressed`, and `Click` with `RoutedEventArgs.OriginalSource`.
+  - `Panel.Children` and the row/column collections share one `IVector`/`IVectorView`/`IIterable`/`IIterator` implementation. An element can't be added to two parents, and removing an element clears its `Parent`.
+  - Pointer input is hit-tested through the tree, honouring `IsHitTestVisible` and panel backgrounds. Hover uses `WM_MOUSELEAVE` tracking; a press captures the button and the release decides the click.
+
+**Deviations from the ladder:**
+
+- Rendering is still GDI. The move to Direct2D/DirectWrite (anti-aliased geometry, transforms, `Opacity`, rounded corners) is now its own step before milestone 4, where templates first need it.
+- The dependency-property store is still typed fields on each object, with change invalidation, not a `DependencyProperty`/`GetValue`/`SetValue` system. Markup (milestone 3) and styles (milestone 4) are where a generic store pays off, so it moves there.
+
+**Tests** (fresh scratch prefix):
+
+- `tests/xaml/xamllayout.c`, **34/34 checks pass**. It builds a Grid (`*`/`2*` columns, Auto/`*` rows) holding a StackPanel of TextBlocks and two Buttons, a blue Border with a child, and a green Border spanning both columns. It checks:
+  - every arranged size: two-thirds column, Auto row equal to the StackPanel plus its margin, star row taking the rest, button height 32, StackPanel width
+  - drawn colours: borders, button `#cccccc`, a hover border of 2 px `#999999`, a pressed background of `#999999`
+  - Click on release only, with the right sender and source, and that the handler's text change is re-measured
+  - no click when the release is outside the button, or on a disabled button
+  - the Children collection: size, iteration, `Parent`, the second-parent refusal, removing and re-adding
+- `xamlhello` (milestone 1) still passes 34/34.
+- Halo Wars 2, 90 s windowed: normal render loop. Its binaries don't reference Windows.UI.Xaml at all; the only log differences from v1.0 were two lines of run-to-run noise in its startup (a thread-start race and the order of its first `PropertyValue` lookups).
+
+**Still missing**, for milestone 3 and later:
+
+- No keyboard input or focus (Tab, Space/Enter on a button).
+- No `TextBox`, `ScrollViewer` or clipping: content larger than its slot is drawn past it.
+- Grid `RowSpacing`/`ColumnSpacing` (`IGrid3`) and Grid/StackPanel border properties (`IGrid2`, `IStackPanel2`) aren't implemented; querying for those interfaces fails.
+- `Border.CornerRadius` is drawn square.
+- Hover and pressed colours assume the page background is the theme's (the real brushes are translucent).
+- `PointerPressed`/`Tapped` and other `UIElement` routed events aren't raised; only `Button.Click` is.
+- Still no XAML markup, so Visual Studio-built apps stop at `LoadComponent` as before.

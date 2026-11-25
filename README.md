@@ -74,9 +74,11 @@ Wine has no `Windows.UI.Xaml`, the UI framework most non-game UWP apps are built
 
 **Milestone 1 (done): code-only XAML apps.** `Application.Start`, an app's own `App` class deriving from `Application` (with `OnLaunched` called on launch), `Application.Current`, `RequestedTheme` (light or dark background), `Window.Current` (`Content`, `Activate`, `Bounds`, `Dispatcher`, `Close`), and a `TextBlock` (`Text`, `FontSize`, `FontWeight`, `FontStyle`, `Foreground`, `TextWrapping`, `TextAlignment`, `Padding`) with `Margin`, `Width`/`Height` and alignment, drawn in the CoreWindow. Brushes are `SolidColorBrush` only. Rendering is GDI, so text is anti-aliased but there are no transforms or opacity yet.
 
-**Not yet:** XAML markup. Every app built with Visual Studio loads `App.xbf` and page `.xbf` files at startup, which milestone 3 adds; until then such an app stops with `FIXME ... XAML markup (.xbf) is not supported yet` in the log. Panels (`Grid`, `StackPanel`), `Button` and input are milestone 2.
+**Milestone 2 (done): layout and buttons.** Measure/arrange layout with `StackPanel`, `Grid` (Auto, pixel and star rows and columns, spans), `Border`, and `Button` with the Windows 10 look, hover and pressed states, and `Click` from the mouse. Elements can be subclassed by apps (aggregation), and `Panel.Children` and Grid row/column definitions are real collections.
 
-To try it, build the test client and run it in a throwaway prefix (it opens a window for a few seconds and checks what was drawn):
+**Not yet:** XAML markup. Every app built with Visual Studio loads `App.xbf` and page `.xbf` files at startup, which milestone 3 adds; until then such an app stops with `FIXME ... XAML markup (.xbf) is not supported yet` in the log. Keyboard input and focus, `TextBox`, scrolling and templates come later.
+
+To try it, build the test clients and run them in a throwaway prefix (each opens a window for a few seconds and checks what was drawn):
 
 ```bash
 tests/xaml/build.sh
@@ -163,12 +165,12 @@ This is not legal advice. The LGPL requires that anyone who gets the binaries ca
 patches/wine/   patches against the wine-11.0 tag (apply in order with git apply): 0001-0007 the UWP host and
                 services, 0008 CurrentApp, 0009 DisplayRequest, 0010 GameSaveProvider, 0011 class registration,
                 0012 no hard-coded Store ID, 0013-0016 Windows.UI.Xaml milestone 1 (widl fix, generated IDL,
-                ProcessUntilQuit, the XAML code)
+                ProcessUntilQuit, the XAML code), 0017-0018 milestone 2 (IDL, layout, panels, Button)
 patches/dxvk/   patch against DXVK f90f1bf1 (v3.1.1-235)
 docker/         build containers
 apps/           optional per-app settings
 scripts/        fetch-release.sh, build-wine.sh, build-dxvk.sh, setup-prefix.sh, run-app.sh,
                 package-release.sh, uwptool.py, winmd2idl.py (WinRT IDL from Windows metadata)
-tests/xaml/     the XAML test client (build.sh, run.sh)
+tests/xaml/     the XAML test clients (build.sh, run.sh): xamlhello (milestone 1), xamllayout (milestone 2)
 docs/           xaml-plan.md
 ```
