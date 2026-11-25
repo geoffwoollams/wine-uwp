@@ -16,7 +16,7 @@ UWP apps don't create a normal Win32 window. They ask Windows for a `CoreApplica
 |---|---|
 | Halo Wars 2 (`Microsoft.HoganThreshold`, D3D12) | Playable offline: videos, menus, skirmish, native-resolution fullscreen, mouse and keyboard, settings and local saves. See [the example](#example-halo-wars-2). |
 
-Other native C++ UWP apps may work; many will need WinRT classes this project doesn't have yet. XAML apps (anything using `Windows.UI.Xaml`) do not work yet: Wine has no XAML implementation. [docs/xaml-plan.md](docs/xaml-plan.md) lays out a staged plan for one. Reports and patches are welcome.
+Other native C++ UWP apps may work; many will need WinRT classes this project doesn't have yet. Real XAML apps (anything built with `Windows.UI.Xaml` pages and markup) do not work yet; see [XAML apps](#xaml-apps). Reports and patches are welcome.
 
 ## Quick start: prebuilt release
 
@@ -67,6 +67,24 @@ scripts/run-app.sh Microsoft.HoganThreshold
 ```
 
 Everything lives under `~/.local/share/wine-uwp/` (the prefix and logs) and the repo's `build/` folder. Delete those to uninstall.
+
+## XAML apps
+
+Wine has no `Windows.UI.Xaml`, the UI framework most non-game UWP apps are built on. This project is adding it in stages; [docs/xaml-plan.md](docs/xaml-plan.md) has the plan, the evidence behind it and estimates.
+
+**Milestone 1 (done): code-only XAML apps.** `Application.Start`, an app's own `App` class deriving from `Application` (with `OnLaunched` called on launch), `Application.Current`, `RequestedTheme` (light or dark background), `Window.Current` (`Content`, `Activate`, `Bounds`, `Dispatcher`, `Close`), and a `TextBlock` (`Text`, `FontSize`, `FontWeight`, `FontStyle`, `Foreground`, `TextWrapping`, `TextAlignment`, `Padding`) with `Margin`, `Width`/`Height` and alignment, drawn in the CoreWindow. Brushes are `SolidColorBrush` only. Rendering is GDI, so text is anti-aliased but there are no transforms or opacity yet.
+
+**Not yet:** XAML markup. Every app built with Visual Studio loads `App.xbf` and page `.xbf` files at startup, which milestone 3 adds; until then such an app stops with `FIXME ... XAML markup (.xbf) is not supported yet` in the log. Panels (`Grid`, `StackPanel`), `Button` and input are milestone 2.
+
+To try it, build the test client and run it in a throwaway prefix (it opens a window for a few seconds and checks what was drawn):
+
+```bash
+tests/xaml/build.sh
+```
+
+```bash
+tests/xaml/run.sh
+```
 
 ## Options
 
@@ -144,10 +162,13 @@ This is not legal advice. The LGPL requires that anyone who gets the binaries ca
 ```
 patches/wine/   patches against the wine-11.0 tag (apply in order with git apply): 0001-0007 the UWP host and
                 services, 0008 CurrentApp, 0009 DisplayRequest, 0010 GameSaveProvider, 0011 class registration,
-                0012 no hard-coded Store ID
+                0012 no hard-coded Store ID, 0013-0016 Windows.UI.Xaml milestone 1 (widl fix, generated IDL,
+                ProcessUntilQuit, the XAML code)
 patches/dxvk/   patch against DXVK f90f1bf1 (v3.1.1-235)
 docker/         build containers
 apps/           optional per-app settings
 scripts/        fetch-release.sh, build-wine.sh, build-dxvk.sh, setup-prefix.sh, run-app.sh,
-                package-release.sh, uwptool.py
+                package-release.sh, uwptool.py, winmd2idl.py (WinRT IDL from Windows metadata)
+tests/xaml/     the XAML test client (build.sh, run.sh)
+docs/           xaml-plan.md
 ```
