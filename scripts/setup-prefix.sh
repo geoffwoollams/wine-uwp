@@ -49,6 +49,8 @@ for dll in wintypes windows.storage; do   # Wine PE builds: copied so they load 
     python3 -I "$REPO/scripts/uwptool.py" native-copy "$WINEDLL_DIR/$dll.dll" "$SYS32/$dll.dll"
 done
 cp "$DXVK_DXGI" "$SYS32/dxgi.dll"
+# a prefix made by an older build lacks classes our patches register (msxml6: FreeThreadedXMLHTTP60, for Xbox Live)
+wine regsvr32 /s msxml6.dll >/dev/null 2>&1 || echo "warning: could not register msxml6.dll" >&2
 
 APP="$PREFIX/drive_c/$APPS_DIR_NAME/$PKG_NAME"
 info "Linking the package into C:\\$APPS_DIR_NAME\\$PKG_NAME"

@@ -1,0 +1,1263 @@
+Subject: combase, msxml6, twinapi.appcore: IContextCallback::ContextCallback, FreeThreadedXMLHTTP60 registration,
+ XboxLiveDeviceAddress, PointerDevice, GetIntermediatePoints and PointerCursor (Gears of War 4 campaign and mouse)
+
+diff --git a/dlls/combase/apartment.c b/dlls/combase/apartment.c
+index 85e06a6..cc10374 100644
+--- a/dlls/combase/apartment.c
++++ b/dlls/combase/apartment.c
+@@ -1116,6 +1116,9 @@ static LRESULT CALLBACK apartment_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LP
+         return 0;
+     case DM_HOSTOBJECT:
+         return apartment_hostobject(com_get_current_apt(), (const struct host_object_params *)lParam);
++    case DM_CONTEXTCALL:
++        context_call_execute((struct context_call *)lParam);
++        return 0;
+     default:
+         return DefWindowProcW(hWnd, msg, wParam, lParam);
+     }
+diff --git a/dlls/combase/combase.c b/dlls/combase/combase.c
+index 34a9a42..b91bfa2 100644
+--- a/dlls/combase/combase.c
++++ b/dlls/combase/combase.c
+@@ -2443,6 +2443,7 @@ struct thread_context
+     IContextCallback IContextCallback_iface;
+     IObjContext IObjContext_iface;
+     LONG refcount;
++    DWORD tid;   /* the thread whose context this is */
+ };
+ 
+ static inline struct thread_context *impl_from_IComThreadingInfo(IComThreadingInfo *iface)
+@@ -2588,12 +2589,81 @@ static ULONG WINAPI thread_context_callback_Release(IContextCallback *iface)
+     return IComThreadingInfo_Release(&context->IComThreadingInfo_iface);
+ }
+ 
++/* A callback to run in another thread's context: an STA runs it from its apartment window, as it does incoming
++ * calls; the MTA runs it on a thread-pool thread. The caller waits, pumping messages when it is in an STA itself. */
++struct context_call
++{
++    PFNCONTEXTCALL callback;
++    ComCallData *param;
++    HRESULT hr;
++    HANDLE done;
++};
++
++void context_call_execute(struct context_call *call)
++{
++    call->hr = call->callback(call->param);
++    SetEvent(call->done);
++}
++
++static void CALLBACK context_call_mta(TP_CALLBACK_INSTANCE *instance, void *arg)
++{
++    context_call_execute(arg);
++}
++
+ static HRESULT WINAPI thread_context_callback_ContextCallback(IContextCallback *iface,
+         PFNCONTEXTCALL callback, ComCallData *param, REFIID riid, int method, IUnknown *punk)
+ {
+-    FIXME("%p, %p, %p, %s, %d, %p\n", iface, callback, param, debugstr_guid(riid), method, punk);
++    struct thread_context *context = impl_from_IContextCallback(iface);
++    struct apartment *target, *current = com_get_current_apt();
++    struct context_call call = { callback, param, E_FAIL };
++    DWORD index;
++    HWND hwnd;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p, %p, %s, %d, %p\n", iface, callback, param, debugstr_guid(riid), method, punk);
++
++    if (!callback) return E_INVALIDARG;
++    if (context->tid == GetCurrentThreadId())
++        return callback(param);
++
++    /* no apartment, or a multi-threaded one, means the MTA (apartment_findfromtid() can return an MTA other
++     * than the current one, such as one that thread created after the first was released) */
++    if ((target = apartment_findfromtid(context->tid)) && target->multi_threaded)
++    {
++        apartment_release(target);
++        target = NULL;
++    }
++    if (!target && (!current || current->multi_threaded))
++        return callback(param);
++
++    if (!(call.done = CreateEventW(NULL, TRUE, FALSE, NULL)))
++    {
++        if (target) apartment_release(target);
++        return HRESULT_FROM_WIN32(GetLastError());
++    }
++    if (target)
++    {
++        hwnd = apartment_getwindow(target);
++        apartment_release(target);
++        if (!hwnd || !PostMessageW(hwnd, DM_CONTEXTCALL, 0, (LPARAM)&call))
++        {
++            WARN("no window for the apartment of thread %04lx.\n", context->tid);
++            CloseHandle(call.done);
++            return RPC_E_DISCONNECTED;
++        }
++    }
++    else if (!TrySubmitThreadpoolCallback(context_call_mta, &call, NULL))
++    {
++        CloseHandle(call.done);
++        return HRESULT_FROM_WIN32(GetLastError());
++    }
++
++    if (current && !current->multi_threaded)
++        hr = CoWaitForMultipleHandles(0, INFINITE, 1, &call.done, &index);
++    else
++        hr = WaitForSingleObject(call.done, INFINITE) == WAIT_OBJECT_0 ? S_OK : HRESULT_FROM_WIN32(GetLastError());
++    CloseHandle(call.done);
++    return FAILED(hr) ? hr : call.hr;
+ }
+ 
+ static const IContextCallbackVtbl thread_context_callback_vtbl =
+@@ -2739,6 +2809,7 @@ HRESULT WINAPI CoGetContextToken(ULONG_PTR *token)
+         /* Context token does not take a reference, it's always zero until the
+            interface is explicitly requested with CoGetObjectContext(). */
+         context->refcount = 0;
++        context->tid = GetCurrentThreadId();
+ 
+         tlsdata->context_token = &context->IObjContext_iface;
+     }
+diff --git a/dlls/combase/combase_private.h b/dlls/combase/combase_private.h
+index ca79356..7c30edc 100644
+--- a/dlls/combase/combase_private.h
++++ b/dlls/combase/combase_private.h
+@@ -59,6 +59,10 @@ HRESULT open_appidkey_from_clsid(REFCLSID clsid, REGSAM access, HKEY *subkey);
+ /* DCOM messages used by the apartment window (not compatible with native) */
+ #define DM_EXECUTERPC   (WM_USER + 0) /* WPARAM = 0, LPARAM = (struct dispatch_params *) */
+ #define DM_HOSTOBJECT   (WM_USER + 1) /* WPARAM = 0, LPARAM = (struct host_object_params *) */
++#define DM_CONTEXTCALL  (WM_USER + 2) /* WPARAM = 0, LPARAM = (struct context_call *) */
++
++struct context_call;
++void context_call_execute(struct context_call *call);
+ 
+ #define CHARS_IN_GUID 39
+ 
+diff --git a/dlls/msxml6/Makefile.in b/dlls/msxml6/Makefile.in
+index d3b7ccc..4fde38c 100644
+--- a/dlls/msxml6/Makefile.in
++++ b/dlls/msxml6/Makefile.in
+@@ -2,5 +2,6 @@ MODULE    = msxml6.dll
+ IMPORTS   = oleaut32 ole32 advapi32
+ 
+ SOURCES = \
++	msxml6_classes.idl \
+ 	msxml6_tlb.idl \
+ 	rsrc.rc
+diff --git a/dlls/msxml6/msxml6_classes.idl b/dlls/msxml6/msxml6_classes.idl
+new file mode 100644
+index 0000000..e77a51a
+--- /dev/null
++++ b/dlls/msxml6/msxml6_classes.idl
+@@ -0,0 +1,35 @@
++/*
++ * COM classes for msxml6
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/* FreeThreadedXMLHTTP60 is declared outside the type library in msxml6.idl, so the type library's registration
++ * leaves it out; it is registered here. Xbox Live services create it with CoCreateInstance for their web
++ * requests (IXMLHTTPRequest2). */
++
++#pragma makedep register
++
++import "unknwn.idl";
++
++[
++    helpstring("Free Threaded XML HTTP Request class 6.0"),
++    progid("Msxml2.FreeThreadedXMLHTTP60.6.0"),
++    threading(both),
++    uuid(88d96a09-f192-11d4-a65f-0040963251e5)
++]
++coclass FreeThreadedXMLHTTP60 { interface IUnknown; }
+diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
+index 868841e..5ab2083 100644
+--- a/dlls/twinapi.appcore/Makefile.in
++++ b/dlls/twinapi.appcore/Makefile.in
+@@ -16,6 +16,7 @@ SOURCES = \
+ 	sink.c \
+ 	store.c \
+ 	xbox_identity.c \
++	xboxlive_address.c \
+ 	user_gen.c \
+ 	user_statics.c \
+ 	strmap_gen.c \
+diff --git a/dlls/twinapi.appcore/core_gen.c b/dlls/twinapi.appcore/core_gen.c
+index fbf8b46..8dd2cb7 100644
+--- a/dlls/twinapi.appcore/core_gen.c
++++ b/dlls/twinapi.appcore/core_gen.c
+@@ -57,6 +57,8 @@ struct core_window
+     LONG ref;
+     struct core_dispatcher *dispatcher;
+     HWND hwnd;
++    __x_ABI_CWindows_CUI_CCore_CICoreCursor *cursor;   /* PointerCursor: NULL hides the cursor */
++    HCURSOR hcursor;
+ };
+ 
+ struct core_view
+@@ -744,16 +746,44 @@ static HRESULT WINAPI core_window_put_IsInputEnabled(ICoreWindow *iface, boolean
+     return S_OK;
+ }
+ 
++#define WM_CORE_APPLY_CURSOR (WM_APP + 0x7c3)
++
++/* the system cursor for a CoreCursorType; a Custom cursor (a resource of the app) shows as the arrow */
++static HCURSOR cursor_for_type(int type)
++{
++    static const ULONG_PTR ids[] =
++    {
++        IDC_ARROW, IDC_CROSS, IDC_ARROW, IDC_HAND, IDC_HELP, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENESW,
++        IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IDC_NO, IDC_UPARROW, IDC_WAIT, IDC_HAND, IDC_HAND,   /* Pin and Person: no such system cursors in Wine */
++    };
++    return LoadCursorW(NULL, (const WCHAR *)(type >= 0 && type < ARRAY_SIZE(ids) ? ids[type] : (ULONG_PTR)IDC_ARROW));
++}
++
+ static HRESULT WINAPI core_window_get_PointerCursor(ICoreWindow *iface, __x_ABI_CWindows_CUI_CCore_CICoreCursor **value)
+ {
+-    struct core_window *impl __attribute__((unused)) = impl_from_core_window(iface);
+-    *value = NULL;
++    struct core_window *impl = impl_from_core_window(iface);
++    if ((*value = impl->cursor)) __x_ABI_CWindows_CUI_CCore_CICoreCursor_AddRef(*value);
+     return S_OK;
+ }
+ 
++/* Games set it to NULL to hide the cursor while they read relative motion from MouseDevice.MouseMoved. The
++ * window procedure shows impl->hcursor over the client area; the posted message applies it at once. */
+ static HRESULT WINAPI core_window_put_PointerCursor(ICoreWindow *iface, __x_ABI_CWindows_CUI_CCore_CICoreCursor *value)
+ {
+-    struct core_window *impl __attribute__((unused)) = impl_from_core_window(iface);
++    struct core_window *impl = impl_from_core_window(iface);
++    __x_ABI_CWindows_CUI_CCore_CICoreCursor *old = impl->cursor;
++    __x_ABI_CWindows_CUI_CCore_CCoreCursorType type = 0;
++
++    if (value)
++    {
++        __x_ABI_CWindows_CUI_CCore_CICoreCursor_AddRef(value);
++        __x_ABI_CWindows_CUI_CCore_CICoreCursor_get_Type(value, &type);
++    }
++    TRACE("iface %p, cursor %p, type %d.\n", iface, value, value ? (int)type : -1);
++    impl->cursor = value;
++    impl->hcursor = value ? cursor_for_type(type) : NULL;
++    if (old) __x_ABI_CWindows_CUI_CCore_CICoreCursor_Release(old);
++    if (impl->hwnd) PostMessageW(impl->hwnd, WM_CORE_APPLY_CURSOR, 0, 0);
+     return S_OK;
+ }
+ 
+@@ -1987,6 +2017,21 @@ static LRESULT CALLBACK core_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPA
+     case WM_INPUT:
+         mouse_device_raw_input((HRAWINPUT)lparam);
+         return DefWindowProcW(hwnd, msg, wparam, lparam);
++    case WM_SETCURSOR:
++        if (window && LOWORD(lparam) == HTCLIENT)
++        {
++            SetCursor(window->hcursor);
++            return TRUE;
++        }
++        break;
++    case WM_CORE_APPLY_CURSOR:
++        if (window)
++        {
++            POINT pt;
++            GetCursorPos(&pt);
++            if (WindowFromPoint(pt) == hwnd) SetCursor(window->hcursor);
++        }
++        return 0;
+     case WM_CLOSE:
+         FIXME("WM_CLOSE: posting quit.\n");
+         PostQuitMessage(0);
+@@ -2158,6 +2203,10 @@ static struct core_view *get_core_view(void)
+     window->ICoreWindow4_iface.lpVtbl = &core_window4_vtbl;
+     window->ref = 1;
+     window->dispatcher = dispatcher;
++    /* PointerCursor starts as the arrow, as on Windows */
++    core_cursor_init();
++    core_cursor_fac_CreateCursor(&core_cursor_factory_instance.ICoreCursorFactory_iface, 0, 0, &window->cursor);
++    window->hcursor = LoadCursorW(NULL, (const WCHAR *)IDC_ARROW);
+     view->ICoreApplicationView_iface.lpVtbl = &core_view_vtbl;
+     view->ICoreApplicationView2_iface.lpVtbl = &core_view2_vtbl;
+     view->ICoreApplicationView3_iface.lpVtbl = &core_view3_vtbl;
+diff --git a/dlls/twinapi.appcore/core_input_gen.c b/dlls/twinapi.appcore/core_input_gen.c
+index fcce577..e71eaf1 100644
+--- a/dlls/twinapi.appcore/core_input_gen.c
++++ b/dlls/twinapi.appcore/core_input_gen.c
+@@ -444,8 +444,7 @@ static HRESULT WINAPI ppoint_GetTrustLevel(IPointerPoint *iface, TrustLevel *lev
+ 
+ static HRESULT WINAPI ppoint_get_PointerDevice(IPointerPoint *iface, __x_ABI_CWindows_CDevices_CInput_CIPointerDevice **value)
+ {
+-    struct pointer_point *impl __attribute__((unused)) = impl_from_ppoint(iface);
+-    *value = NULL;
++    *value = mouse_pointer_device();   /* static; AddRef is a no-op */
+     return S_OK;
+ }
+ 
+@@ -729,14 +728,204 @@ static HRESULT WINAPI pargs_get_KeyModifiers(IPointerEventArgs *iface, __x_ABI_C
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI pargs_GetIntermediatePoints(IPointerEventArgs *iface, __FIVector_1_Windows__CUI__CInput__CPointerPoint **value)
++/* GetIntermediatePoints: the points merged into this event since the last one, oldest first, ending with
++ * CurrentPoint. Mouse messages arrive one at a time here, so the vector holds just the current point. Unreal
++ * Engine's UWP input reads every pointer event through it. */
++struct point_vector
+ {
+-    struct pointer_args *impl __attribute__((unused)) = impl_from_pargs(iface);
+-    FIXME("iface %p, value %p stub!\n", iface, value);
++    __FIVector_1_Windows__CUI__CInput__CPointerPoint IVector_iface;
++    LONG ref;
++    UINT32 count, capacity;
++    __x_ABI_CWindows_CUI_CInput_CIPointerPoint **points;
++};
++
++static inline struct point_vector *impl_from_point_vector(__FIVector_1_Windows__CUI__CInput__CPointerPoint *iface)
++{ return CONTAINING_RECORD(iface, struct point_vector, IVector_iface); }
++
++static HRESULT WINAPI pvec_QueryInterface(__FIVector_1_Windows__CUI__CInput__CPointerPoint *iface, REFIID iid, void **out)
++{
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) || IsEqualGUID(iid, &IID_IAgileObject) ||
++        IsEqualGUID(iid, &IID___FIVector_1_Windows__CUI__CInput__CPointerPoint))
++    {
++        *out = iface;
++        __FIVector_1_Windows__CUI__CInput__CPointerPoint_AddRef(iface);
++        return S_OK;
++    }
++    FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI pvec_AddRef(__FIVector_1_Windows__CUI__CInput__CPointerPoint *iface)
++{ return InterlockedIncrement(&impl_from_point_vector(iface)->ref); }
++
++static ULONG WINAPI pvec_Release(__FIVector_1_Windows__CUI__CInput__CPointerPoint *iface)
++{
++    struct point_vector *impl = impl_from_point_vector(iface);
++    ULONG ref = InterlockedDecrement(&impl->ref), i;
++    if (!ref)
++    {
++        for (i = 0; i < impl->count; i++) __x_ABI_CWindows_CUI_CInput_CIPointerPoint_Release(impl->points[i]);
++        free(impl->points);
++        free(impl);
++    }
++    return ref;
++}
++
++static HRESULT WINAPI pvec_GetIids(__FIVector_1_Windows__CUI__CInput__CPointerPoint *iface, ULONG *count, IID **iids)
++{ return E_NOTIMPL; }
++static HRESULT WINAPI pvec_GetRuntimeClassName(__FIVector_1_Windows__CUI__CInput__CPointerPoint *iface, HSTRING *name)
++{ return E_NOTIMPL; }
++static HRESULT WINAPI pvec_GetTrustLevel(__FIVector_1_Windows__CUI__CInput__CPointerPoint *iface, TrustLevel *level)
++{ *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI pvec_GetAt(__FIVector_1_Windows__CUI__CInput__CPointerPoint *iface, UINT32 index,
++                                 __x_ABI_CWindows_CUI_CInput_CIPointerPoint **value)
++{
++    struct point_vector *impl = impl_from_point_vector(iface);
++    *value = NULL;
++    if (index >= impl->count) return E_BOUNDS;
++    __x_ABI_CWindows_CUI_CInput_CIPointerPoint_AddRef((*value = impl->points[index]));
++    return S_OK;
++}
++
++static HRESULT WINAPI pvec_get_Size(__FIVector_1_Windows__CUI__CInput__CPointerPoint *iface, UINT32 *value)
++{
++    *value = impl_from_point_vector(iface)->count;
++    return S_OK;
++}
++
++static HRESULT WINAPI pvec_GetView(__FIVector_1_Windows__CUI__CInput__CPointerPoint *iface,
++                                   __FIVectorView_1_Windows__CUI__CInput__CPointerPoint **value)
++{
++    FIXME("iface %p, value %p: not implemented.\n", iface, value);
+     *value = NULL;
+     return E_NOTIMPL;
+ }
+ 
++static HRESULT WINAPI pvec_IndexOf(__FIVector_1_Windows__CUI__CInput__CPointerPoint *iface,
++                                   __x_ABI_CWindows_CUI_CInput_CIPointerPoint *element, UINT32 *index, boolean *found)
++{
++    struct point_vector *impl = impl_from_point_vector(iface);
++    for (*index = 0; *index < impl->count; (*index)++)
++        if (impl->points[*index] == element) return (*found = TRUE), S_OK;
++    *index = 0;
++    *found = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI pvec_SetAt(__FIVector_1_Windows__CUI__CInput__CPointerPoint *iface, UINT32 index,
++                                 __x_ABI_CWindows_CUI_CInput_CIPointerPoint *value)
++{
++    struct point_vector *impl = impl_from_point_vector(iface);
++    if (index >= impl->count) return E_BOUNDS;
++    __x_ABI_CWindows_CUI_CInput_CIPointerPoint_AddRef(value);
++    __x_ABI_CWindows_CUI_CInput_CIPointerPoint_Release(impl->points[index]);
++    impl->points[index] = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI pvec_InsertAt(__FIVector_1_Windows__CUI__CInput__CPointerPoint *iface, UINT32 index,
++                                    __x_ABI_CWindows_CUI_CInput_CIPointerPoint *value)
++{
++    struct point_vector *impl = impl_from_point_vector(iface);
++    __x_ABI_CWindows_CUI_CInput_CIPointerPoint **points;
++
++    if (index > impl->count) return E_BOUNDS;
++    if (impl->count == impl->capacity)
++    {
++        UINT32 capacity = max(4, impl->capacity * 2);
++        if (!(points = realloc(impl->points, capacity * sizeof(*points)))) return E_OUTOFMEMORY;
++        impl->points = points;
++        impl->capacity = capacity;
++    }
++    memmove(&impl->points[index + 1], &impl->points[index], (impl->count - index) * sizeof(*impl->points));
++    __x_ABI_CWindows_CUI_CInput_CIPointerPoint_AddRef((impl->points[index] = value));
++    impl->count++;
++    return S_OK;
++}
++
++static HRESULT WINAPI pvec_RemoveAt(__FIVector_1_Windows__CUI__CInput__CPointerPoint *iface, UINT32 index)
++{
++    struct point_vector *impl = impl_from_point_vector(iface);
++    if (index >= impl->count) return E_BOUNDS;
++    __x_ABI_CWindows_CUI_CInput_CIPointerPoint_Release(impl->points[index]);
++    impl->count--;
++    memmove(&impl->points[index], &impl->points[index + 1], (impl->count - index) * sizeof(*impl->points));
++    return S_OK;
++}
++
++static HRESULT WINAPI pvec_Append(__FIVector_1_Windows__CUI__CInput__CPointerPoint *iface,
++                                  __x_ABI_CWindows_CUI_CInput_CIPointerPoint *value)
++{ return pvec_InsertAt(iface, impl_from_point_vector(iface)->count, value); }
++
++static HRESULT WINAPI pvec_RemoveAtEnd(__FIVector_1_Windows__CUI__CInput__CPointerPoint *iface)
++{
++    struct point_vector *impl = impl_from_point_vector(iface);
++    if (!impl->count) return E_BOUNDS;
++    return pvec_RemoveAt(iface, impl->count - 1);
++}
++
++static HRESULT WINAPI pvec_Clear(__FIVector_1_Windows__CUI__CInput__CPointerPoint *iface)
++{
++    struct point_vector *impl = impl_from_point_vector(iface);
++    while (impl->count) __x_ABI_CWindows_CUI_CInput_CIPointerPoint_Release(impl->points[--impl->count]);
++    return S_OK;
++}
++
++static HRESULT WINAPI pvec_GetMany(__FIVector_1_Windows__CUI__CInput__CPointerPoint *iface, UINT32 start, UINT32 size,
++                                   __x_ABI_CWindows_CUI_CInput_CIPointerPoint **items, UINT32 *count)
++{
++    struct point_vector *impl = impl_from_point_vector(iface);
++    UINT32 i;
++    for (i = 0; i < size && start + i < impl->count; i++)
++        __x_ABI_CWindows_CUI_CInput_CIPointerPoint_AddRef((items[i] = impl->points[start + i]));
++    *count = i;
++    return S_OK;
++}
++
++static HRESULT WINAPI pvec_ReplaceAll(__FIVector_1_Windows__CUI__CInput__CPointerPoint *iface, UINT32 count,
++                                      __x_ABI_CWindows_CUI_CInput_CIPointerPoint **items)
++{
++    HRESULT hr = S_OK;
++    UINT32 i;
++    pvec_Clear(iface);
++    for (i = 0; i < count && SUCCEEDED(hr); i++) hr = pvec_Append(iface, items[i]);
++    return hr;
++}
++
++static const __FIVector_1_Windows__CUI__CInput__CPointerPointVtbl pvec_vtbl =
++{
++    pvec_QueryInterface, pvec_AddRef, pvec_Release,
++    pvec_GetIids, pvec_GetRuntimeClassName, pvec_GetTrustLevel,
++    pvec_GetAt, pvec_get_Size, pvec_GetView, pvec_IndexOf, pvec_SetAt, pvec_InsertAt,
++    pvec_RemoveAt, pvec_Append, pvec_RemoveAtEnd, pvec_Clear, pvec_GetMany, pvec_ReplaceAll,
++};
++
++static HRESULT WINAPI pargs_GetIntermediatePoints(IPointerEventArgs *iface, __FIVector_1_Windows__CUI__CInput__CPointerPoint **value)
++{
++    struct point_vector *vector;
++    __x_ABI_CWindows_CUI_CInput_CIPointerPoint *point;
++    HRESULT hr;
++
++    *value = NULL;
++    if (!(vector = calloc(1, sizeof(*vector)))) return E_OUTOFMEMORY;
++    vector->IVector_iface.lpVtbl = &pvec_vtbl;
++    vector->ref = 1;
++    if (SUCCEEDED(hr = pargs_get_CurrentPoint(iface, &point)))
++    {
++        hr = pvec_Append(&vector->IVector_iface, point);
++        __x_ABI_CWindows_CUI_CInput_CIPointerPoint_Release(point);
++    }
++    if (FAILED(hr))
++    {
++        pvec_Release(&vector->IVector_iface);
++        return hr;
++    }
++    *value = &vector->IVector_iface;
++    return S_OK;
++}
++
+ static const IPointerEventArgsVtbl pargs_vtbl =
+ {
+     pargs_QueryInterface,
+@@ -1109,6 +1298,8 @@ static __x_ABI_CWindows_CSystem_CVirtualKeyModifiers current_modifiers(void)
+ 
+ static void raise_pointer(ICoreWindow *sender, int ev, struct pointer_data *d)
+ {
++    static int warned;
++    HRESULT hr;
+     UINT32 i;
+ 
+     if (ev == EV_PPRESSED || ev == EV_PRELEASED)
+@@ -1122,8 +1313,9 @@ static void raise_pointer(ICoreWindow *sender, int ev, struct pointer_data *d)
+         args->ICoreWindowEventArgs_iface.lpVtbl = &pargs_cw_vtbl;
+         args->ref = 1;
+         args->d = *d;
+-        ITypedEventHandler_CoreWindow_PointerEventArgs_Invoke(
++        hr = ITypedEventHandler_CoreWindow_PointerEventArgs_Invoke(
+                 (ITypedEventHandler_CoreWindow_PointerEventArgs *)handlers[ev].h[i], sender, &args->IPointerEventArgs_iface);
++        if (FAILED(hr) && !warned++) WARN("pointer event %d: handler failed, hr %#lx.\n", ev, hr);
+         IPointerEventArgs_Release(&args->IPointerEventArgs_iface);
+     }
+ }
+diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
+index 5d2d8d6..2b4f62d 100644
+--- a/dlls/twinapi.appcore/main.c
++++ b/dlls/twinapi.appcore/main.c
+@@ -108,9 +108,15 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( core_window_factory, &IID_IActivationFactory, (void **)factory );
+     }
+ 
++    else if (!wcscmp( buffer, L"Windows.Devices.Input.PointerDevice" ))
++        IActivationFactory_QueryInterface( pointer_device_factory, &IID_IActivationFactory, (void **)factory );
++
+     else if (!wcscmp( buffer, L"Windows.Devices.Input.MouseDevice" ))
+         IActivationFactory_QueryInterface( mouse_device_factory, &IID_IActivationFactory, (void **)factory );
+ 
++    else if (!wcscmp( buffer, L"Windows.Networking.XboxLive.XboxLiveDeviceAddress" ))
++        IActivationFactory_QueryInterface( xboxlive_device_address_factory, &IID_IActivationFactory, (void **)factory );
++
+     else if (!wcscmp( buffer, L"Windows.UI.Popups.UICommand" ))
+         IActivationFactory_QueryInterface( ui_command_factory, &IID_IActivationFactory, (void **)factory );
+ 
+diff --git a/dlls/twinapi.appcore/mouse.c b/dlls/twinapi.appcore/mouse.c
+index c2cfdc0..34ea5a3 100644
+--- a/dlls/twinapi.appcore/mouse.c
++++ b/dlls/twinapi.appcore/mouse.c
+@@ -303,3 +303,180 @@ static struct mouse_device mouse =
+ };
+ 
+ IActivationFactory *mouse_device_factory = &mouse.IActivationFactory_iface;
++
++/* ---- PointerDevice: the mouse ---- */
++
++/* Every pointer here comes from the mouse (pointer id 1), so one PointerDevice describes it; PointerPoint's
++ * PointerDevice returns it and games check its PointerDeviceType to tell mouse input from touch. */
++
++struct pointer_device
++{
++    IActivationFactory IActivationFactory_iface;
++    IPointerDeviceStatics IPointerDeviceStatics_iface;
++    IPointerDevice IPointerDevice_iface;
++    IPointerDevice2 IPointerDevice2_iface;
++};
++
++static struct pointer_device pointer_device;
++
++static HRESULT WINAPI pdev_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &pointer_device.IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IPointerDeviceStatics ))
++        *out = &pointer_device.IPointerDeviceStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static const IActivationFactoryVtbl pdev_factory_vtbl =
++{
++    pdev_factory_QueryInterface, factory_AddRef, factory_Release,
++    factory_GetIids, factory_GetRuntimeClassName, factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( pdev_statics, IPointerDeviceStatics, struct pointer_device, IActivationFactory_iface )
++
++static HRESULT WINAPI pdev_statics_GetPointerDevice( IPointerDeviceStatics *iface, UINT32 id, IPointerDevice **device )
++{
++    TRACE( "iface %p, id %u, device %p.\n", iface, id, device );
++    *device = &pointer_device.IPointerDevice_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI pdev_statics_GetPointerDevices( IPointerDeviceStatics *iface, IVectorView_PointerDevice **devices )
++{
++    FIXME( "iface %p, devices %p: not implemented.\n", iface, devices );
++    *devices = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct IPointerDeviceStaticsVtbl pdev_statics_vtbl =
++{
++    pdev_statics_QueryInterface, pdev_statics_AddRef, pdev_statics_Release,
++    pdev_statics_GetIids, pdev_statics_GetRuntimeClassName, pdev_statics_GetTrustLevel,
++    pdev_statics_GetPointerDevice, pdev_statics_GetPointerDevices,
++};
++
++static HRESULT WINAPI pdev_QueryInterface( IPointerDevice *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IPointerDevice ))
++        *out = &pointer_device.IPointerDevice_iface;
++    else if (IsEqualGUID( iid, &IID_IPointerDevice2 ))
++        *out = &pointer_device.IPointerDevice2_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI pdev_AddRef( IPointerDevice *iface ) { return 2; }
++static ULONG WINAPI pdev_Release( IPointerDevice *iface ) { return 1; }
++static HRESULT WINAPI pdev_GetIids( IPointerDevice *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI pdev_GetRuntimeClassName( IPointerDevice *iface, HSTRING *name )
++{
++    return WindowsCreateString( RuntimeClass_Windows_Devices_Input_PointerDevice,
++                                wcslen( RuntimeClass_Windows_Devices_Input_PointerDevice ), name );
++}
++
++static HRESULT WINAPI pdev_GetTrustLevel( IPointerDevice *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI pdev_get_PointerDeviceType( IPointerDevice *iface, PointerDeviceType *value )
++{
++    *value = PointerDeviceType_Mouse;
++    return S_OK;
++}
++
++static HRESULT WINAPI pdev_get_IsIntegrated( IPointerDevice *iface, boolean *value )
++{
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI pdev_get_MaxContacts( IPointerDevice *iface, UINT32 *value )
++{
++    *value = 1;
++    return S_OK;
++}
++
++static void screen_rect( Rect *value )
++{
++    float scale = core_view_scale();
++
++    value->X = GetSystemMetrics( SM_XVIRTUALSCREEN ) / scale;
++    value->Y = GetSystemMetrics( SM_YVIRTUALSCREEN ) / scale;
++    value->Width = GetSystemMetrics( SM_CXVIRTUALSCREEN ) / scale;
++    value->Height = GetSystemMetrics( SM_CYVIRTUALSCREEN ) / scale;
++}
++
++static HRESULT WINAPI pdev_get_PhysicalDeviceRect( IPointerDevice *iface, Rect *value )
++{
++    screen_rect( value );   /* a mouse covers the whole screen */
++    return S_OK;
++}
++
++static HRESULT WINAPI pdev_get_ScreenRect( IPointerDevice *iface, Rect *value )
++{
++    screen_rect( value );
++    return S_OK;
++}
++
++static HRESULT WINAPI pdev_get_SupportedUsages( IPointerDevice *iface, IVectorView_PointerDeviceUsage **value )
++{
++    FIXME( "iface %p, value %p: not implemented.\n", iface, value );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct IPointerDeviceVtbl pdev_vtbl =
++{
++    pdev_QueryInterface, pdev_AddRef, pdev_Release,
++    pdev_GetIids, pdev_GetRuntimeClassName, pdev_GetTrustLevel,
++    pdev_get_PointerDeviceType, pdev_get_IsIntegrated, pdev_get_MaxContacts,
++    pdev_get_PhysicalDeviceRect, pdev_get_ScreenRect, pdev_get_SupportedUsages,
++};
++
++DEFINE_IINSPECTABLE_( pdev2, IPointerDevice2, struct pointer_device, impl_from_IPointerDevice2, IPointerDevice2_iface,
++                      &impl->IPointerDevice_iface )
++
++static HRESULT WINAPI pdev2_get_MaxPointersWithZDistance( IPointerDevice2 *iface, UINT32 *value )
++{
++    *value = 0;
++    return S_OK;
++}
++
++static const struct IPointerDevice2Vtbl pdev2_vtbl =
++{
++    pdev2_QueryInterface, pdev2_AddRef, pdev2_Release,
++    pdev2_GetIids, pdev2_GetRuntimeClassName, pdev2_GetTrustLevel,
++    pdev2_get_MaxPointersWithZDistance,
++};
++
++static struct pointer_device pointer_device =
++{
++    { &pdev_factory_vtbl },
++    { &pdev_statics_vtbl },
++    { &pdev_vtbl },
++    { &pdev2_vtbl },
++};
++
++IActivationFactory *pointer_device_factory = &pointer_device.IActivationFactory_iface;
++
++__x_ABI_CWindows_CDevices_CInput_CIPointerDevice *mouse_pointer_device( void )
++{
++    return &pointer_device.IPointerDevice_iface;
++}
+diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
+index f6afca3..2bf980e 100644
+--- a/dlls/twinapi.appcore/private.h
++++ b/dlls/twinapi.appcore/private.h
+@@ -44,10 +44,13 @@
+ #define WIDL_using_Windows_UI_Input
+ #define WIDL_using_Windows_Devices_Input
+ #define WIDL_using_Windows_UI_Popups
++#define WIDL_using_Windows_Networking_XboxLive
+ #define WIDL_using_Windows_System
+ #include "windows.ui.viewmanagement.h"
+ #include "windows.ui.core.h"
+ #include "windows.ui.popups.h"
++#include "windows.devices.input.h"
++#include "windows.networking.xboxlive.h"
+ #include "windows.applicationmodel.core.h"
+ 
+ #include "wine/debug.h"
+@@ -66,7 +69,10 @@ extern IActivationFactory *web_token_manager_factory, *web_token_request_factory
+ extern IActivationFactory *async_causality_tracer_factory;   /* causality.c */
+ extern IActivationFactory *mouse_device_factory;   /* mouse.c */
+ extern IActivationFactory *ui_command_factory;   /* message_dialog.c */
++extern IActivationFactory *xboxlive_device_address_factory;   /* xboxlive_address.c */
+ extern void mouse_device_raw_input( HRAWINPUT input );
++extern IActivationFactory *pointer_device_factory;   /* mouse.c */
++extern __x_ABI_CWindows_CDevices_CInput_CIPointerDevice *mouse_pointer_device( void );
+ extern IActivationFactory *core_window_factory;
+ extern IActivationFactory *current_app_factory;
+ extern IActivationFactory *display_request_factory;
+diff --git a/dlls/twinapi.appcore/twinapi.appcore.rgs b/dlls/twinapi.appcore/twinapi.appcore.rgs
+index 9c28d89..adaec20 100644
+--- a/dlls/twinapi.appcore/twinapi.appcore.rgs
++++ b/dlls/twinapi.appcore/twinapi.appcore.rgs
+@@ -108,10 +108,18 @@ HKLM
+                     {
+                         val 'DllPath' = s '%MODULE%'
+                     }
++                    ForceRemove Windows.Devices.Input.PointerDevice
++                    {
++                        val 'DllPath' = s '%MODULE%'
++                    }
+                     ForceRemove Windows.Devices.Input.MouseDevice
+                     {
+                         val 'DllPath' = s '%MODULE%'
+                     }
++                    ForceRemove Windows.Networking.XboxLive.XboxLiveDeviceAddress
++                    {
++                        val 'DllPath' = s '%MODULE%'
++                    }
+                     ForceRemove Windows.UI.Popups.UICommand
+                     {
+                         val 'DllPath' = s '%MODULE%'
+diff --git a/dlls/twinapi.appcore/xboxlive_address.c b/dlls/twinapi.appcore/xboxlive_address.c
+new file mode 100644
+index 0000000..e433604
+--- /dev/null
++++ b/dlls/twinapi.appcore/xboxlive_address.c
+@@ -0,0 +1,334 @@
++/* WinRT Windows.Networking.XboxLive.XboxLiveDeviceAddress implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
++
++/* An Xbox Live device address is an opaque snapshot that a game puts into its multiplayer session document so
++ * that other consoles and PCs can open a secure connection to it. Games create a session even for local play
++ * (Gears of War 4's campaign), so GetLocal must work. There is no Xbox Live network here: the local address is
++ * a made-up snapshot ("WXBL", a version and a per-process random id) that only ever compares equal to itself,
++ * and addresses made from other snapshots are kept as they are. */
++
++#define SNAPSHOT_MAX 1024
++
++struct device_address
++{
++    IXboxLiveDeviceAddress IXboxLiveDeviceAddress_iface;
++    LONG ref;
++    UINT32 size;
++    BYTE data[SNAPSHOT_MAX];
++};
++
++static BYTE local_snapshot[24];
++static INIT_ONCE local_once = INIT_ONCE_STATIC_INIT;
++
++static BOOL WINAPI init_local_snapshot( INIT_ONCE *once, void *param, void **context )
++{
++    GUID id;
++
++    memcpy( local_snapshot, "WXBL", 4 );
++    local_snapshot[4] = 1;
++    CoCreateGuid( &id );
++    memcpy( local_snapshot + 8, &id, sizeof(id) );
++    return TRUE;
++}
++
++static inline struct device_address *impl_from_IXboxLiveDeviceAddress( IXboxLiveDeviceAddress *iface )
++{
++    return CONTAINING_RECORD( iface, struct device_address, IXboxLiveDeviceAddress_iface );
++}
++
++static HRESULT WINAPI address_QueryInterface( IXboxLiveDeviceAddress *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IXboxLiveDeviceAddress ))
++    {
++        *out = iface;
++        IXboxLiveDeviceAddress_AddRef( iface );
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI address_AddRef( IXboxLiveDeviceAddress *iface )
++{
++    return InterlockedIncrement( &impl_from_IXboxLiveDeviceAddress( iface )->ref );
++}
++
++static ULONG WINAPI address_Release( IXboxLiveDeviceAddress *iface )
++{
++    struct device_address *impl = impl_from_IXboxLiveDeviceAddress( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI address_GetIids( IXboxLiveDeviceAddress *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI address_GetRuntimeClassName( IXboxLiveDeviceAddress *iface, HSTRING *name )
++{
++    return WindowsCreateString( RuntimeClass_Windows_Networking_XboxLive_XboxLiveDeviceAddress,
++                                wcslen( RuntimeClass_Windows_Networking_XboxLive_XboxLiveDeviceAddress ), name );
++}
++
++static HRESULT WINAPI address_GetTrustLevel( IXboxLiveDeviceAddress *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI address_add_SnapshotChanged( IXboxLiveDeviceAddress *iface,
++                                                   ITypedEventHandler_XboxLiveDeviceAddress_IInspectable *handler,
++                                                   EventRegistrationToken *token )
++{
++    static LONG next_token;
++
++    /* the snapshot never changes */
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
++    token->value = InterlockedIncrement( &next_token );
++    return S_OK;
++}
++
++static HRESULT WINAPI address_remove_SnapshotChanged( IXboxLiveDeviceAddress *iface, EventRegistrationToken token )
++{
++    TRACE( "iface %p, token %#I64x.\n", iface, token.value );
++    return S_OK;
++}
++
++static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++
++static HRESULT WINAPI address_GetSnapshotAsBase64( IXboxLiveDeviceAddress *iface, HSTRING *value )
++{
++    struct device_address *impl = impl_from_IXboxLiveDeviceAddress( iface );
++    WCHAR out[(SNAPSHOT_MAX + 2) / 3 * 4 + 1], *p = out;
++    UINT32 i;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    for (i = 0; i < impl->size; i += 3)
++    {
++        UINT32 n = impl->data[i] << 16, left = impl->size - i;
++        if (left > 1) n |= impl->data[i + 1] << 8;
++        if (left > 2) n |= impl->data[i + 2];
++        *p++ = base64_chars[(n >> 18) & 63];
++        *p++ = base64_chars[(n >> 12) & 63];
++        *p++ = left > 1 ? base64_chars[(n >> 6) & 63] : '=';
++        *p++ = left > 2 ? base64_chars[n & 63] : '=';
++    }
++    return WindowsCreateString( out, p - out, value );
++}
++
++static HRESULT WINAPI address_GetSnapshotAsBuffer( IXboxLiveDeviceAddress *iface, __x_ABI_CWindows_CStorage_CStreams_CIBuffer **value )
++{
++    FIXME( "iface %p, value %p: not implemented.\n", iface, value );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI address_GetSnapshotAsBytes( IXboxLiveDeviceAddress *iface, UINT32 size, BYTE *buffer, UINT32 *written )
++{
++    struct device_address *impl = impl_from_IXboxLiveDeviceAddress( iface );
++
++    TRACE( "iface %p, size %u, buffer %p, written %p.\n", iface, size, buffer, written );
++
++    *written = 0;
++    if (size < impl->size) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
++    memcpy( buffer, impl->data, impl->size );
++    *written = impl->size;
++    return S_OK;
++}
++
++static HRESULT WINAPI address_Compare( IXboxLiveDeviceAddress *iface, IXboxLiveDeviceAddress *other, INT32 *value )
++{
++    struct device_address *impl = impl_from_IXboxLiveDeviceAddress( iface ), *impl2;
++    int cmp;
++
++    TRACE( "iface %p, other %p, value %p.\n", iface, other, value );
++
++    if (!other) return E_INVALIDARG;
++    impl2 = impl_from_IXboxLiveDeviceAddress( other );
++    cmp = memcmp( impl->data, impl2->data, min( impl->size, impl2->size ) );
++    if (!cmp) cmp = (int)impl->size - (int)impl2->size;
++    *value = cmp < 0 ? -1 : cmp > 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI address_get_IsValid( IXboxLiveDeviceAddress *iface, boolean *value )
++{
++    *value = impl_from_IXboxLiveDeviceAddress( iface )->size != 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI address_get_IsLocal( IXboxLiveDeviceAddress *iface, boolean *value )
++{
++    struct device_address *impl = impl_from_IXboxLiveDeviceAddress( iface );
++
++    *value = impl->size == sizeof(local_snapshot) && !memcmp( impl->data, local_snapshot, sizeof(local_snapshot) );
++    return S_OK;
++}
++
++static HRESULT WINAPI address_get_NetworkAccessKind( IXboxLiveDeviceAddress *iface, XboxLiveNetworkAccessKind *value )
++{
++    *value = XboxLiveNetworkAccessKind_Open;
++    return S_OK;
++}
++
++static const struct IXboxLiveDeviceAddressVtbl address_vtbl =
++{
++    address_QueryInterface, address_AddRef, address_Release,
++    address_GetIids, address_GetRuntimeClassName, address_GetTrustLevel,
++    address_add_SnapshotChanged, address_remove_SnapshotChanged,
++    address_GetSnapshotAsBase64, address_GetSnapshotAsBuffer, address_GetSnapshotAsBytes,
++    address_Compare, address_get_IsValid, address_get_IsLocal, address_get_NetworkAccessKind,
++};
++
++static HRESULT create_address( const BYTE *data, UINT32 size, IXboxLiveDeviceAddress **out )
++{
++    struct device_address *impl;
++
++    *out = NULL;
++    if (!size || size > SNAPSHOT_MAX) return E_INVALIDARG;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IXboxLiveDeviceAddress_iface.lpVtbl = &address_vtbl;
++    impl->ref = 1;
++    impl->size = size;
++    memcpy( impl->data, data, size );
++    *out = &impl->IXboxLiveDeviceAddress_iface;
++    return S_OK;
++}
++
++static int base64_value( WCHAR c )
++{
++    if (c >= 'A' && c <= 'Z') return c - 'A';
++    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
++    if (c >= '0' && c <= '9') return c - '0' + 52;
++    if (c == '+') return 62;
++    if (c == '/') return 63;
++    return -1;
++}
++
++/* ---- statics ---- */
++
++struct address_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IXboxLiveDeviceAddressStatics IXboxLiveDeviceAddressStatics_iface;
++};
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out );
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance ) { return E_NOTIMPL; }
++
++static const IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface, factory_AddRef, factory_Release,
++    factory_GetIids, factory_GetRuntimeClassName, factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( statics, IXboxLiveDeviceAddressStatics, struct address_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI statics_CreateFromSnapshotBase64( IXboxLiveDeviceAddressStatics *iface, HSTRING base64,
++                                                        IXboxLiveDeviceAddress **value )
++{
++    const WCHAR *str = WindowsGetStringRawBuffer( base64, NULL );
++    BYTE data[SNAPSHOT_MAX];
++    UINT32 size = 0, bits = 0, n = 0;
++    int v;
++
++    TRACE( "iface %p, base64 %s, value %p.\n", iface, debugstr_hstring(base64), value );
++
++    for (; *str && *str != '='; str++)
++    {
++        if ((v = base64_value( *str )) < 0) return E_INVALIDARG;
++        n = (n << 6) | v;
++        if ((bits += 6) >= 8)
++        {
++            if (size == SNAPSHOT_MAX) return E_INVALIDARG;
++            data[size++] = n >> (bits -= 8);
++        }
++    }
++    return create_address( data, size, value );
++}
++
++static HRESULT WINAPI statics_CreateFromSnapshotBuffer( IXboxLiveDeviceAddressStatics *iface, __x_ABI_CWindows_CStorage_CStreams_CIBuffer *buffer,
++                                                        IXboxLiveDeviceAddress **value )
++{
++    FIXME( "iface %p, buffer %p, value %p: not implemented.\n", iface, buffer, value );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI statics_CreateFromSnapshotBytes( IXboxLiveDeviceAddressStatics *iface, UINT32 size, BYTE *buffer,
++                                                       IXboxLiveDeviceAddress **value )
++{
++    TRACE( "iface %p, size %u, buffer %p, value %p.\n", iface, size, buffer, value );
++    return create_address( buffer, size, value );
++}
++
++static HRESULT WINAPI statics_GetLocal( IXboxLiveDeviceAddressStatics *iface, IXboxLiveDeviceAddress **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    InitOnceExecuteOnce( &local_once, init_local_snapshot, NULL, NULL );
++    return create_address( local_snapshot, sizeof(local_snapshot), value );
++}
++
++static HRESULT WINAPI statics_get_MaxSnapshotBytesSize( IXboxLiveDeviceAddressStatics *iface, UINT32 *value )
++{
++    *value = SNAPSHOT_MAX;
++    return S_OK;
++}
++
++static const struct IXboxLiveDeviceAddressStaticsVtbl statics_vtbl =
++{
++    statics_QueryInterface, statics_AddRef, statics_Release,
++    statics_GetIids, statics_GetRuntimeClassName, statics_GetTrustLevel,
++    statics_CreateFromSnapshotBase64, statics_CreateFromSnapshotBuffer, statics_CreateFromSnapshotBytes,
++    statics_GetLocal, statics_get_MaxSnapshotBytesSize,
++};
++
++static struct address_statics address_statics =
++{
++    { &factory_vtbl },
++    { &statics_vtbl },
++};
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &address_statics.IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IXboxLiveDeviceAddressStatics ))
++        *out = &address_statics.IXboxLiveDeviceAddressStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++IActivationFactory *xboxlive_device_address_factory = &address_statics.IActivationFactory_iface;
+diff --git a/include/Makefile.in b/include/Makefile.in
+index 6f56227..84311c0 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -922,6 +922,7 @@ SOURCES = \
+ 	windows.networking.connectivity.idl \
+ 	windows.networking.idl \
+ 	windows.networking.sockets.idl \
++	windows.networking.xboxlive.idl \
+ 	windows.perception.idl \
+ 	windows.perception.spatial.idl \
+ 	windows.perception.spatial.surfaces.idl \
+diff --git a/include/windows.networking.xboxlive.idl b/include/windows.networking.xboxlive.idl
+new file mode 100644
+index 0000000..f0d104a
+--- /dev/null
++++ b/include/windows.networking.xboxlive.idl
+@@ -0,0 +1,112 @@
++/*
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/* Generated from Windows.winmd by scripts/winmd2idl.py (Windows.Networking.XboxLive.XboxLiveDeviceAddress). */
++
++#ifdef __WIDL__
++#pragma winrt ns_prefix
++#endif
++
++import "inspectable.idl";
++import "asyncinfo.idl";
++import "eventtoken.idl";
++import "windowscontracts.idl";
++import "windows.foundation.idl";
++import "windows.storage.streams.idl";
++
++namespace Windows.Networking.XboxLive {
++    [contractversion(1)]
++    apicontract XboxLiveSecureSocketsContract
++    {};
++}
++
++namespace Windows.Networking.XboxLive {
++    interface IXboxLiveDeviceAddress;
++    interface IXboxLiveDeviceAddressStatics;
++    runtimeclass XboxLiveDeviceAddress;
++    typedef enum XboxLiveNetworkAccessKind XboxLiveNetworkAccessKind;
++}
++
++namespace Windows.Networking.XboxLive {
++    declare {
++        interface Windows.Foundation.TypedEventHandler<Windows.Networking.XboxLive.XboxLiveDeviceAddress *, IInspectable *>;
++    }
++}
++
++namespace Windows.Networking.XboxLive {
++    [
++        contract(Windows.Networking.XboxLive.XboxLiveSecureSocketsContract, 1.0)
++    ]
++    enum XboxLiveNetworkAccessKind
++    {
++        Open = 0,
++        Moderate = 1,
++        Strict = 2
++    };
++
++}
++
++namespace Windows.Networking.XboxLive {
++    [
++        contract(Windows.Networking.XboxLive.XboxLiveSecureSocketsContract, 1.0),
++        exclusiveto(Windows.Networking.XboxLive.XboxLiveDeviceAddress),
++        uuid(f5bbd279-3c86-4b57-a31a-b9462408fd01)
++    ]
++    interface IXboxLiveDeviceAddress : IInspectable
++    {
++        [eventadd] HRESULT SnapshotChanged([in] Windows.Foundation.TypedEventHandler<Windows.Networking.XboxLive.XboxLiveDeviceAddress *, IInspectable *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT SnapshotChanged([in] Windows.Foundation.EventRegistrationToken token);
++        HRESULT GetSnapshotAsBase64([out, retval] HSTRING *value);
++        HRESULT GetSnapshotAsBuffer([out, retval] Windows.Storage.Streams.IBuffer * *value);
++        HRESULT GetSnapshotAsBytes([in] UINT32 __bufferSize, [out, size_is(__bufferSize)] BYTE *buffer, [out] UINT32 *bytesWritten);
++        HRESULT Compare([in] Windows.Networking.XboxLive.XboxLiveDeviceAddress * otherDeviceAddress, [out, retval] INT32 *value);
++        [propget] HRESULT IsValid([out, retval] boolean *value);
++        [propget] HRESULT IsLocal([out, retval] boolean *value);
++        [propget] HRESULT NetworkAccessKind([out, retval] Windows.Networking.XboxLive.XboxLiveNetworkAccessKind *value);
++    }
++
++    [
++        contract(Windows.Networking.XboxLive.XboxLiveSecureSocketsContract, 1.0),
++        exclusiveto(Windows.Networking.XboxLive.XboxLiveDeviceAddress),
++        uuid(5954a819-4a79-4931-827c-7f503e963263)
++    ]
++    interface IXboxLiveDeviceAddressStatics : IInspectable
++    {
++        HRESULT CreateFromSnapshotBase64([in] HSTRING base64, [out, retval] Windows.Networking.XboxLive.XboxLiveDeviceAddress * *value);
++        HRESULT CreateFromSnapshotBuffer([in] Windows.Storage.Streams.IBuffer * buffer, [out, retval] Windows.Networking.XboxLive.XboxLiveDeviceAddress * *value);
++        HRESULT CreateFromSnapshotBytes([in] UINT32 __bufferSize, [in, size_is(__bufferSize)] BYTE *buffer, [out, retval] Windows.Networking.XboxLive.XboxLiveDeviceAddress * *value);
++        HRESULT GetLocal([out, retval] Windows.Networking.XboxLive.XboxLiveDeviceAddress * *value);
++        [propget] HRESULT MaxSnapshotBytesSize([out, retval] UINT32 *value);
++    }
++
++}
++
++namespace Windows.Networking.XboxLive {
++    [
++        contract(Windows.Networking.XboxLive.XboxLiveSecureSocketsContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.Networking.XboxLive.IXboxLiveDeviceAddressStatics, Windows.Networking.XboxLive.XboxLiveSecureSocketsContract, 1.0),
++        threading(both)
++    ]
++    runtimeclass XboxLiveDeviceAddress
++    {
++        [default] interface Windows.Networking.XboxLive.IXboxLiveDeviceAddress;
++    }
++
++}
++
