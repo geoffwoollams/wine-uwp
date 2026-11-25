@@ -167,16 +167,17 @@ class Xbf:
         if kind in (2, 8, 11):          # Style v1..v3
             def setter():
                 flags = r.u7()
+                desc = ['flags=%#x' % flags]
                 if not flags & 0x40:
-                    if flags & 0x10: r.take('H')                 # resolved property
-                    else: sstr(); r.take('H')                    # property name, declaring type
-                if flags & 0x04: sstr()                          # string value
-                elif flags & 0x20: self.constant(r)              # container value
-                elif flags & (0x01 | 0x02 | 0x08 | 0x40): tok()  # theme/static resource, object, self
-                return flags
+                    if flags & 0x10: desc.append(self.property_name(r.take('H')))       # resolved property
+                    else: desc += [self.strings[sstr()], self.type_name(r.take('H'))]  # name, declaring type
+                if flags & 0x04: desc.append('string=' + self.strings[sstr()])
+                elif flags & 0x20: desc.append('constant=%r' % (self.constant(r),))
+                elif flags & (0x01 | 0x02 | 0x08 | 0x40): desc.append('token=%d' % tok())   # theme/static/object/self
+                return ' '.join(desc)
             setters = vec(setter)
             if kind == 11: conditional()
-            return ('Style', len(setters))
+            return ('Style', setters)
         if kind in (420, 1, 3, 4, 5):    # VisualStateGroupCollection v1..v5
             vec(r.u7)
             def state():
@@ -303,16 +304,19 @@ def compile_xaml(src, out):
         if entry not in types: types.append(entry)
         return types.index(entry)
 
+    bases = {'Button': ['ButtonBase', 'ContentControl', 'Control'], 'Frame': ['ContentControl', 'Control'],
+             'Page': ['UserControl', 'Control'], 'UserControl': ['Control'], 'Grid': ['Panel'], 'StackPanel': ['Panel'],
+             'ContentControl': ['Control']}
+
     def prop_ref(type_name, name):
-        cand = ['%s_%s' % (type_name, name)] + ['%s_%s' % (b, name) for b in
-                ('TextBlock', 'Panel', 'Border', 'Control', 'FrameworkElement', 'UIElement', 'ContentControl',
-                 'UserControl', 'Page', 'Application', 'RowDefinition', 'ColumnDefinition', 'SolidColorBrush', 'Grid', 'StackPanel',
-                 'ButtonBase', 'DependencyObject')]
-        for c in cand:
+        """the stable index of Type.Name, looking through the type's base classes like the compiler does"""
+        chain = [type_name] + bases.get(type_name, []) + ['FrameworkElement', 'UIElement', 'DependencyObject']
+        for t in chain + ['Application', 'RowDefinition', 'ColumnDefinition', 'SolidColorBrush', 'Grid', 'TextBlock', 'Border']:
+            c = '%s_%s' % (t, name)
             if c in stable_prop: return 0x8000 | stable_prop[c], c
         raise KeyError('no stable property for %s.%s' % (type_name, name))
 
-    streams = [bytearray(), bytearray()]   # main, resources
+    streams = [bytearray()]   # the main node stream; dictionaries and styles add their own
     conn = [0]
     connections = []
 
@@ -359,15 +363,34 @@ def compile_xaml(src, out):
             w(stream, 'BI', C_COLOR, c); return
         w(stream, 'BH', C_SHARED, s(value))
 
-    def element(stream, el, is_root, resources_stream):
+    def new_stream():
+        streams.append(bytearray())
+        return len(streams) - 1
+
+    def header(stream, el):
+        xclass = el.attrib.get('{%s}Class' % XAML)
+        w(stream, 'BH', NODE['PushScopeAddNamespace'], xmlns(PRESENTATION)); ustring(stream, '')
+        w(stream, 'BH', NODE['AddNamespace'], xmlns(XAML)); ustring(stream, 'x')
+        if xclass:
+            w(stream, 'B', NODE['CheckPeerType']); ustring(stream, xclass)
+
+    def value_node(stream, pref, pfull, value):
+        m = re.match(r'\{StaticResource (\w+)\}', value)
+        m2 = re.match(r'\{ThemeResource (\w+)\}', value)
+        if m: w(stream, 'BHBH', NODE['SetValueFromStaticResource'], pref, C_SHARED, s(m.group(1)))
+        elif m2: w(stream, 'BHBH', NODE['SetValueFromThemeResource'], pref, C_SHARED, s(m2.group(1)))
+        else:
+            w(stream, 'BH', NODE['SetValueTypeConvertedConstant'], pref); constant(stream, value, pfull)
+
+    def element(stream, el, is_root):
         ns, name = el.tag[1:].split('}')
+        if name == 'ResourceDictionary': return dictionary_element(stream, el, is_root)
+        if name == 'Style': return style_element(stream, el)
         attrs = dict(el.attrib)
-        xclass = attrs.pop('{%s}Class' % XAML, None)
+        attrs.pop('{%s}Class' % XAML, None)
+        attrs.pop('{%s}Key' % XAML, None)
         if is_root:
-            w(stream, 'BH', NODE['PushScopeAddNamespace'], xmlns(PRESENTATION)); ustring(stream, '')
-            w(stream, 'BH', NODE['AddNamespace'], xmlns(XAML)); ustring(stream, 'x')
-            if xclass:
-                w(stream, 'B', NODE['CheckPeerType']); ustring(stream, xclass)
+            header(stream, el)
             w(stream, 'BH', NODE['CreateTypeBeginInit'], type_ref(ns, name))
         else:
             w(stream, 'BH', NODE['PushScopeCreateTypeBeginInit'], type_ref(ns, name))
@@ -383,29 +406,30 @@ def compile_xaml(src, out):
             if key.startswith('{'): continue
             owner, _, pname = key.rpartition('.')
             pref, pfull = prop_ref(owner or name, pname)
-            m = re.match(r'\{StaticResource (\w+)\}', value)
-            m2 = re.match(r'\{ThemeResource (\w+)\}', value)
-            if m: w(stream, 'BHBH', NODE['SetValueFromStaticResource'], pref, C_SHARED, s(m.group(1)))
-            elif m2: w(stream, 'BHBH', NODE['SetValueFromThemeResource'], pref, C_SHARED, s(m2.group(1)))
-            else:
-                w(stream, 'BH', NODE['SetValueTypeConvertedConstant'], pref); constant(stream, value, pfull)
+            value_node(stream, pref, pfull, value)
         content = []
         for child in el:
             cns, cname = child.tag[1:].split('}')
             if '.' in cname:     # property element
                 owner, pname = cname.split('.')
-                if pname == 'Resources':
-                    resource_dictionary(stream, owner, child, resources_stream)
-                    continue
                 pref, pfull = prop_ref(owner, pname)
+                items = list(child)
+                if pname == 'Resources':
+                    if len(items) == 1 and items[0].tag.endswith('}ResourceDictionary') and \
+                       '{%s}Key' % XAML not in items[0].attrib:
+                        dictionary_element(stream, items[0], False)
+                    else:
+                        dictionary_element(stream, None, False, entries=items)
+                    w(stream, 'BH', NODE['SetValue'], pref)
+                    continue
                 if pfull in ('Grid_RowDefinitions', 'Grid_ColumnDefinitions'):
                     w(stream, 'BH', NODE['PushScopeGetValue'], pref)
-                    for item in child:
-                        element(stream, item, False, resources_stream); w(stream, 'B', NODE['AddToCollection'])
+                    for item in items:
+                        element(stream, item, False); w(stream, 'B', NODE['AddToCollection'])
                     w(stream, 'B', NODE['PopScope'])
                     continue
-                for item in child:
-                    element(stream, item, False, resources_stream)
+                for item in items:
+                    element(stream, item, False)
                     w(stream, 'BH', NODE['SetValue'], pref)
                 continue
             content.append(child)
@@ -415,39 +439,103 @@ def compile_xaml(src, out):
             if prop in COLLECTION_CONTENT:
                 w(stream, 'BH', NODE['PushScopeGetValue'], pref)
                 for c in content:
-                    element(stream, c, False, resources_stream); w(stream, 'B', NODE['AddToCollection'])
+                    element(stream, c, False); w(stream, 'B', NODE['AddToCollection'])
                 w(stream, 'B', NODE['PopScope'])
             elif content:
-                element(stream, content[0], False, resources_stream); w(stream, 'BH', NODE['SetValue'], pref)
+                element(stream, content[0], False); w(stream, 'BH', NODE['SetValue'], pref)
             else:
                 w(stream, 'BH', NODE['SetValueConstant'], pref); w(stream, 'BH', C_SHARED, s(el.text.strip()))
         w(stream, 'B', NODE['EndInitPopScope'])
 
-    def resource_dictionary(stream, owner, prop_el, res):
-        pref, _ = prop_ref(owner, 'Resources')
-        w(stream, 'BH', NODE['PushScopeCreateTypeBeginInit'], 0x8000 | stable_type['ResourceDictionary'])
-        entries = []
-        for item in prop_el:
-            key = item.attrib.pop('{%s}Key' % XAML)
-            entries.append((key, len(res)))
-            element(res, item, False, res)
-        w(stream, 'B', NODE['SetCustomRuntimeData']); u7(stream, 1); u7(stream, 0); u7(stream, 0)
-        u7(stream, 7)                                    # ResourceDictionary_v2
-        u7(stream, len(entries))
-        for key, off in entries:
-            w(stream, 'H', s(key)); u7(stream, off)
-        u7(stream, 0)                                    # resources with x:Name
-        u7(stream, 0)                                    # implicit-key resources
-        u7(stream, 0)                                    # (v2 trailer)
+    def dictionary_element(stream, el, is_root, entries=None):
+        """A ResourceDictionary: Source, MergedDictionaries, ThemeDictionaries, and its entries in their own node
+        stream described by ResourceDictionary_v2 custom runtime data (explicit keys, then implicit styles)."""
+        rd = 0x8000 | stable_type['ResourceDictionary']
+        if is_root:
+            header(stream, el)
+            w(stream, 'BH', NODE['CreateTypeBeginInit'], rd)
+        else:
+            w(stream, 'BH', NODE['PushScopeCreateTypeBeginInit'], rd)
+        if el is not None:
+            if 'Source' in el.attrib:
+                w(stream, 'BHBH', NODE['SetValueTypeConvertedConstant'], 0x8000 | stable_prop['ResourceDictionary_Source'],
+                  C_SHARED, s(el.attrib['Source']))
+            entries = []
+            for child in el:
+                cname = child.tag[1:].split('}')[1]
+                if cname == 'ResourceDictionary.MergedDictionaries':
+                    w(stream, 'BH', NODE['PushScopeGetValue'], 0x8000 | stable_prop['ResourceDictionary_MergedDictionaries'])
+                    for d in child:
+                        dictionary_element(stream, d, False); w(stream, 'B', NODE['AddToCollection'])
+                    w(stream, 'B', NODE['PopScope'])
+                elif cname == 'ResourceDictionary.ThemeDictionaries':
+                    w(stream, 'BH', NODE['PushScopeGetValue'], 0x8000 | stable_prop['ResourceDictionary_ThemeDictionaries'])
+                    for d in child:
+                        key = d.attrib['{%s}Key' % XAML]
+                        dictionary_element(stream, d, False)
+                        w(stream, 'BBH', NODE['AddToDictionaryWithKey'], C_SHARED, s(key))
+                    w(stream, 'B', NODE['PopScope'])
+                else:
+                    entries.append(child)
+        if entries:
+            sub = new_stream()
+            explicit, implicit = [], []
+            for item in entries:
+                key = item.attrib.get('{%s}Key' % XAML)
+                off = len(streams[sub])
+                if key: explicit.append((key, off))
+                else: implicit.append(('Windows.UI.Xaml.Controls.' + item.attrib['TargetType'], off))
+                element(streams[sub], item, False)
+            w(stream, 'B', NODE['SetCustomRuntimeData']); u7(stream, sub); u7(stream, 0); u7(stream, 0)
+            u7(stream, 7)                                    # ResourceDictionary_v2
+            u7(stream, len(explicit))
+            for key, off in explicit:
+                w(stream, 'H', s(key)); u7(stream, off)
+            u7(stream, 0)                                    # resources with x:Name
+            u7(stream, len(implicit))
+            for key, off in implicit:
+                w(stream, 'H', s(key)); u7(stream, off)
+            u7(stream, 0)                                    # (v2 trailer)
         w(stream, 'B', NODE['EndInitPopScope'])
-        w(stream, 'BH', NODE['SetValue'], pref)
+
+    def style_element(stream, el):
+        """A Style: TargetType, BasedOn, and Style_v2 custom runtime data with its setters; resource references go
+        in the style's own node stream, as single nodes setting Setter.Value."""
+        target = el.attrib['TargetType']
+        w(stream, 'BH', NODE['PushScopeCreateTypeBeginInit'], 0x8000 | stable_type['Style'])
+        w(stream, 'BHH', NODE['SetValueTypeConvertedResolvedType'], 0x8000 | stable_prop['Style_TargetType'],
+          type_ref(PRESENTATION, target))
+        m = re.match(r'\{StaticResource (\w+)\}', el.attrib.get('BasedOn', ''))
+        if m:
+            w(stream, 'BHBH', NODE['SetValueFromStaticResource'], 0x8000 | stable_prop['Style_BasedOn'], C_SHARED, s(m.group(1)))
+        sub = new_stream()
+        w(streams[sub], 'B', NODE['PushScope'])
+        data = bytearray()
+        setters = [c for c in el if c.tag.endswith('}Setter')]
+        u7(data, len(setters))
+        setter_value = 0x8000 | stable_prop['Setter_Value']
+        for setter in setters:
+            owner, _, pname = setter.attrib['Property'].rpartition('.')
+            pref, pfull = prop_ref(owner or target, pname)
+            value = setter.attrib['Value']
+            m = re.match(r'\{(Static|Theme)Resource (\w+)\}', value)
+            if m:
+                u7(data, 0x10 | (0x02 if m.group(1) == 'Static' else 0x01)); w(data, 'H', pref)
+                u7(data, len(streams[sub]))
+                w(streams[sub], 'BHBH', NODE['SetValueFrom%sResource' % m.group(1)], setter_value, C_SHARED, s(m.group(2)))
+            else:
+                u7(data, 0x10 | 0x20); w(data, 'H', pref); constant(data, value, pfull)
+        w(streams[sub], 'B', NODE['PopScope'])
+        w(stream, 'B', NODE['SetCustomRuntimeData']); u7(stream, sub); u7(stream, 0); u7(stream, 0)
+        u7(stream, 8)                                        # Style_v2
+        stream.extend(data)
+        w(stream, 'B', NODE['EndInitPopScope'])
 
     def xmlns(uri):
         if s(uri) not in xmlns_list: xmlns_list.append(s(uri))
         return xmlns_list.index(s(uri))
 
-    element(streams[0], root, True, streams[1])
-    if not streams[1]: streams.pop()
+    element(streams[0], root, True)
 
     meta = bytearray()
     def vec(items, fn):

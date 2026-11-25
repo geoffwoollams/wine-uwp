@@ -1,0 +1,978 @@
+Subject: windows.ui.xaml: styles (explicit, implicit, BasedOn), theme and merged dictionaries, ResourceDictionary.Source (milestone 4, part 1)
+
+diff --git a/dlls/windows.ui.xaml/collection.c b/dlls/windows.ui.xaml/collection.c
+index 3fa0be7..139f9f9 100644
+--- a/dlls/windows.ui.xaml/collection.c
++++ b/dlls/windows.ui.xaml/collection.c
+@@ -375,7 +375,7 @@ static inline struct vector *impl_from_IVector_IInspectable( IVector_IInspectabl
+ static struct vector *vector_from_iinspectable( IInspectable *object )
+ {
+     IVector_IInspectable *iface = (IVector_IInspectable *)object;
+-    return iface->lpVtbl == &vector_vtbl ? impl_from_IVector_IInspectable( iface ) : NULL;
++    return iface && iface->lpVtbl == &vector_vtbl ? impl_from_IVector_IInspectable( iface ) : NULL;
+ }
+ 
+ static HRESULT WINAPI vector_QueryInterface( IVector_IInspectable *iface, REFIID iid, void **out )
+diff --git a/dlls/windows.ui.xaml/element.c b/dlls/windows.ui.xaml/element.c
+index 8cb5a74..30a6112 100644
+--- a/dlls/windows.ui.xaml/element.c
++++ b/dlls/windows.ui.xaml/element.c
+@@ -80,6 +80,9 @@ static ULONG WINAPI inner_Release( IInspectable *iface )
+     {
+         WindowsDeleteString( impl->name );
+         if (impl->resources) IInspectable_Release( impl->resources );
++        if (impl->style) IInspectable_Release( impl->style );
++        while (impl->local_count) free( impl->local_properties[--impl->local_count] );
++        free( impl->local_properties );
+         impl->ops->destroy( impl );
+     }
+     return ref;
+@@ -1024,14 +1027,23 @@ static HRESULT WINAPI framework_element_put_DataContext(IFrameworkElement *iface
+ 
+ static HRESULT WINAPI framework_element_get_Style(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CIStyle **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    struct xaml_element *impl = impl_from_IFrameworkElement( iface );
++
++    *value = NULL;
++    if (!impl->style) return S_OK;
++    return IInspectable_QueryInterface( impl->style, &IID_IStyle, (void **)value );
+ }
+ 
+ static HRESULT WINAPI framework_element_put_Style(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CIStyle *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    struct xaml_element *impl = impl_from_IFrameworkElement( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (value) IStyle_AddRef( value );
++    if (impl->style) IInspectable_Release( impl->style );
++    impl->style = (IInspectable *)value;
++    if (value) style_apply( (IInspectable *)value, impl->outer );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI framework_element_get_FlowDirection(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CFlowDirection *value)
+@@ -1291,6 +1303,25 @@ HRESULT element_compose( struct xaml_element *element, IInspectable *outer, IIns
+     return S_OK;
+ }
+ 
++BOOL element_is_local( struct xaml_element *element, const WCHAR *property )
++{
++    UINT32 i;
++    for (i = 0; i < element->local_count; i++) if (!wcscmp( element->local_properties[i], property )) return TRUE;
++    return FALSE;
++}
++
++/* a value set directly on the element: it takes precedence over style setters (no full dependency property
++ * value precedence yet, only this "local beats style" rule) */
++void element_mark_local( struct xaml_element *element, const WCHAR *property )
++{
++    WCHAR **props;
++
++    if (element_is_local( element, property )) return;
++    if (!(props = realloc( element->local_properties, (element->local_count + 1) * sizeof(*props) ))) return;
++    element->local_properties = props;
++    props[element->local_count++] = wcsdup( property );
++}
++
+ void element_set_parent( struct xaml_element *child, struct xaml_element *parent )
+ {
+     if (child) child->parent = parent;
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index b11229f..643eb21 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -190,6 +190,10 @@ struct xaml_element
+     HSTRING name;
+     INT32 row, column, row_span, column_span;  /* Grid attached properties */
+     IInspectable *resources;                   /* FrameworkElement.Resources */
++    IInspectable *style;                       /* FrameworkElement.Style */
++    BOOL implicit_style_done;
++    WCHAR **local_properties;                  /* set directly (not by a style): styles don't override them */
++    UINT32 local_count;
+ 
+     /* layout results */
+     float desired_width, desired_height;  /* including margin */
+@@ -203,6 +207,9 @@ HRESULT element_compose( struct xaml_element *element, IInspectable *outer, IIns
+ struct xaml_element *element_from_iinspectable( IInspectable *object );
+ struct xaml_element *element_from_object( IInspectable *object );   /* NULL without a FIXME if not ours */
+ IInspectable *element_resources( IInspectable *object );            /* FrameworkElement.Resources, not referenced */
++void element_mark_local( struct xaml_element *element, const WCHAR *property );
++BOOL element_is_local( struct xaml_element *element, const WCHAR *property );
++void style_apply( IInspectable *style, IInspectable *target );
+ void element_set_parent( struct xaml_element *child, struct xaml_element *parent );
+ void element_measure( struct xaml_element *element, struct layout_context *ctx, float avail_width, float avail_height );
+ void element_arrange( struct xaml_element *element, struct layout_context *ctx, float x, float y, float width, float height );
+diff --git a/dlls/windows.ui.xaml/resources.c b/dlls/windows.ui.xaml/resources.c
+index b56a67a..98c762f 100644
+--- a/dlls/windows.ui.xaml/resources.c
++++ b/dlls/windows.ui.xaml/resources.c
+@@ -40,8 +40,23 @@ struct resource_dictionary
+     LONG ref;
+     struct resource_entry *entries;
+     UINT32 count;
++    IInspectable *theme_dictionaries;   /* a ResourceDictionary of ResourceDictionaries keyed Light, Dark, Default */
++    IInspectable *merged;               /* IVector<ResourceDictionary> */
+ };
+ 
++static const struct vector_iids merged_iids =
++{
++    &IID___FIVector_1_Windows__CUI__CXaml__CResourceDictionary,
++    &IID___FIVectorView_1_Windows__CUI__CXaml__CResourceDictionary,
++    &IID___FIIterable_1_Windows__CUI__CXaml__CResourceDictionary,
++    &IID___FIIterator_1_Windows__CUI__CXaml__CResourceDictionary,
++    &IID_IResourceDictionary,
++};
++
++static HRESULT merged_inserted( void *owner, IInspectable *item ) { return S_OK; }
++static void merged_removed( void *owner, IInspectable *item ) {}
++static const struct vector_callbacks merged_callbacks = { merged_inserted, merged_removed };
++
+ static const struct IResourceDictionaryVtbl resource_dictionary_vtbl;
+ 
+ static inline struct resource_dictionary *impl_from_inner( IInspectable *iface )
+@@ -111,14 +126,34 @@ static HSTRING key_string( IInspectable *key )
+     return str;
+ }
+ 
++/* own entries, then the theme dictionary for the current theme (or "Default"), then merged dictionaries, last first */
+ IInspectable *resource_dictionary_lookup( IInspectable *object, const WCHAR *key )
+ {
+     struct resource_dictionary *impl = dictionary_from_object( object );
+     struct resource_entry *entry;
++    IInspectable *value = NULL, *theme;
++    UINT32 i;
+ 
+-    if (!impl || !(entry = find_entry( impl, key )) || !entry->value) return NULL;
+-    IInspectable_AddRef( entry->value );
+-    return entry->value;
++    if (!impl) return NULL;
++    if ((entry = find_entry( impl, key )) && entry->value)
++    {
++        IInspectable_AddRef( entry->value );
++        return entry->value;
++    }
++    if (impl->theme_dictionaries)
++    {
++        const WCHAR *name = application_theme() == ApplicationTheme_Dark ? L"Dark" : L"Light";
++        if ((theme = resource_dictionary_lookup( impl->theme_dictionaries, name )) ||
++            (theme = resource_dictionary_lookup( impl->theme_dictionaries, L"Default" )))
++        {
++            value = resource_dictionary_lookup( theme, key );
++            IInspectable_Release( theme );
++            if (value) return value;
++        }
++    }
++    for (i = vector_size( impl->merged ); i > 0 && !value; i--)
++        value = resource_dictionary_lookup( vector_get( impl->merged, i - 1 ), key );
++    return value;
+ }
+ 
+ void resource_dictionary_insert( IInspectable *object, const WCHAR *key, IInspectable *value )
+@@ -174,6 +209,8 @@ static ULONG WINAPI inner_Release( IInspectable *iface )
+             if (impl->entries[i].value) IInspectable_Release( impl->entries[i].value );
+         }
+         free( impl->entries );
++        if (impl->theme_dictionaries) IInspectable_Release( impl->theme_dictionaries );
++        if (impl->merged) IInspectable_Release( impl->merged );
+         free( impl );
+     }
+     return ref;
+@@ -218,20 +255,34 @@ static HRESULT WINAPI resource_dictionary_get_Source(IResourceDictionary *iface,
+ 
+ static HRESULT WINAPI resource_dictionary_put_Source(IResourceDictionary *iface, __x_ABI_CWindows_CFoundation_CIUriRuntimeClass *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    HSTRING uri = NULL;
++    HRESULT hr;
++
++    if (!value) return E_INVALIDARG;
++    IUriRuntimeClass_get_RawUri( value, &uri );
++    TRACE( "iface %p, source %s.\n", iface, debugstr_hstring(uri) );
++    hr = load_component( (IInspectable *)iface, uri );
++    WindowsDeleteString( uri );
++    return hr;
+ }
+ 
+ static HRESULT WINAPI resource_dictionary_get_MergedDictionaries(IResourceDictionary *iface, __FIVector_1_Windows__CUI__CXaml__CResourceDictionary **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    struct resource_dictionary *impl = impl_from_IResourceDictionary( iface );
++
++    if (!impl->merged && FAILED(vector_create( &merged_iids, &merged_callbacks, impl, &impl->merged ))) return E_OUTOFMEMORY;
++    *value = (__FIVector_1_Windows__CUI__CXaml__CResourceDictionary *)impl->merged;
++    IInspectable_AddRef( impl->merged );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI resource_dictionary_get_ThemeDictionaries(IResourceDictionary *iface, __FIMap_2_IInspectable_IInspectable **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    struct resource_dictionary *impl = impl_from_IResourceDictionary( iface );
++
++    if (!impl->theme_dictionaries &&
++        FAILED(IActivationFactory_ActivateInstance( resource_dictionary_factory, &impl->theme_dictionaries ))) return E_OUTOFMEMORY;
++    return IInspectable_QueryInterface( impl->theme_dictionaries, &IID_IMap_IInspectable_IInspectable, (void **)value );
+ }
+ 
+ static const struct IResourceDictionaryVtbl resource_dictionary_vtbl =
+@@ -262,12 +313,15 @@ static HRESULT WINAPI map_Lookup( IMap_IInspectable_IInspectable *iface, IInspec
+ 
+     *value = NULL;
+     if (!str) return E_INVALIDARG;
+-    entry = find_entry( impl, WindowsGetStringRawBuffer( str, NULL ) );
+-    TRACE( "iface %p, key %s -> %p.\n", iface, debugstr_hstring(str), entry ? entry->value : NULL );
++    if ((entry = find_entry( impl, WindowsGetStringRawBuffer( str, NULL ) )))
++    {
++        if ((*value = entry->value)) IInspectable_AddRef( *value );
++    }
++    /* like Windows, the indexer also finds the theme and merged dictionaries' resources */
++    else *value = resource_dictionary_lookup( (IInspectable *)&impl->IResourceDictionary_iface, WindowsGetStringRawBuffer( str, NULL ) );
++    TRACE( "iface %p, key %s -> %p.\n", iface, debugstr_hstring(str), *value );
+     WindowsDeleteString( str );
+-    if (!entry) return E_BOUNDS;
+-    if ((*value = entry->value)) IInspectable_AddRef( *value );
+-    return S_OK;
++    return entry || *value ? S_OK : E_BOUNDS;
+ }
+ 
+ static HRESULT WINAPI map_get_Size( IMap_IInspectable_IInspectable *iface, unsigned int *size )
+diff --git a/dlls/windows.ui.xaml/xbf.c b/dlls/windows.ui.xaml/xbf.c
+index e2aadb8..7511c8a 100644
+--- a/dlls/windows.ui.xaml/xbf.c
++++ b/dlls/windows.ui.xaml/xbf.c
+@@ -502,11 +502,22 @@ struct resource_entry
+     BOOL implicit;   /* keyed by type (implicit styles) */
+ };
+ 
++struct style_essence
++{
++    UINT32 flags;        /* 0x01 theme resource, 0x02 static resource, 0x04 string, 0x08 object, 0x10 resolved property,
++                            0x20 constant ("container") value, 0x40 the whole setter is an object */
++    struct xprop prop;
++    struct xvalue value;
++    UINT32 token;        /* offset in the style's node stream */
++};
++
+ struct custom_data
+ {
+     UINT32 kind;
+     struct resource_entry *resources;
+     UINT32 resource_count;
++    struct style_essence *setters;
++    UINT32 setter_count;
+ };
+ 
+ static void skip_predicates( struct reader *r )
+@@ -563,6 +574,8 @@ static void free_custom_data( struct custom_data *data )
+     UINT32 i;
+     for (i = 0; i < data->resource_count; i++) free( data->resources[i].key );
+     free( data->resources );
++    for (i = 0; i < data->setter_count; i++) xvalue_clear( &data->setters[i].value );
++    free( data->setters );
+ }
+ 
+ /* Read a custom runtime data block. Only resource dictionaries keep anything; the rest is consumed so that the
+@@ -601,17 +614,30 @@ static void read_custom_data( struct reader *r, struct custom_data *data )
+         skip_conditional_objects( r );
+         break;
+     case 2: case 8: case 11:      /* Style v1, v2, v3 */
+-        for (i = 0, n = read_7bit( r ); i < n && !r->error; i++)
++        n = read_7bit( r );
++        if (r->error || n > 4096 || !(data->setters = calloc( max( 1, n ), sizeof(*data->setters) ))) { r->error = TRUE; break; }
++        for (i = 0; i < n && !r->error; i++)
+         {
+-            flags = read_7bit( r );
++            struct style_essence *e = &data->setters[data->setter_count++];
++            e->flags = flags = read_7bit( r );
+             if (!(flags & 0x40))
+             {
+-                if (flags & 0x10) read_u16( r );            /* resolved property */
+-                else { read_u16( r ); read_u16( r ); }      /* property name, declaring type */
++                if (flags & 0x10) read_property( r, &e->prop );    /* resolved property */
++                else
++                {
++                    struct xtype type;
++                    lstrcpynW( e->prop.name, xbf_string( r->xbf, read_u16( r ) & 0x7fff ), ARRAY_SIZE(e->prop.name) );
++                    read_type( r, &type );
++                    lstrcpyW( e->prop.owner, type.name );
++                }
++            }
++            if (flags & 0x04)
++            {
++                e->value.kind = XV_STRING;
++                e->value.s = wcsdup( xbf_string( r->xbf, read_u16( r ) & 0x7fff ) );
+             }
+-            if (flags & 0x04) read_u16( r );                /* string value */
+-            else if (flags & 0x20) { read_constant( r, &value ); xvalue_clear( &value ); }
+-            else if (flags & (0x01 | 0x02 | 0x08 | 0x40)) read_7bit( r );
++            else if (flags & 0x20) read_constant( r, &e->value );
++            else if (flags & (0x01 | 0x02 | 0x08 | 0x40)) e->token = read_7bit( r );
+         }
+         if (kind == 11) skip_conditional_objects( r );
+         break;
+@@ -713,6 +739,290 @@ static void push_object( struct writer *w, IInspectable *object )
+     push( w, &v );
+ }
+ 
++/* ---- Style (created by markup) ---- */
++
++static HRESULT set_property( struct writer *w, IInspectable *target, const struct xprop *prop, struct xvalue *value,
++                             BOOL from_style );
++
++static void xvalue_copy( struct xvalue *dst, const struct xvalue *src )
++{
++    *dst = *src;
++    if (src->kind == XV_STRING) dst->s = wcsdup( src->s );
++    if (src->kind == XV_OBJECT && src->object) IInspectable_AddRef( src->object );
++}
++
++struct style_setter
++{
++    struct xprop prop;
++    struct xvalue value;
++};
++
++struct style
++{
++    IStyle IStyle_iface;
++    LONG ref;
++    WCHAR target[96];          /* TargetType, short name */
++    IInspectable *based_on;
++    struct style_setter *setters;
++    UINT32 count;
++    boolean sealed;
++};
++
++static const struct IStyleVtbl style_vtbl;
++
++static struct style *style_from_object( IInspectable *object )
++{
++    IStyle *style;
++    struct style *impl = NULL;
++
++    if (!object || FAILED(IInspectable_QueryInterface( object, &IID_IStyle, (void **)&style ))) return NULL;
++    if (style->lpVtbl == &style_vtbl) impl = CONTAINING_RECORD( style, struct style, IStyle_iface );
++    IStyle_Release( style );
++    return impl;
++}
++
++static inline struct style *impl_from_IStyle( IStyle *iface )
++{
++    return CONTAINING_RECORD( iface, struct style, IStyle_iface );
++}
++
++static HRESULT WINAPI style_QueryInterface( IStyle *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IStyle ))
++    {
++        *out = iface;
++        IStyle_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI style_AddRef( IStyle *iface )
++{
++    return InterlockedIncrement( &impl_from_IStyle( iface )->ref );
++}
++
++static ULONG WINAPI style_Release( IStyle *iface )
++{
++    struct style *impl = impl_from_IStyle( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    UINT32 i;
++
++    if (!ref)
++    {
++        for (i = 0; i < impl->count; i++) xvalue_clear( &impl->setters[i].value );
++        free( impl->setters );
++        if (impl->based_on) IInspectable_Release( impl->based_on );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI style_GetIids( IStyle *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI style_GetRuntimeClassName( IStyle *iface, HSTRING *class_name )
++{
++    return WindowsCreateString( L"Windows.UI.Xaml.Style", 21, class_name );
++}
++
++static HRESULT WINAPI style_GetTrustLevel( IStyle *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI style_get_IsSealed( IStyle *iface, boolean *value )
++{
++    *value = impl_from_IStyle( iface )->sealed;
++    return S_OK;
++}
++
++static HRESULT WINAPI style_get_Setters( IStyle *iface, ISetterBaseCollection **value )
++{
++    FIXME( "iface %p: the setters are not exposed as objects.\n", iface );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI style_get_TargetType( IStyle *iface, TypeName *value )
++{
++    struct style *impl = impl_from_IStyle( iface );
++    value->Kind = TypeKind_Metadata;
++    return WindowsCreateString( impl->target, wcslen( impl->target ), &value->Name );
++}
++
++static void style_set_target( struct style *impl, const WCHAR *name )
++{
++    const WCHAR *dot = wcsrchr( name, '.' );
++    lstrcpynW( impl->target, dot ? dot + 1 : name, ARRAY_SIZE(impl->target) );
++}
++
++static HRESULT WINAPI style_put_TargetType( IStyle *iface, TypeName value )
++{
++    style_set_target( impl_from_IStyle( iface ), WindowsGetStringRawBuffer( value.Name, NULL ) );
++    return S_OK;
++}
++
++static HRESULT WINAPI style_get_BasedOn( IStyle *iface, IStyle **value )
++{
++    struct style *impl = impl_from_IStyle( iface );
++    *value = NULL;
++    if (impl->based_on) return IInspectable_QueryInterface( impl->based_on, &IID_IStyle, (void **)value );
++    return S_OK;
++}
++
++static HRESULT WINAPI style_put_BasedOn( IStyle *iface, IStyle *value )
++{
++    struct style *impl = impl_from_IStyle( iface );
++
++    if (value == iface) return E_INVALIDARG;
++    if (value) IStyle_AddRef( value );
++    if (impl->based_on) IInspectable_Release( impl->based_on );
++    impl->based_on = (IInspectable *)value;
++    return S_OK;
++}
++
++static HRESULT WINAPI style_Seal( IStyle *iface )
++{
++    impl_from_IStyle( iface )->sealed = TRUE;
++    return S_OK;
++}
++
++static const struct IStyleVtbl style_vtbl =
++{
++    style_QueryInterface,
++    style_AddRef,
++    style_Release,
++    /* IInspectable methods */
++    style_GetIids,
++    style_GetRuntimeClassName,
++    style_GetTrustLevel,
++    /* IStyle methods */
++    style_get_IsSealed,
++    style_get_Setters,
++    style_get_TargetType,
++    style_put_TargetType,
++    style_get_BasedOn,
++    style_put_BasedOn,
++    style_Seal,
++};
++
++static IInspectable *style_create(void)
++{
++    struct style *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return NULL;
++    impl->IStyle_iface.lpVtbl = &style_vtbl;
++    impl->ref = 1;
++    return (IInspectable *)&impl->IStyle_iface;
++}
++
++/* takes the value */
++static void style_add_setter( struct style *impl, const struct xprop *prop, struct xvalue *value )
++{
++    struct style_setter *setters;
++    UINT32 i;
++
++    for (i = 0; i < impl->count; i++)
++    {
++        if (wcscmp( impl->setters[i].prop.name, prop->name )) continue;
++        xvalue_clear( &impl->setters[i].value );   /* a later setter for the same property wins */
++        impl->setters[i].value = *value;
++        memset( value, 0, sizeof(*value) );
++        return;
++    }
++    if (!(setters = realloc( impl->setters, (impl->count + 1) * sizeof(*setters) ))) return;
++    impl->setters = setters;
++    setters[impl->count].prop = *prop;
++    setters[impl->count].value = *value;
++    memset( value, 0, sizeof(*value) );
++    impl->count++;
++}
++
++/* apply BasedOn's setters, then the style's own; properties set directly on the element keep their values */
++void style_apply( IInspectable *style, IInspectable *target )
++{
++    struct style *impl = style_from_object( style );
++    struct xvalue copy;
++    UINT32 i;
++
++    if (!impl) return;
++    TRACE( "style %p (%s, %u setters) on %p.\n", impl, debugstr_w(impl->target), impl->count, target );
++    if (impl->based_on) style_apply( impl->based_on, target );
++    for (i = 0; i < impl->count; i++)
++    {
++        xvalue_copy( &copy, &impl->setters[i].value );
++        set_property( NULL, target, &impl->setters[i].prop, &copy, TRUE );
++        xvalue_clear( &copy );
++    }
++}
++
++/* where a setter's {StaticResource}/{ThemeResource} value node puts Setter.Value */
++struct value_sink
++{
++    IInspectable IInspectable_iface;
++    LONG ref;
++    struct xvalue value;
++};
++
++static const struct IInspectableVtbl value_sink_vtbl;
++
++static HRESULT WINAPI sink_QueryInterface( IInspectable *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ))
++    {
++        *out = iface;
++        IInspectable_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI sink_AddRef( IInspectable *iface )
++{
++    return InterlockedIncrement( &CONTAINING_RECORD( iface, struct value_sink, IInspectable_iface )->ref );
++}
++
++static ULONG WINAPI sink_Release( IInspectable *iface )
++{
++    struct value_sink *impl = CONTAINING_RECORD( iface, struct value_sink, IInspectable_iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        xvalue_clear( &impl->value );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI sink_GetIids( IInspectable *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI sink_GetRuntimeClassName( IInspectable *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI sink_GetTrustLevel( IInspectable *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static const struct IInspectableVtbl value_sink_vtbl =
++{
++    sink_QueryInterface, sink_AddRef, sink_Release, sink_GetIids, sink_GetRuntimeClassName, sink_GetTrustLevel,
++};
++
++static struct value_sink *sink_from_object( IInspectable *object )
++{
++    return object && object->lpVtbl == &value_sink_vtbl ? CONTAINING_RECORD( object, struct value_sink, IInspectable_iface ) : NULL;
++}
++
++/* "Type" or "Namespace.Type" to the key implicit styles are stored under */
++static void implicit_key( const WCHAR *type, WCHAR *key, SIZE_T len )
++{
++    const WCHAR *dot = wcsrchr( type, '.' );
++    key[0] = 1;
++    lstrcpynW( key + 1, dot ? dot + 1 : type, len - 1 );
++}
++
+ /* ---- values to properties ---- */
+ 
+ /* the value inside a boxed IPropertyValue, as a constant */
+@@ -991,8 +1301,11 @@ static BOOL prop_is( const struct xprop *prop, const WCHAR *name )
+ #define QI( obj, I, out ) SUCCEEDED(IInspectable_QueryInterface( obj, &IID_##I, (void **)out ))
+ 
+ /* Set prop on target from a markup value. Unsupported properties are logged and skipped. */
+-static HRESULT set_property( struct writer *w, IInspectable *target, const struct xprop *prop, struct xvalue *value )
++static HRESULT set_property( struct writer *w, IInspectable *target, const struct xprop *prop, struct xvalue *value,
++                             BOOL from_style )
+ {
++    struct value_sink *sink;
++    struct style *style;
+     IFrameworkElement *fe;
+     IUIElement *ui;
+     ITextBlock *tb;
+@@ -1024,9 +1337,61 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+         TRACE( "no target for %s.%s.\n", debugstr_w(prop->owner), debugstr_w(prop->name) );
+         return S_OK;
+     }
++    if ((sink = sink_from_object( target )))
++    {
++        xvalue_clear( &sink->value );
++        xvalue_copy( &sink->value, value );
++        return S_OK;
++    }
++    if ((style = style_from_object( target )))
++    {
++        if (prop_is( prop, L"TargetType" ) && value->kind == XV_STRING) style_set_target( style, value->s );
++        else if (prop_is( prop, L"BasedOn" ) && value->kind == XV_OBJECT && style_from_object( value->object ))
++        {
++            if (style->based_on) IInspectable_Release( style->based_on );
++            IInspectable_AddRef( (style->based_on = value->object) );
++        }
++        else FIXME( "Style.%s is not supported.\n", debugstr_w(prop->name) );
++        return S_OK;
++    }
++    if ((element = element_from_object( target )) && !prop->directive && !prop_is( prop, L"Name" ) && !prop_is( prop, L"Style" ))
++    {
++        if (!from_style) element_mark_local( element, prop->name );
++        else if (element_is_local( element, prop->name ))
++        {
++            TRACE( "%s is set locally, the style doesn't change it.\n", debugstr_w(prop->name) );
++            return S_OK;
++        }
++    }
+     unbox_value( value );
+     TRACE( "%p.%s.%s, value kind %d.\n", target, debugstr_w(prop->owner), debugstr_w(prop->name), value->kind );
+ 
++    if (prop_is( prop, L"Style" ))
++    {
++        if (value->kind == XV_OBJECT && style_from_object( value->object ) && QI( target, IFrameworkElement, &fe ))
++        {
++            IStyle *istyle;
++            IInspectable_QueryInterface( value->object, &IID_IStyle, (void **)&istyle );
++            IFrameworkElement_put_Style( fe, istyle );
++            IStyle_Release( istyle );
++            IFrameworkElement_Release( fe );
++            return S_OK;
++        }
++        goto unsupported;
++    }
++    if (prop_is( prop, L"Source" ) && value->kind == XV_STRING)
++    {
++        IResourceDictionary *dict;
++        if (QI( target, IResourceDictionary, &dict ))
++        {
++            WindowsCreateString( value->s, wcslen( value->s ), &str );
++            load_component( target, str );
++            WindowsDeleteString( str );
++            IResourceDictionary_Release( dict );
++            return S_OK;
++        }
++    }
++
+     /* Grid attached properties */
+     if (!wcscmp( prop->owner, L"Grid" ) && (prop_is( prop, L"Row" ) || prop_is( prop, L"Column" ) ||
+         prop_is( prop, L"RowSpan" ) || prop_is( prop, L"ColumnSpan" )))
+@@ -1290,12 +1655,23 @@ static IInspectable *get_property( IInspectable *target, const struct xprop *pro
+         }
+         result = (IInspectable *)dict;
+     }
++    else if (prop_is( prop, L"ThemeDictionaries" ) || prop_is( prop, L"MergedDictionaries" ))
++    {
++        if (QI( target, IResourceDictionary, &dict ))
++        {
++            if (prop_is( prop, L"ThemeDictionaries" ))
++                IResourceDictionary_get_ThemeDictionaries( dict, (IMap_IInspectable_IInspectable **)&result );
++            else
++                IResourceDictionary_get_MergedDictionaries( dict, (__FIVector_1_Windows__CUI__CXaml__CResourceDictionary **)&result );
++            IResourceDictionary_Release( dict );
++        }
++    }
+     else FIXME( "getting %s.%s from %p is not supported.\n", debugstr_w(prop->owner), debugstr_w(prop->name), target );
+     return result;
+ }
+ 
+ /* find a resource: in dictionaries on the stack (innermost first), then the application's, then the theme's */
+-static IInspectable *lookup_resource( struct writer *w, const WCHAR *key, BOOL theme )
++static IInspectable *lookup_resource( struct writer *w, const WCHAR *key, BOOL theme, BOOL quiet )
+ {
+     IInspectable *value = NULL, *dict;
+     int i;
+@@ -1308,7 +1684,7 @@ static IInspectable *lookup_resource( struct writer *w, const WCHAR *key, BOOL t
+     }
+     if (!value && (dict = application_resources())) value = resource_dictionary_lookup( dict, key );
+     if (!value) value = theme_resource_lookup( key );
+-    if (!value) WARN( "%s resource %s not found.\n", theme ? "theme" : "static", debugstr_w(key) );
++    if (!value && !quiet) WARN( "%s resource %s not found.\n", theme ? "theme" : "static", debugstr_w(key) );
+     return value;
+ }
+ 
+@@ -1332,6 +1708,7 @@ IInspectable *create_builtin( const WCHAR *name )
+     IInspectable *object;
+     UINT32 i;
+ 
++    if (!wcscmp( name, L"Style" )) return style_create();
+     for (i = 0; i < ARRAY_SIZE(classes); i++)
+     {
+         if (wcscmp( name, classes[i].name )) continue;
+@@ -1361,7 +1738,14 @@ static IInspectable *create_type( struct writer *w, const struct xtype *type )
+     return app_create_instance( full );
+ }
+ 
+-static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, BOOL single );
++enum run_mode
++{
++    RUN_ALL,       /* the whole stream */
++    RUN_OBJECT,    /* one complete object (a resource, a deferred element, a setter's object value) */
++    RUN_NODE,      /* one node (a setter's resource reference) */
++};
++
++static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, enum run_mode mode );
+ 
+ static void add_to_collection( IInspectable *collection, struct xvalue *value )
+ {
+@@ -1391,11 +1775,9 @@ static void run_custom_data( struct writer *w, UINT32 stream, struct custom_data
+         TRACE( "resource dictionary with %u resources in stream %u.\n", data->resource_count, stream );
+         for (i = 0; i < data->resource_count; i++)
+         {
+-            if (data->resources[i].implicit)
+-            {
+-                FIXME( "implicit (type-keyed) resource %s is not supported.\n", debugstr_w(data->resources[i].key) );
+-                continue;
+-            }
++            WCHAR key[100];
++            if (data->resources[i].implicit) implicit_key( data->resources[i].key, key, ARRAY_SIZE(key) );
++            else lstrcpynW( key, data->resources[i].key, ARRAY_SIZE(key) );
+             memset( sub, 0, sizeof(*sub) );
+             sub->xbf = w->xbf;
+             sub->root_used = TRUE;
+@@ -1403,12 +1785,12 @@ static void run_custom_data( struct writer *w, UINT32 stream, struct custom_data
+             /* resources may refer to earlier ones: the sub-writer sees this writer's stack, without owning it */
+             memcpy( sub->stack, w->stack, w->sp * sizeof(*w->stack) );
+             sub->sp = w->sp;
+-            run_stream( sub, stream, data->resources[i].offset, TRUE );
++            run_stream( sub, stream, data->resources[i].offset, RUN_OBJECT );
+             if (sub->sp > w->sp)
+             {
+                 pop( sub, &value );
+                 if (value.kind == XV_OBJECT && value.object && target)
+-                    resource_dictionary_insert( target, data->resources[i].key, value.object );
++                    resource_dictionary_insert( target, key, value.object );
+                 else if (value.kind != XV_OBJECT)
+                     FIXME( "resource %s isn't an object.\n", debugstr_w(data->resources[i].key) );
+                 xvalue_clear( &value );
+@@ -1423,17 +1805,91 @@ static void run_custom_data( struct writer *w, UINT32 stream, struct custom_data
+         sub->xbf = w->xbf;
+         sub->root_used = TRUE;
+         sub->connector = w->connector;
+-        run_stream( sub, stream, 0, TRUE );
++        run_stream( sub, stream, 0, RUN_OBJECT );
+         if (sub->sp) { pop( sub, &value ); push( w, &value ); }
+         while (sub->sp) { pop( sub, &value ); xvalue_clear( &value ); }
+         break;
++    case 2: case 8: case 11:
++    {
++        struct style *style = style_from_object( target );
++        struct value_sink *sink;
++
++        if (!style)
++        {
++            FIXME( "style data for something that isn't a style.\n" );
++            break;
++        }
++        TRACE( "style %s with %u setters in stream %u.\n", debugstr_w(style->target), data->setter_count, stream );
++        for (i = 0; i < data->setter_count; i++)
++        {
++            struct style_essence *e = &data->setters[i];
++            struct xprop prop = e->prop;
++
++            memset( &value, 0, sizeof(value) );
++            if (e->flags & 0x40)
++            {
++                FIXME( "setter given as an object is not supported.\n" );
++                continue;
++            }
++            if (e->flags & (0x04 | 0x20)) xvalue_copy( &value, &e->value );
++            else if (e->flags & (0x01 | 0x02 | 0x08))
++            {
++                memset( sub, 0, sizeof(*sub) );
++                sub->xbf = w->xbf;
++                sub->root_used = TRUE;
++                memcpy( sub->stack, w->stack, w->sp * sizeof(*w->stack) );
++                sub->sp = w->sp;
++                if (e->flags & 0x08)
++                {
++                    /* an object value (often a ControlTemplate, which isn't supported yet) */
++                    run_stream( sub, stream, e->token, RUN_OBJECT );
++                    if (sub->sp > w->sp) pop( sub, &value );
++                }
++                else if ((sink = calloc( 1, sizeof(*sink) )))
++                {
++                    /* a {StaticResource}/{ThemeResource} node that sets Setter.Value on the setter */
++                    sink->IInspectable_iface.lpVtbl = &value_sink_vtbl;
++                    sink->ref = 1;
++                    push_object( sub, &sink->IInspectable_iface );
++                    run_stream( sub, stream, e->token, RUN_NODE );
++                    value = sink->value;
++                    memset( &sink->value, 0, sizeof(sink->value) );
++                }
++                while (sub->sp > w->sp) { struct xvalue v; pop( sub, &v ); xvalue_clear( &v ); }
++            }
++            if (!value.kind || (value.kind == XV_OBJECT && !value.object))
++            {
++                TRACE( "setter %s.%s has no usable value.\n", debugstr_w(prop.owner), debugstr_w(prop.name) );
++                continue;
++            }
++            style_add_setter( style, &prop, &value );
++            xvalue_clear( &value );
++        }
++        break;
++    }
+     default:
+-        FIXME( "custom runtime data type %u (styles, visual states) is ignored.\n", data->kind );
++        FIXME( "custom runtime data type %u (visual states) is ignored.\n", data->kind );
+         break;
+     }
+     free( sub );
+ }
+ 
++/* at the end of an element's initialization: its implicit style, if it has no Style and one is in scope */
++static void finish_object( struct writer *w, IInspectable *object )
++{
++    struct xaml_element *element = element_from_object( object );
++    IInspectable *style;
++    WCHAR key[100];
++
++    if (!element || element->style || element->implicit_style_done) return;
++    element->implicit_style_done = TRUE;
++    implicit_key( element->class_name, key, ARRAY_SIZE(key) );
++    if (!(style = lookup_resource( w, key, FALSE, TRUE ))) return;
++    TRACE( "implicit style for %s.\n", debugstr_w(element->class_name) );
++    style_apply( style, object );
++    IInspectable_Release( style );
++}
++
+ static void scope_push( struct writer *w, enum scope_kind kind )
+ {
+     if (w->scope_count < MAX_STACK) w->scopes[w->scope_count++] = kind;
+@@ -1454,7 +1910,7 @@ static BOOL scope_pop( struct writer *w )
+ }
+ 
+ /* Run a node stream from offset. With single, stop after one complete object (a resource, a deferred element). */
+-static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, BOOL single )
++static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, enum run_mode mode )
+ {
+     struct reader r = {0};
+     struct xvalue value, key;
+@@ -1485,6 +1941,7 @@ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, BOOL sin
+         case NODE_POP_SCOPE:
+         case NODE_END_INIT_POP_SCOPE:
+         case NODE_END_INIT_PROVIDE_VALUE_POP_SCOPE:
++            if (node != NODE_POP_SCOPE) finish_object( w, top_object( w ) );
+             scope_pop( w );
+             break;
+         case NODE_ADD_NAMESPACE:
+@@ -1503,7 +1960,7 @@ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, BOOL sin
+             pop( w, &value );
+             if (node == NODE_SET_VALUE_FROM_MARKUP_EXTENSION && value.kind == XV_OBJECT && !value.object)
+                 FIXME( "markup extension for %s.%s (Binding?) is not supported.\n", debugstr_w(prop.owner), debugstr_w(prop.name) );
+-            else set_property( w, top_object( w ), &prop, &value );
++            else set_property( w, top_object( w ), &prop, &value, FALSE );
+             xvalue_clear( &value );
+             break;
+         case NODE_ADD_TO_COLLECTION:
+@@ -1513,7 +1970,13 @@ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, BOOL sin
+             break;
+         case NODE_ADD_TO_DICTIONARY:
+             pop( w, &value );
+-            FIXME( "adding to a dictionary without a key (implicit styles) is not supported.\n" );
++            if (value.kind == XV_OBJECT && style_from_object( value.object ) && top_object( w ))
++            {
++                WCHAR key2[100];
++                implicit_key( style_from_object( value.object )->target, key2, ARRAY_SIZE(key2) );
++                resource_dictionary_insert( top_object( w ), key2, value.object );
++            }
++            else FIXME( "adding to a dictionary without a key is only supported for styles.\n" );
+             xvalue_clear( &value );
+             break;
+         case NODE_ADD_TO_DICTIONARY_WITH_KEY:
+@@ -1548,7 +2011,7 @@ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, BOOL sin
+                 prop.directive = FALSE;
+                 lstrcpyW( prop.owner, L"FrameworkElement" );
+                 lstrcpyW( prop.name, L"Name" );
+-                set_property( w, object, &prop, &value );
++                set_property( w, object, &prop, &value, FALSE );
+             }
+             xvalue_clear( &value );
+             break;
+@@ -1601,7 +2064,7 @@ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, BOOL sin
+         case NODE_SET_VALUE_CONVERTED_CONSTANT:
+             read_property( &r, &prop );
+             read_constant( &r, &value );
+-            set_property( w, top_object( w ), &prop, &value );
++            set_property( w, top_object( w ), &prop, &value, FALSE );
+             xvalue_clear( &value );
+             break;
+         case NODE_SET_VALUE_CONVERTED_RESOLVED_PROPERTY:
+@@ -1614,17 +2077,20 @@ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, BOOL sin
+         case NODE_SET_VALUE_CONVERTED_RESOLVED_TYPE:
+             read_property( &r, &prop );
+             read_type( &r, &type );
+-            FIXME( "%s.%s = type %s is not supported.\n", debugstr_w(prop.owner), debugstr_w(prop.name), debugstr_w(type.name) );
++            if (prop_is( &prop, L"TargetType" ) && style_from_object( top_object( w ) ))
++                style_set_target( style_from_object( top_object( w ) ), type.name );
++            else
++                FIXME( "%s.%s = type %s is not supported.\n", debugstr_w(prop.owner), debugstr_w(prop.name), debugstr_w(type.name) );
+             break;
+         case NODE_SET_VALUE_FROM_STATIC_RESOURCE:
+         case NODE_SET_VALUE_FROM_THEME_RESOURCE:
+             read_property( &r, &prop );
+             read_constant( &r, &key );
+-            if (key.kind == XV_STRING && (object = lookup_resource( w, key.s, node == NODE_SET_VALUE_FROM_THEME_RESOURCE )))
++            if (key.kind == XV_STRING && (object = lookup_resource( w, key.s, node == NODE_SET_VALUE_FROM_THEME_RESOURCE, FALSE )))
+             {
+                 value.kind = XV_OBJECT;
+                 value.object = object;
+-                set_property( w, top_object( w ), &prop, &value );
++                set_property( w, top_object( w ), &prop, &value, FALSE );
+                 xvalue_clear( &value );
+             }
+             xvalue_clear( &key );
+@@ -1633,7 +2099,7 @@ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, BOOL sin
+         case NODE_PROVIDE_THEME_RESOURCE_VALUE:
+             read_constant( &r, &key );
+             value.kind = XV_OBJECT;
+-            value.object = key.kind == XV_STRING ? lookup_resource( w, key.s, node == NODE_PROVIDE_THEME_RESOURCE_VALUE ) : NULL;
++            value.object = key.kind == XV_STRING ? lookup_resource( w, key.s, node == NODE_PROVIDE_THEME_RESOURCE_VALUE, FALSE ) : NULL;
+             push( w, &value );
+             xvalue_clear( &key );
+             break;
+@@ -1650,7 +2116,8 @@ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, BOOL sin
+             break;
+         }
+         /* one complete object: back at the starting scope depth with something new on the stack */
+-        if (single && w->scope_count == start_scopes && w->sp > start_sp) return;
++        if (mode == RUN_OBJECT && w->scope_count == start_scopes && w->sp > start_sp) return;
++        if (mode == RUN_NODE) return;
+     }
+     if (r.error)
+     {
+@@ -1675,7 +2142,7 @@ HRESULT xbf_load( struct xbf *xbf, IInspectable *root, IInspectable **out )
+     if (root && FAILED(IInspectable_QueryInterface( root, &IID_IComponentConnector, (void **)&w->connector )))
+         w->connector = NULL;
+ 
+-    run_stream( w, 0, 0, FALSE );
++    run_stream( w, 0, 0, RUN_ALL );
+     if (w->failed) hr = E_FAIL;
+     if (w->sp)
+     {
