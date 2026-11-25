@@ -400,3 +400,47 @@ Milestone 4 is the largest rung (3 to 6 months in the ladder), so it lands in pa
 - `DataTemplate`.
 - `{Binding}`.
 - Direct2D rendering.
+
+## 14. Milestone 4, part 5: shapes, CornerRadius, CheckBox/RadioButton templates, theme changes, loose XAML (patches 0030-0031)
+
+**What was built:**
+
+- **Shapes** (patch 0030 is their IDL, generated with `winmd2idl.py ... Windows.UI.Xaml.Shapes.Shape Shapes.Rectangle Shapes.Ellipse Shapes.Path`).
+  - `Rectangle` (with `RadiusX`/`RadiusY`) and `Ellipse` fill their layout slot and draw their stroke inside it.
+  - `Path` takes path markup from markup: `M`, `L`, `H`, `V` and `Z`, absolute and relative, with curves reduced to their end points. It draws at its own coordinates. `Geometry` objects from code are not supported.
+  - Strokes and fills are GDI regions, so translucent brushes blend.
+- **`CornerRadius`** on Border (`IBorder`), ContentPresenter and controls, from markup and through `TemplateBinding`. Each corner has its own radius, drawn as polygon regions with the stroke inside the edge. Without corners, the old rectangle code draws pixel for pixel as before.
+- **CheckBox and RadioButton default templates** in `generic.xaml`, built from shapes:
+  - **CheckBox:** a `CombinedStates` group (`UncheckedNormal` ... `IndeterminateDisabled`); a 20 px `NormalRectangle`; a `Path` check mark (Windows uses a Segoe MDL2 Assets glyph); an indeterminate square.
+  - **RadioButton:** `CommonStates` and `CheckStates`, with `OuterEllipse`, `CheckOuterEllipse` and `CheckGlyph`.
+  - **Both:** WinUI's resource keys (`CheckBoxCheckBackgroundFillChecked`, `RadioButtonOuterEllipseCheckedStroke`, ...), with Windows 10 values for both themes.
+  - The built-in drawing in `button.c` is now only a fallback.
+- **Theme changes while running.**
+  - **What is remembered:** `{ThemeResource}` values set on elements, from XBF or text, and the theme-dependent setters of explicit, implicit and default styles. The implicit style is now kept on the element.
+  - **`FrameworkElement.RequestedTheme`** (`IFrameworkElement2`, and markup) marks the subtree. On its next layout the subtree looks these values up again under the element's theme. Theme dictionaries consult an override while this happens. Templates are rebuilt, and drawing (built-in looks, default text colour) follows the subtree's theme.
+  - **The system theme:** the app theme now starts from the system's (`AppsUseLightTheme`) unless App.xaml or code sets `RequestedTheme`. `WM_SETTINGCHANGE` "ImmersiveColorSet" refreshes the tree when it changes.
+- **Loose XAML.** `LoadComponent` reads `Page.xaml` (UTF-8 or UTF-16) when there is no `Page.xbf`.
+  - `x:ConnectionId`, which Visual Studio writes into processed markup when XBF generation is off, reaches the component's `Connect`, so `x:Name` fields and event handlers are hooked up.
+  - `FrameworkElement.FindName` searches the element's tree.
+- **Quieter logs.** The markup writer probes objects for many interfaces. Elements, brushes and dictionaries now FIXME a missing interface once per class, then TRACE. The test log went from about 28,000 lines to about 2,000.
+
+**Tests:**
+
+- **`xamlmarkup`: 105/105 checks pass.** New checks:
+  - CheckBox and RadioButton get the default templates. The checked box is the template's 20 px Rectangle in the app's `CheckBoxCheckBackgroundFillChecked`, with the Path check mark inside.
+  - A `CornerRadius="10"` Border has rounded corners: the corner pixel is outside, the edge and fill inside.
+  - `RequestedTheme=Dark` on the page's root Grid switches App.xaml's `PanelBrush` and generic.xaml's page background and `ButtonBackground` to their dark values. `Default` brings the light ones back.
+  - A system theme change doesn't affect an app with an explicit `RequestedTheme`.
+  - A loose `LoosePage.xaml` loads through `LoadComponent`, its `x:ConnectionId` reaches `Connect`, its `CornerRadius` is read, and `FindName` finds its TextBlock.
+- Milestones 1 and 2 still pass 34/34.
+
+**Still to do in milestone 4:**
+
+- ToggleSwitch, Slider, ProgressBar and their templates.
+- Path curves and `Geometry` objects.
+- Opacity rendering.
+- Anti-aliased shapes (GDI draws them aliased).
+- Animation timing.
+- `DataTemplate`.
+- `{Binding}`.
+- Direct2D rendering.
