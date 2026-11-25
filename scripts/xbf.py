@@ -281,7 +281,7 @@ NAMED_COLORS = {'Red': 0xffff0000, 'Green': 0xff008000, 'Blue': 0xff0000ff, 'Whi
 
 def compile_xaml(src, out):
     """Compile a small XAML subset to XBF 2.1 the way Microsoft's compiler lays it out: built-in types and properties
-    by stable index, x:Class types through the type table, Click handlers and x:Name through connection ids,
+    by stable index, x:Class types through the type table, Click/Checked/Unchecked/Indeterminate handlers and x:Name through connection ids,
     {StaticResource} as SetValueFromStaticResource, Application/FrameworkElement.Resources as a ResourceDictionary
     custom-runtime-data block with its entries in a second node stream. Good enough for wine-uwp's test apps."""
     import xml.etree.ElementTree as ET
@@ -311,7 +311,10 @@ def compile_xaml(src, out):
              'ObjectAnimationUsingKeyFrames': ['Timeline'], 'Storyboard': ['Timeline'],
              'Button': ['ButtonBase', 'ContentControl', 'Control'], 'Frame': ['ContentControl', 'Control'],
              'Page': ['UserControl', 'Control'], 'UserControl': ['Control'], 'Grid': ['Panel'], 'StackPanel': ['Panel'],
-             'ContentControl': ['Control']}
+             'ContentControl': ['Control'],
+             'ToggleButton': ['ButtonBase', 'ContentControl', 'Control'],
+             'CheckBox': ['ToggleButton', 'ButtonBase', 'ContentControl', 'Control'],
+             'RadioButton': ['ToggleButton', 'ButtonBase', 'ContentControl', 'Control']}
 
     def prop_ref(type_name, name):
         """the stable index of Type.Name, looking through the type's base classes like the compiler does"""
@@ -359,7 +362,7 @@ def compile_xaml(src, out):
             w(stream, 'Bf', C_FLOAT, float(value)); return
         if short in ('Row', 'Column', 'RowSpan', 'ColumnSpan'):
             w(stream, 'Bi', C_SIGNED, int(value)); return
-        if short in ('IsEnabled',):
+        if short in ('IsEnabled', 'IsChecked', 'IsThreeState'):
             w(stream, 'B', C_BOOL_TRUE if value.lower() == 'true' else C_BOOL_FALSE); return
         if short in ('Color', 'Foreground', 'Background', 'BorderBrush'):
             c = NAMED_COLORS.get(value)
@@ -405,7 +408,7 @@ def compile_xaml(src, out):
         xname = attrs.pop('{%s}Name' % XAML, None) or attrs.pop('Name', None)
         if xname:
             w(stream, 'BBH', NODE['SetName'], C_SHARED, s(xname))
-        events = {k: attrs.pop(k) for k in list(attrs) if k == 'Click'}
+        events = {k: attrs.pop(k) for k in list(attrs) if k in ('Click', 'Checked', 'Unchecked', 'Indeterminate')}
         if (xname or events) and not template_target:   # template parts aren't connected to the page
             conn[0] += 1
             w(stream, 'BBi', NODE['SetConnectionId'], C_SIGNED, conn[0])

@@ -1,0 +1,1438 @@
+Subject: windows.ui.xaml: ToggleButton, CheckBox, RadioButton, live TemplateBinding and WinUI resource keys (milestone 4, part 3)
+
+diff --git a/dlls/windows.ui.xaml/button.c b/dlls/windows.ui.xaml/button.c
+index 3c992db..7969f76 100644
+--- a/dlls/windows.ui.xaml/button.c
++++ b/dlls/windows.ui.xaml/button.c
+@@ -23,9 +23,28 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(xaml);
+ 
+-/* There are no control templates yet (milestone 4), so Button draws the Windows 10 default look itself: a filled
+- * rectangle with a 2 px border and its content centred, with the Normal / PointerOver / Pressed / Disabled colours
+- * of the light and dark themes. Content is a UIElement, or anything else shown as text (strings, IStringable). */
++/* Button, ToggleButton, CheckBox and RadioButton. With a control template (from markup or a style) the template
++ * draws the control and visual states follow its pointer and check state. Without one the control draws the
++ * Windows 10 default look itself: a Button is a filled rectangle with a 2 px border and its content centred; a
++ * CheckBox or RadioButton is a 20 px box or circle with the content to its right. The built-in look uses WinUI's
++ * resource keys (ButtonBackgroundPointerOver, CheckBoxCheckBackgroundFillChecked, ...) where the app defines them,
++ * as the default templates do, and the light / dark theme colours otherwise. Content is a UIElement, or anything
++ * else shown as text (strings, IStringable). */
++
++enum button_kind
++{
++    BUTTON_PLAIN,
++    BUTTON_TOGGLE,
++    BUTTON_CHECK,
++    BUTTON_RADIO,
++};
++
++enum check_state
++{
++    CHECK_OFF,
++    CHECK_ON,
++    CHECK_INDETERMINATE,   /* IsChecked is null */
++};
+ 
+ struct button
+ {
+@@ -34,6 +53,10 @@ struct button
+     IButtonBase IButtonBase_iface;
+     IContentControl IContentControl_iface;
+     IControl IControl_iface;
++    IToggleButton IToggleButton_iface;
++    ICheckBox ICheckBox_iface;
++    IRadioButton IRadioButton_iface;
++    enum button_kind kind;
+ 
+     IInspectable *content;
+     struct xaml_element *content_element;   /* content, when it is a UIElement */
+@@ -48,8 +71,14 @@ struct button
+     boolean enabled, pointer_over, pressed, captured;
+     ClickMode click_mode;
+     struct event_list click;
++    enum check_state check;
++    boolean three_state;
++    HSTRING group_name;
++    struct event_list checked, unchecked, indeterminate;
+ };
+ 
++static const struct element_ops button_ops;
++
+ static inline struct button *impl_from_element( struct xaml_element *element )
+ {
+     return CONTAINING_RECORD( element, struct button, element );
+@@ -60,6 +89,8 @@ static struct xaml_element *button_content_element( struct button *impl )
+     return impl->content_element;
+ }
+ 
++static void button_update_state( struct button *impl );
++
+ /* the control template, if the button has one: instantiated on first layout, like WinUI's ApplyTemplate */
+ static struct xaml_element *button_template_root( struct button *impl )
+ {
+@@ -71,37 +102,77 @@ static struct xaml_element *button_template_root( struct button *impl )
+         if (!(impl->element.template_instance = template_instantiate( impl->element.template, impl->element.outer )))
+             return NULL;
+         if ((root = template_root( impl->element.template_instance ))) element_set_parent( root, &impl->element );
+-        template_go_to_state( impl->element.template_instance, impl->enabled ? L"Normal" : L"Disabled" );
++        button_update_state( impl );
+     }
+     return template_root( impl->element.template_instance );
+ }
+ 
++static const WCHAR *common_state( struct button *impl )
++{
++    if (!impl->enabled) return L"Disabled";
++    if (impl->pressed) return L"Pressed";
++    if (impl->pointer_over) return L"PointerOver";
++    return L"Normal";
++}
++
++static const WCHAR *check_state_name( struct button *impl )
++{
++    static const WCHAR *names[] = { L"Unchecked", L"Checked", L"Indeterminate" };
++    return names[impl->check];
++}
++
++/* Each visual state group goes to the first of these states it has. That covers the templates' different schemes:
++ * ToggleButton's CommonStates (Normal, PointerOver, Checked, CheckedPointerOver, ...), CheckBox's CombinedStates
++ * (UncheckedNormal, CheckedPointerOver, ...) and RadioButton's separate CommonStates and CheckStates. */
+ static void button_update_state( struct button *impl )
+ {
+-    const WCHAR *state;
++    WCHAR combined[64];
++    const WCHAR *names[3];
++    UINT32 count = 0;
+ 
+     if (!impl->element.template_instance) return;
+-    if (!impl->enabled) state = L"Disabled";
+-    else if (impl->pressed) state = L"Pressed";
+-    else if (impl->pointer_over) state = L"PointerOver";
+-    else state = L"Normal";
+-    template_go_to_state( impl->element.template_instance, state );
++    if (impl->kind != BUTTON_PLAIN)
++    {
++        swprintf( combined, ARRAY_SIZE(combined), L"%s%s", check_state_name( impl ), common_state( impl ) );
++        names[count++] = combined;
++        if (impl->check != CHECK_OFF && !wcscmp( common_state( impl ), L"Normal" )) names[count++] = check_state_name( impl );
++        else if (impl->check == CHECK_OFF) names[count++] = L"Unchecked";
++    }
++    names[count++] = common_state( impl );
++    template_go_to_states( impl->element.template_instance, names, count );
+ }
+ 
++/* a property TemplateBindings in the template may read changed */
++static void button_changed( struct button *impl, const WCHAR *property )
++{
++    if (impl->element.template_instance) template_property_changed( impl->element.template_instance, property );
++    window_invalidate();
++}
++
++static BOOL has_glyph( struct button *impl )
++{
++    return impl->kind == BUTTON_CHECK || impl->kind == BUTTON_RADIO;
++}
++
++#define GLYPH_SIZE 20.0f
++
+ static void button_text_format( struct button *impl, struct text_format *format )
+ {
+     format->font_size = impl->font_size;
+     format->weight = impl->font_weight.Weight;
+     format->italic = impl->font_style != FontStyle_Normal;
+     format->wrap = FALSE;
+-    format->alignment = TextAlignment_Center;
++    format->alignment = has_glyph( impl ) ? TextAlignment_Left : TextAlignment_Center;
+ }
+ 
+ static HRESULT button_query_interface( struct xaml_element *element, REFIID iid, void **out )
+ {
+     struct button *impl = impl_from_element( element );
+ 
+-    if (IsEqualGUID( iid, &IID_IButton )) *out = &impl->IButton_iface;
++    if (impl->kind == BUTTON_PLAIN && IsEqualGUID( iid, &IID_IButton )) *out = &impl->IButton_iface;
++    else if (impl->kind != BUTTON_PLAIN && IsEqualGUID( iid, &IID_IToggleButton )) *out = &impl->IToggleButton_iface;
++    else if (impl->kind == BUTTON_CHECK && IsEqualGUID( iid, &IID_ICheckBox )) *out = &impl->ICheckBox_iface;
++    else if (impl->kind == BUTTON_RADIO && IsEqualGUID( iid, &IID_IRadioButton )) *out = &impl->IRadioButton_iface;
+     else if (IsEqualGUID( iid, &IID_IButtonBase )) *out = &impl->IButtonBase_iface;
+     else if (IsEqualGUID( iid, &IID_IContentControl )) *out = &impl->IContentControl_iface;
+     else if (IsEqualGUID( iid, &IID_IControl )) *out = &impl->IControl_iface;
+@@ -140,6 +211,12 @@ static void button_measure( struct xaml_element *element, struct layout_context
+     }
+     *width += extra_width;
+     *height += extra_height;
++    if (has_glyph( impl ))
++    {
++        /* the default templates: a 20 px glyph column, and a 32 px minimum height */
++        *width += GLYPH_SIZE;
++        *height = max( *height, 32.0f );
++    }
+ }
+ 
+ static void button_inner_rect( struct button *impl, struct layout_rect *rect )
+@@ -147,9 +224,11 @@ static void button_inner_rect( struct button *impl, struct layout_rect *rect )
+     const Thickness *b = &impl->border_thickness, *p = &impl->padding;
+     const struct layout_rect *r = &impl->element.bounds;
+ 
+-    rect->x = r->x + b->Left + p->Left;
++    float glyph = has_glyph( impl ) ? GLYPH_SIZE : 0;
++
++    rect->x = r->x + b->Left + p->Left + glyph;
+     rect->y = r->y + b->Top + p->Top;
+-    rect->width = max( 0.0f, r->width - b->Left - b->Right - p->Left - p->Right );
++    rect->width = max( 0.0f, r->width - b->Left - b->Right - p->Left - p->Right - glyph );
+     rect->height = max( 0.0f, r->height - b->Top - b->Bottom - p->Top - p->Bottom );
+ }
+ 
+@@ -185,52 +264,99 @@ static void button_arrange( struct xaml_element *element, struct layout_context
+     element_arrange( child, ctx, x, y, w, h );
+ }
+ 
+-static BOOL brush_colorref( IBrush *brush, COLORREF *color )
++/* a colour of the built-in look; paint is FALSE for transparent */
++struct look
++{
++    COLORREF color;
++    BOOL paint;
++};
++
++static void set_look( struct look *look, COLORREF color )
++{
++    look->color = color;
++    look->paint = TRUE;
++}
++
++static void brush_look( IBrush *brush, struct look *look )
+ {
+     Color c;
+ 
+-    if (!brush || !brush_get_color( brush, &c ) || !c.A) return FALSE;
+-    *color = RGB( c.R, c.G, c.B );
+-    return TRUE;
++    if (!brush_get_color( brush, &c )) return;
++    look->color = RGB( c.R, c.G, c.B );
++    look->paint = c.A != 0;
+ }
+ 
+-static void button_render( struct xaml_element *element, struct layout_context *ctx )
++/* the app's brush for a WinUI resource key (its own, its ancestors' or the application's resources), if any */
++static void resource_look( struct button *impl, struct look *look, const WCHAR *format, ... )
+ {
+-    struct button *impl = impl_from_element( element );
+-    struct xaml_element *child = button_content_element( impl ), *root = button_template_root( impl );
+-    /* Windows 10 theme colours, as #33/#66 black or white over the page background */
+-    COLORREF base_low = ctx->dark ? RGB(51, 51, 51) : RGB(204, 204, 204);
+-    COLORREF base_medium_low = ctx->dark ? RGB(102, 102, 102) : RGB(153, 153, 153);
+-    COLORREF text = ctx->foreground, background = base_low, border = 0;
+-    BOOL has_background = TRUE, has_border = FALSE;
+-    struct text_format format;
+-    struct layout_rect inner;
+-    COLORREF saved;
++    IInspectable *value;
++    IBrush *brush;
++    WCHAR key[96];
++    va_list args;
+ 
+-    if (root)
+-    {
+-        element_render( root, ctx );   /* the template draws the button */
+-        return;
+-    }
+-    if (!impl->enabled)
+-        text = base_medium_low;
+-    else if (impl->pressed)
+-        background = base_medium_low;
+-    else if (impl->pointer_over)
++    va_start( args, format );
++    vswprintf( key, ARRAY_SIZE(key), format, args );
++    va_end( args );
++    if (!(value = element_lookup_resource( &impl->element, key ))) return;
++    if (SUCCEEDED(IInspectable_QueryInterface( value, &IID_IBrush, (void **)&brush )))
+     {
+-        border = base_medium_low;
+-        has_border = TRUE;
++        TRACE( "%s from the app's resources.\n", debugstr_w(key) );
++        brush_look( brush, look );
++        IBrush_Release( brush );
+     }
+-    else
++    IInspectable_Release( value );
++}
++
++/* the resource keys' state suffix: "" for Normal */
++static const WCHAR *state_suffix( struct button *impl )
++{
++    const WCHAR *state = common_state( impl );
++    return wcscmp( state, L"Normal" ) ? state : L"";
++}
++
++static void fill_ellipse( struct layout_context *ctx, const struct layout_rect *rect, const struct look *fill,
++                          const struct look *stroke, float stroke_width )
++{
++    HPEN pen = stroke && stroke->paint ? CreatePen( PS_INSIDEFRAME, max( 1, (int)(stroke_width * ctx->scale + 0.5f) ), stroke->color )
++                                       : GetStockObject( NULL_PEN );
++    HBRUSH brush = fill && fill->paint ? CreateSolidBrush( fill->color ) : GetStockObject( NULL_BRUSH );
++    HGDIOBJ old_pen = SelectObject( ctx->hdc, pen ), old_brush = SelectObject( ctx->hdc, brush );
++    RECT r;
++
++    element_device_rect( rect, ctx, &r );
++    Ellipse( ctx->hdc, r.left, r.top, r.right, r.bottom );
++    SelectObject( ctx->hdc, old_pen );
++    SelectObject( ctx->hdc, old_brush );
++    if (stroke && stroke->paint) DeleteObject( pen );
++    if (fill && fill->paint) DeleteObject( brush );
++}
++
++static void draw_check_mark( struct layout_context *ctx, const struct layout_rect *box, COLORREF color )
++{
++    static const float points[3][2] = { {4.5f, 10.0f}, {8.0f, 13.5f}, {15.5f, 6.0f} };
++    HPEN pen = CreatePen( PS_SOLID, max( 1, (int)(2 * ctx->scale + 0.5f) ), color );
++    HGDIOBJ old = SelectObject( ctx->hdc, pen );
++    POINT pt[3];
++    RECT r;
++    int i;
++
++    element_device_rect( box, ctx, &r );
++    for (i = 0; i < 3; i++)
+     {
+-        /* Normal state: the app's own brushes, if set */
+-        if (impl->background) has_background = brush_colorref( impl->background, &background );
+-        if (impl->border_brush) has_border = brush_colorref( impl->border_brush, &border );
++        pt[i].x = r.left + (int)(points[i][0] * ctx->scale + 0.5f);
++        pt[i].y = r.top + (int)(points[i][1] * ctx->scale + 0.5f);
+     }
+-    if (impl->enabled && impl->foreground) brush_colorref( impl->foreground, &text );
++    Polyline( ctx->hdc, pt, 3 );
++    SelectObject( ctx->hdc, old );
++    DeleteObject( pen );
++}
+ 
+-    if (has_background) element_fill_color( ctx, &element->bounds, background );
+-    if (has_border) element_frame_color( ctx, &element->bounds, &impl->border_thickness, border );
++static void render_content( struct button *impl, struct layout_context *ctx, COLORREF text )
++{
++    struct xaml_element *child = button_content_element( impl );
++    struct text_format format;
++    struct layout_rect inner;
++    COLORREF saved;
+ 
+     if (child)
+     {
+@@ -247,6 +373,148 @@ static void button_render( struct xaml_element *element, struct layout_context *
+     }
+ }
+ 
++/* CheckBox and RadioButton: the glyph in a 32 px row, the content to its right */
++static void render_glyph_control( struct button *impl, struct layout_context *ctx )
++{
++    static const Thickness two = { 2, 2, 2, 2 };
++    const struct layout_rect *b = &impl->element.bounds;
++    COLORREF base_high = ctx->dark ? RGB(255, 255, 255) : RGB(0, 0, 0);
++    COLORREF base_medium_high = ctx->dark ? RGB(204, 204, 204) : RGB(51, 51, 51);
++    COLORREF base_medium = ctx->dark ? RGB(153, 153, 153) : RGB(102, 102, 102);
++    COLORREF base_medium_low = ctx->dark ? RGB(102, 102, 102) : RGB(153, 153, 153);
++    COLORREF accent = RGB(0, 120, 215), white = RGB(255, 255, 255);
++    const WCHAR *state = state_suffix( impl ), *check = check_state_name( impl );
++    struct look background = {0}, fg = { ctx->foreground, TRUE }, stroke = {0}, fill = {0}, glyph = {0};
++    struct layout_rect box, dot;
++    BOOL on = impl->check == CHECK_ON;
++
++    box.x = b->x + impl->border_thickness.Left;
++    box.y = b->y + (min( 32.0f, b->height ) - GLYPH_SIZE) / 2;
++    box.width = box.height = GLYPH_SIZE;
++
++    /* the Windows 10 defaults */
++    if (!impl->enabled) set_look( &fg, base_medium_low );
++    if (impl->check == CHECK_OFF || impl->kind == BUTTON_RADIO)
++    {
++        set_look( &stroke, !impl->enabled ? base_medium_low : impl->pointer_over && !impl->pressed ? base_high : base_medium_high );
++        if (impl->enabled && impl->pressed) set_look( &fill, base_medium );
++        if (impl->kind == BUTTON_RADIO && on)
++        {
++            set_look( &stroke, impl->enabled ? accent : base_medium_low );
++            set_look( &glyph, impl->enabled ? base_medium_high : base_medium_low );
++        }
++    }
++    else if (on)
++    {
++        set_look( &fill, !impl->enabled ? base_medium_low : impl->pressed ? base_medium : accent );
++        set_look( &glyph, white );
++    }
++    else
++    {
++        set_look( &stroke, impl->enabled ? accent : base_medium_low );
++        set_look( &glyph, impl->enabled ? base_high : base_medium_low );
++    }
++    if (impl->enabled && !impl->pressed && !impl->pointer_over && impl->background) brush_look( impl->background, &background );
++    if (impl->enabled && impl->foreground) brush_look( impl->foreground, &fg );
++
++    /* the app's resources */
++    if (impl->kind == BUTTON_CHECK)
++    {
++        resource_look( impl, &fg, L"CheckBoxForeground%s%s", check, state );
++        resource_look( impl, &background, L"CheckBoxBackground%s%s", check, state );
++        resource_look( impl, &stroke, L"CheckBoxCheckBackgroundStroke%s%s", check, state );
++        resource_look( impl, &fill, L"CheckBoxCheckBackgroundFill%s%s", check, state );
++        resource_look( impl, &glyph, L"CheckBoxCheckGlyphForeground%s%s", check, state );
++    }
++    else
++    {
++        resource_look( impl, &fg, L"RadioButtonForeground%s", state );
++        resource_look( impl, &background, L"RadioButtonBackground%s", state );
++        resource_look( impl, &stroke, on ? L"RadioButtonOuterEllipseCheckedStroke%s" : L"RadioButtonOuterEllipseStroke%s", state );
++        resource_look( impl, &fill, on ? L"RadioButtonOuterEllipseCheckedFill%s" : L"RadioButtonOuterEllipseFill%s", state );
++        resource_look( impl, &glyph, L"RadioButtonCheckGlyphFill%s", state );
++    }
++
++    if (background.paint) element_fill_color( ctx, b, background.color );
++    if (impl->kind == BUTTON_CHECK)
++    {
++        if (fill.paint) element_fill_color( ctx, &box, fill.color );
++        if (stroke.paint) element_frame_color( ctx, &box, &two, stroke.color );
++        if (glyph.paint && on) draw_check_mark( ctx, &box, glyph.color );
++        else if (glyph.paint && impl->check == CHECK_INDETERMINATE)
++        {
++            dot.x = box.x + 5;
++            dot.y = box.y + 5;
++            dot.width = dot.height = 10;
++            element_fill_color( ctx, &dot, glyph.color );
++        }
++    }
++    else
++    {
++        fill_ellipse( ctx, &box, &fill, &stroke, 2 );
++        if (on && glyph.paint)
++        {
++            dot.x = box.x + 5;
++            dot.y = box.y + 5;
++            dot.width = dot.height = 10;
++            fill_ellipse( ctx, &dot, &glyph, NULL, 0 );
++        }
++    }
++    render_content( impl, ctx, fg.color );
++}
++
++static void button_render( struct xaml_element *element, struct layout_context *ctx )
++{
++    struct button *impl = impl_from_element( element );
++    struct xaml_element *root = button_template_root( impl );
++    /* Windows 10 theme colours, as #33/#66 black or white over the page background */
++    COLORREF base_low = ctx->dark ? RGB(51, 51, 51) : RGB(204, 204, 204);
++    COLORREF base_medium_low = ctx->dark ? RGB(102, 102, 102) : RGB(153, 153, 153);
++    struct look background = { base_low, TRUE }, fg = { ctx->foreground, TRUE }, border = {0};
++    const WCHAR *prefix = impl->kind == BUTTON_TOGGLE ? L"ToggleButton" : L"Button";
++    const WCHAR *check = impl->kind == BUTTON_TOGGLE && impl->check != CHECK_OFF ? check_state_name( impl ) : L"";
++    const WCHAR *state = state_suffix( impl );
++    BOOL normal = !*check && !*state;
++
++    if (root)
++    {
++        element_render( root, ctx );   /* the template draws the button */
++        return;
++    }
++    if (has_glyph( impl ))
++    {
++        render_glyph_control( impl, ctx );
++        return;
++    }
++
++    /* the Windows 10 defaults */
++    if (!impl->enabled)
++        set_look( &fg, base_medium_low );
++    else if (impl->pressed)
++        set_look( &background, base_medium_low );
++    else if (*check)
++    {
++        set_look( &background, RGB(0, 120, 215) );   /* the accent colour */
++        set_look( &fg, RGB(255, 255, 255) );
++        if (impl->pointer_over) set_look( &border, base_medium_low );
++    }
++    else if (impl->pointer_over)
++        set_look( &border, base_medium_low );
++    if (impl->enabled && impl->foreground) brush_look( impl->foreground, &fg );
++
++    /* the app's resources; in the Normal state, like the default template's TemplateBindings, the control's own
++     * brushes win over them */
++    if (normal && impl->background) brush_look( impl->background, &background );
++    else resource_look( impl, &background, L"%sBackground%s%s", prefix, check, state );
++    if (normal && impl->border_brush) brush_look( impl->border_brush, &border );
++    else resource_look( impl, &border, L"%sBorderBrush%s%s", prefix, check, state );
++    if (!(normal && impl->foreground)) resource_look( impl, &fg, L"%sForeground%s%s", prefix, check, state );
++
++    if (background.paint) element_fill_color( ctx, &element->bounds, background.color );
++    if (border.paint) element_frame_color( ctx, &element->bounds, &impl->border_thickness, border.color );
++    render_content( impl, ctx, fg.color );
++}
++
+ static UINT32 button_child_count( struct xaml_element *element )
+ {
+     struct button *impl = impl_from_element( element );
+@@ -266,16 +534,16 @@ static BOOL button_hit_self( struct xaml_element *element, float x, float y )
+     return TRUE;
+ }
+ 
+-static void button_raise_click( struct button *impl )
++static void raise_event( struct button *impl, struct event_list *list, const char *name )
+ {
+     IRoutedEventArgs *args;
+     IUnknown **handlers;
+-    UINT32 i, count = impl->click.count;
++    UINT32 i, count = list->count;
+ 
+-    TRACE( "button %p clicked, %u handler slots.\n", impl, count );
++    TRACE( "%p: %s, %u handler slots.\n", impl, name, count );
+ 
+     if (!count || !(handlers = calloc( count, sizeof(*handlers) ))) return;
+-    for (i = 0; i < count; i++) if ((handlers[i] = impl->click.handlers[i])) IUnknown_AddRef( handlers[i] );
++    for (i = 0; i < count; i++) if ((handlers[i] = list->handlers[i])) IUnknown_AddRef( handlers[i] );
+     if (SUCCEEDED(routed_event_args_create( impl->element.outer, &args )))
+     {
+         for (i = 0; i < count; i++)
+@@ -283,7 +551,7 @@ static void button_raise_click( struct button *impl )
+             HRESULT hr;
+             if (!handlers[i]) continue;
+             hr = IRoutedEventHandler_Invoke( (IRoutedEventHandler *)handlers[i], impl->element.outer, args );
+-            if (FAILED(hr)) WARN( "Click handler %p failed, hr %#lx.\n", handlers[i], hr );
++            if (FAILED(hr)) WARN( "%s handler %p failed, hr %#lx.\n", name, handlers[i], hr );
+         }
+         IRoutedEventArgs_Release( args );
+     }
+@@ -291,6 +559,82 @@ static void button_raise_click( struct button *impl )
+     free( handlers );
+ }
+ 
++static struct button *radio_from_element( struct xaml_element *element )
++{
++    struct button *impl;
++
++    if (element->ops != &button_ops) return NULL;
++    impl = impl_from_element( element );
++    return impl->kind == BUTTON_RADIO ? impl : NULL;
++}
++
++static void set_check( struct button *impl, enum check_state check );
++
++/* uncheck the other radio buttons of the group under element: with a GroupName, those with the same name;
++ * without one, those with the same parent and no name */
++static void uncheck_group( struct button *impl, struct xaml_element *element )
++{
++    struct button *other = radio_from_element( element );
++    UINT32 i, count;
++    INT32 order;
++
++    if (other && other != impl)
++    {
++        if (impl->group_name || other->group_name)
++        {
++            if (SUCCEEDED(WindowsCompareStringOrdinal( impl->group_name, other->group_name, &order )) && !order)
++                set_check( other, CHECK_OFF );
++        }
++        else if (other->element.parent == impl->element.parent) set_check( other, CHECK_OFF );
++        return;
++    }
++    if (!element->ops->child_count) return;
++    count = element->ops->child_count( element );
++    for (i = 0; i < count; i++)
++    {
++        struct xaml_element *child = element->ops->child_at( element, i );
++        if (child) uncheck_group( impl, child );
++    }
++}
++
++static void set_check( struct button *impl, enum check_state check )
++{
++    struct xaml_element *root;
++
++    if (impl->check == check) return;
++    impl->check = check;
++    button_update_state( impl );
++    window_invalidate();
++    if (check == CHECK_ON && impl->kind == BUTTON_RADIO)
++    {
++        if (impl->group_name) for (root = &impl->element; root->parent; root = root->parent);
++        else root = impl->element.parent;
++        if (root) uncheck_group( impl, root );
++    }
++    if (check == CHECK_ON) raise_event( impl, &impl->checked, "Checked" );
++    else if (check == CHECK_OFF) raise_event( impl, &impl->unchecked, "Unchecked" );
++    else raise_event( impl, &impl->indeterminate, "Indeterminate" );
++}
++
++/* ToggleButton.OnToggle, then the Click event, as ButtonBase.OnClick does */
++static void button_raise_click( struct button *impl )
++{
++    switch (impl->kind)
++    {
++    case BUTTON_PLAIN:
++        break;
++    case BUTTON_RADIO:
++        set_check( impl, CHECK_ON );
++        break;
++    default:
++        if (impl->check == CHECK_ON) set_check( impl, impl->three_state ? CHECK_INDETERMINATE : CHECK_OFF );
++        else if (impl->check == CHECK_INDETERMINATE) set_check( impl, CHECK_OFF );
++        else set_check( impl, CHECK_ON );
++        break;
++    }
++    raise_event( impl, &impl->click, "Click" );
++}
++
+ static void button_pointer( struct xaml_element *element, UINT msg, float x, float y )
+ {
+     struct button *impl = impl_from_element( element );
+@@ -339,6 +683,10 @@ static void button_destroy( struct xaml_element *element )
+     if (impl->foreground) IBrush_Release( impl->foreground );
+     if (impl->border_brush) IBrush_Release( impl->border_brush );
+     event_list_clear( &impl->click );
++    event_list_clear( &impl->checked );
++    event_list_clear( &impl->unchecked );
++    event_list_clear( &impl->indeterminate );
++    WindowsDeleteString( impl->group_name );
+     free( impl );
+ }
+ 
+@@ -526,7 +874,7 @@ static HRESULT WINAPI content_control_put_Content( IContentControl *iface, IInsp
+     }
+     if ((child = impl->content_element)) element_set_parent( child, &impl->element );
+     else if (value) impl->content_text = object_to_text( value );
+-    window_invalidate();
++    button_changed( impl, L"Content" );
+     return S_OK;
+ }
+ 
+@@ -600,7 +948,7 @@ static HRESULT WINAPI control_put_FontSize( IControl *iface, DOUBLE value )
+ {
+     if (!(value > 0)) return E_INVALIDARG;
+     impl_from_IControl( iface )->font_size = value;
+-    window_invalidate();
++    button_changed( impl_from_IControl( iface ), L"FontSize" );
+     return S_OK;
+ }
+ 
+@@ -639,6 +987,7 @@ static HRESULT WINAPI control_get_Foreground( IControl *iface, IBrush **value )
+ static HRESULT WINAPI control_put_Foreground( IControl *iface, IBrush *value )
+ {
+     set_brush( &impl_from_IControl( iface )->foreground, value );
++    button_changed( impl_from_IControl( iface ), L"Foreground" );
+     return S_OK;
+ }
+ 
+@@ -656,7 +1005,7 @@ static HRESULT WINAPI control_put_IsEnabled( IControl *iface, boolean value )
+     impl->enabled = value;
+     if (!value) impl->pressed = impl->captured = FALSE;
+     button_update_state( impl );
+-    window_invalidate();
++    button_changed( impl, L"IsEnabled" );
+     return S_OK;
+ }
+ 
+@@ -669,7 +1018,7 @@ static HRESULT WINAPI control_get_Padding( IControl *iface, Thickness *value )
+ static HRESULT WINAPI control_put_Padding( IControl *iface, Thickness value )
+ {
+     impl_from_IControl( iface )->padding = value;
+-    window_invalidate();
++    button_changed( impl_from_IControl( iface ), L"Padding" );
+     return S_OK;
+ }
+ 
+@@ -682,7 +1031,7 @@ static HRESULT WINAPI control_get_HorizontalContentAlignment( IControl *iface, H
+ static HRESULT WINAPI control_put_HorizontalContentAlignment( IControl *iface, HorizontalAlignment value )
+ {
+     impl_from_IControl( iface )->content_horizontal = value;
+-    window_invalidate();
++    button_changed( impl_from_IControl( iface ), L"HorizontalContentAlignment" );
+     return S_OK;
+ }
+ 
+@@ -695,7 +1044,7 @@ static HRESULT WINAPI control_get_VerticalContentAlignment( IControl *iface, Ver
+ static HRESULT WINAPI control_put_VerticalContentAlignment( IControl *iface, VerticalAlignment value )
+ {
+     impl_from_IControl( iface )->content_vertical = value;
+-    window_invalidate();
++    button_changed( impl_from_IControl( iface ), L"VerticalContentAlignment" );
+     return S_OK;
+ }
+ 
+@@ -708,6 +1057,7 @@ static HRESULT WINAPI control_get_Background( IControl *iface, IBrush **value )
+ static HRESULT WINAPI control_put_Background( IControl *iface, IBrush *value )
+ {
+     set_brush( &impl_from_IControl( iface )->background, value );
++    button_changed( impl_from_IControl( iface ), L"Background" );
+     return S_OK;
+ }
+ 
+@@ -720,7 +1070,7 @@ static HRESULT WINAPI control_get_BorderThickness( IControl *iface, Thickness *v
+ static HRESULT WINAPI control_put_BorderThickness( IControl *iface, Thickness value )
+ {
+     impl_from_IControl( iface )->border_thickness = value;
+-    window_invalidate();
++    button_changed( impl_from_IControl( iface ), L"BorderThickness" );
+     return S_OK;
+ }
+ 
+@@ -733,12 +1083,17 @@ static HRESULT WINAPI control_get_BorderBrush( IControl *iface, IBrush **value )
+ static HRESULT WINAPI control_put_BorderBrush( IControl *iface, IBrush *value )
+ {
+     set_brush( &impl_from_IControl( iface )->border_brush, value );
++    button_changed( impl_from_IControl( iface ), L"BorderBrush" );
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_ApplyTemplate( IControl *iface, boolean *value )
+ {
+-    *value = FALSE;  /* nothing to apply: the look is built in */
++    struct button *impl = impl_from_IControl( iface );
++    BOOL applied = impl->element.template_instance != NULL;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = button_template_root( impl ) && !applied;
+     return S_OK;
+ }
+ 
+@@ -816,14 +1171,22 @@ static HRESULT WINAPI control_put_TabNavigation(IControl *iface, __x_ABI_CWindow
+ 
+ static HRESULT WINAPI control_get_Template(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CControls_CIControlTemplate **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    IInspectable *template = impl_from_IControl( iface )->element.template;
++
++    *value = NULL;
++    if (template) return IInspectable_QueryInterface( template, &IID_IControlTemplate, (void **)value );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_put_Template(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CControls_CIControlTemplate *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    struct button *impl = impl_from_IControl( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (value && !is_control_template( (IInspectable *)value )) return E_INVALIDARG;
++    element_set_template( &impl->element, (IInspectable *)value );
++    element_mark_local( &impl->element, L"Template" );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_get_FocusState(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CFocusState *value)
+@@ -903,38 +1266,218 @@ static const struct IControlVtbl control_vtbl =
+     control_Focus
+ };
+ 
+-static HRESULT button_create( IInspectable *outer, IInspectable **inner, void **value )
++/* IToggleButton */
++
++DEFINE_IINSPECTABLE_( toggle_button, IToggleButton, struct button, impl_from_IToggleButton, IToggleButton_iface,
++                      impl->element.outer )
++
++static HRESULT WINAPI toggle_button_get_IsChecked( IToggleButton *iface, IReference_boolean **value )
++{
++    static const WCHAR name[] = L"Windows.Foundation.PropertyValue";
++    struct button *impl = impl_from_IToggleButton( iface );
++    IPropertyValueStatics *statics;
++    HSTRING_HEADER header;
++    IInspectable *boxed;
++    HSTRING class_name;
++    HRESULT hr;
++
++    *value = NULL;
++    if (impl->check == CHECK_INDETERMINATE) return S_OK;
++    WindowsCreateStringReference( name, wcslen( name ), &header, &class_name );
++    if (FAILED(hr = RoGetActivationFactory( class_name, &IID_IPropertyValueStatics, (void **)&statics ))) return hr;
++    hr = IPropertyValueStatics_CreateBoolean( statics, impl->check == CHECK_ON, &boxed );
++    IPropertyValueStatics_Release( statics );
++    if (FAILED(hr)) return hr;
++    hr = IInspectable_QueryInterface( boxed, &IID_IReference_boolean, (void **)value );
++    IInspectable_Release( boxed );
++    return hr;
++}
++
++static HRESULT WINAPI toggle_button_put_IsChecked( IToggleButton *iface, IReference_boolean *value )
++{
++    struct button *impl = impl_from_IToggleButton( iface );
++    boolean checked;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) set_check( impl, CHECK_INDETERMINATE );
++    else if (FAILED(hr = IReference_boolean_get_Value( value, &checked ))) return hr;
++    else set_check( impl, checked ? CHECK_ON : CHECK_OFF );
++    return S_OK;
++}
++
++static HRESULT WINAPI toggle_button_get_IsThreeState( IToggleButton *iface, boolean *value )
++{
++    *value = impl_from_IToggleButton( iface )->three_state;
++    return S_OK;
++}
++
++static HRESULT WINAPI toggle_button_put_IsThreeState( IToggleButton *iface, boolean value )
++{
++    impl_from_IToggleButton( iface )->three_state = value;
++    return S_OK;
++}
++
++#define TOGGLE_EVENT( name, field ) \
++static HRESULT WINAPI toggle_button_add_##name( IToggleButton *iface, IRoutedEventHandler *handler, EventRegistrationToken *token ) \
++{ \
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token ); \
++    if (!handler) return E_INVALIDARG; \
++    return event_list_add( &impl_from_IToggleButton( iface )->field, (IUnknown *)handler, token ); \
++} \
++static HRESULT WINAPI toggle_button_remove_##name( IToggleButton *iface, EventRegistrationToken token ) \
++{ \
++    TRACE( "iface %p, token %#I64x.\n", iface, token.value ); \
++    return event_list_remove( &impl_from_IToggleButton( iface )->field, token ); \
++}
++
++TOGGLE_EVENT( Checked, checked )
++TOGGLE_EVENT( Unchecked, unchecked )
++TOGGLE_EVENT( Indeterminate, indeterminate )
++
++static const struct IToggleButtonVtbl toggle_button_vtbl =
++{
++    toggle_button_QueryInterface,
++    toggle_button_AddRef,
++    toggle_button_Release,
++    /* IInspectable methods */
++    toggle_button_GetIids,
++    toggle_button_GetRuntimeClassName,
++    toggle_button_GetTrustLevel,
++    /* IToggleButton methods */
++    toggle_button_get_IsChecked,
++    toggle_button_put_IsChecked,
++    toggle_button_get_IsThreeState,
++    toggle_button_put_IsThreeState,
++    toggle_button_add_Checked,
++    toggle_button_remove_Checked,
++    toggle_button_add_Unchecked,
++    toggle_button_remove_Unchecked,
++    toggle_button_add_Indeterminate,
++    toggle_button_remove_Indeterminate,
++};
++
++/* ICheckBox has no methods of its own */
++
++DEFINE_IINSPECTABLE_( check_box, ICheckBox, struct button, impl_from_ICheckBox, ICheckBox_iface, impl->element.outer )
++
++static const struct ICheckBoxVtbl check_box_vtbl =
++{
++    check_box_QueryInterface,
++    check_box_AddRef,
++    check_box_Release,
++    /* IInspectable methods */
++    check_box_GetIids,
++    check_box_GetRuntimeClassName,
++    check_box_GetTrustLevel,
++};
++
++/* IRadioButton */
++
++DEFINE_IINSPECTABLE_( radio_button, IRadioButton, struct button, impl_from_IRadioButton, IRadioButton_iface,
++                      impl->element.outer )
++
++static HRESULT WINAPI radio_button_get_GroupName( IRadioButton *iface, HSTRING *value )
+ {
++    return WindowsDuplicateString( impl_from_IRadioButton( iface )->group_name, value );
++}
++
++static HRESULT WINAPI radio_button_put_GroupName( IRadioButton *iface, HSTRING value )
++{
++    struct button *impl = impl_from_IRadioButton( iface );
++    HSTRING copy = NULL;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %s.\n", iface, debugstr_hstring(value) );
++    if (WindowsGetStringLen( value ) && FAILED(hr = WindowsDuplicateString( value, &copy ))) return hr;
++    WindowsDeleteString( impl->group_name );
++    impl->group_name = copy;
++    return S_OK;
++}
++
++static const struct IRadioButtonVtbl radio_button_vtbl =
++{
++    radio_button_QueryInterface,
++    radio_button_AddRef,
++    radio_button_Release,
++    /* IInspectable methods */
++    radio_button_GetIids,
++    radio_button_GetRuntimeClassName,
++    radio_button_GetTrustLevel,
++    /* IRadioButton methods */
++    radio_button_get_GroupName,
++    radio_button_put_GroupName,
++};
++
++static HRESULT button_create( enum button_kind kind, IInspectable *outer, IInspectable **inner, void **value )
++{
++    static const WCHAR *names[] =
++    {
++        RuntimeClass_Windows_UI_Xaml_Controls_Button,
++        RuntimeClass_Windows_UI_Xaml_Controls_Primitives_ToggleButton,
++        RuntimeClass_Windows_UI_Xaml_Controls_CheckBox,
++        RuntimeClass_Windows_UI_Xaml_Controls_RadioButton,
++    };
+     struct button *impl;
++    void *iface;
+ 
+     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+-    element_init( &impl->element, &button_ops, RuntimeClass_Windows_UI_Xaml_Controls_Button, outer );
++    element_init( &impl->element, &button_ops, names[kind], outer );
+     impl->IButton_iface.lpVtbl = &button_iface_vtbl;
+     impl->IButtonBase_iface.lpVtbl = &button_base_vtbl;
+     impl->IContentControl_iface.lpVtbl = &content_control_vtbl;
+     impl->IControl_iface.lpVtbl = &control_vtbl;
+-    /* the default Button style */
+-    impl->element.horizontal_alignment = HorizontalAlignment_Left;
+-    impl->element.vertical_alignment = VerticalAlignment_Center;
+-    impl->border_thickness.Left = impl->border_thickness.Top = impl->border_thickness.Right = impl->border_thickness.Bottom = 2;
+-    impl->padding.Left = 8;
+-    impl->padding.Top = 4;
+-    impl->padding.Right = 8;
+-    impl->padding.Bottom = 5;
++    impl->IToggleButton_iface.lpVtbl = &toggle_button_vtbl;
++    impl->ICheckBox_iface.lpVtbl = &check_box_vtbl;
++    impl->IRadioButton_iface.lpVtbl = &radio_button_vtbl;
++    impl->kind = kind;
+     impl->font_size = 14.0;
+     impl->font_weight.Weight = 400;
+-    impl->content_horizontal = HorizontalAlignment_Center;
+-    impl->content_vertical = VerticalAlignment_Center;
+     impl->enabled = TRUE;
+     impl->click_mode = ClickMode_Release;
+-    TRACE( "created %p, outer %p.\n", impl, outer );
+-    return element_compose( &impl->element, outer, inner, &impl->IButton_iface, value );
++    impl->element.vertical_alignment = VerticalAlignment_Center;
++    if (has_glyph( impl ))
++    {
++        /* the default CheckBox and RadioButton styles */
++        impl->element.horizontal_alignment = HorizontalAlignment_Left;
++        impl->padding.Left = 8;
++        impl->padding.Top = 5;
++        impl->content_horizontal = HorizontalAlignment_Left;
++        impl->content_vertical = VerticalAlignment_Top;
++    }
++    else
++    {
++        /* the default Button and ToggleButton styles */
++        impl->element.horizontal_alignment = HorizontalAlignment_Left;
++        impl->border_thickness.Left = impl->border_thickness.Top = impl->border_thickness.Right = impl->border_thickness.Bottom = 2;
++        impl->padding.Left = 8;
++        impl->padding.Top = 4;
++        impl->padding.Right = 8;
++        impl->padding.Bottom = 5;
++        impl->content_horizontal = HorizontalAlignment_Center;
++        impl->content_vertical = VerticalAlignment_Center;
++    }
++    switch (kind)
++    {
++    case BUTTON_PLAIN: iface = &impl->IButton_iface; break;
++    case BUTTON_CHECK: iface = &impl->ICheckBox_iface; break;
++    case BUTTON_RADIO: iface = &impl->IRadioButton_iface; break;
++    default: iface = &impl->IToggleButton_iface; break;
++    }
++    TRACE( "created %s %p, outer %p.\n", debugstr_w(names[kind]), impl, outer );
++    return element_compose( &impl->element, outer, inner, iface, value );
+ }
+ 
++/* activation factories: IActivationFactory plus the class's composable factory */
++
+ struct button_statics
+ {
+     IActivationFactory IActivationFactory_iface;
+     IButtonFactory IButtonFactory_iface;
++    IToggleButtonFactory IToggleButtonFactory_iface;
++    ICheckBoxFactory ICheckBoxFactory_iface;
++    IRadioButtonFactory IRadioButtonFactory_iface;
++    enum button_kind kind;
+ };
+ 
+ static inline struct button_statics *impl_from_IActivationFactory( IActivationFactory *iface )
+@@ -949,8 +1492,14 @@ static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID
+     if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+         IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
+         *out = &impl->IActivationFactory_iface;
+-    else if (IsEqualGUID( iid, &IID_IButtonFactory ))
++    else if (impl->kind == BUTTON_PLAIN && IsEqualGUID( iid, &IID_IButtonFactory ))
+         *out = &impl->IButtonFactory_iface;
++    else if (impl->kind == BUTTON_TOGGLE && IsEqualGUID( iid, &IID_IToggleButtonFactory ))
++        *out = &impl->IToggleButtonFactory_iface;
++    else if (impl->kind == BUTTON_CHECK && IsEqualGUID( iid, &IID_ICheckBoxFactory ))
++        *out = &impl->ICheckBoxFactory_iface;
++    else if (impl->kind == BUTTON_RADIO && IsEqualGUID( iid, &IID_IRadioButtonFactory ))
++        *out = &impl->IRadioButtonFactory_iface;
+     else
+     {
+         FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
+@@ -989,7 +1538,7 @@ static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLev
+ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+ {
+     TRACE( "iface %p, instance %p.\n", iface, instance );
+-    return button_create( NULL, NULL, (void **)instance );
++    return button_create( impl_from_IActivationFactory( iface )->kind, NULL, NULL, (void **)instance );
+ }
+ 
+ static const struct IActivationFactoryVtbl factory_vtbl =
+@@ -1005,27 +1554,35 @@ static const struct IActivationFactoryVtbl factory_vtbl =
+     factory_ActivateInstance,
+ };
+ 
+-DEFINE_IINSPECTABLE( button_factory_iface, IButtonFactory, struct button_statics, IActivationFactory_iface )
++#define BUTTON_FACTORY( name, Iface, Default, field, kind ) \
++DEFINE_IINSPECTABLE_( name, Iface, struct button_statics, impl_from_##field, field, &impl->IActivationFactory_iface ) \
++static HRESULT WINAPI name##_CreateInstance( Iface *iface, IInspectable *outer, IInspectable **inner, Default **value ) \
++{ \
++    TRACE( "iface %p, outer %p, inner %p, value %p.\n", iface, outer, inner, value ); \
++    return button_create( kind, outer, inner, (void **)value ); \
++} \
++static const struct Iface##Vtbl name##_vtbl = \
++{ \
++    name##_QueryInterface, name##_AddRef, name##_Release, \
++    name##_GetIids, name##_GetRuntimeClassName, name##_GetTrustLevel, \
++    name##_CreateInstance, \
++};
+ 
+-static HRESULT WINAPI button_factory_iface_CreateInstance( IButtonFactory *iface, IInspectable *outer, IInspectable **inner,
+-                                                           IButton **value )
+-{
+-    TRACE( "iface %p, outer %p, inner %p, value %p.\n", iface, outer, inner, value );
+-    return button_create( outer, inner, (void **)value );
+-}
++BUTTON_FACTORY( button_factory_iface, IButtonFactory, IButton, IButtonFactory_iface, BUTTON_PLAIN )
++BUTTON_FACTORY( toggle_button_factory_iface, IToggleButtonFactory, IToggleButton, IToggleButtonFactory_iface, BUTTON_TOGGLE )
++BUTTON_FACTORY( check_box_factory_iface, ICheckBoxFactory, ICheckBox, ICheckBoxFactory_iface, BUTTON_CHECK )
++BUTTON_FACTORY( radio_button_factory_iface, IRadioButtonFactory, IRadioButton, IRadioButtonFactory_iface, BUTTON_RADIO )
+ 
+-static const struct IButtonFactoryVtbl button_factory_iface_vtbl =
+-{
+-    button_factory_iface_QueryInterface,
+-    button_factory_iface_AddRef,
+-    button_factory_iface_Release,
+-    /* IInspectable methods */
+-    button_factory_iface_GetIids,
+-    button_factory_iface_GetRuntimeClassName,
+-    button_factory_iface_GetTrustLevel,
+-    /* IButtonFactory methods */
+-    button_factory_iface_CreateInstance,
+-};
++#define BUTTON_STATICS( kind ) \
++    { {&factory_vtbl}, {&button_factory_iface_vtbl}, {&toggle_button_factory_iface_vtbl}, \
++      {&check_box_factory_iface_vtbl}, {&radio_button_factory_iface_vtbl}, kind }
++
++static struct button_statics button_statics = BUTTON_STATICS( BUTTON_PLAIN );
++static struct button_statics toggle_button_statics = BUTTON_STATICS( BUTTON_TOGGLE );
++static struct button_statics check_box_statics = BUTTON_STATICS( BUTTON_CHECK );
++static struct button_statics radio_button_statics = BUTTON_STATICS( BUTTON_RADIO );
+ 
+-static struct button_statics button_statics = { {&factory_vtbl}, {&button_factory_iface_vtbl} };
+ IActivationFactory *button_factory = &button_statics.IActivationFactory_iface;
++IActivationFactory *toggle_button_factory = &toggle_button_statics.IActivationFactory_iface;
++IActivationFactory *check_box_factory = &check_box_statics.IActivationFactory_iface;
++IActivationFactory *radio_button_factory = &radio_button_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/classes.idl b/dlls/windows.ui.xaml/classes.idl
+index 2fb3d9a..cb916d5 100644
+--- a/dlls/windows.ui.xaml/classes.idl
++++ b/dlls/windows.ui.xaml/classes.idl
+@@ -37,17 +37,23 @@ namespace Windows.UI.Xaml {
+ namespace Windows.UI.Xaml.Controls {
+     runtimeclass Border;
+     runtimeclass Button;
++    runtimeclass CheckBox;
+     runtimeclass ColumnDefinition;
+     runtimeclass ContentPresenter;
+     runtimeclass Frame;
+     runtimeclass Grid;
+     runtimeclass Page;
++    runtimeclass RadioButton;
+     runtimeclass RowDefinition;
+     runtimeclass StackPanel;
+     runtimeclass TextBlock;
+     runtimeclass UserControl;
+ }
+ 
++namespace Windows.UI.Xaml.Controls.Primitives {
++    runtimeclass ToggleButton;
++}
++
+ namespace Windows.UI.Xaml.Media {
+     runtimeclass SolidColorBrush;
+ }
+diff --git a/dlls/windows.ui.xaml/element.c b/dlls/windows.ui.xaml/element.c
+index 476b29c..3e4be56 100644
+--- a/dlls/windows.ui.xaml/element.c
++++ b/dlls/windows.ui.xaml/element.c
+@@ -1325,6 +1325,30 @@ void element_mark_local( struct xaml_element *element, const WCHAR *property )
+     props[element->local_count++] = wcsdup( property );
+ }
+ 
++/* Control.Template: the template is applied again on the next layout */
++void element_set_template( struct xaml_element *element, IInspectable *template )
++{
++    struct xaml_element *root = template_root( element->template_instance );
++
++    if (template) IInspectable_AddRef( template );
++    if (root && root->parent == element) root->parent = NULL;
++    template_free( element->template_instance );
++    element->template_instance = NULL;
++    if (element->template) IInspectable_Release( element->template );
++    element->template = template;
++    window_invalidate();
++}
++
++IInspectable *element_lookup_resource( struct xaml_element *element, const WCHAR *key )
++{
++    IInspectable *value = NULL, *dict;
++
++    for (; element && !value; element = element->parent)
++        if (element->resources) value = resource_dictionary_lookup( element->resources, key );
++    if (!value && (dict = application_resources())) value = resource_dictionary_lookup( dict, key );
++    return value;
++}
++
+ void element_set_parent( struct xaml_element *child, struct xaml_element *parent )
+ {
+     if (child) child->parent = parent;
+diff --git a/dlls/windows.ui.xaml/main.c b/dlls/windows.ui.xaml/main.c
+index 4e68712..8b335d2 100644
+--- a/dlls/windows.ui.xaml/main.c
++++ b/dlls/windows.ui.xaml/main.c
+@@ -48,6 +48,12 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( border_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Button ))
+         IActivationFactory_QueryInterface( button_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Primitives_ToggleButton ))
++        IActivationFactory_QueryInterface( toggle_button_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_CheckBox ))
++        IActivationFactory_QueryInterface( check_box_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_RadioButton ))
++        IActivationFactory_QueryInterface( radio_button_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_RowDefinition ))
+         IActivationFactory_QueryInterface( row_definition_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ColumnDefinition ))
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index 1ff4936..331d5cd 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -65,6 +65,9 @@ extern IActivationFactory *stack_panel_factory;
+ extern IActivationFactory *grid_factory;
+ extern IActivationFactory *border_factory;
+ extern IActivationFactory *button_factory;
++extern IActivationFactory *toggle_button_factory;
++extern IActivationFactory *check_box_factory;
++extern IActivationFactory *radio_button_factory;
+ extern IActivationFactory *row_definition_factory;
+ extern IActivationFactory *column_definition_factory;
+ extern IActivationFactory *resource_dictionary_factory;
+@@ -212,6 +215,9 @@ struct xaml_element *element_from_iinspectable( IInspectable *object );
+ struct xaml_element *element_from_object( IInspectable *object );   /* NULL without a FIXME if not ours */
+ IInspectable *element_resources( IInspectable *object );            /* FrameworkElement.Resources, not referenced */
+ void element_mark_local( struct xaml_element *element, const WCHAR *property );
++void element_set_template( struct xaml_element *element, IInspectable *template );
++/* a resource in the element's or its ancestors' Resources, or the application's; referenced, or NULL */
++IInspectable *element_lookup_resource( struct xaml_element *element, const WCHAR *key );
+ BOOL element_is_local( struct xaml_element *element, const WCHAR *property );
+ void style_apply( IInspectable *style, IInspectable *target );
+ HSTRING object_to_text( IInspectable *object );   /* text for non-UIElement content */
+@@ -228,6 +234,10 @@ BOOL is_control_template( IInspectable *object );
+ struct template_instance *template_instantiate( IInspectable *template, IInspectable *templated_parent );
+ struct xaml_element *template_root( struct template_instance *instance );
+ void template_go_to_state( struct template_instance *instance, const WCHAR *state );
++/* each visual state group goes to the first of the states it has */
++void template_go_to_states( struct template_instance *instance, const WCHAR *const *states, UINT32 count );
++/* the templated parent's property changed: update the TemplateBindings to it */
++void template_property_changed( struct template_instance *instance, const WCHAR *property );
+ void template_free( struct template_instance *instance );
+ void element_set_parent( struct xaml_element *child, struct xaml_element *parent );
+ void element_measure( struct xaml_element *element, struct layout_context *ctx, float avail_width, float avail_height );
+diff --git a/dlls/windows.ui.xaml/xbf.c b/dlls/windows.ui.xaml/xbf.c
+index 468cba4..2f90808 100644
+--- a/dlls/windows.ui.xaml/xbf.c
++++ b/dlls/windows.ui.xaml/xbf.c
+@@ -697,6 +697,14 @@ static void read_custom_data( struct reader *r, struct custom_data *data )
+ 
+ enum scope_kind { SCOPE_PLAIN, SCOPE_GET_VALUE };
+ 
++/* a TemplateBinding: target.prop follows the templated parent's source property */
++struct binding
++{
++    IInspectable *target;
++    struct xprop prop;
++    WCHAR source[64];
++};
++
+ struct writer
+ {
+     struct xbf *xbf;
+@@ -712,6 +720,8 @@ struct writer
+     struct writer *names_owner;      /* collects x:Name objects (a template's name scope), or NULL */
+     struct name_entry { WCHAR name[64]; IInspectable *object; } *names;
+     UINT32 name_count;
++    struct binding *bindings;        /* a template's TemplateBindings */
++    UINT32 binding_count;
+ };
+ 
+ static void register_name( struct writer *w, const WCHAR *name, IInspectable *object )
+@@ -1661,6 +1671,9 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+     ISolidColorBrush *solid;
+     IApplication *app;
+     IButtonBase *bb;
++    IToggleButton *toggle;
++    IRadioButton *radio;
++    IReference_boolean *ref;
+     struct xaml_element *element;
+     IInspectable *content;
+     IBrush *brush;
+@@ -1701,13 +1714,7 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+         if (mode == SET_STYLE && element_is_local( element, prop->name )) return S_OK;
+         if (mode == SET_LOCAL) element_mark_local( element, prop->name );
+         if (value->kind == XV_OBJECT && template_from_object( value->object ))
+-        {
+-            if (element->template_instance) template_free( element->template_instance );
+-            element->template_instance = NULL;
+-            if (element->template) IInspectable_Release( element->template );
+-            IInspectable_AddRef( (element->template = value->object) );
+-            window_invalidate();
+-        }
++            element_set_template( element, value->object );
+         return S_OK;
+     }
+     if ((style = style_from_object( target )))
+@@ -1971,6 +1978,50 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+         IControl_Release( control );
+         done = TRUE;
+     }
++    else if (prop_is( prop, L"IsChecked" ) && QI( target, IToggleButton, &toggle ))
++    {
++        struct xvalue boxed = {0};
++
++        if (value->kind == XV_NULL || (value->kind == XV_OBJECT && !value->object))
++        {
++            IToggleButton_put_IsChecked( toggle, NULL );
++            done = TRUE;
++        }
++        else if (value->kind == XV_OBJECT && QI( value->object, IReference_boolean, &ref ))
++        {
++            IToggleButton_put_IsChecked( toggle, ref );
++            IReference_boolean_Release( ref );
++            done = TRUE;
++        }
++        else if (to_bool( value, &b ))
++        {
++            boxed.kind = XV_BOOL;
++            boxed.b = b;
++            box_value( &boxed );
++            if (boxed.object && QI( boxed.object, IReference_boolean, &ref ))
++            {
++                IToggleButton_put_IsChecked( toggle, ref );
++                IReference_boolean_Release( ref );
++                done = TRUE;
++            }
++            xvalue_clear( &boxed );
++        }
++        IToggleButton_Release( toggle );
++    }
++    else if (prop_is( prop, L"IsThreeState" ) && to_bool( value, &b ) && QI( target, IToggleButton, &toggle ))
++    {
++        IToggleButton_put_IsThreeState( toggle, b );
++        IToggleButton_Release( toggle );
++        done = TRUE;
++    }
++    else if (prop_is( prop, L"GroupName" ) && value->kind == XV_STRING && QI( target, IRadioButton, &radio ))
++    {
++        WindowsCreateString( value->s, wcslen( value->s ), &str );
++        IRadioButton_put_GroupName( radio, str );
++        WindowsDeleteString( str );
++        IRadioButton_Release( radio );
++        done = TRUE;
++    }
+     else if (prop_is( prop, L"ClickMode" ) && to_enum( value, click_mode_names, 3, &e ) && QI( target, IButtonBase, &bb ))
+     {
+         IButtonBase_put_ClickMode( bb, e );
+@@ -2117,15 +2168,18 @@ IInspectable *create_builtin( const WCHAR *name )
+     {
+         { L"Border", &border_factory },
+         { L"Button", &button_factory },
++        { L"CheckBox", &check_box_factory },
+         { L"ColumnDefinition", &column_definition_factory },
+         { L"Frame", &frame_factory },
+         { L"Grid", &grid_factory },
+         { L"Page", &page_factory },
++        { L"RadioButton", &radio_button_factory },
+         { L"ResourceDictionary", &resource_dictionary_factory },
+         { L"RowDefinition", &row_definition_factory },
+         { L"SolidColorBrush", &solid_color_brush_factory },
+         { L"StackPanel", &stack_panel_factory },
+         { L"TextBlock", &text_block_factory },
++        { L"ToggleButton", &toggle_button_factory },
+         { L"UserControl", &user_control_factory },
+     };
+     IInspectable *object;
+@@ -2536,7 +2590,17 @@ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, enum run
+             read_property( &r, &prop2 );
+             if (w->templated_parent)
+             {
+-                /* evaluated once, when the template is applied */
++                struct binding *binding;
++
++                /* kept, so that later changes on the control reach the template */
++                if (top_object( w ) && (binding = realloc( w->bindings, (w->binding_count + 1) * sizeof(*binding) )))
++                {
++                    w->bindings = binding;
++                    binding += w->binding_count++;
++                    IInspectable_AddRef( (binding->target = top_object( w )) );
++                    binding->prop = prop;
++                    lstrcpynW( binding->source, prop2.name, ARRAY_SIZE(binding->source) );
++                }
+                 if (get_value( w->templated_parent, prop2.name, &value ))
+                 {
+                     set_property( w, top_object( w ), &prop, &value, SET_LOCAL );
+@@ -2772,6 +2836,25 @@ static BOOL get_value( IInspectable *target, const WCHAR *name, struct xvalue *o
+         ITextBlock_Release( tb );
+         return TRUE;
+     }
++    if (!wcscmp( name, L"IsChecked" ))
++    {
++        IToggleButton *toggle;
++        IReference_boolean *ref;
++        boolean b;
++
++        if (!QI( target, IToggleButton, &toggle )) return FALSE;
++        IToggleButton_get_IsChecked( toggle, &ref );
++        IToggleButton_Release( toggle );
++        if (!ref) out->kind = XV_NULL;
++        else
++        {
++            IReference_boolean_get_Value( ref, &b );
++            IReference_boolean_Release( ref );
++            out->kind = XV_BOOL;
++            out->b = b;
++        }
++        return TRUE;
++    }
+     if (!wcscmp( name, L"IsEnabled" ) && QI( target, IControl, &control ))
+     {
+         boolean b;
+@@ -2797,6 +2880,9 @@ struct applied_value
+ struct template_instance
+ {
+     IInspectable *root;
++    IInspectable *templated_parent;   /* not referenced: it owns the instance */
++    struct binding *bindings;
++    UINT32 binding_count;
+     struct name_entry *names;
+     UINT32 name_count;
+     struct applied_value *applied;
+@@ -2836,6 +2922,9 @@ struct template_instance *template_instantiate( IInspectable *template, IInspect
+     while (w->sp) { pop( w, &value ); xvalue_clear( &value ); }
+     instance->names = w->names;
+     instance->name_count = w->name_count;
++    instance->bindings = w->bindings;
++    instance->binding_count = w->binding_count;
++    instance->templated_parent = templated_parent;
+     free( w );
+     if (!instance->root)
+     {
+@@ -2862,7 +2951,9 @@ void template_free( struct template_instance *instance )
+         xvalue_clear( &instance->applied[i].old );
+     }
+     for (i = 0; i < instance->name_count; i++) IInspectable_Release( instance->names[i].object );
++    for (i = 0; i < instance->binding_count; i++) IInspectable_Release( instance->bindings[i].target );
+     if (instance->root) IInspectable_Release( instance->root );
++    free( instance->bindings );
+     free( instance->applied );
+     free( instance->names );
+     free( instance );
+@@ -2975,28 +3066,44 @@ static void apply_animation( struct template_instance *instance, IInspectable *g
+     xvalue_clear( &value );
+ }
+ 
+-void template_go_to_state( struct template_instance *instance, const WCHAR *state_name )
++static struct bag *group_state( struct bag *group, const WCHAR *name )
++{
++    struct bag *states = bag_value( group, L"States" ), *state;
++    UINT32 i;
++
++    for (i = 0; states && i < states->item_count; i++)
++        if ((state = bag_from_object( states->items[i] )) && !wcscmp( state->name, name )) return state;
++    return NULL;
++}
++
++static void group_go_to_state( struct template_instance *instance, struct bag *group, struct bag *state );
++
++void template_go_to_states( struct template_instance *instance, const WCHAR *const *names, UINT32 count )
+ {
+     struct xaml_element *root = template_root( instance );
+-    struct bag *groups, *group, *states, *state = NULL, *board, *children, *setters;
++    struct bag *groups, *group, *state;
+     UINT32 i, j;
+ 
+     if (!root || !(groups = bag_from_object( root->visual_state_groups ))) return;
+-    for (i = 0; i < groups->item_count && !state; i++)
++    for (i = 0; i < groups->item_count; i++)
+     {
+-        if (!(group = bag_from_object( groups->items[i] )) || !(states = bag_value( group, L"States" ))) continue;
+-        for (j = 0; j < states->item_count; j++)
+-        {
+-            struct bag *s = bag_from_object( states->items[j] );
+-            if (s && !wcscmp( s->name, state_name )) { state = s; break; }
+-        }
++        if (!(group = bag_from_object( groups->items[i] ))) continue;
++        for (j = 0, state = NULL; j < count && !state; j++) state = group_state( group, names[j] );
++        if (state) group_go_to_state( instance, group, state );
+     }
+-    if (!state)
+-    {
+-        TRACE( "no state %s.\n", debugstr_w(state_name) );
+-        return;
+-    }
+-    TRACE( "going to state %s of group %s.\n", debugstr_w(state_name), debugstr_w(group->name) );
++}
++
++void template_go_to_state( struct template_instance *instance, const WCHAR *state_name )
++{
++    template_go_to_states( instance, &state_name, 1 );
++}
++
++static void group_go_to_state( struct template_instance *instance, struct bag *group, struct bag *state )
++{
++    struct bag *board, *children, *setters;
++    UINT32 i;
++
++    TRACE( "going to state %s of group %s.\n", debugstr_w(state->name), debugstr_w(group->name) );
+ 
+     /* leave the group's current state: restore what it changed, newest first */
+     for (i = instance->applied_count; i > 0; i--)
+@@ -3042,6 +3149,31 @@ void template_go_to_state( struct template_instance *instance, const WCHAR *stat
+     window_invalidate();
+ }
+ 
++void template_property_changed( struct template_instance *instance, const WCHAR *property )
++{
++    struct binding *binding;
++    struct xvalue value;
++    UINT32 i, j;
++
++    for (i = 0; i < instance->binding_count; i++)
++    {
++        binding = &instance->bindings[i];
++        if (wcscmp( binding->source, property ) || !get_value( instance->templated_parent, property, &value )) continue;
++        TRACE( "%s changed: updating %p.%s.\n", debugstr_w(property), binding->target, debugstr_w(binding->prop.name) );
++        /* a visual state that set the property keeps it: the new value is what leaving the state restores */
++        for (j = 0; j < instance->applied_count; j++)
++        {
++            struct applied_value *a = &instance->applied[j];
++            if (a->target != binding->target || wcscmp( a->prop.name, binding->prop.name )) continue;
++            xvalue_clear( &a->old );
++            xvalue_copy( &a->old, &value );
++            break;
++        }
++        if (j == instance->applied_count) set_property( NULL, binding->target, &binding->prop, &value, SET_LOCAL );
++        xvalue_clear( &value );
++    }
++}
++
+ /* Application.LoadComponent: ms-appx:///Folder/Page.xaml is compiled to Folder\Page.xbf in the package folder,
+  * which for wine-uwp is the folder of the app's executable. */
+ HRESULT load_component( IInspectable *component, HSTRING uri )
