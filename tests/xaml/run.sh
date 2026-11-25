@@ -1,6 +1,7 @@
 #!/bin/bash
-# Runs the XAML test apps (xamlhello: milestone 1, xamllayout: milestone 2) in a throwaway Wine prefix (never the shared one): tests/xaml/run.sh [keep-prefix-dir]
+# Runs the XAML test apps (xamlhello: milestone 1, xamllayout: milestone 2, xamlmarkup: milestone 3) in a throwaway Wine prefix (never the shared one): tests/xaml/run.sh [keep-prefix-dir]
 # Opens a 1280x720 window for a few seconds. Exit status 0 means every check passed.
+# XAML_MS_XBF_DIR=dir also loads Microsoft's compiler-made .xbf test files from dir.
 set -uo pipefail
 source "$(dirname "$0")/../../scripts/common.sh"
 [ -x "$WINE_ROOT/bin/wine" ] || die "patched Wine not found in $WINE_ROOT"
@@ -12,7 +13,10 @@ export WINEDLLOVERRIDES="mscoree,mshtml=d" WINE_CORE_WINDOWED=1 WINEDEBUG="${WIN
 [ -d "$WINEPREFIX" ] || { info "Creating a test prefix in $WINEPREFIX"; wineboot -i >/dev/null 2>&1; wineserver -w; }
 cd "$WINEPREFIX/drive_c" || exit 1
 RC=0
-for t in xamlhello xamllayout; do
+cp "$BUILD"/tests/xaml/*.xbf .
+# optional: Microsoft's compiler-made test files (microsoft-ui-xaml, dxaml/test/resources/res/...), to check the reader
+if [ -n "${XAML_MS_XBF_DIR:-}" ]; then mkdir -p ms; cp "$XAML_MS_XBF_DIR"/*.xbf ms/; fi
+for t in xamlhello xamllayout xamlmarkup; do
     info "$t"
     cp "$BUILD/tests/xaml/$t.exe" .
     timeout 60 wine $t.exe || RC=1
