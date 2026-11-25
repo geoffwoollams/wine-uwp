@@ -17,6 +17,15 @@
             <TextBlock x:Name="Styled" Text="Styled by the implicit TextBlock style"/>
             <Button x:Name="TemplatedButton" Content="Templated" Style="{StaticResource TemplatedButton}" Margin="0,10,0,0"/>
         </StackPanel>
+        <!-- milestone 4 part 3: toggle controls; each has its own Background (or BorderBrush) to be found by -->
+        <StackPanel Margin="20" HorizontalAlignment="Right" Width="200">
+            <CheckBox x:Name="Check" Content="Check me" Background="#FF102030" Checked="OnChecked" Unchecked="OnUnchecked"/>
+            <CheckBox x:Name="ThreeState" Content="Three states" Background="#FF203040" IsThreeState="True" IsChecked="True"/>
+            <RadioButton x:Name="RadioA" Content="A" Background="#FF304050" IsChecked="True"/>
+            <RadioButton x:Name="RadioB" Content="B" Background="#FF405060"/>
+            <ToggleButton x:Name="Toggle" Content="Toggle" Style="{StaticResource TemplatedToggle}" Margin="0,4,0,0"/>
+            <Button x:Name="PlainButton" Content="Plain" BorderBrush="#FF506070" Margin="0,4,0,0"/>
+        </StackPanel>
         <Border Grid.Row="1" Background="{StaticResource AccentBrush}" Margin="20" Padding="10">
             <TextBlock Text="Brush from Application.Resources" Foreground="White" FontSize="20"/>
         </Border>

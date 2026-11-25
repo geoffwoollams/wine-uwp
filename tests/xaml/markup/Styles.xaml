@@ -58,4 +58,44 @@
             </Setter.Value>
         </Setter>
     </Style>
+
+    <!-- milestone 4 part 3: WinUI resource keys the built-in looks use, as the default templates do -->
+    <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillChecked" Color="#FF8E44AD"/>
+    <SolidColorBrush x:Key="ButtonBackgroundPointerOver" Color="#FFF7630C"/>
+
+    <!-- a templated ToggleButton: CommonStates with the checked states, like WinUI's ToggleButton template -->
+    <Style x:Key="TemplatedToggle" TargetType="ToggleButton">
+        <Setter Property="Background" Value="#FFFFB900"/>
+        <Setter Property="Padding" Value="16,8,16,8"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ToggleButton">
+                    <Grid x:Name="Root" Background="{TemplateBinding Background}">
+                        <VisualStateManager.VisualStateGroups>
+                            <VisualStateGroup x:Name="CommonStates">
+                                <VisualState x:Name="Normal"/>
+                                <VisualState x:Name="PointerOver">
+                                    <VisualState.Setters>
+                                        <Setter Target="Root.Background" Value="#FF5C2D91"/>
+                                    </VisualState.Setters>
+                                </VisualState>
+                                <VisualState x:Name="Checked">
+                                    <VisualState.Setters>
+                                        <Setter Target="Root.Background" Value="#FFE81123"/>
+                                    </VisualState.Setters>
+                                </VisualState>
+                                <VisualState x:Name="CheckedPointerOver">
+                                    <VisualState.Setters>
+                                        <Setter Target="Root.Background" Value="#FFA80000"/>
+                                    </VisualState.Setters>
+                                </VisualState>
+                            </VisualStateGroup>
+                        </VisualStateManager.VisualStateGroups>
+                        <ContentPresenter Content="{TemplateBinding Content}" Padding="{TemplateBinding Padding}"
+                                          HorizontalContentAlignment="Center" VerticalContentAlignment="Center"/>
+                    </Grid>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
 </ResourceDictionary>

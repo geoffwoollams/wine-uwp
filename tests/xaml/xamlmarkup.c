@@ -120,6 +120,9 @@ struct main_page
     IButton *templated;         /* x:Name="TemplatedButton" */
     IButton *click_button;      /* x:Name="ClickButton" */
     int clicks;
+    IToggleButton *check, *three_state, *radio_a, *radio_b, *toggle;   /* milestone 4 part 3 */
+    IButton *plain;
+    int checked, unchecked;     /* Checked="OnChecked" Unchecked="OnUnchecked" */
 };
 
 static struct main_page *the_page;
@@ -187,6 +190,21 @@ static HRESULT WINAPI click_Invoke(IRoutedEventHandler *iface, IInspectable *sen
 static IRoutedEventHandlerVtbl click_vtbl = { click_QueryInterface, click_AddRef, click_Release, click_Invoke };
 static IRoutedEventHandler on_click = { &click_vtbl };
 
+/* "OnChecked" and "OnUnchecked": count into the page */
+struct counter_handler
+{
+    IRoutedEventHandler IRoutedEventHandler_iface;
+    int *count;
+};
+static HRESULT WINAPI counter_Invoke(IRoutedEventHandler *iface, IInspectable *sender, IRoutedEventArgs *args)
+{
+    struct counter_handler *handler = CONTAINING_RECORD(iface, struct counter_handler, IRoutedEventHandler_iface);
+    if (handler->count) (*handler->count)++;
+    return S_OK;
+}
+static IRoutedEventHandlerVtbl counter_vtbl = { click_QueryInterface, click_AddRef, click_Release, counter_Invoke };
+static struct counter_handler on_checked = { { &counter_vtbl } }, on_unchecked = { { &counter_vtbl } };
+
 static HRESULT WINAPI page_Connect(IComponentConnector *iface, INT32 id, IInspectable *target)
 {
     struct main_page *page = page_from_connector(iface);
@@ -211,6 +229,21 @@ static HRESULT WINAPI page_Connect(IComponentConnector *iface, INT32 id, IInspec
     case 4:
         IInspectable_QueryInterface(target, &IID_IButton, (void **)&page->templated);
         break;
+    case 5:
+        IInspectable_QueryInterface(target, &IID_IToggleButton, (void **)&page->check);
+        on_checked.count = &page->checked;
+        on_unchecked.count = &page->unchecked;
+        if (page->check)
+        {
+            IToggleButton_add_Checked(page->check, &on_checked.IRoutedEventHandler_iface, &token);
+            IToggleButton_add_Unchecked(page->check, &on_unchecked.IRoutedEventHandler_iface, &token);
+        }
+        break;
+    case 6: IInspectable_QueryInterface(target, &IID_IToggleButton, (void **)&page->three_state); break;
+    case 7: IInspectable_QueryInterface(target, &IID_IToggleButton, (void **)&page->radio_a); break;
+    case 8: IInspectable_QueryInterface(target, &IID_IToggleButton, (void **)&page->radio_b); break;
+    case 9: IInspectable_QueryInterface(target, &IID_IToggleButton, (void **)&page->toggle); break;
+    case 10: IInspectable_QueryInterface(target, &IID_IButton, (void **)&page->plain); break;
     }
     return S_OK;
 }
@@ -628,6 +661,180 @@ static void check_template(struct main_page *page)
     check(find_color(0x107c10, &box) > 1500 && find_color(0x0b5a0b, &box) == 0, "Normal again: the original background is restored");
 }
 
+/* milestone 4 part 3: ToggleButton, CheckBox, RadioButton, live TemplateBinding and WinUI resource keys */
+
+static int is_checked(IToggleButton *toggle)
+{
+    IReference_boolean *ref = NULL;
+    boolean value;
+
+    if (FAILED(IToggleButton_get_IsChecked(toggle, &ref))) return -2;
+    if (!ref) return -1;
+    IReference_boolean_get_Value(ref, &value);
+    IReference_boolean_Release(ref);
+    return value;
+}
+
+static BOOL center_of(DWORD rgb, POINT *pt)
+{
+    RECT box;
+    if (find_color(rgb, &box) < 50) return FALSE;
+    pt->x = (box.left + box.right) / 2;
+    pt->y = (box.top + box.bottom) / 2;
+    return TRUE;
+}
+
+static void hover(POINT pt)
+{
+    SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(pt.x, pt.y));
+}
+
+static void click_at(POINT pt)
+{
+    hover(pt);
+    SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(pt.x, pt.y));
+    SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(pt.x, pt.y));
+}
+
+static void leave(void)
+{
+    SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(5, 5));
+    SendMessageW(hwnd, WM_MOUSELEAVE, 0, 0);
+}
+
+static IBrush *make_brush(UINT32 rgb)
+{
+    IActivationFactory *factory = get_factory(L"Windows.UI.Xaml.Media.SolidColorBrush", &IID_IActivationFactory);
+    ISolidColorBrush *solid;
+    IInspectable *object;
+    IBrush *brush = NULL;
+    Color c = { 0xff, rgb >> 16, (rgb >> 8) & 0xff, rgb & 0xff };
+
+    if (!factory) return NULL;
+    IActivationFactory_ActivateInstance(factory, &object);
+    IActivationFactory_Release(factory);
+    IInspectable_QueryInterface(object, &IID_ISolidColorBrush, (void **)&solid);
+    ISolidColorBrush_put_Color(solid, c);
+    ISolidColorBrush_QueryInterface(solid, &IID_IBrush, (void **)&brush);
+    ISolidColorBrush_Release(solid);
+    IInspectable_Release(object);
+    return brush;
+}
+
+static void set_background(void *object, UINT32 rgb)
+{
+    IControl *control;
+    IBrush *brush = make_brush(rgb);
+
+    if (SUCCEEDED(IUnknown_QueryInterface((IUnknown *)object, &IID_IControl, (void **)&control)))
+    {
+        IControl_put_Background(control, brush);
+        IControl_Release(control);
+    }
+    if (brush) IBrush_Release(brush);
+}
+
+static void check_toggles(struct main_page *page)
+{
+    POINT check_pt, three_pt, a_pt, b_pt, toggle_pt, plain_pt;
+    IReference_boolean *ref;
+    IPropertyValueStatics *pv;
+    IInspectable *boxed;
+    int n1, n2;
+    BOOL found;
+
+    check(page->check && page->three_state && page->radio_a && page->radio_b && page->toggle && page->plain,
+          "Connect(5-10) gave us the CheckBoxes, RadioButtons, ToggleButton and the plain Button");
+    if (!page->check || !page->three_state || !page->radio_a || !page->radio_b || !page->toggle || !page->plain) return;
+    leave();
+    snapshot();
+    found = center_of(0x102030, &check_pt) && center_of(0x203040, &three_pt) && center_of(0x304050, &a_pt) &&
+            center_of(0x405060, &b_pt) && center_of(0xffb900, &toggle_pt) && center_of(0x506070, &plain_pt);
+    check(found, "each toggle control draws its Background (the ToggleButton through its template)");
+    if (!found) return;
+
+    /* the values from markup */
+    check(is_checked(page->check) == 0, "Check starts unchecked (%d)", is_checked(page->check));
+    check(is_checked(page->three_state) == 1, "ThreeState has IsChecked=\"True\" from markup (%d)", is_checked(page->three_state));
+    check(is_checked(page->radio_a) == 1 && is_checked(page->radio_b) == 0, "RadioA has IsChecked=\"True\", RadioB doesn't");
+
+    /* CheckBox: Checked/Unchecked events, and the app's CheckBoxCheckBackgroundFillChecked brush */
+    n1 = count_color(0x8e44ad);
+    check(n1 > 200, "the checked ThreeState box is filled with the app's CheckBoxCheckBackgroundFillChecked (%d px)", n1);
+    click_at(check_pt);
+    leave();
+    check(is_checked(page->check) == 1 && page->checked == 1, "clicking Check checks it and raises Checked (%d, %d)",
+          is_checked(page->check), page->checked);
+    snapshot();
+    n2 = count_color(0x8e44ad);
+    check(n2 > n1 + 200, "the checked box is filled too (%d px, was %d)", n2, n1);
+    click_at(check_pt);
+    leave();
+    snapshot();
+    check(is_checked(page->check) == 0 && page->unchecked == 1 && count_color(0x8e44ad) == n1,
+          "clicking again unchecks it and raises Unchecked (%d, %d)", is_checked(page->check), page->unchecked);
+
+    /* IsThreeState: checked -> indeterminate (null) -> unchecked */
+    click_at(three_pt);
+    check(is_checked(page->three_state) == -1, "IsThreeState: Checked goes to Indeterminate, IsChecked null (%d)", is_checked(page->three_state));
+    click_at(three_pt);
+    leave();
+    check(is_checked(page->three_state) == 0, "then to Unchecked (%d)", is_checked(page->three_state));
+
+    /* RadioButtons with the same parent form a group */
+    click_at(b_pt);
+    leave();
+    check(is_checked(page->radio_b) == 1 && is_checked(page->radio_a) == 0, "checking RadioB unchecks RadioA (%d, %d)",
+          is_checked(page->radio_b), is_checked(page->radio_a));
+    click_at(b_pt);
+    leave();
+    check(is_checked(page->radio_b) == 1, "clicking a checked RadioButton leaves it checked");
+    pv = get_factory(L"Windows.Foundation.PropertyValue", &IID_IPropertyValueStatics);
+    IPropertyValueStatics_CreateBoolean(pv, TRUE, &boxed);
+    IInspectable_QueryInterface(boxed, &IID_IReference_boolean, (void **)&ref);
+    IToggleButton_put_IsChecked(page->radio_a, ref);
+    IReference_boolean_Release(ref);
+    IInspectable_Release(boxed);
+    IPropertyValueStatics_Release(pv);
+    check(is_checked(page->radio_a) == 1 && is_checked(page->radio_b) == 0, "IsChecked = true from code unchecks the other one too");
+
+    /* the templated ToggleButton: Normal, PointerOver, CheckedPointerOver, Checked */
+    hover(toggle_pt);
+    snapshot();
+    check(count_color(0x5c2d91) > 1000, "ToggleButton template: PointerOver (%d px)", count_color(0x5c2d91));
+    click_at(toggle_pt);
+    snapshot();
+    check(is_checked(page->toggle) == 1 && count_color(0xa80000) > 1000, "clicked: checked, in CheckedPointerOver (%d px)",
+          count_color(0xa80000));
+    leave();
+    snapshot();
+    check(count_color(0xe81123) > 1000 && count_color(0xa80000) == 0, "pointer gone: Checked (%d px)", count_color(0xe81123));
+
+    /* live TemplateBinding: a new Background while the Checked state's Setter holds the Grid's background... */
+    set_background(page->toggle, 0x00b294);
+    snapshot();
+    check(count_color(0xe81123) > 1000 && count_color(0x00b294) == 0, "a Background set in the Checked state stays hidden by the state");
+    /* ...is what leaving the state restores */
+    click_at(toggle_pt);
+    leave();
+    snapshot();
+    check(is_checked(page->toggle) == 0 && count_color(0x00b294) > 1000 && count_color(0xffb900) == 0,
+          "unchecked, Normal: the template shows the new Background (%d px)", count_color(0x00b294));
+
+    /* live TemplateBinding in the Normal state: straight through */
+    set_background(page->templated, 0xff8c00);
+    snapshot();
+    check(count_color(0xff8c00) > 1500 && count_color(0x107c10) == 0, "TemplatedButton.Background = #FF8C00 reaches its template (%d px)",
+          count_color(0xff8c00));
+
+    /* a built-in Button look takes ButtonBackgroundPointerOver from the app's resources */
+    hover(plain_pt);
+    snapshot();
+    check(count_color(0xf7630c) > 500, "the plain Button's hover colour is the app's ButtonBackgroundPointerOver (%d px)",
+          count_color(0xf7630c));
+    leave();
+}
+
 static void check_microsoft_xbf(const WCHAR *file, const WCHAR *component_class)
 {
     IActivationFactory *factory;
@@ -732,6 +939,7 @@ static void CALLBACK verify(HWND unused, UINT msg, UINT_PTR id, DWORD time)
     }
     check(the_page->clicks == 1, "clicking ClickButton ran OnClick (%d)", the_page->clicks);
     check_template(the_page);
+    check_toggles(the_page);
     check(!wcscmp(text_of(the_page->title, buf, ARRAYSIZE(buf)), L"Clicked!"), "OnClick changed Title (%ls)", buf);
     snapshot();
 
