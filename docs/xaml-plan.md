@@ -194,3 +194,46 @@ Out of scope for milestone 1: layout beyond a single content element, any input 
 - Hover and pressed colours assume the page background is the theme's (the real brushes are translucent).
 - `PointerPressed`/`Tapped` and other `UIElement` routed events aren't raised; only `Button.Click` is.
 - Still no XAML markup, so Visual Studio-built apps stop at `LoadComponent` as before.
+
+## 9. Milestone 3: compiled markup, Page, Frame and resources (patches 0019-0022)
+
+**What was built:**
+
+- **XBF v2 reader and object writer** (`dlls/windows.ui.xaml/xbf.c`), following Microsoft's MIT-licensed reader (microsoft-ui-xaml, `dxaml/xcp/tools/XbfParser`):
+  - It reads the metadata tables and node streams, and resolves built-in types and properties through the stable XBF index table (`xbf_stable.h`, generated from `StableXbfIndexes.g.h`).
+  - It runs the object-writer instructions as a stack machine: create type, set value (constant, type-converted, `{StaticResource}`, `{ThemeResource}`), get a collection and add to it, keyed dictionary entries, `x:Name`, connection ids.
+  - It reads all four kinds of custom runtime data (resource dictionaries v1–v4, styles v1–v3, visual-state groups v1–v5, `x:Load` elements v1–v3). Dictionary entries are built from their own node streams; the others are read past.
+- **`Application.LoadComponent`** maps `ms-appx:///Folder/Page.xaml` to `Folder\Page.xbf` in the package folder. The markup's root element is the component itself. `x:Name` and event handlers go to the component's `IComponentConnector.Connect`, the way Visual Studio's generated code expects.
+- **Custom types** (`local:MyControl`, pages) are created through the app's `IXamlMetadataProvider`, which the framework finds on the `Application` object.
+- **New classes:**
+  - `UserControl` and `Page`: composable, so app pages derive from them.
+  - `Frame`: `Navigate(TypeName[, parameter])` creates the page through the metadata provider and shows it; `CurrentSourcePageType`; the navigation events are stored.
+  - `ResourceDictionary`: an `IMap` with string keys, used by `Application.Resources` and `FrameworkElement.Resources`. Lookups walk the dictionaries in scope, then the application's, then a small built-in theme dictionary (`ApplicationPageBackgroundThemeBrush` and other common Windows 10 brushes, light and dark).
+- **Property setting from markup** covers everything milestones 1 and 2 implemented: text, fonts, brushes from colours, names or `#AARRGGBB`, thickness, sizes, `GridLength` (`Auto`, `*`, `2*`), alignment, orientation, visibility, content, `Child`, Grid attached properties, `IsEnabled`, `ClickMode`, `RequestedTheme` and `Resources`.
+- **0019 widl:** composable-only runtime classes were not written to the registry (only activatable or static ones), so `ResourceDictionary` couldn't be activated. Fixed.
+- **0021 twinapi.appcore:** launch activation args now implement `IPrelaunchActivatedEventArgs` (false), `ILaunchActivatedEventArgs2`, `IApplicationViewActivatedEventArgs` and `IViewSwitcherProvider`.
+  - The Visual Studio template's `OnLaunched` reads `e->PrelaunchActivated` first.
+  - Before this, any unknown interface got a logging probe whose getter wrote an 8-byte NULL. That corrupted memory when the getter returned a `boolean` or `INT32`. Halo Wars 2 itself queried `IPrelaunchActivatedEventArgs` and hit this, and now gets the real interface.
+- **`scripts/xbf.py`**: `dump` prints any XBF file's tables and node streams; `compile` turns a small XAML subset into XBF 2.1 laid out the way Microsoft's compiler does it. That is how the test app's markup is built, since there is no Windows toolchain here.
+
+**Tests** (fresh scratch prefix, `tests/xaml/run.sh`):
+
+- **`xamlmarkup.c`: 31/31 checks pass.** The app is structured like Visual Studio's generated C++/CX:
+  - an `App` with `IXamlMetadataProvider` that loads `App.xaml` (light theme, two brushes in `Application.Resources`)
+  - the Blank App `OnLaunched`: `PrelaunchActivated`, a new `Frame`, `Navigate(typeof(MainPage))`
+  - a `MainPage` that aggregates `Page`, implements `IComponentConnector` and loads `MainPage.xaml`: a Grid with Auto and `*` rows, a StackPanel with a named TextBlock and a named Button with `Click="OnClick"`, and a Border whose background is `{StaticResource AccentBrush}` with a white TextBlock
+  - The checks cover the theme, the dictionary contents, the frame asking the provider for `MainPage`, `Connect()` delivering both named elements, the text from markup, the layout, the resource brush and theme background in the drawn pixels, and clicking the button running `OnClick`.
+- **Microsoft's compiler output:** 7 `.xbf` test files from microsoft-ui-xaml (MIT, fetched into the scratch folder and not committed; `XAML_MS_XBF_DIR=dir tests/xaml/run.sh` uses them) all load to the end with `S_OK`. Together they have 1 to 216 node streams, resource dictionaries with theme dictionaries, styles, visual states, conditional XAML, `x:Uid`, bindings and custom types. `scripts/xbf.py dump` of `CustomTypesPage.xbf` matches Microsoft's own dump of it node for node.
+- `xamlhello` and `xamllayout` still pass 34/34.
+- **Halo Wars 2**, 90 s windowed: normal render loop and swapchain. The only log difference from v1.0 is that the probe messages for `IPrelaunchActivatedEventArgs` are gone.
+
+**Not working yet** (this is where milestone 4 starts):
+
+- **Styles and templates:** `Style`, `ControlTemplate`, `DataTemplate`, deferred template properties and visual states are read but not applied. Built-in controls keep their hard-coded look.
+- **Data binding:** `{Binding}` and other markup extensions are not created (logged). `x:Bind` is compiled into the app and should mostly work, but it is untested.
+- **Dictionaries:** implicit (type-keyed) resources, `MergedDictionaries`, `ThemeDictionaries` and `ResourceDictionary.Source` are not supported.
+- **Localization:** `x:Uid` localized strings need `resources.pri`, which is not supported.
+- **Frame navigation** has no history (`GoBack`), no `OnNavigatedTo`/`NavigationEventArgs` and no navigation events.
+- **Types:** properties and types the earlier milestones didn't implement are logged and skipped. Built-in types other than the twelve implemented ones come out as nothing, so their content is lost.
+- **Text XAML** (`XamlReader.Load`, or `.xaml` files shipped uncompiled) is not supported, only `.xbf`.
+- Not tested against an app built by Visual Studio: none can be built here. The compiled markup is checked against Microsoft's compiler output (above), but the C++/CX runtime (`vccorlib`) side is still unexercised.

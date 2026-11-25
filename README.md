@@ -76,7 +76,9 @@ Wine has no `Windows.UI.Xaml`, the UI framework most non-game UWP apps are built
 
 **Milestone 2 (done): layout and buttons.** Measure/arrange layout with `StackPanel`, `Grid` (Auto, pixel and star rows and columns, spans), `Border`, and `Button` with the Windows 10 look, hover and pressed states, and `Click` from the mouse. Elements can be subclassed by apps (aggregation), and `Panel.Children` and Grid row/column definitions are real collections.
 
-**Not yet:** XAML markup. Every app built with Visual Studio loads `App.xbf` and page `.xbf` files at startup, which milestone 3 adds; until then such an app stops with `FIXME ... XAML markup (.xbf) is not supported yet` in the log. Keyboard input and focus, `TextBox`, scrolling and templates come later.
+**Milestone 3 (done): compiled markup.** `Application.LoadComponent` loads the app's `.xbf` files (compiled XAML, version 2), so an app laid out like Visual Studio's Blank App starts. The markup can use the controls above, `Page`, `UserControl` and `Frame` (with `Navigate` creating the app's pages through its `IXamlMetadataProvider`), `x:Name` and `Click` handlers, `Application.Resources` and `{StaticResource}`, and common `{ThemeResource}` brushes. Microsoft's own compiler-made test files load.
+
+**Not yet:** styles and control templates, data binding (`{Binding}`), `TextBox`, scrolling, keyboard focus, localized `x:Uid` strings and navigation history. Real Store apps will mostly still look wrong or stop where they need these; see [docs/xaml-plan.md](docs/xaml-plan.md).
 
 To try it, build the test clients and run them in a throwaway prefix (each opens a window for a few seconds and checks what was drawn):
 
@@ -165,12 +167,15 @@ This is not legal advice. The LGPL requires that anyone who gets the binaries ca
 patches/wine/   patches against the wine-11.0 tag (apply in order with git apply): 0001-0007 the UWP host and
                 services, 0008 CurrentApp, 0009 DisplayRequest, 0010 GameSaveProvider, 0011 class registration,
                 0012 no hard-coded Store ID, 0013-0016 Windows.UI.Xaml milestone 1 (widl fix, generated IDL,
-                ProcessUntilQuit, the XAML code), 0017-0018 milestone 2 (IDL, layout, panels, Button)
+                ProcessUntilQuit, the XAML code), 0017-0018 milestone 2 (IDL, layout, panels, Button),
+                0019-0022 milestone 3 (widl registration fix, IDL, launch args, markup loading)
 patches/dxvk/   patch against DXVK f90f1bf1 (v3.1.1-235)
 docker/         build containers
 apps/           optional per-app settings
 scripts/        fetch-release.sh, build-wine.sh, build-dxvk.sh, setup-prefix.sh, run-app.sh,
-                package-release.sh, uwptool.py, winmd2idl.py (WinRT IDL from Windows metadata)
-tests/xaml/     the XAML test clients (build.sh, run.sh): xamlhello (milestone 1), xamllayout (milestone 2)
+                package-release.sh, uwptool.py, winmd2idl.py (WinRT IDL from Windows metadata),
+                xbf.py (dump compiled XAML, or compile test XAML)
+tests/xaml/     the XAML test clients (build.sh, run.sh): xamlhello (milestone 1), xamllayout (milestone 2),
+                xamlmarkup + markup/ (milestone 3)
 docs/           xaml-plan.md
 ```
