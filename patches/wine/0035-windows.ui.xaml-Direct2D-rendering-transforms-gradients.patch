@@ -1,4 +1,4 @@
-Subject: windows.ui.xaml: draw with Direct2D and DirectWrite, RenderTransform, Clip, LinearGradientBrush (Direct2D round, work in progress)
+Subject: windows.ui.xaml: draw with Direct2D and DirectWrite, RenderTransform, Clip, LinearGradientBrush (Direct2D round)
 
 diff --git a/dlls/windows.ui.xaml/Makefile.in b/dlls/windows.ui.xaml/Makefile.in
 index cf48f13..e2851b1 100644
@@ -535,10 +535,10 @@ index f5ffaaa..cd35fe4 100644
      if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_EllipseGeometry ))
 diff --git a/dlls/windows.ui.xaml/media.c b/dlls/windows.ui.xaml/media.c
 new file mode 100644
-index 0000000..5ede920
+index 0000000..26fe517
 --- /dev/null
 +++ b/dlls/windows.ui.xaml/media.c
-@@ -0,0 +1,735 @@
+@@ -0,0 +1,749 @@
 +/* Windows.UI.Xaml.Media transforms and LinearGradientBrush
 + *
 + * Copyright 2026 wine-uwp contributors
@@ -1175,6 +1175,20 @@ index 0000000..5ede920
 +    &IID_IGradientStop,
 +};
 +
++static HRESULT stop_inserted( void *owner, IInspectable *item )
++{
++    if (!media_from_object( item )) return E_INVALIDARG;   /* only GradientStops */
++    window_invalidate();
++    return S_OK;
++}
++
++static void stop_removed( void *owner, IInspectable *item )
++{
++    window_invalidate();
++}
++
++static const struct vector_callbacks stops_callbacks = { stop_inserted, stop_removed };
++
 +static HRESULT media_create( enum media_kind kind, IInspectable **out )
 +{
 +    struct media *impl;
@@ -1200,7 +1214,7 @@ index 0000000..5ede920
 +    impl->opacity = 1;
 +    impl->end.X = impl->end.Y = 1;
 +    impl->mapping = BrushMappingMode_RelativeToBoundingBox;
-+    if (kind == MEDIA_LINEAR_GRADIENT && FAILED(hr = vector_create( &stops_iids, NULL, impl, &impl->stops )))
++    if (kind == MEDIA_LINEAR_GRADIENT && FAILED(hr = vector_create( &stops_iids, &stops_callbacks, impl, &impl->stops )))
 +    {
 +        free( impl );
 +        return hr;
@@ -1966,7 +1980,7 @@ index 0a18234..548daf2 100644
      DeleteObject( bitmap );
      DeleteDC( mem );
 diff --git a/dlls/windows.ui.xaml/xbf.c b/dlls/windows.ui.xaml/xbf.c
-index 38aff3f..ae1f140 100644
+index 38aff3f..d4a2112 100644
 --- a/dlls/windows.ui.xaml/xbf.c
 +++ b/dlls/windows.ui.xaml/xbf.c
 @@ -2125,6 +2125,44 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
@@ -1977,7 +1991,7 @@ index 38aff3f..ae1f140 100644
 +    {
 +        Color c;
 +        double dd;
-+        BOOL has_c = to_color( value, &c ), has_d = value->kind != XV_STRING && to_double( value, &dd );
++        BOOL has_c = prop_is( prop, L"Color" ) && to_color( value, &c ), has_d = value->kind != XV_STRING && to_double( value, &dd );
 +        if (media_set_property( target, prop->name, value->kind == XV_STRING ? value->s : NULL, has_d ? &dd : NULL,
 +                                has_c ? &c : NULL ))
 +            return S_OK;

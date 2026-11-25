@@ -1767,6 +1767,93 @@ static void check_part6(struct main_page *page)
     IInspectable_Release(root);
 }
 
+/* the Direct2D round: LinearGradientBrush, RenderTransform, Clip, at known places (an overlay at 600,300) */
+
+static DWORD px(int x, int y)
+{
+    return pixels[y * width + x] & 0xffffff;
+}
+
+static BOOL close_rgb(DWORD c, int r, int g, int b, int tolerance)
+{
+    return abs((int)(c >> 16) - r) <= tolerance && abs((int)((c >> 8) & 0xff) - g) <= tolerance && abs((int)(c & 0xff) - b) <= tolerance;
+}
+
+static const WCHAR d2d_xaml[] =
+    L"<Grid xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\" Grid.RowSpan=\"2\" Margin=\"600,300,0,0\"\n"
+    L"      HorizontalAlignment=\"Left\" VerticalAlignment=\"Top\" Width=\"300\" Height=\"200\" Background=\"White\">\n"
+    L"  <Border HorizontalAlignment=\"Left\" VerticalAlignment=\"Top\" Width=\"100\" Height=\"20\">\n"
+    L"    <Border.Background>\n"
+    L"      <LinearGradientBrush StartPoint=\"0,0\" EndPoint=\"1,0\">\n"
+    L"        <GradientStop Color=\"#FFFF0000\" Offset=\"0\"/>\n"
+    L"        <GradientStop Color=\"#FF0000FF\" Offset=\"1\"/>\n"
+    L"      </LinearGradientBrush>\n"
+    L"    </Border.Background>\n"
+    L"  </Border>\n"
+    L"  <Border Margin=\"60,40,0,0\" HorizontalAlignment=\"Left\" VerticalAlignment=\"Top\" Width=\"100\" Height=\"20\"\n"
+    L"          Background=\"#FF00C000\" RenderTransformOrigin=\"0,0\">\n"
+    L"    <Border.RenderTransform><RotateTransform Angle=\"90\"/></Border.RenderTransform>\n"
+    L"  </Border>\n"
+    L"  <Border Margin=\"150,0,0,0\" HorizontalAlignment=\"Left\" VerticalAlignment=\"Top\" Width=\"100\" Height=\"40\"\n"
+    L"          Background=\"#FFC0C000\">\n"
+    L"    <Border.Clip><RectangleGeometry Rect=\"0,0,50,40\"/></Border.Clip>\n"
+    L"  </Border>\n"
+    L"  <Border Margin=\"150,60,0,0\" HorizontalAlignment=\"Left\" VerticalAlignment=\"Top\" Width=\"20\" Height=\"20\"\n"
+    L"          Background=\"#FF0000C0\">\n"
+    L"    <Border.RenderTransform><TranslateTransform X=\"30\"/></Border.RenderTransform>\n"
+    L"  </Border>\n"
+    L"</Grid>\n";
+
+static void check_d2d(struct main_page *page)
+{
+    IFrameworkElement2 *page_grid = page_root(page);
+    IVector_UIElement *children;
+    IInspectable *root;
+    IPanel *panel;
+    IUIElement *ui;
+    HRESULT hr;
+    DWORD c;
+    int x = 600, y = 300;
+
+    root = xaml_load(d2d_xaml, &hr);
+    check(hr == S_OK && root, "XamlReader.Load of gradients, transforms and a clip, hr %#lx", hr);
+    if (!root || !page_grid) return;
+    IFrameworkElement2_QueryInterface(page_grid, &IID_IPanel, (void **)&panel);
+    IPanel_get_Children(panel, &children);
+    IInspectable_QueryInterface(root, &IID_IUIElement, (void **)&ui);
+    IVector_UIElement_Append(children, ui);
+    snapshot();
+
+    c = px(x + 2, y + 10);
+    check(close_rgb(c, 250, 0, 5, 12), "LinearGradientBrush: red at its start (%06lx)", c);
+    c = px(x + 97, y + 10);
+    check(close_rgb(c, 5, 0, 250, 12), "and blue at its end (%06lx)", c);
+    c = px(x + 50, y + 10);
+    check((c >> 16) > 60 && (c & 0xff) > 60 && ((c >> 8) & 0xff) < 30, "and a mix in the middle (%06lx)", c);
+
+    /* rotated 90 degrees about its top left (60,40): it runs down from there, to the left of x = 60 */
+    c = px(x + 50, y + 90);
+    check(c == 0x00c000, "RotateTransform 90: the bar is turned to run downwards (%06lx at 50,90)", c);
+    c = px(x + 110, y + 50);
+    check(c != 0x00c000, "and is no longer where it was laid out (%06lx at 110,50)", c);
+
+    c = px(x + 175, y + 20);
+    check(c == 0xc0c000, "Clip: the left half of the clipped Border is drawn (%06lx)", c);
+    c = px(x + 225, y + 20);
+    check(c != 0xc0c000, "and its right half isn't (%06lx)", c);
+
+    c = px(x + 190, y + 70);
+    check(c == 0x0000c0, "TranslateTransform X=30 moves the square right (%06lx)", c);
+    c = px(x + 155, y + 70);
+    check(c != 0x0000c0, "from where it was laid out (%06lx)", c);
+
+    IVector_UIElement_Release(children);
+    IPanel_Release(panel);
+    IUIElement_Release(ui);
+    IFrameworkElement2_Release(page_grid);
+    IInspectable_Release(root);
+}
+
 static void check_microsoft_xbf(const WCHAR *file, const WCHAR *component_class)
 {
     IActivationFactory *factory;
@@ -1878,6 +1965,7 @@ static void CALLBACK verify(HWND unused, UINT msg, UINT_PTR id, DWORD time)
     check_theme_change(the_page);
     check_loose_xaml();
     check_part6(the_page);
+    check_d2d(the_page);
     check(!wcscmp(text_of(the_page->title, buf, ARRAYSIZE(buf)), L"Clicked!"), "OnClick changed Title (%ls)", buf);
     snapshot();
 

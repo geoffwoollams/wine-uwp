@@ -90,7 +90,9 @@ Wine has no `Windows.UI.Xaml`, the UI framework most non-game UWP apps are built
 
 **Milestone 4, part 6 (done): data and motion.** `{Binding}` (DataContext, ElementName, TwoWay, converters, `INotifyPropertyChanged`), `DataTemplate` (ContentTemplate, `ItemsControl` with `ItemsSource` and `ItemTemplate`), `ToggleSwitch`, `Slider` and `ProgressBar`, storyboards that run over time (visual states, and `Storyboard.Begin` from code), `Opacity`, and Path curves and geometries.
 
-**Not yet:** Direct2D rendering (anti-aliased shapes, transforms), ListView/GridView and other item controls, `x:Bind` beyond what its generated code calls, `TextBox`, scrolling, keyboard focus, localized `x:Uid` strings and navigation history. Real Store apps will still often stop or look wrong where they need these; see [docs/xaml-plan.md](docs/xaml-plan.md).
+**Direct2D (done):** frames are drawn with Direct2D and DirectWrite (anti-aliased shapes and text), with `RenderTransform`, `Clip` and `LinearGradientBrush`; GDI remains the fallback.
+
+**Not yet:** ListView/GridView and other item controls, `x:Bind` beyond what its generated code calls, `TextBox`, scrolling, keyboard focus, localized `x:Uid` strings and navigation history. Real Store apps will still often stop or look wrong where they need these; see [docs/xaml-plan.md](docs/xaml-plan.md).
 
 To try it, build the test clients and run them in a throwaway prefix (each opens a window for a few seconds and checks what was drawn):
 
@@ -185,7 +187,8 @@ patches/wine/   patches against the wine-11.0 tag (apply in order with git apply
                 templates, visual states), 0026-0027 part 3 (ToggleButton, CheckBox, RadioButton, live
                 TemplateBinding), 0028-0029 part 4 (XAML text, XamlReader, generic.xaml),
                 0030-0031 part 5 (shapes, corners, theme changes, loose XAML), 0032-0033 part 6
-                (ToggleSwitch, Slider, ProgressBar, ItemsControl, DataTemplate, {Binding}, animation timing)
+                (ToggleSwitch, Slider, ProgressBar, ItemsControl, DataTemplate, {Binding}, animation timing),
+                0034-0035 Direct2D rendering (transforms, clips, gradients)
 patches/dxvk/   patch against DXVK f90f1bf1 (v3.1.1-235)
 docker/         build containers
 apps/           optional per-app settings

@@ -515,3 +515,46 @@ Patch 0032 is the IDL, generated with `winmd2idl.py` for:
 - Scrolling.
 - Keyboard focus.
 - Visual transitions and easing.
+
+## 16. The Direct2D round: Direct2D and DirectWrite rendering, transforms, clips, gradients (patches 0034-0035)
+
+Patch 0034 is the IDL, generated with `winmd2idl.py` for `Media.Transform`, `GeneralTransform`, `TranslateTransform`,
+`ScaleTransform`, `RotateTransform`, `CompositeTransform`, `MatrixTransform`, `LinearGradientBrush`, `GradientBrush`,
+`GradientStop` and `GradientStopCollection`.
+
+**What was built:**
+
+- **`render.c`:** each frame is drawn by one Direct2D DC render target bound to the window's back buffer, in view pixels (its DPI is 96 x the view scale). Text is laid out and drawn with DirectWrite, and measured with it too, so layout matches drawing. If Direct2D can't start, element.c draws with GDI as before.
+- **Shapes:** fills, borders, rounded corners, ellipses and paths are anti-aliased.
+  - Corner and ellipse arcs are cubic Béziers, because Wine's `ID2D1GeometrySink::AddArc` is a stub.
+  - Strokes inside the edge are two-figure alternate-fill geometries, because `CombineWithGeometry` is a stub.
+- **Opacity** draws the subtree into a compatible bitmap render target and blends it in with `DrawBitmap`, because Wine's `PushLayer` is a stub. Translucent text keeps its alpha: the inherited foreground carries an alpha value.
+- **`media.c`:**
+  - **Transforms:** TranslateTransform, ScaleTransform, RotateTransform, CompositeTransform (scale, skew, rotate about the centre, then translate) and MatrixTransform, each with `IGeneralTransform` (`Inverse`, `TransformPoint`, `TransformBounds`).
+  - **Gradients:** `LinearGradientBrush` with `GradientStops`, `StartPoint`/`EndPoint`, `MappingMode` and `SpreadMethod`, plus `GradientStop`.
+  - **Not supported:** TransformGroup, brush transforms and ColorInterpolationMode.
+- **Elements:**
+  - `UIElement.RenderTransform` about `RenderTransformOrigin` is applied when drawing and inverted for hit testing.
+  - `UIElement.Clip` (a RectangleGeometry) is an axis-aligned clip in the element's space. Under a rotation it clips to the bounding box.
+  - Without Direct2D, transforms and clips are ignored.
+- **Markup and animations:** the new types and properties work from XAML. Storyboards can target `(UIElement.RenderTransform).(RotateTransform.Angle)`-style paths, which resolve to the transform object.
+- **Speed:** frames take about 16-25 ms at 1280x720. The first frame of a process takes about half a second (Direct3D start-up).
+- **Test harness:** the markup test's `pump()` could run past its time when frames outlast the animation timer; it now checks the clock between messages.
+
+**Tests:**
+
+- **`xamlmarkup`: 138/138 checks pass**, all under Direct2D.
+  - **New checks:** a LinearGradientBrush red at its start, blue at its end and mixed between; a RotateTransform of 90 degrees about the top left turning a bar downwards; a Clip drawing only the left half of a Border; a TranslateTransform moving a square.
+  - **Existing checks:** the pixel checks of earlier rounds (corners, opacity, ellipse area, check marks, theme colours) still pass with anti-aliasing.
+- Milestones 1 and 2 still pass 34/34.
+
+**Still to do:**
+
+- ListView/GridView.
+- TextBox.
+- Scrolling (ScrollViewer).
+- Keyboard focus.
+- Visual transitions and easing.
+- Image and ImageBrush (WIC).
+- TransformGroup and rotated clips.
+- Faster frames: drawing straight to the window instead of through the DC render target's copies.
