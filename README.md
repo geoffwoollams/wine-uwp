@@ -78,7 +78,9 @@ Wine has no `Windows.UI.Xaml`, the UI framework most non-game UWP apps are built
 
 **Milestone 3 (done): compiled markup.** `Application.LoadComponent` loads the app's `.xbf` files (compiled XAML, version 2), so an app laid out like Visual Studio's Blank App starts. The markup can use the controls above, `Page`, `UserControl` and `Frame` (with `Navigate` creating the app's pages through its `IXamlMetadataProvider`), `x:Name` and `Click` handlers, `Application.Resources` and `{StaticResource}`, and common `{ThemeResource}` brushes. Microsoft's own compiler-made test files load.
 
-**Not yet:** styles and control templates, data binding (`{Binding}`), `TextBox`, scrolling, keyboard focus, localized `x:Uid` strings and navigation history. Real Store apps will mostly still look wrong or stop where they need these; see [docs/xaml-plan.md](docs/xaml-plan.md).
+**Milestone 4, part 1 (done): styles.** Explicit and implicit `Style`s with `BasedOn` (local values still win), theme dictionaries for `{ThemeResource}`, merged dictionaries and `ResourceDictionary Source="ms-appx:///Styles.xaml"`.
+
+**Not yet:** control templates and visual states, data binding (`{Binding}`), `TextBox`, scrolling, keyboard focus, localized `x:Uid` strings and navigation history. Real Store apps will mostly still look wrong or stop where they need these; see [docs/xaml-plan.md](docs/xaml-plan.md).
 
 To try it, build the test clients and run them in a throwaway prefix (each opens a window for a few seconds and checks what was drawn):
 
@@ -168,7 +170,8 @@ patches/wine/   patches against the wine-11.0 tag (apply in order with git apply
                 services, 0008 CurrentApp, 0009 DisplayRequest, 0010 GameSaveProvider, 0011 class registration,
                 0012 no hard-coded Store ID, 0013-0016 Windows.UI.Xaml milestone 1 (widl fix, generated IDL,
                 ProcessUntilQuit, the XAML code), 0017-0018 milestone 2 (IDL, layout, panels, Button),
-                0019-0022 milestone 3 (widl registration fix, IDL, launch args, markup loading)
+                0019-0022 milestone 3 (widl registration fix, IDL, launch args, markup loading),
+                0023 milestone 4 part 1 (styles, theme and merged dictionaries)
 patches/dxvk/   patch against DXVK f90f1bf1 (v3.1.1-235)
 docker/         build containers
 apps/           optional per-app settings
@@ -176,6 +179,6 @@ scripts/        fetch-release.sh, build-wine.sh, build-dxvk.sh, setup-prefix.sh,
                 package-release.sh, uwptool.py, winmd2idl.py (WinRT IDL from Windows metadata),
                 xbf.py (dump compiled XAML, or compile test XAML)
 tests/xaml/     the XAML test clients (build.sh, run.sh): xamlhello (milestone 1), xamllayout (milestone 2),
-                xamlmarkup + markup/ (milestone 3)
+                xamlmarkup + markup/ (milestones 3 and 4)
 docs/           xaml-plan.md
 ```

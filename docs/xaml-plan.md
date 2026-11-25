@@ -237,3 +237,43 @@ Out of scope for milestone 1: layout beyond a single content element, any input 
 - **Types:** properties and types the earlier milestones didn't implement are logged and skipped. Built-in types other than the twelve implemented ones come out as nothing, so their content is lost.
 - **Text XAML** (`XamlReader.Load`, or `.xaml` files shipped uncompiled) is not supported, only `.xbf`.
 - Not tested against an app built by Visual Studio: none can be built here. The compiled markup is checked against Microsoft's compiler output (above), but the C++/CX runtime (`vccorlib`) side is still unexercised.
+
+## 10. Milestone 4, part 1: styles and resource dictionaries (patch 0023)
+
+Milestone 4 is the largest rung (3 to 6 months in the ladder), so it lands in parts. Part 1 is styles and dictionaries, which work without control templates.
+
+**What was built:**
+
+- **`Style` from markup:**
+  - `TargetType`, `BasedOn` and the Style_v1–v3 setter data the compiler writes (constant values, string values, `{StaticResource}`/`{ThemeResource}` values, which are single nodes setting `Setter.Value` in the style's node stream, and object values).
+  - `FrameworkElement.Style` (get/put) applies the style, `BasedOn` first.
+  - An element with no `Style` gets the **implicit style** for its type when its markup finishes initializing, if one is in scope. That means a type-keyed entry in a dictionary, or a keyless `Style` added to one.
+- **Value precedence:** a property set directly on an element (in markup or by the app) is not overridden by a style. This is the "local beats style" part of WinUI's precedence rules, not a full dependency-property system.
+- **ResourceDictionary:**
+  - `ThemeDictionaries`: `{ThemeResource}` and lookups use the `Light`/`Dark` entry for the app's theme, else `Default`.
+  - `MergedDictionaries`: searched last-first after the dictionary's own entries.
+  - `Source`: `ms-appx:///Styles.xaml` loads that file's `.xbf` into the dictionary.
+  - The `IMap` indexer finds theme and merged resources, as on Windows.
+- **`scripts/xbf.py compile`** now handles `<Style>`/`<Setter>`, explicit and implicit dictionary entries, merged and theme dictionaries and `Source`, using the same layout as Microsoft's compiler. `dump` shows style setters.
+
+**Tests:**
+
+- **`xamlmarkup`: 45/45 checks pass.**
+  - `App.xaml` merges `Styles.xaml` and defines Light/Dark theme dictionaries.
+  - The implicit `TextBlock` style sets FontSize and Foreground, except where a TextBlock sets FontSize locally.
+  - `ClickButton` uses `AccentButton` (BasedOn `BaseButton`): padding and font size come from the base, background from a `{StaticResource}` setter, and `Style.TargetType`/`BasedOn` read back.
+  - A `{ThemeResource PanelBrush}` resolves to the Light theme's brush, checked in the drawn pixels.
+- Milestones 1 and 2 still pass 34/34; Microsoft's 7 sample files still load.
+- Halo Wars 2 isn't affected: only `windows.ui.xaml.dll` changed, and the game never loads it.
+
+**Still to do in milestone 4:**
+
+- **Control templates:** `ControlTemplate`/`DataTemplate` instantiation from their deferred node streams, `ContentPresenter`, `TemplateBinding` and `VisualStateManager`. Until then, `Template` setters are dropped and controls keep their built-in look.
+- **The control set:** a built-in `generic.xaml` adapted from WinUI 3 (MIT), and CheckBox, RadioButton, ToggleSwitch, Slider and ProgressBar.
+- **`{Binding}`** with `INotifyPropertyChanged`/`ICustomPropertyProvider`.
+- **Direct2D/DirectWrite rendering**, which templates need for rounded corners, opacity and transforms.
+- **Smaller gaps:**
+  - `new Style()` from app code (the class isn't activatable yet), and `Style.Setters` as objects.
+  - Setters given as whole objects (flag 0x40).
+  - Styles keyed by anything but a string or type.
+  - Re-evaluating `{ThemeResource}` when the theme changes at run time.
