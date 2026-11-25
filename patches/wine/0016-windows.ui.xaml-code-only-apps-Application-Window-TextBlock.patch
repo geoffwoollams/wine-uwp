@@ -1,0 +1,3927 @@
+Subject: windows.ui.xaml: Application.Start, Window and TextBlock for code-only XAML apps (milestone 1)
+
+diff --git a/dlls/windows.ui.xaml/Makefile.in b/dlls/windows.ui.xaml/Makefile.in
+index 2c8e5b7..64373a4 100644
+--- a/dlls/windows.ui.xaml/Makefile.in
++++ b/dlls/windows.ui.xaml/Makefile.in
+@@ -1,7 +1,12 @@
+ MODULE  = windows.ui.xaml.dll
+-IMPORTS = combase
++IMPORTS = combase user32 gdi32
+ 
+ SOURCES = \
++	application.c \
++	brush.c \
+ 	classes.idl \
+ 	color_helper.c \
+-	main.c
++	element.c \
++	main.c \
++	text_block.c \
++	window.c
+diff --git a/dlls/windows.ui.xaml/application.c b/dlls/windows.ui.xaml/application.c
+new file mode 100644
+index 0000000..b6b6ad4
+--- /dev/null
++++ b/dlls/windows.ui.xaml/application.c
+@@ -0,0 +1,947 @@
++/* WinRT Windows.UI.Xaml.Application implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* Application.Start runs CoreApplication.Run with the view below. The app's own App class derives from
++ * Application, so it is created by aggregation (IApplicationFactory::CreateInstance with an outer object), and
++ * its overrides (OnLaunched, ...) are found by querying the outer object for IApplicationOverrides. */
++
++struct application
++{
++    IApplication IApplication_iface;
++    IApplicationOverrides IApplicationOverrides_iface;
++    IInspectable IInspectable_inner;  /* non-delegating */
++    IInspectable *outer;              /* the app's object, or our own inner interface */
++    LONG ref;
++    ApplicationTheme theme;
++    struct event_list suspending, resuming, unhandled_exception;
++};
++
++static struct application *current_app;
++static IInspectable *current_app_ref;   /* keeps the app object alive while it runs, like Windows does */
++
++ApplicationTheme application_theme(void)
++{
++    return current_app ? current_app->theme : ApplicationTheme_Light;
++}
++
++IApplicationOverrides *application_get_overrides(void)
++{
++    IApplicationOverrides *overrides;
++
++    if (!current_app) return NULL;
++    if (FAILED(IInspectable_QueryInterface( current_app->outer, &IID_IApplicationOverrides, (void **)&overrides )))
++        return NULL;
++    return overrides;
++}
++
++/* non-delegating IInspectable */
++
++static inline struct application *impl_from_inner( IInspectable *iface )
++{
++    return CONTAINING_RECORD( iface, struct application, IInspectable_inner );
++}
++
++static HRESULT WINAPI inner_QueryInterface( IInspectable *iface, REFIID iid, void **out )
++{
++    struct application *impl = impl_from_inner( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ))
++        *out = &impl->IInspectable_inner;
++    else if (IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IApplication ))
++        *out = &impl->IApplication_iface;
++    else if (IsEqualGUID( iid, &IID_IApplicationOverrides ))
++        *out = &impl->IApplicationOverrides_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI inner_AddRef( IInspectable *iface )
++{
++    struct application *impl = impl_from_inner( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI inner_Release( IInspectable *iface )
++{
++    struct application *impl = impl_from_inner( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        if (current_app == impl) current_app = NULL;
++        event_list_clear( &impl->suspending );
++        event_list_clear( &impl->resuming );
++        event_list_clear( &impl->unhandled_exception );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI inner_GetIids( IInspectable *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI inner_GetRuntimeClassName( IInspectable *iface, HSTRING *class_name )
++{
++    const WCHAR *name = RuntimeClass_Windows_UI_Xaml_Application;
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI inner_GetTrustLevel( IInspectable *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static const struct IInspectableVtbl inner_vtbl =
++{
++    inner_QueryInterface,
++    inner_AddRef,
++    inner_Release,
++    /* IInspectable methods */
++    inner_GetIids,
++    inner_GetRuntimeClassName,
++    inner_GetTrustLevel,
++};
++
++/* IApplication */
++
++DEFINE_IINSPECTABLE_( application, IApplication, struct application, impl_from_IApplication, IApplication_iface, impl->outer )
++
++static HRESULT WINAPI application_get_Resources( IApplication *iface, IResourceDictionary **value )
++{
++    FIXME( "iface %p, value %p stub!\n", iface, value );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI application_put_Resources( IApplication *iface, IResourceDictionary *value )
++{
++    FIXME( "iface %p, value %p stub!\n", iface, value );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI application_get_DebugSettings( IApplication *iface, IDebugSettings **value )
++{
++    FIXME( "iface %p, value %p stub!\n", iface, value );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI application_get_RequestedTheme( IApplication *iface, ApplicationTheme *value )
++{
++    *value = impl_from_IApplication( iface )->theme;
++    return S_OK;
++}
++
++static HRESULT WINAPI application_put_RequestedTheme( IApplication *iface, ApplicationTheme value )
++{
++    TRACE( "iface %p, value %d.\n", iface, value );
++    impl_from_IApplication( iface )->theme = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI application_add_UnhandledException( IApplication *iface, IUnhandledExceptionEventHandler *handler,
++                                                         EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return event_list_add( &impl_from_IApplication( iface )->unhandled_exception, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI application_remove_UnhandledException( IApplication *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IApplication( iface )->unhandled_exception, token );
++}
++
++static HRESULT WINAPI application_add_Suspending( IApplication *iface, ISuspendingEventHandler *handler,
++                                                 EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return event_list_add( &impl_from_IApplication( iface )->suspending, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI application_remove_Suspending( IApplication *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IApplication( iface )->suspending, token );
++}
++
++static HRESULT WINAPI application_add_Resuming( IApplication *iface, __FIEventHandler_1_IInspectable *handler,
++                                               EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return event_list_add( &impl_from_IApplication( iface )->resuming, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI application_remove_Resuming( IApplication *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IApplication( iface )->resuming, token );
++}
++
++static HRESULT WINAPI application_Exit( IApplication *iface )
++{
++    TRACE( "iface %p.\n", iface );
++    PostQuitMessage( 0 );
++    return S_OK;
++}
++
++static const struct IApplicationVtbl application_vtbl =
++{
++    application_QueryInterface,
++    application_AddRef,
++    application_Release,
++    /* IInspectable methods */
++    application_GetIids,
++    application_GetRuntimeClassName,
++    application_GetTrustLevel,
++    /* IApplication methods */
++    application_get_Resources,
++    application_put_Resources,
++    application_get_DebugSettings,
++    application_get_RequestedTheme,
++    application_put_RequestedTheme,
++    application_add_UnhandledException,
++    application_remove_UnhandledException,
++    application_add_Suspending,
++    application_remove_Suspending,
++    application_add_Resuming,
++    application_remove_Resuming,
++    application_Exit,
++};
++
++/* IApplicationOverrides: the base class implementations, which do nothing */
++
++DEFINE_IINSPECTABLE_( overrides, IApplicationOverrides, struct application, impl_from_IApplicationOverrides,
++                      IApplicationOverrides_iface, impl->outer )
++
++static HRESULT WINAPI overrides_OnActivated( IApplicationOverrides *iface, IActivatedEventArgs *args )
++{
++    TRACE( "iface %p, args %p.\n", iface, args );
++    return S_OK;
++}
++
++static HRESULT WINAPI overrides_OnLaunched( IApplicationOverrides *iface, ILaunchActivatedEventArgs *args )
++{
++    TRACE( "iface %p, args %p.\n", iface, args );
++    return S_OK;
++}
++
++static HRESULT WINAPI overrides_OnFileActivated( IApplicationOverrides *iface, IFileActivatedEventArgs *args )
++{
++    TRACE( "iface %p, args %p.\n", iface, args );
++    return S_OK;
++}
++
++static HRESULT WINAPI overrides_OnSearchActivated( IApplicationOverrides *iface, ISearchActivatedEventArgs *args )
++{
++    TRACE( "iface %p, args %p.\n", iface, args );
++    return S_OK;
++}
++
++static HRESULT WINAPI overrides_OnShareTargetActivated( IApplicationOverrides *iface, IShareTargetActivatedEventArgs *args )
++{
++    TRACE( "iface %p, args %p.\n", iface, args );
++    return S_OK;
++}
++
++static HRESULT WINAPI overrides_OnFileOpenPickerActivated( IApplicationOverrides *iface, IFileOpenPickerActivatedEventArgs *args )
++{
++    TRACE( "iface %p, args %p.\n", iface, args );
++    return S_OK;
++}
++
++static HRESULT WINAPI overrides_OnFileSavePickerActivated( IApplicationOverrides *iface, IFileSavePickerActivatedEventArgs *args )
++{
++    TRACE( "iface %p, args %p.\n", iface, args );
++    return S_OK;
++}
++
++static HRESULT WINAPI overrides_OnCachedFileUpdaterActivated( IApplicationOverrides *iface,
++                                                             ICachedFileUpdaterActivatedEventArgs *args )
++{
++    TRACE( "iface %p, args %p.\n", iface, args );
++    return S_OK;
++}
++
++static HRESULT WINAPI overrides_OnWindowCreated( IApplicationOverrides *iface, IWindowCreatedEventArgs *args )
++{
++    TRACE( "iface %p, args %p.\n", iface, args );
++    return S_OK;
++}
++
++static const struct IApplicationOverridesVtbl overrides_vtbl =
++{
++    overrides_QueryInterface,
++    overrides_AddRef,
++    overrides_Release,
++    /* IInspectable methods */
++    overrides_GetIids,
++    overrides_GetRuntimeClassName,
++    overrides_GetTrustLevel,
++    /* IApplicationOverrides methods */
++    overrides_OnActivated,
++    overrides_OnLaunched,
++    overrides_OnFileActivated,
++    overrides_OnSearchActivated,
++    overrides_OnShareTargetActivated,
++    overrides_OnFileOpenPickerActivated,
++    overrides_OnFileSavePickerActivated,
++    overrides_OnCachedFileUpdaterActivated,
++    overrides_OnWindowCreated,
++};
++
++static HRESULT application_create( IInspectable *outer, IInspectable **inner, IApplication **value )
++{
++    struct application *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IApplication_iface.lpVtbl = &application_vtbl;
++    impl->IApplicationOverrides_iface.lpVtbl = &overrides_vtbl;
++    impl->IInspectable_inner.lpVtbl = &inner_vtbl;
++    impl->outer = outer ? outer : &impl->IInspectable_inner;
++    impl->ref = 1;
++    impl->theme = ApplicationTheme_Light;
++
++    if (current_app) FIXME( "an Application already exists, replacing %p.\n", current_app );
++    current_app = impl;
++    if (current_app_ref) IInspectable_Release( current_app_ref );
++    current_app_ref = impl->outer;
++    IInspectable_AddRef( current_app_ref );
++
++    if (outer)
++    {
++        *inner = &impl->IInspectable_inner;  /* owns our reference */
++        *value = &impl->IApplication_iface;
++        IApplication_AddRef( *value );       /* counted on the outer object */
++    }
++    else
++    {
++        if (inner) *inner = NULL;
++        *value = &impl->IApplication_iface;  /* owns our reference */
++    }
++    TRACE( "created %p, outer %p.\n", impl, outer );
++    return S_OK;
++}
++
++/* the CoreApplicationView Activated handler: raises OnLaunched / OnActivated on the app */
++
++struct activated_handler
++{
++    ITypedEventHandler_CoreApplicationView_IActivatedEventArgs iface;
++    LONG ref;
++};
++
++static HRESULT WINAPI activated_QueryInterface( ITypedEventHandler_CoreApplicationView_IActivatedEventArgs *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_ITypedEventHandler_CoreApplicationView_IActivatedEventArgs ))
++    {
++        *out = iface;
++        ITypedEventHandler_CoreApplicationView_IActivatedEventArgs_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI activated_AddRef( ITypedEventHandler_CoreApplicationView_IActivatedEventArgs *iface )
++{
++    return InterlockedIncrement( &CONTAINING_RECORD( iface, struct activated_handler, iface )->ref );
++}
++
++static ULONG WINAPI activated_Release( ITypedEventHandler_CoreApplicationView_IActivatedEventArgs *iface )
++{
++    struct activated_handler *impl = CONTAINING_RECORD( iface, struct activated_handler, iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI activated_Invoke( ITypedEventHandler_CoreApplicationView_IActivatedEventArgs *iface,
++                                        ICoreApplicationView *sender, IActivatedEventArgs *args )
++{
++    IApplicationOverrides *overrides = application_get_overrides();
++    ILaunchActivatedEventArgs *launch;
++    HRESULT hr;
++
++    TRACE( "iface %p, sender %p, args %p.\n", iface, sender, args );
++
++    if (!overrides)
++    {
++        WARN( "no Application object, ignoring activation.\n" );
++        return S_OK;
++    }
++    if (SUCCEEDED(IActivatedEventArgs_QueryInterface( args, &IID_ILaunchActivatedEventArgs, (void **)&launch )))
++    {
++        TRACE( "OnLaunched\n" );
++        hr = IApplicationOverrides_OnLaunched( overrides, launch );
++        ILaunchActivatedEventArgs_Release( launch );
++    }
++    else
++    {
++        TRACE( "OnActivated\n" );
++        hr = IApplicationOverrides_OnActivated( overrides, args );
++    }
++    IApplicationOverrides_Release( overrides );
++    if (FAILED(hr)) ERR( "activation handler failed, hr %#lx.\n", hr );
++    return S_OK;
++}
++
++static const struct ITypedEventHandler_CoreApplicationView_IActivatedEventArgsVtbl activated_vtbl =
++{
++    activated_QueryInterface,
++    activated_AddRef,
++    activated_Release,
++    activated_Invoke,
++};
++
++/* IApplicationInitializationCallbackParams: an empty object passed to the Start callback */
++
++struct init_params
++{
++    IApplicationInitializationCallbackParams iface;
++    LONG ref;
++};
++
++static HRESULT WINAPI params_QueryInterface( IApplicationInitializationCallbackParams *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IApplicationInitializationCallbackParams ))
++    {
++        *out = iface;
++        IApplicationInitializationCallbackParams_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI params_AddRef( IApplicationInitializationCallbackParams *iface )
++{
++    return InterlockedIncrement( &CONTAINING_RECORD( iface, struct init_params, iface )->ref );
++}
++
++static ULONG WINAPI params_Release( IApplicationInitializationCallbackParams *iface )
++{
++    struct init_params *impl = CONTAINING_RECORD( iface, struct init_params, iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI params_GetIids( IApplicationInitializationCallbackParams *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI params_GetRuntimeClassName( IApplicationInitializationCallbackParams *iface, HSTRING *class_name )
++{
++    const WCHAR *name = RuntimeClass_Windows_UI_Xaml_ApplicationInitializationCallbackParams;
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI params_GetTrustLevel( IApplicationInitializationCallbackParams *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static const struct IApplicationInitializationCallbackParamsVtbl params_vtbl =
++{
++    params_QueryInterface,
++    params_AddRef,
++    params_Release,
++    params_GetIids,
++    params_GetRuntimeClassName,
++    params_GetTrustLevel,
++};
++
++/* the FrameworkView given to CoreApplication.Run */
++
++struct framework_view
++{
++    IFrameworkView IFrameworkView_iface;
++    LONG ref;
++    IApplicationInitializationCallback *callback;
++    ICoreApplicationView *view;
++    EventRegistrationToken activated_token;
++    ICoreWindow *core_window;
++};
++
++static inline struct framework_view *impl_from_IFrameworkView( IFrameworkView *iface )
++{
++    return CONTAINING_RECORD( iface, struct framework_view, IFrameworkView_iface );
++}
++
++static HRESULT WINAPI view_QueryInterface( IFrameworkView *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IFrameworkView ))
++    {
++        *out = iface;
++        IFrameworkView_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI view_AddRef( IFrameworkView *iface )
++{
++    return InterlockedIncrement( &impl_from_IFrameworkView( iface )->ref );
++}
++
++static ULONG WINAPI view_Release( IFrameworkView *iface )
++{
++    struct framework_view *impl = impl_from_IFrameworkView( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        if (impl->callback) IApplicationInitializationCallback_Release( impl->callback );
++        if (impl->view) ICoreApplicationView_Release( impl->view );
++        if (impl->core_window) ICoreWindow_Release( impl->core_window );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI view_GetIids( IFrameworkView *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI view_GetRuntimeClassName( IFrameworkView *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI view_GetTrustLevel( IFrameworkView *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI view_Initialize( IFrameworkView *iface, ICoreApplicationView *view )
++{
++    struct framework_view *impl = impl_from_IFrameworkView( iface );
++    struct activated_handler *handler;
++    struct init_params *params;
++    HRESULT hr;
++
++    TRACE( "iface %p, view %p.\n", iface, view );
++
++    impl->view = view;
++    ICoreApplicationView_AddRef( view );
++
++    if (!(handler = calloc( 1, sizeof(*handler) ))) return E_OUTOFMEMORY;
++    handler->iface.lpVtbl = &activated_vtbl;
++    handler->ref = 1;
++    hr = ICoreApplicationView_add_Activated( view, &handler->iface, &impl->activated_token );
++    ITypedEventHandler_CoreApplicationView_IActivatedEventArgs_Release( &handler->iface );
++    if (FAILED(hr)) return hr;
++
++    /* the app creates its Application object in this callback */
++    if (!(params = calloc( 1, sizeof(*params) ))) return E_OUTOFMEMORY;
++    params->iface.lpVtbl = &params_vtbl;
++    params->ref = 1;
++    TRACE( "calling the ApplicationInitializationCallback.\n" );
++    hr = IApplicationInitializationCallback_Invoke( impl->callback, &params->iface );
++    IApplicationInitializationCallbackParams_Release( &params->iface );
++    if (FAILED(hr)) ERR( "ApplicationInitializationCallback failed, hr %#lx.\n", hr );
++    if (!current_app) ERR( "the callback did not create an Application.\n" );
++    return hr;
++}
++
++static HRESULT WINAPI view_SetWindow( IFrameworkView *iface, ICoreWindow *window )
++{
++    struct framework_view *impl = impl_from_IFrameworkView( iface );
++
++    TRACE( "iface %p, window %p.\n", iface, window );
++
++    impl->core_window = window;
++    ICoreWindow_AddRef( window );
++    return window_create_for_core_window( window );
++}
++
++static HRESULT WINAPI view_Load( IFrameworkView *iface, HSTRING entry_point )
++{
++    TRACE( "iface %p, entry_point %s.\n", iface, debugstr_hstring(entry_point) );
++    return S_OK;
++}
++
++static HRESULT WINAPI view_Run( IFrameworkView *iface )
++{
++    struct framework_view *impl = impl_from_IFrameworkView( iface );
++    ICoreDispatcher *dispatcher;
++    HRESULT hr;
++
++    TRACE( "iface %p.\n", iface );
++
++    if (FAILED(hr = ICoreWindow_get_Dispatcher( impl->core_window, &dispatcher ))) return hr;
++    hr = ICoreDispatcher_ProcessEvents( dispatcher, CoreProcessEventsOption_ProcessUntilQuit );
++    ICoreDispatcher_Release( dispatcher );
++    TRACE( "message loop ended, hr %#lx.\n", hr );
++    return hr;
++}
++
++static HRESULT WINAPI view_Uninitialize( IFrameworkView *iface )
++{
++    struct framework_view *impl = impl_from_IFrameworkView( iface );
++
++    TRACE( "iface %p.\n", iface );
++
++    if (impl->view) ICoreApplicationView_remove_Activated( impl->view, impl->activated_token );
++    window_destroy_current();
++    if (current_app_ref)
++    {
++        IInspectable *app = current_app_ref;
++        current_app_ref = NULL;
++        IInspectable_Release( app );
++    }
++    return S_OK;
++}
++
++static const struct IFrameworkViewVtbl view_vtbl =
++{
++    view_QueryInterface,
++    view_AddRef,
++    view_Release,
++    /* IInspectable methods */
++    view_GetIids,
++    view_GetRuntimeClassName,
++    view_GetTrustLevel,
++    /* IFrameworkView methods */
++    view_Initialize,
++    view_SetWindow,
++    view_Load,
++    view_Run,
++    view_Uninitialize,
++};
++
++struct view_source
++{
++    IFrameworkViewSource IFrameworkViewSource_iface;
++    LONG ref;
++    IApplicationInitializationCallback *callback;
++};
++
++static inline struct view_source *impl_from_IFrameworkViewSource( IFrameworkViewSource *iface )
++{
++    return CONTAINING_RECORD( iface, struct view_source, IFrameworkViewSource_iface );
++}
++
++static HRESULT WINAPI source_QueryInterface( IFrameworkViewSource *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IFrameworkViewSource ))
++    {
++        *out = iface;
++        IFrameworkViewSource_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI source_AddRef( IFrameworkViewSource *iface )
++{
++    return InterlockedIncrement( &impl_from_IFrameworkViewSource( iface )->ref );
++}
++
++static ULONG WINAPI source_Release( IFrameworkViewSource *iface )
++{
++    struct view_source *impl = impl_from_IFrameworkViewSource( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        IApplicationInitializationCallback_Release( impl->callback );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI source_GetIids( IFrameworkViewSource *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI source_GetRuntimeClassName( IFrameworkViewSource *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI source_GetTrustLevel( IFrameworkViewSource *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI source_CreateView( IFrameworkViewSource *iface, IFrameworkView **value )
++{
++    struct view_source *source = impl_from_IFrameworkViewSource( iface );
++    struct framework_view *impl;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IFrameworkView_iface.lpVtbl = &view_vtbl;
++    impl->ref = 1;
++    impl->callback = source->callback;
++    IApplicationInitializationCallback_AddRef( impl->callback );
++    *value = &impl->IFrameworkView_iface;
++    return S_OK;
++}
++
++static const struct IFrameworkViewSourceVtbl source_vtbl =
++{
++    source_QueryInterface,
++    source_AddRef,
++    source_Release,
++    /* IInspectable methods */
++    source_GetIids,
++    source_GetRuntimeClassName,
++    source_GetTrustLevel,
++    /* IFrameworkViewSource methods */
++    source_CreateView,
++};
++
++/* activation factory, IApplicationStatics and IApplicationFactory */
++
++struct application_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IApplicationStatics IApplicationStatics_iface;
++    IApplicationFactory IApplicationFactory_iface;
++    LONG ref;
++};
++
++static inline struct application_statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct application_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct application_statics *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IApplicationStatics ))
++        *out = &impl->IApplicationStatics_iface;
++    else if (IsEqualGUID( iid, &IID_IApplicationFactory ))
++        *out = &impl->IApplicationFactory_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    return InterlockedIncrement( &impl_from_IActivationFactory( iface )->ref );
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    return InterlockedDecrement( &impl_from_IActivationFactory( iface )->ref );
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    IApplication *application;
++    HRESULT hr;
++
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++
++    if (FAILED(hr = application_create( NULL, NULL, &application ))) return hr;
++    *instance = (IInspectable *)application;
++    return S_OK;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( statics, IApplicationStatics, struct application_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI statics_get_Current( IApplicationStatics *iface, IApplication **value )
++{
++    TRACE( "iface %p, value %p -> %p.\n", iface, value, current_app );
++
++    if ((*value = current_app ? &current_app->IApplication_iface : NULL)) IApplication_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_Start( IApplicationStatics *iface, IApplicationInitializationCallback *callback )
++{
++    static const WCHAR core_application_name[] = L"Windows.ApplicationModel.Core.CoreApplication";
++    ICoreApplication *core_application;
++    struct view_source *source;
++    HSTRING_HEADER header;
++    HSTRING name;
++    HRESULT hr;
++
++    TRACE( "iface %p, callback %p.\n", iface, callback );
++
++    if (!callback) return E_INVALIDARG;
++    WindowsCreateStringReference( core_application_name, wcslen( core_application_name ), &header, &name );
++    if (FAILED(hr = RoGetActivationFactory( name, &IID_ICoreApplication, (void **)&core_application )))
++    {
++        ERR( "CoreApplication is not available, hr %#lx.\n", hr );
++        return hr;
++    }
++    if (!(source = calloc( 1, sizeof(*source) )))
++    {
++        ICoreApplication_Release( core_application );
++        return E_OUTOFMEMORY;
++    }
++    source->IFrameworkViewSource_iface.lpVtbl = &source_vtbl;
++    source->ref = 1;
++    source->callback = callback;
++    IApplicationInitializationCallback_AddRef( callback );
++
++    hr = ICoreApplication_Run( core_application, &source->IFrameworkViewSource_iface );
++    IFrameworkViewSource_Release( &source->IFrameworkViewSource_iface );
++    ICoreApplication_Release( core_application );
++    TRACE( "returning %#lx.\n", hr );
++    return hr;
++}
++
++static HRESULT WINAPI statics_LoadComponent( IApplicationStatics *iface, IInspectable *component, IUriRuntimeClass *locator )
++{
++    HSTRING uri = NULL;
++
++    if (locator) IUriRuntimeClass_get_RawUri( locator, &uri );
++    FIXME( "iface %p, component %p, locator %s: XAML markup (.xbf) is not supported yet.\n", iface, component,
++           debugstr_hstring(uri) );
++    WindowsDeleteString( uri );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI statics_LoadComponentWithResourceLocation( IApplicationStatics *iface, IInspectable *component,
++                                                                IUriRuntimeClass *locator,
++                                                                __x_ABI_CWindows_CUI_CXaml_CControls_CPrimitives_CComponentResourceLocation location )
++{
++    return statics_LoadComponent( iface, component, locator );
++}
++
++static const struct IApplicationStaticsVtbl statics_vtbl =
++{
++    statics_QueryInterface,
++    statics_AddRef,
++    statics_Release,
++    /* IInspectable methods */
++    statics_GetIids,
++    statics_GetRuntimeClassName,
++    statics_GetTrustLevel,
++    /* IApplicationStatics methods */
++    statics_get_Current,
++    statics_Start,
++    statics_LoadComponent,
++    statics_LoadComponentWithResourceLocation,
++};
++
++DEFINE_IINSPECTABLE( application_factory_iface, IApplicationFactory, struct application_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI application_factory_iface_CreateInstance( IApplicationFactory *iface, IInspectable *outer,
++                                                              IInspectable **inner, IApplication **value )
++{
++    TRACE( "iface %p, outer %p, inner %p, value %p.\n", iface, outer, inner, value );
++
++    if (outer && !inner) return E_INVALIDARG;
++    return application_create( outer, inner, value );
++}
++
++static const struct IApplicationFactoryVtbl application_factory_iface_vtbl =
++{
++    application_factory_iface_QueryInterface,
++    application_factory_iface_AddRef,
++    application_factory_iface_Release,
++    /* IInspectable methods */
++    application_factory_iface_GetIids,
++    application_factory_iface_GetRuntimeClassName,
++    application_factory_iface_GetTrustLevel,
++    /* IApplicationFactory methods */
++    application_factory_iface_CreateInstance,
++};
++
++static struct application_statics application_statics =
++{
++    {&factory_vtbl},
++    {&statics_vtbl},
++    {&application_factory_iface_vtbl},
++    1,
++};
++
++IActivationFactory *application_factory = &application_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/brush.c b/dlls/windows.ui.xaml/brush.c
+new file mode 100644
+index 0000000..e302d01
+--- /dev/null
++++ b/dlls/windows.ui.xaml/brush.c
+@@ -0,0 +1,383 @@
++/* WinRT Windows.UI.Xaml.Media.SolidColorBrush implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++struct solid_brush
++{
++    ISolidColorBrush ISolidColorBrush_iface;
++    IBrush IBrush_iface;
++    IDependencyObject IDependencyObject_iface;
++    LONG ref;
++    Color color;
++    double opacity;
++};
++
++static inline struct solid_brush *impl_from_ISolidColorBrush( ISolidColorBrush *iface )
++{
++    return CONTAINING_RECORD( iface, struct solid_brush, ISolidColorBrush_iface );
++}
++
++static const ISolidColorBrushVtbl solid_brush_iface_vtbl;
++
++static HRESULT WINAPI solid_brush_iface_QueryInterface( ISolidColorBrush *iface, REFIID iid, void **out )
++{
++    struct solid_brush *impl = impl_from_ISolidColorBrush( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_ISolidColorBrush ))
++        *out = &impl->ISolidColorBrush_iface;
++    else if (IsEqualGUID( iid, &IID_IBrush ))
++        *out = &impl->IBrush_iface;
++    else if (IsEqualGUID( iid, &IID_IDependencyObject ))
++        *out = &impl->IDependencyObject_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI solid_brush_iface_AddRef( ISolidColorBrush *iface )
++{
++    return InterlockedIncrement( &impl_from_ISolidColorBrush( iface )->ref );
++}
++
++static ULONG WINAPI solid_brush_iface_Release( ISolidColorBrush *iface )
++{
++    struct solid_brush *impl = impl_from_ISolidColorBrush( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI solid_brush_iface_GetIids( ISolidColorBrush *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI solid_brush_iface_GetRuntimeClassName( ISolidColorBrush *iface, HSTRING *class_name )
++{
++    const WCHAR *name = RuntimeClass_Windows_UI_Xaml_Media_SolidColorBrush;
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI solid_brush_iface_GetTrustLevel( ISolidColorBrush *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI solid_brush_iface_get_Color( ISolidColorBrush *iface, Color *value )
++{
++    *value = impl_from_ISolidColorBrush( iface )->color;
++    return S_OK;
++}
++
++static HRESULT WINAPI solid_brush_iface_put_Color( ISolidColorBrush *iface, Color value )
++{
++    TRACE( "iface %p, value #%02x%02x%02x%02x.\n", iface, value.A, value.R, value.G, value.B );
++    impl_from_ISolidColorBrush( iface )->color = value;
++    window_invalidate();
++    return S_OK;
++}
++
++
++static const struct ISolidColorBrushVtbl solid_brush_iface_vtbl =
++{
++    solid_brush_iface_QueryInterface,
++    solid_brush_iface_AddRef,
++    solid_brush_iface_Release,
++    /* IInspectable methods */
++    solid_brush_iface_GetIids,
++    solid_brush_iface_GetRuntimeClassName,
++    solid_brush_iface_GetTrustLevel,
++    /* ISolidColorBrush methods */
++    solid_brush_iface_get_Color,
++    solid_brush_iface_put_Color
++};
++
++
++DEFINE_IINSPECTABLE(brush_iface, IBrush, struct solid_brush, ISolidColorBrush_iface)
++
++static HRESULT WINAPI brush_iface_get_Opacity( IBrush *iface, DOUBLE *value )
++{
++    *value = impl_from_IBrush( iface )->opacity;
++    return S_OK;
++}
++
++static HRESULT WINAPI brush_iface_put_Opacity( IBrush *iface, DOUBLE value )
++{
++    impl_from_IBrush( iface )->opacity = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI brush_iface_get_Transform(IBrush *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CITransform **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI brush_iface_put_Transform(IBrush *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CITransform *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI brush_iface_get_RelativeTransform(IBrush *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CITransform **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI brush_iface_put_RelativeTransform(IBrush *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CITransform *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static const struct IBrushVtbl brush_iface_vtbl =
++{
++    brush_iface_QueryInterface,
++    brush_iface_AddRef,
++    brush_iface_Release,
++    /* IInspectable methods */
++    brush_iface_GetIids,
++    brush_iface_GetRuntimeClassName,
++    brush_iface_GetTrustLevel,
++    /* IBrush methods */
++    brush_iface_get_Opacity,
++    brush_iface_put_Opacity,
++    brush_iface_get_Transform,
++    brush_iface_put_Transform,
++    brush_iface_get_RelativeTransform,
++    brush_iface_put_RelativeTransform
++};
++
++DEFINE_IINSPECTABLE(brush_dependency_object, IDependencyObject, struct solid_brush, ISolidColorBrush_iface)
++
++static HRESULT WINAPI brush_dependency_object_GetValue(IDependencyObject *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp, IInspectable **result)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI brush_dependency_object_SetValue(IDependencyObject *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp, IInspectable *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI brush_dependency_object_ClearValue(IDependencyObject *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI brush_dependency_object_ReadLocalValue(IDependencyObject *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp, IInspectable **result)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI brush_dependency_object_GetAnimationBaseValue(IDependencyObject *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp, IInspectable **result)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI brush_dependency_object_get_Dispatcher(IDependencyObject *iface, __x_ABI_CWindows_CUI_CCore_CICoreDispatcher **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static const struct IDependencyObjectVtbl brush_dependency_object_vtbl =
++{
++    brush_dependency_object_QueryInterface,
++    brush_dependency_object_AddRef,
++    brush_dependency_object_Release,
++    /* IInspectable methods */
++    brush_dependency_object_GetIids,
++    brush_dependency_object_GetRuntimeClassName,
++    brush_dependency_object_GetTrustLevel,
++    /* IDependencyObject methods */
++    brush_dependency_object_GetValue,
++    brush_dependency_object_SetValue,
++    brush_dependency_object_ClearValue,
++    brush_dependency_object_ReadLocalValue,
++    brush_dependency_object_GetAnimationBaseValue,
++    brush_dependency_object_get_Dispatcher
++};
++
++static HRESULT solid_brush_create( Color color, ISolidColorBrush **out )
++{
++    struct solid_brush *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->ISolidColorBrush_iface.lpVtbl = &solid_brush_iface_vtbl;
++    impl->IBrush_iface.lpVtbl = &brush_iface_vtbl;
++    impl->IDependencyObject_iface.lpVtbl = &brush_dependency_object_vtbl;
++    impl->ref = 1;
++    impl->color = color;
++    impl->opacity = 1.0;
++    *out = &impl->ISolidColorBrush_iface;
++    return S_OK;
++}
++
++/* Colour of a brush for drawing; only solid colour brushes are supported. Opacity scales alpha. */
++BOOL brush_get_color( IBrush *brush, Color *color )
++{
++    ISolidColorBrush *solid;
++    DOUBLE opacity = 1.0;
++
++    if (FAILED(IBrush_QueryInterface( brush, &IID_ISolidColorBrush, (void **)&solid )))
++    {
++        FIXME( "brush %p is not a SolidColorBrush.\n", brush );
++        return FALSE;
++    }
++    ISolidColorBrush_get_Color( solid, color );
++    ISolidColorBrush_Release( solid );
++    IBrush_get_Opacity( brush, &opacity );
++    color->A = (BYTE)(color->A * max( 0.0, min( 1.0, opacity ) ));
++    return TRUE;
++}
++
++/* activation factory */
++
++struct brush_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    ISolidColorBrushFactory ISolidColorBrushFactory_iface;
++    LONG ref;
++};
++
++static inline struct brush_statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct brush_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct brush_statics *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_ISolidColorBrushFactory ))
++        *out = &impl->ISolidColorBrushFactory_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    return InterlockedIncrement( &impl_from_IActivationFactory( iface )->ref );
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    return InterlockedDecrement( &impl_from_IActivationFactory( iface )->ref );
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    Color transparent = {0};
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++    return solid_brush_create( transparent, (ISolidColorBrush **)instance );
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE(brush_factory, ISolidColorBrushFactory, struct brush_statics, IActivationFactory_iface)
++
++static HRESULT WINAPI brush_factory_CreateInstanceWithColor( ISolidColorBrushFactory *iface, Color color, ISolidColorBrush **value )
++{
++    TRACE( "iface %p, color #%02x%02x%02x%02x, value %p.\n", iface, color.A, color.R, color.G, color.B, value );
++    return solid_brush_create( color, value );
++}
++
++
++static const struct ISolidColorBrushFactoryVtbl brush_factory_vtbl =
++{
++    brush_factory_QueryInterface,
++    brush_factory_AddRef,
++    brush_factory_Release,
++    /* IInspectable methods */
++    brush_factory_GetIids,
++    brush_factory_GetRuntimeClassName,
++    brush_factory_GetTrustLevel,
++    /* ISolidColorBrushFactory methods */
++    brush_factory_CreateInstanceWithColor
++};
++
++static struct brush_statics brush_statics =
++{
++    {&factory_vtbl},
++    {&brush_factory_vtbl},
++    1,
++};
++
++IActivationFactory *solid_color_brush_factory = &brush_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/classes.idl b/dlls/windows.ui.xaml/classes.idl
+index 70d9d59..2807511 100644
+--- a/dlls/windows.ui.xaml/classes.idl
++++ b/dlls/windows.ui.xaml/classes.idl
+@@ -22,7 +22,21 @@
+ #pragma winrt ns_prefix
+ 
+ import "windows.ui.idl";
++import "windows.ui.xaml.idl";
+ 
+ namespace Windows.UI {
+     runtimeclass ColorHelper;
+ }
++
++namespace Windows.UI.Xaml {
++    runtimeclass Application;
++    runtimeclass Window;
++}
++
++namespace Windows.UI.Xaml.Controls {
++    runtimeclass TextBlock;
++}
++
++namespace Windows.UI.Xaml.Media {
++    runtimeclass SolidColorBrush;
++}
+diff --git a/dlls/windows.ui.xaml/element.c b/dlls/windows.ui.xaml/element.c
+new file mode 100644
+index 0000000..5fecd9e
+--- /dev/null
++++ b/dlls/windows.ui.xaml/element.c
+@@ -0,0 +1,1263 @@
++/* WinRT Windows.UI.Xaml UIElement / FrameworkElement base
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <math.h>
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* Every element shares this IUIElement/IFrameworkElement/IDependencyObject implementation; the class adds its own
++ * interfaces through ops->query_interface. Milestone 1 only has a single content element per window, so layout is
++ * "measure, then align inside the window". */
++
++static inline struct xaml_element *impl_from_IUIElement( IUIElement *iface )
++{
++    return CONTAINING_RECORD( iface, struct xaml_element, IUIElement_iface );
++}
++
++static const IUIElementVtbl uielement_vtbl;
++
++struct xaml_element *element_from_iinspectable( IInspectable *object )
++{
++    IUIElement *uielement;
++    struct xaml_element *element;
++
++    if (!object || FAILED(IInspectable_QueryInterface( object, &IID_IUIElement, (void **)&uielement ))) return NULL;
++    element = uielement->lpVtbl == &uielement_vtbl ? impl_from_IUIElement( uielement ) : NULL;
++    IUIElement_Release( uielement );
++    if (!element) FIXME( "element %p is not one of ours.\n", object );
++    return element;
++}
++
++static HRESULT WINAPI uielement_QueryInterface( IUIElement *iface, REFIID iid, void **out )
++{
++    struct xaml_element *impl = impl_from_IUIElement( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IUIElement ))
++        *out = &impl->IUIElement_iface;
++    else if (IsEqualGUID( iid, &IID_IFrameworkElement ))
++        *out = &impl->IFrameworkElement_iface;
++    else if (IsEqualGUID( iid, &IID_IDependencyObject ))
++        *out = &impl->IDependencyObject_iface;
++    else if (impl->ops->query_interface && SUCCEEDED(impl->ops->query_interface( impl, iid, out )))
++        return S_OK;
++    else
++    {
++        FIXME( "%s %s not implemented, returning E_NOINTERFACE.\n", debugstr_w(impl->class_name), debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI uielement_AddRef( IUIElement *iface )
++{
++    struct xaml_element *impl = impl_from_IUIElement( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI uielement_Release( IUIElement *iface )
++{
++    struct xaml_element *impl = impl_from_IUIElement( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        WindowsDeleteString( impl->name );
++        impl->ops->destroy( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI uielement_GetIids( IUIElement *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_GetRuntimeClassName( IUIElement *iface, HSTRING *class_name )
++{
++    struct xaml_element *impl = impl_from_IUIElement( iface );
++    return WindowsCreateString( impl->class_name, wcslen( impl->class_name ), class_name );
++}
++
++static HRESULT WINAPI uielement_GetTrustLevel( IUIElement *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI uielement_get_Visibility( IUIElement *iface, Visibility *value )
++{
++    *value = impl_from_IUIElement( iface )->visibility;
++    return S_OK;
++}
++
++static HRESULT WINAPI uielement_put_Visibility( IUIElement *iface, Visibility value )
++{
++    TRACE( "iface %p, value %d.\n", iface, value );
++    impl_from_IUIElement( iface )->visibility = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI uielement_get_Opacity( IUIElement *iface, DOUBLE *value )
++{
++    *value = impl_from_IUIElement( iface )->opacity;
++    return S_OK;
++}
++
++static HRESULT WINAPI uielement_put_Opacity( IUIElement *iface, DOUBLE value )
++{
++    FIXME( "iface %p, value %f: opacity is stored but not rendered.\n", iface, value );
++    impl_from_IUIElement( iface )->opacity = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI uielement_InvalidateMeasure( IUIElement *iface )
++{
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI uielement_InvalidateArrange( IUIElement *iface )
++{
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI uielement_UpdateLayout( IUIElement *iface )
++{
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI uielement_get_DesiredSize(IUIElement *iface, __x_ABI_CWindows_CFoundation_CSize *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_get_AllowDrop(IUIElement *iface, boolean *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_put_AllowDrop(IUIElement *iface, boolean value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_get_Clip(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIRectangleGeometry **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_put_Clip(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIRectangleGeometry *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_get_RenderTransform(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CITransform **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_put_RenderTransform(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CITransform *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_get_Projection(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIProjection **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_put_Projection(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIProjection *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_get_RenderTransformOrigin(IUIElement *iface, __x_ABI_CWindows_CFoundation_CPoint *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_put_RenderTransformOrigin(IUIElement *iface, __x_ABI_CWindows_CFoundation_CPoint value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_get_IsHitTestVisible(IUIElement *iface, boolean *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_put_IsHitTestVisible(IUIElement *iface, boolean value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_get_RenderSize(IUIElement *iface, __x_ABI_CWindows_CFoundation_CSize *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_get_UseLayoutRounding(IUIElement *iface, boolean *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_put_UseLayoutRounding(IUIElement *iface, boolean value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_get_Transitions(IUIElement *iface, __FIVector_1_Windows__CUI__CXaml__CMedia__CAnimation__CTransition **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_put_Transitions(IUIElement *iface, __FIVector_1_Windows__CUI__CXaml__CMedia__CAnimation__CTransition *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_get_CacheMode(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CICacheMode **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_put_CacheMode(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CICacheMode *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_get_IsTapEnabled(IUIElement *iface, boolean *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_put_IsTapEnabled(IUIElement *iface, boolean value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_get_IsDoubleTapEnabled(IUIElement *iface, boolean *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_put_IsDoubleTapEnabled(IUIElement *iface, boolean value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_get_IsRightTapEnabled(IUIElement *iface, boolean *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_put_IsRightTapEnabled(IUIElement *iface, boolean value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_get_IsHoldingEnabled(IUIElement *iface, boolean *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_put_IsHoldingEnabled(IUIElement *iface, boolean value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_get_ManipulationMode(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CManipulationModes *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_put_ManipulationMode(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CManipulationModes value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_get_PointerCaptures(IUIElement *iface, __FIVectorView_1_Windows__CUI__CXaml__CInput__CPointer **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_KeyUp(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIKeyEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_KeyUp(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_KeyDown(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIKeyEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_KeyDown(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_GotFocus(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CIRoutedEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_GotFocus(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_LostFocus(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CIRoutedEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_LostFocus(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_DragEnter(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CIDragEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_DragEnter(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_DragLeave(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CIDragEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_DragLeave(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_DragOver(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CIDragEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_DragOver(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_Drop(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CIDragEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_Drop(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_PointerPressed(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIPointerEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_PointerPressed(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_PointerMoved(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIPointerEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_PointerMoved(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_PointerReleased(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIPointerEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_PointerReleased(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_PointerEntered(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIPointerEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_PointerEntered(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_PointerExited(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIPointerEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_PointerExited(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_PointerCaptureLost(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIPointerEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_PointerCaptureLost(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_PointerCanceled(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIPointerEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_PointerCanceled(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_PointerWheelChanged(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIPointerEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_PointerWheelChanged(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_Tapped(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CITappedEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_Tapped(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_DoubleTapped(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIDoubleTappedEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_DoubleTapped(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_Holding(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIHoldingEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_Holding(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_RightTapped(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIRightTappedEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_RightTapped(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_ManipulationStarting(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIManipulationStartingEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_ManipulationStarting(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_ManipulationInertiaStarting(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIManipulationInertiaStartingEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_ManipulationInertiaStarting(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_ManipulationStarted(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIManipulationStartedEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_ManipulationStarted(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_ManipulationDelta(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIManipulationDeltaEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_ManipulationDelta(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_add_ManipulationCompleted(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIManipulationCompletedEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_remove_ManipulationCompleted(IUIElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_Measure(IUIElement *iface, __x_ABI_CWindows_CFoundation_CSize availableSize)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_Arrange(IUIElement *iface, __x_ABI_CWindows_CFoundation_CRect finalRect)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_CapturePointer(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIPointer *value, boolean *result)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_ReleasePointerCapture(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIPointer *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_ReleasePointerCaptures(IUIElement *iface)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_AddHandler(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CIRoutedEvent *routedEvent, IInspectable *handler, boolean handledEventsToo)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_RemoveHandler(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CIRoutedEvent *routedEvent, IInspectable *handler)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI uielement_TransformToVisual(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CIUIElement *visual, __x_ABI_CWindows_CUI_CXaml_CMedia_CIGeneralTransform **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static const struct IUIElementVtbl uielement_vtbl =
++{
++    uielement_QueryInterface,
++    uielement_AddRef,
++    uielement_Release,
++    /* IInspectable methods */
++    uielement_GetIids,
++    uielement_GetRuntimeClassName,
++    uielement_GetTrustLevel,
++    /* IUIElement methods */
++    uielement_get_DesiredSize,
++    uielement_get_AllowDrop,
++    uielement_put_AllowDrop,
++    uielement_get_Opacity,
++    uielement_put_Opacity,
++    uielement_get_Clip,
++    uielement_put_Clip,
++    uielement_get_RenderTransform,
++    uielement_put_RenderTransform,
++    uielement_get_Projection,
++    uielement_put_Projection,
++    uielement_get_RenderTransformOrigin,
++    uielement_put_RenderTransformOrigin,
++    uielement_get_IsHitTestVisible,
++    uielement_put_IsHitTestVisible,
++    uielement_get_Visibility,
++    uielement_put_Visibility,
++    uielement_get_RenderSize,
++    uielement_get_UseLayoutRounding,
++    uielement_put_UseLayoutRounding,
++    uielement_get_Transitions,
++    uielement_put_Transitions,
++    uielement_get_CacheMode,
++    uielement_put_CacheMode,
++    uielement_get_IsTapEnabled,
++    uielement_put_IsTapEnabled,
++    uielement_get_IsDoubleTapEnabled,
++    uielement_put_IsDoubleTapEnabled,
++    uielement_get_IsRightTapEnabled,
++    uielement_put_IsRightTapEnabled,
++    uielement_get_IsHoldingEnabled,
++    uielement_put_IsHoldingEnabled,
++    uielement_get_ManipulationMode,
++    uielement_put_ManipulationMode,
++    uielement_get_PointerCaptures,
++    uielement_add_KeyUp,
++    uielement_remove_KeyUp,
++    uielement_add_KeyDown,
++    uielement_remove_KeyDown,
++    uielement_add_GotFocus,
++    uielement_remove_GotFocus,
++    uielement_add_LostFocus,
++    uielement_remove_LostFocus,
++    uielement_add_DragEnter,
++    uielement_remove_DragEnter,
++    uielement_add_DragLeave,
++    uielement_remove_DragLeave,
++    uielement_add_DragOver,
++    uielement_remove_DragOver,
++    uielement_add_Drop,
++    uielement_remove_Drop,
++    uielement_add_PointerPressed,
++    uielement_remove_PointerPressed,
++    uielement_add_PointerMoved,
++    uielement_remove_PointerMoved,
++    uielement_add_PointerReleased,
++    uielement_remove_PointerReleased,
++    uielement_add_PointerEntered,
++    uielement_remove_PointerEntered,
++    uielement_add_PointerExited,
++    uielement_remove_PointerExited,
++    uielement_add_PointerCaptureLost,
++    uielement_remove_PointerCaptureLost,
++    uielement_add_PointerCanceled,
++    uielement_remove_PointerCanceled,
++    uielement_add_PointerWheelChanged,
++    uielement_remove_PointerWheelChanged,
++    uielement_add_Tapped,
++    uielement_remove_Tapped,
++    uielement_add_DoubleTapped,
++    uielement_remove_DoubleTapped,
++    uielement_add_Holding,
++    uielement_remove_Holding,
++    uielement_add_RightTapped,
++    uielement_remove_RightTapped,
++    uielement_add_ManipulationStarting,
++    uielement_remove_ManipulationStarting,
++    uielement_add_ManipulationInertiaStarting,
++    uielement_remove_ManipulationInertiaStarting,
++    uielement_add_ManipulationStarted,
++    uielement_remove_ManipulationStarted,
++    uielement_add_ManipulationDelta,
++    uielement_remove_ManipulationDelta,
++    uielement_add_ManipulationCompleted,
++    uielement_remove_ManipulationCompleted,
++    uielement_Measure,
++    uielement_Arrange,
++    uielement_CapturePointer,
++    uielement_ReleasePointerCapture,
++    uielement_ReleasePointerCaptures,
++    uielement_AddHandler,
++    uielement_RemoveHandler,
++    uielement_TransformToVisual,
++    uielement_InvalidateMeasure,
++    uielement_InvalidateArrange,
++    uielement_UpdateLayout
++};
++
++DEFINE_IINSPECTABLE(framework_element, IFrameworkElement, struct xaml_element, IUIElement_iface)
++
++static HRESULT WINAPI framework_element_get_Width( IFrameworkElement *iface, DOUBLE *value )
++{
++    *value = impl_from_IFrameworkElement( iface )->width;
++    return S_OK;
++}
++
++static HRESULT WINAPI framework_element_put_Width( IFrameworkElement *iface, DOUBLE value )
++{
++    impl_from_IFrameworkElement( iface )->width = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI framework_element_get_Height( IFrameworkElement *iface, DOUBLE *value )
++{
++    *value = impl_from_IFrameworkElement( iface )->height;
++    return S_OK;
++}
++
++static HRESULT WINAPI framework_element_put_Height( IFrameworkElement *iface, DOUBLE value )
++{
++    impl_from_IFrameworkElement( iface )->height = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI framework_element_get_Margin( IFrameworkElement *iface, Thickness *value )
++{
++    *value = impl_from_IFrameworkElement( iface )->margin;
++    return S_OK;
++}
++
++static HRESULT WINAPI framework_element_put_Margin( IFrameworkElement *iface, Thickness value )
++{
++    impl_from_IFrameworkElement( iface )->margin = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI framework_element_get_HorizontalAlignment( IFrameworkElement *iface, HorizontalAlignment *value )
++{
++    *value = impl_from_IFrameworkElement( iface )->horizontal_alignment;
++    return S_OK;
++}
++
++static HRESULT WINAPI framework_element_put_HorizontalAlignment( IFrameworkElement *iface, HorizontalAlignment value )
++{
++    impl_from_IFrameworkElement( iface )->horizontal_alignment = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI framework_element_get_VerticalAlignment( IFrameworkElement *iface, VerticalAlignment *value )
++{
++    *value = impl_from_IFrameworkElement( iface )->vertical_alignment;
++    return S_OK;
++}
++
++static HRESULT WINAPI framework_element_put_VerticalAlignment( IFrameworkElement *iface, VerticalAlignment value )
++{
++    impl_from_IFrameworkElement( iface )->vertical_alignment = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI framework_element_get_Name( IFrameworkElement *iface, HSTRING *value )
++{
++    return WindowsDuplicateString( impl_from_IFrameworkElement( iface )->name, value );
++}
++
++static HRESULT WINAPI framework_element_put_Name( IFrameworkElement *iface, HSTRING value )
++{
++    struct xaml_element *impl = impl_from_IFrameworkElement( iface );
++    WindowsDeleteString( impl->name );
++    return WindowsDuplicateString( value, &impl->name );
++}
++
++
++static HRESULT WINAPI framework_element_get_Triggers(IFrameworkElement *iface, __FIVector_1_Windows__CUI__CXaml__CTriggerBase **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_get_Resources(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CIResourceDictionary **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_put_Resources(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CIResourceDictionary *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_get_Tag(IFrameworkElement *iface, IInspectable **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_put_Tag(IFrameworkElement *iface, IInspectable *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_get_Language(IFrameworkElement *iface, HSTRING *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_put_Language(IFrameworkElement *iface, HSTRING value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_get_ActualWidth(IFrameworkElement *iface, DOUBLE *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_get_ActualHeight(IFrameworkElement *iface, DOUBLE *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_get_MinWidth(IFrameworkElement *iface, DOUBLE *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_put_MinWidth(IFrameworkElement *iface, DOUBLE value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_get_MaxWidth(IFrameworkElement *iface, DOUBLE *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_put_MaxWidth(IFrameworkElement *iface, DOUBLE value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_get_MinHeight(IFrameworkElement *iface, DOUBLE *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_put_MinHeight(IFrameworkElement *iface, DOUBLE value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_get_MaxHeight(IFrameworkElement *iface, DOUBLE *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_put_MaxHeight(IFrameworkElement *iface, DOUBLE value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_get_BaseUri(IFrameworkElement *iface, __x_ABI_CWindows_CFoundation_CIUriRuntimeClass **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_get_DataContext(IFrameworkElement *iface, IInspectable **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_put_DataContext(IFrameworkElement *iface, IInspectable *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_get_Style(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CIStyle **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_put_Style(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CIStyle *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_get_Parent(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyObject **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_get_FlowDirection(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CFlowDirection *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_put_FlowDirection(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CFlowDirection value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_add_Loaded(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CIRoutedEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_remove_Loaded(IFrameworkElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_add_Unloaded(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CIRoutedEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_remove_Unloaded(IFrameworkElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_add_SizeChanged(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CISizeChangedEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_remove_SizeChanged(IFrameworkElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_add_LayoutUpdated(IFrameworkElement *iface, __FIEventHandler_1_IInspectable *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_remove_LayoutUpdated(IFrameworkElement *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_FindName(IFrameworkElement *iface, HSTRING name, IInspectable **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI framework_element_SetBinding(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp, __x_ABI_CWindows_CUI_CXaml_CData_CIBindingBase *binding)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static const struct IFrameworkElementVtbl framework_element_vtbl =
++{
++    framework_element_QueryInterface,
++    framework_element_AddRef,
++    framework_element_Release,
++    /* IInspectable methods */
++    framework_element_GetIids,
++    framework_element_GetRuntimeClassName,
++    framework_element_GetTrustLevel,
++    /* IFrameworkElement methods */
++    framework_element_get_Triggers,
++    framework_element_get_Resources,
++    framework_element_put_Resources,
++    framework_element_get_Tag,
++    framework_element_put_Tag,
++    framework_element_get_Language,
++    framework_element_put_Language,
++    framework_element_get_ActualWidth,
++    framework_element_get_ActualHeight,
++    framework_element_get_Width,
++    framework_element_put_Width,
++    framework_element_get_Height,
++    framework_element_put_Height,
++    framework_element_get_MinWidth,
++    framework_element_put_MinWidth,
++    framework_element_get_MaxWidth,
++    framework_element_put_MaxWidth,
++    framework_element_get_MinHeight,
++    framework_element_put_MinHeight,
++    framework_element_get_MaxHeight,
++    framework_element_put_MaxHeight,
++    framework_element_get_HorizontalAlignment,
++    framework_element_put_HorizontalAlignment,
++    framework_element_get_VerticalAlignment,
++    framework_element_put_VerticalAlignment,
++    framework_element_get_Margin,
++    framework_element_put_Margin,
++    framework_element_get_Name,
++    framework_element_put_Name,
++    framework_element_get_BaseUri,
++    framework_element_get_DataContext,
++    framework_element_put_DataContext,
++    framework_element_get_Style,
++    framework_element_put_Style,
++    framework_element_get_Parent,
++    framework_element_get_FlowDirection,
++    framework_element_put_FlowDirection,
++    framework_element_add_Loaded,
++    framework_element_remove_Loaded,
++    framework_element_add_Unloaded,
++    framework_element_remove_Unloaded,
++    framework_element_add_SizeChanged,
++    framework_element_remove_SizeChanged,
++    framework_element_add_LayoutUpdated,
++    framework_element_remove_LayoutUpdated,
++    framework_element_FindName,
++    framework_element_SetBinding
++};
++
++DEFINE_IINSPECTABLE(element_dependency_object, IDependencyObject, struct xaml_element, IUIElement_iface)
++
++static HRESULT WINAPI element_dependency_object_GetValue(IDependencyObject *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp, IInspectable **result)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI element_dependency_object_SetValue(IDependencyObject *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp, IInspectable *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI element_dependency_object_ClearValue(IDependencyObject *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI element_dependency_object_ReadLocalValue(IDependencyObject *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp, IInspectable **result)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI element_dependency_object_GetAnimationBaseValue(IDependencyObject *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp, IInspectable **result)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI element_dependency_object_get_Dispatcher(IDependencyObject *iface, __x_ABI_CWindows_CUI_CCore_CICoreDispatcher **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static const struct IDependencyObjectVtbl element_dependency_object_vtbl =
++{
++    element_dependency_object_QueryInterface,
++    element_dependency_object_AddRef,
++    element_dependency_object_Release,
++    /* IInspectable methods */
++    element_dependency_object_GetIids,
++    element_dependency_object_GetRuntimeClassName,
++    element_dependency_object_GetTrustLevel,
++    /* IDependencyObject methods */
++    element_dependency_object_GetValue,
++    element_dependency_object_SetValue,
++    element_dependency_object_ClearValue,
++    element_dependency_object_ReadLocalValue,
++    element_dependency_object_GetAnimationBaseValue,
++    element_dependency_object_get_Dispatcher
++};
++
++void element_init( struct xaml_element *element, const struct element_ops *ops, const WCHAR *class_name )
++{
++    element->IUIElement_iface.lpVtbl = &uielement_vtbl;
++    element->IFrameworkElement_iface.lpVtbl = &framework_element_vtbl;
++    element->IDependencyObject_iface.lpVtbl = &element_dependency_object_vtbl;
++    element->ref = 1;
++    element->ops = ops;
++    element->class_name = class_name;
++    element->width = element->height = NAN;
++    element->horizontal_alignment = HorizontalAlignment_Stretch;
++    element->vertical_alignment = VerticalAlignment_Stretch;
++    element->visibility = Visibility_Visible;
++    element->opacity = 1.0;
++}
++
++/* Measure the element, then place it inside bounds (physical pixels) by its margin, size and alignment. */
++void element_layout_and_render( struct xaml_element *element, struct layout_context *ctx, const RECT *bounds )
++{
++    float scale = ctx->scale, avail_w, avail_h, w, h, x, y;
++    const Thickness *m = &element->margin;
++    RECT rect;
++
++    if (element->visibility != Visibility_Visible) return;
++
++    avail_w = max( 0.0f, (bounds->right - bounds->left) / scale - m->Left - m->Right );
++    avail_h = max( 0.0f, (bounds->bottom - bounds->top) / scale - m->Top - m->Bottom );
++    if (!isnan( element->width )) avail_w = min( avail_w, element->width );
++    if (!isnan( element->height )) avail_h = min( avail_h, element->height );
++    element->ops->measure( element, ctx, avail_w, avail_h, &w, &h );
++    if (!isnan( element->width )) w = element->width;
++    else if (element->horizontal_alignment == HorizontalAlignment_Stretch) w = avail_w;
++    if (!isnan( element->height )) h = element->height;
++    else if (element->vertical_alignment == VerticalAlignment_Stretch) h = avail_h;
++    w = min( w, avail_w );
++    h = min( h, avail_h );
++
++    switch (element->horizontal_alignment)
++    {
++    case HorizontalAlignment_Center: x = m->Left + (avail_w - w) / 2; break;
++    case HorizontalAlignment_Right: x = m->Left + avail_w - w; break;
++    default: x = m->Left; break;
++    }
++    switch (element->vertical_alignment)
++    {
++    case VerticalAlignment_Center: y = m->Top + (avail_h - h) / 2; break;
++    case VerticalAlignment_Bottom: y = m->Top + avail_h - h; break;
++    default: y = m->Top; break;
++    }
++
++    rect.left = bounds->left + lroundf( x * scale );
++    rect.top = bounds->top + lroundf( y * scale );
++    rect.right = rect.left + lroundf( w * scale );
++    rect.bottom = rect.top + lroundf( h * scale );
++    TRACE( "%s at %s.\n", debugstr_w(element->class_name), wine_dbgstr_rect(&rect) );
++    element->ops->render( element, ctx, &rect );
++}
+diff --git a/dlls/windows.ui.xaml/main.c b/dlls/windows.ui.xaml/main.c
+index fae440d..e8da556 100644
+--- a/dlls/windows.ui.xaml/main.c
++++ b/dlls/windows.ui.xaml/main.c
+@@ -32,7 +32,54 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+ 
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_ColorHelper ))
+         IActivationFactory_QueryInterface( color_helper_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Application ))
++        IActivationFactory_QueryInterface( application_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Window ))
++        IActivationFactory_QueryInterface( window_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_TextBlock ))
++        IActivationFactory_QueryInterface( text_block_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_SolidColorBrush ))
++        IActivationFactory_QueryInterface( solid_color_brush_factory, &IID_IActivationFactory, (void **)factory );
+ 
+     if (*factory) return S_OK;
+     return CLASS_E_CLASSNOTAVAILABLE;
+ }
++
++HRESULT event_list_add( struct event_list *list, IUnknown *handler, EventRegistrationToken *token )
++{
++    IUnknown **handlers;
++    UINT32 i;
++
++    if (!handler || !token) return E_INVALIDARG;
++    for (i = 0; i < list->count; i++) if (!list->handlers[i]) break;
++    if (i == list->count)
++    {
++        if (!(handlers = realloc( list->handlers, (list->count + 1) * sizeof(*handlers) ))) return E_OUTOFMEMORY;
++        list->handlers = handlers;
++        list->count++;
++    }
++    list->handlers[i] = handler;
++    IUnknown_AddRef( handler );
++    token->value = i + 1;
++    return S_OK;
++}
++
++HRESULT event_list_remove( struct event_list *list, EventRegistrationToken token )
++{
++    UINT64 i = token.value - 1;
++
++    if (token.value < 1 || i >= list->count || !list->handlers[i]) return S_OK;
++    IUnknown_Release( list->handlers[i] );
++    list->handlers[i] = NULL;
++    return S_OK;
++}
++
++void event_list_clear( struct event_list *list )
++{
++    UINT32 i;
++
++    for (i = 0; i < list->count; i++) if (list->handlers[i]) IUnknown_Release( list->handlers[i] );
++    free( list->handlers );
++    list->handlers = NULL;
++    list->count = 0;
++}
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index e634d15..b7bc292 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -28,6 +28,10 @@
+ #include "winstring.h"
+ 
+ #include "activation.h"
++#include "roapi.h"
++
++#include "winuser.h"
++#include "wingdi.h"
+ 
+ #include "wine/debug.h"
+ 
+@@ -36,8 +40,84 @@
+ #include "windows.foundation.h"
+ #define WIDL_using_Windows_UI
+ #include "windows.ui.h"
++#define WIDL_using_Windows_UI_Core
++#include "windows.ui.core.h"
++#define WIDL_using_Windows_ApplicationModel
++#define WIDL_using_Windows_ApplicationModel_Activation
++#define WIDL_using_Windows_ApplicationModel_Core
++#include "windows.applicationmodel.core.h"
++#define WIDL_using_Windows_UI_Text
++#define WIDL_using_Windows_UI_Xaml
++#define WIDL_using_Windows_UI_Xaml_Controls
++#define WIDL_using_Windows_UI_Xaml_Media
++#include "windows.ui.xaml.h"
+ 
+ extern IActivationFactory *color_helper_factory;
++extern IActivationFactory *application_factory;
++extern IActivationFactory *window_factory;
++extern IActivationFactory *text_block_factory;
++extern IActivationFactory *solid_color_brush_factory;
++
++/* event handler lists (handlers are kept, tokens are indices + 1) */
++struct event_list
++{
++    IUnknown **handlers;
++    UINT32 count;
++};
++HRESULT event_list_add( struct event_list *list, IUnknown *handler, EventRegistrationToken *token );
++HRESULT event_list_remove( struct event_list *list, EventRegistrationToken token );
++void event_list_clear( struct event_list *list );
++
++/* application.c */
++ApplicationTheme application_theme(void);
++IApplicationOverrides *application_get_overrides(void);
++
++/* window.c */
++HRESULT window_create_for_core_window( ICoreWindow *core_window );
++void window_destroy_current(void);
++
++/* elements: one retained tree, laid out and drawn with GDI */
++struct layout_context
++{
++    HDC hdc;
++    float scale;         /* physical pixels per view pixel */
++    COLORREF foreground; /* inherited text colour */
++};
++
++struct xaml_element;
++struct element_ops
++{
++    HRESULT (*query_interface)( struct xaml_element *element, REFIID iid, void **out );
++    void (*measure)( struct xaml_element *element, struct layout_context *ctx, float avail_width, float avail_height,
++                     float *width, float *height );
++    void (*render)( struct xaml_element *element, struct layout_context *ctx, const RECT *rect );
++    void (*destroy)( struct xaml_element *element );
++};
++
++struct xaml_element
++{
++    IUIElement IUIElement_iface;
++    IFrameworkElement IFrameworkElement_iface;
++    IDependencyObject IDependencyObject_iface;
++    LONG ref;
++    const struct element_ops *ops;
++    const WCHAR *class_name;
++
++    /* FrameworkElement layout properties, in view pixels; NAN means Auto */
++    double width, height;
++    Thickness margin;
++    HorizontalAlignment horizontal_alignment;
++    VerticalAlignment vertical_alignment;
++    Visibility visibility;
++    double opacity;
++    HSTRING name;
++};
++
++void element_init( struct xaml_element *element, const struct element_ops *ops, const WCHAR *class_name );
++struct xaml_element *element_from_iinspectable( IInspectable *object );
++void element_layout_and_render( struct xaml_element *element, struct layout_context *ctx, const RECT *bounds );
++void window_invalidate(void);
++BOOL brush_get_color( IBrush *brush, Color *color );
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \
+diff --git a/dlls/windows.ui.xaml/text_block.c b/dlls/windows.ui.xaml/text_block.c
+new file mode 100644
+index 0000000..fb8974d
+--- /dev/null
++++ b/dlls/windows.ui.xaml/text_block.c
+@@ -0,0 +1,610 @@
++/* WinRT Windows.UI.Xaml.Controls.TextBlock implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <math.h>
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++struct text_block
++{
++    struct xaml_element element;
++    ITextBlock ITextBlock_iface;
++
++    HSTRING text;
++    double font_size;
++    FontWeight font_weight;
++    FontStyle font_style;
++    IBrush *foreground;   /* NULL: inherited (theme) foreground */
++    TextWrapping wrapping;
++    TextAlignment alignment;
++    Thickness padding;
++};
++
++static inline struct text_block *impl_from_element( struct xaml_element *element )
++{
++    return CONTAINING_RECORD( element, struct text_block, element );
++}
++
++DEFINE_IINSPECTABLE(text_block_iface, ITextBlock, struct text_block, element.IUIElement_iface)
++
++static HRESULT WINAPI text_block_iface_get_FontSize( ITextBlock *iface, DOUBLE *value )
++{
++    *value = impl_from_ITextBlock( iface )->font_size;
++    return S_OK;
++}
++
++static HRESULT WINAPI text_block_iface_put_FontSize( ITextBlock *iface, DOUBLE value )
++{
++    TRACE( "iface %p, value %f.\n", iface, value );
++    if (!(value > 0)) return E_INVALIDARG;
++    impl_from_ITextBlock( iface )->font_size = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI text_block_iface_get_FontWeight( ITextBlock *iface, FontWeight *value )
++{
++    *value = impl_from_ITextBlock( iface )->font_weight;
++    return S_OK;
++}
++
++static HRESULT WINAPI text_block_iface_put_FontWeight( ITextBlock *iface, FontWeight value )
++{
++    impl_from_ITextBlock( iface )->font_weight = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI text_block_iface_get_FontStyle( ITextBlock *iface, FontStyle *value )
++{
++    *value = impl_from_ITextBlock( iface )->font_style;
++    return S_OK;
++}
++
++static HRESULT WINAPI text_block_iface_put_FontStyle( ITextBlock *iface, FontStyle value )
++{
++    impl_from_ITextBlock( iface )->font_style = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI text_block_iface_get_Foreground( ITextBlock *iface, IBrush **value )
++{
++    struct text_block *impl = impl_from_ITextBlock( iface );
++    if ((*value = impl->foreground)) IBrush_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI text_block_iface_put_Foreground( ITextBlock *iface, IBrush *value )
++{
++    struct text_block *impl = impl_from_ITextBlock( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (value) IBrush_AddRef( value );
++    if (impl->foreground) IBrush_Release( impl->foreground );
++    impl->foreground = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI text_block_iface_get_TextWrapping( ITextBlock *iface, TextWrapping *value )
++{
++    *value = impl_from_ITextBlock( iface )->wrapping;
++    return S_OK;
++}
++
++static HRESULT WINAPI text_block_iface_put_TextWrapping( ITextBlock *iface, TextWrapping value )
++{
++    impl_from_ITextBlock( iface )->wrapping = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI text_block_iface_get_TextAlignment( ITextBlock *iface, TextAlignment *value )
++{
++    *value = impl_from_ITextBlock( iface )->alignment;
++    return S_OK;
++}
++
++static HRESULT WINAPI text_block_iface_put_TextAlignment( ITextBlock *iface, TextAlignment value )
++{
++    impl_from_ITextBlock( iface )->alignment = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI text_block_iface_get_Text( ITextBlock *iface, HSTRING *value )
++{
++    return WindowsDuplicateString( impl_from_ITextBlock( iface )->text, value );
++}
++
++static HRESULT WINAPI text_block_iface_put_Text( ITextBlock *iface, HSTRING value )
++{
++    struct text_block *impl = impl_from_ITextBlock( iface );
++    HSTRING copy;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %s.\n", iface, debugstr_hstring(value) );
++
++    if (FAILED(hr = WindowsDuplicateString( value, &copy ))) return hr;
++    WindowsDeleteString( impl->text );
++    impl->text = copy;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI text_block_iface_get_Padding( ITextBlock *iface, Thickness *value )
++{
++    *value = impl_from_ITextBlock( iface )->padding;
++    return S_OK;
++}
++
++static HRESULT WINAPI text_block_iface_put_Padding( ITextBlock *iface, Thickness value )
++{
++    impl_from_ITextBlock( iface )->padding = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI text_block_iface_get_FontFamily(ITextBlock *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIFontFamily **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_put_FontFamily(ITextBlock *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIFontFamily *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_get_FontStretch(ITextBlock *iface, __x_ABI_CWindows_CUI_CText_CFontStretch *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_put_FontStretch(ITextBlock *iface, __x_ABI_CWindows_CUI_CText_CFontStretch value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_get_CharacterSpacing(ITextBlock *iface, INT32 *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_put_CharacterSpacing(ITextBlock *iface, INT32 value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_get_TextTrimming(ITextBlock *iface, __x_ABI_CWindows_CUI_CXaml_CTextTrimming *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_put_TextTrimming(ITextBlock *iface, __x_ABI_CWindows_CUI_CXaml_CTextTrimming value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_get_Inlines(ITextBlock *iface, __FIVector_1_Windows__CUI__CXaml__CDocuments__CInline **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_get_LineHeight(ITextBlock *iface, DOUBLE *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_put_LineHeight(ITextBlock *iface, DOUBLE value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_get_LineStackingStrategy(ITextBlock *iface, __x_ABI_CWindows_CUI_CXaml_CLineStackingStrategy *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_put_LineStackingStrategy(ITextBlock *iface, __x_ABI_CWindows_CUI_CXaml_CLineStackingStrategy value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_get_IsTextSelectionEnabled(ITextBlock *iface, boolean *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_put_IsTextSelectionEnabled(ITextBlock *iface, boolean value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_get_SelectedText(ITextBlock *iface, HSTRING *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_get_ContentStart(ITextBlock *iface, __x_ABI_CWindows_CUI_CXaml_CDocuments_CITextPointer **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_get_ContentEnd(ITextBlock *iface, __x_ABI_CWindows_CUI_CXaml_CDocuments_CITextPointer **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_get_SelectionStart(ITextBlock *iface, __x_ABI_CWindows_CUI_CXaml_CDocuments_CITextPointer **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_get_SelectionEnd(ITextBlock *iface, __x_ABI_CWindows_CUI_CXaml_CDocuments_CITextPointer **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_get_BaselineOffset(ITextBlock *iface, DOUBLE *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_add_SelectionChanged(ITextBlock *iface, __x_ABI_CWindows_CUI_CXaml_CIRoutedEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_remove_SelectionChanged(ITextBlock *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_add_ContextMenuOpening(ITextBlock *iface, __x_ABI_CWindows_CUI_CXaml_CControls_CIContextMenuOpeningEventHandler *handler, EventRegistrationToken *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_remove_ContextMenuOpening(ITextBlock *iface, EventRegistrationToken token)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_SelectAll(ITextBlock *iface)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_Select(ITextBlock *iface, __x_ABI_CWindows_CUI_CXaml_CDocuments_CITextPointer *start, __x_ABI_CWindows_CUI_CXaml_CDocuments_CITextPointer *end)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI text_block_iface_Focus(ITextBlock *iface, __x_ABI_CWindows_CUI_CXaml_CFocusState value, boolean *result)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static const struct ITextBlockVtbl text_block_iface_vtbl =
++{
++    text_block_iface_QueryInterface,
++    text_block_iface_AddRef,
++    text_block_iface_Release,
++    /* IInspectable methods */
++    text_block_iface_GetIids,
++    text_block_iface_GetRuntimeClassName,
++    text_block_iface_GetTrustLevel,
++    /* ITextBlock methods */
++    text_block_iface_get_FontSize,
++    text_block_iface_put_FontSize,
++    text_block_iface_get_FontFamily,
++    text_block_iface_put_FontFamily,
++    text_block_iface_get_FontWeight,
++    text_block_iface_put_FontWeight,
++    text_block_iface_get_FontStyle,
++    text_block_iface_put_FontStyle,
++    text_block_iface_get_FontStretch,
++    text_block_iface_put_FontStretch,
++    text_block_iface_get_CharacterSpacing,
++    text_block_iface_put_CharacterSpacing,
++    text_block_iface_get_Foreground,
++    text_block_iface_put_Foreground,
++    text_block_iface_get_TextWrapping,
++    text_block_iface_put_TextWrapping,
++    text_block_iface_get_TextTrimming,
++    text_block_iface_put_TextTrimming,
++    text_block_iface_get_TextAlignment,
++    text_block_iface_put_TextAlignment,
++    text_block_iface_get_Text,
++    text_block_iface_put_Text,
++    text_block_iface_get_Inlines,
++    text_block_iface_get_Padding,
++    text_block_iface_put_Padding,
++    text_block_iface_get_LineHeight,
++    text_block_iface_put_LineHeight,
++    text_block_iface_get_LineStackingStrategy,
++    text_block_iface_put_LineStackingStrategy,
++    text_block_iface_get_IsTextSelectionEnabled,
++    text_block_iface_put_IsTextSelectionEnabled,
++    text_block_iface_get_SelectedText,
++    text_block_iface_get_ContentStart,
++    text_block_iface_get_ContentEnd,
++    text_block_iface_get_SelectionStart,
++    text_block_iface_get_SelectionEnd,
++    text_block_iface_get_BaselineOffset,
++    text_block_iface_add_SelectionChanged,
++    text_block_iface_remove_SelectionChanged,
++    text_block_iface_add_ContextMenuOpening,
++    text_block_iface_remove_ContextMenuOpening,
++    text_block_iface_SelectAll,
++    text_block_iface_Select,
++    text_block_iface_Focus
++};
++
++static HRESULT text_block_query_interface( struct xaml_element *element, REFIID iid, void **out )
++{
++    struct text_block *impl = impl_from_element( element );
++
++    if (IsEqualGUID( iid, &IID_ITextBlock ))
++    {
++        *out = &impl->ITextBlock_iface;
++        IInspectable_AddRef( (IInspectable *)*out );
++        return S_OK;
++    }
++    return E_NOINTERFACE;
++}
++
++static HFONT text_block_create_font( struct text_block *impl, float scale )
++{
++    LOGFONTW lf = {0};
++
++    lf.lfHeight = -lround( impl->font_size * scale );
++    lf.lfWeight = impl->font_weight.Weight ? impl->font_weight.Weight : FW_NORMAL;
++    lf.lfItalic = impl->font_style != FontStyle_Normal;
++    lf.lfCharSet = DEFAULT_CHARSET;
++    lf.lfQuality = ANTIALIASED_QUALITY;
++    wcscpy( lf.lfFaceName, L"Segoe UI" );  /* XAML's default; GDI substitutes when it isn't installed */
++    return CreateFontIndirectW( &lf );
++}
++
++static UINT text_block_draw_flags( struct text_block *impl )
++{
++    UINT flags = DT_NOPREFIX;
++
++    if (impl->wrapping != TextWrapping_NoWrap) flags |= DT_WORDBREAK;
++    else flags |= DT_SINGLELINE;
++    switch (impl->alignment)
++    {
++    case TextAlignment_Center: flags |= DT_CENTER; break;
++    case TextAlignment_Right: flags |= DT_RIGHT; break;
++    default: flags |= DT_LEFT; break;
++    }
++    return flags;
++}
++
++static void text_block_measure( struct xaml_element *element, struct layout_context *ctx, float avail_width,
++                                float avail_height, float *width, float *height )
++{
++    struct text_block *impl = impl_from_element( element );
++    const Thickness *p = &impl->padding;
++    UINT32 len;
++    const WCHAR *text = WindowsGetStringRawBuffer( impl->text, &len );
++    RECT rect = { 0, 0, lroundf( max( 0.0f, avail_width - p->Left - p->Right ) * ctx->scale ), 0 };
++    HFONT font = text_block_create_font( impl, ctx->scale ), old;
++
++    old = SelectObject( ctx->hdc, font );
++    if (len) DrawTextW( ctx->hdc, text, len, &rect, text_block_draw_flags( impl ) | DT_CALCRECT );
++    else
++    {
++        TEXTMETRICW tm;
++        GetTextMetricsW( ctx->hdc, &tm );
++        rect.right = 0;
++        rect.bottom = tm.tmHeight;
++    }
++    SelectObject( ctx->hdc, old );
++    DeleteObject( font );
++
++    *width = rect.right / ctx->scale + p->Left + p->Right;
++    *height = rect.bottom / ctx->scale + p->Top + p->Bottom;
++}
++
++static void text_block_render( struct xaml_element *element, struct layout_context *ctx, const RECT *bounds )
++{
++    struct text_block *impl = impl_from_element( element );
++    const Thickness *p = &impl->padding;
++    COLORREF color = ctx->foreground;
++    UINT32 len;
++    const WCHAR *text = WindowsGetStringRawBuffer( impl->text, &len );
++    RECT rect = *bounds;
++    HFONT font, old;
++    Color c;
++
++    if (!len) return;
++    if (impl->foreground)
++    {
++        if (!brush_get_color( impl->foreground, &c ) || !c.A) return;
++        color = RGB( c.R, c.G, c.B );
++    }
++    rect.left += lround( p->Left * ctx->scale );
++    rect.top += lround( p->Top * ctx->scale );
++    rect.right -= lround( p->Right * ctx->scale );
++    rect.bottom -= lround( p->Bottom * ctx->scale );
++
++    font = text_block_create_font( impl, ctx->scale );
++    old = SelectObject( ctx->hdc, font );
++    SetTextColor( ctx->hdc, color );
++    SetBkMode( ctx->hdc, TRANSPARENT );
++    DrawTextW( ctx->hdc, text, len, &rect, text_block_draw_flags( impl ) | DT_NOCLIP );
++    SelectObject( ctx->hdc, old );
++    DeleteObject( font );
++}
++
++static void text_block_destroy( struct xaml_element *element )
++{
++    struct text_block *impl = impl_from_element( element );
++
++    WindowsDeleteString( impl->text );
++    if (impl->foreground) IBrush_Release( impl->foreground );
++    free( impl );
++}
++
++static const struct element_ops text_block_ops =
++{
++    text_block_query_interface,
++    text_block_measure,
++    text_block_render,
++    text_block_destroy,
++};
++
++static HRESULT text_block_create( IInspectable **out )
++{
++    struct text_block *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    element_init( &impl->element, &text_block_ops, RuntimeClass_Windows_UI_Xaml_Controls_TextBlock );
++    impl->ITextBlock_iface.lpVtbl = &text_block_iface_vtbl;
++    impl->font_size = 14.0;
++    impl->font_weight.Weight = 400;
++    impl->font_style = FontStyle_Normal;
++    impl->wrapping = TextWrapping_NoWrap;
++    impl->alignment = TextAlignment_Left;
++
++    *out = (IInspectable *)&impl->ITextBlock_iface;
++    TRACE( "created %p.\n", *out );
++    return S_OK;
++}
++
++/* activation factory */
++
++struct text_block_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    LONG ref;
++};
++
++static inline struct text_block_statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct text_block_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct text_block_statics *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        *out = &impl->IActivationFactory_iface;
++        IInspectable_AddRef( (IInspectable *)*out );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    return InterlockedIncrement( &impl_from_IActivationFactory( iface )->ref );
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    return InterlockedDecrement( &impl_from_IActivationFactory( iface )->ref );
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++    return text_block_create( instance );
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++static struct text_block_statics text_block_statics =
++{
++    {&factory_vtbl},
++    1,
++};
++
++IActivationFactory *text_block_factory = &text_block_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/window.c b/dlls/windows.ui.xaml/window.c
+new file mode 100644
+index 0000000..8d12620
+--- /dev/null
++++ b/dlls/windows.ui.xaml/window.c
+@@ -0,0 +1,488 @@
++/* WinRT Windows.UI.Xaml.Window implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* The XAML Window wraps the view's CoreWindow. Content is drawn with GDI into the CoreWindow's HWND, which is
++ * subclassed for WM_PAINT; everything else goes on to twinapi.appcore's window procedure. */
++
++struct xaml_window
++{
++    IWindow IWindow_iface;
++    LONG ref;
++    ICoreWindow *core_window;
++    HWND hwnd;
++    WNDPROC old_proc;
++    IUIElement *content;
++    struct event_list activated, closed, size_changed, visibility_changed;
++};
++
++static struct xaml_window *current_window;
++
++static inline struct xaml_window *impl_from_IWindow( IWindow *iface )
++{
++    return CONTAINING_RECORD( iface, struct xaml_window, IWindow_iface );
++}
++
++/* View pixels to physical pixels, like twinapi.appcore's WINE_CORE_SCALE. */
++static float view_scale(void)
++{
++    WCHAR buf[32];
++    double scale;
++
++    if (GetEnvironmentVariableW( L"WINE_CORE_SCALE", buf, ARRAY_SIZE(buf) ) && (scale = wcstod( buf, NULL )) >= 1.0)
++        return scale;
++    return 1.0f;
++}
++
++void window_invalidate(void)
++{
++    if (current_window && current_window->hwnd) InvalidateRect( current_window->hwnd, NULL, FALSE );
++}
++
++static void window_paint( struct xaml_window *window )
++{
++    BOOL dark = application_theme() == ApplicationTheme_Dark;
++    struct xaml_element *element;
++    struct layout_context ctx;
++    PAINTSTRUCT ps;
++    HBITMAP bitmap, old;
++    HBRUSH background;
++    RECT client;
++    HDC hdc, mem;
++
++    hdc = BeginPaint( window->hwnd, &ps );
++    GetClientRect( window->hwnd, &client );
++    mem = CreateCompatibleDC( hdc );
++    bitmap = CreateCompatibleBitmap( hdc, max( 1, client.right ), max( 1, client.bottom ) );
++    old = SelectObject( mem, bitmap );
++
++    background = CreateSolidBrush( dark ? RGB(0, 0, 0) : RGB(255, 255, 255) );
++    FillRect( mem, &client, background );
++    DeleteObject( background );
++
++    if (window->content && (element = element_from_iinspectable( (IInspectable *)window->content )))
++    {
++        ctx.hdc = mem;
++        ctx.scale = view_scale();
++        ctx.foreground = dark ? RGB(255, 255, 255) : RGB(0, 0, 0);
++        element_layout_and_render( element, &ctx, &client );
++    }
++
++    BitBlt( hdc, 0, 0, client.right, client.bottom, mem, 0, 0, SRCCOPY );
++    SelectObject( mem, old );
++    DeleteObject( bitmap );
++    DeleteDC( mem );
++    EndPaint( window->hwnd, &ps );
++}
++
++static LRESULT CALLBACK window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
++{
++    struct xaml_window *window = current_window;
++
++    if (!window || window->hwnd != hwnd) return DefWindowProcW( hwnd, msg, wparam, lparam );
++
++    switch (msg)
++    {
++    case WM_ERASEBKGND:
++        return 1;
++    case WM_PAINT:
++        window_paint( window );
++        return 0;
++    case WM_SIZE:
++        InvalidateRect( hwnd, NULL, FALSE );
++        break;
++    }
++    return CallWindowProcW( window->old_proc, hwnd, msg, wparam, lparam );
++}
++
++static BOOL CALLBACK find_core_hwnd( HWND hwnd, LPARAM lparam )
++{
++    WCHAR name[32];
++
++    if (GetClassNameW( hwnd, name, ARRAY_SIZE(name) ) && !wcscmp( name, L"WineCoreWindow" ))
++    {
++        *(HWND *)lparam = hwnd;
++        return FALSE;
++    }
++    return TRUE;
++}
++
++static HRESULT WINAPI window_QueryInterface( IWindow *iface, REFIID iid, void **out )
++{
++    struct xaml_window *impl = impl_from_IWindow( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IWindow ))
++    {
++        *out = &impl->IWindow_iface;
++        IInspectable_AddRef( (IInspectable *)*out );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI window_AddRef( IWindow *iface )
++{
++    return InterlockedIncrement( &impl_from_IWindow( iface )->ref );
++}
++
++static ULONG WINAPI window_Release( IWindow *iface )
++{
++    struct xaml_window *impl = impl_from_IWindow( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        if (impl->hwnd && impl->old_proc && IsWindow( impl->hwnd ))
++            SetWindowLongPtrW( impl->hwnd, GWLP_WNDPROC, (LONG_PTR)impl->old_proc );
++        if (impl->content) IUIElement_Release( impl->content );
++        event_list_clear( &impl->activated );
++        event_list_clear( &impl->closed );
++        event_list_clear( &impl->size_changed );
++        event_list_clear( &impl->visibility_changed );
++        ICoreWindow_Release( impl->core_window );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI window_GetIids( IWindow *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI window_GetRuntimeClassName( IWindow *iface, HSTRING *class_name )
++{
++    const WCHAR *name = RuntimeClass_Windows_UI_Xaml_Window;
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI window_GetTrustLevel( IWindow *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI window_get_Bounds( IWindow *iface, Rect *value )
++{
++    struct xaml_window *impl = impl_from_IWindow( iface );
++    float scale = view_scale();
++    RECT client = {0};
++
++    if (impl->hwnd) GetClientRect( impl->hwnd, &client );
++    value->X = 0;
++    value->Y = 0;
++    value->Width = client.right / scale;
++    value->Height = client.bottom / scale;
++    return S_OK;
++}
++
++static HRESULT WINAPI window_get_Visible( IWindow *iface, boolean *value )
++{
++    struct xaml_window *impl = impl_from_IWindow( iface );
++    *value = impl->hwnd && IsWindowVisible( impl->hwnd );
++    return S_OK;
++}
++
++static HRESULT WINAPI window_get_Content( IWindow *iface, IUIElement **value )
++{
++    struct xaml_window *impl = impl_from_IWindow( iface );
++    if ((*value = impl->content)) IUIElement_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI window_put_Content( IWindow *iface, IUIElement *value )
++{
++    struct xaml_window *impl = impl_from_IWindow( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (value) IUIElement_AddRef( value );
++    if (impl->content) IUIElement_Release( impl->content );
++    impl->content = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI window_get_CoreWindow( IWindow *iface, ICoreWindow **value )
++{
++    struct xaml_window *impl = impl_from_IWindow( iface );
++    *value = impl->core_window;
++    ICoreWindow_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI window_get_Dispatcher( IWindow *iface, ICoreDispatcher **value )
++{
++    return ICoreWindow_get_Dispatcher( impl_from_IWindow( iface )->core_window, value );
++}
++
++static HRESULT WINAPI window_add_Activated( IWindow *iface, IWindowActivatedEventHandler *handler, EventRegistrationToken *token )
++{
++    FIXME( "iface %p, handler %p: handler is kept but never raised.\n", iface, handler );
++    return event_list_add( &impl_from_IWindow( iface )->activated, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI window_remove_Activated( IWindow *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IWindow( iface )->activated, token );
++}
++
++static HRESULT WINAPI window_add_Closed( IWindow *iface, IWindowClosedEventHandler *handler, EventRegistrationToken *token )
++{
++    FIXME( "iface %p, handler %p: handler is kept but never raised.\n", iface, handler );
++    return event_list_add( &impl_from_IWindow( iface )->closed, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI window_remove_Closed( IWindow *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IWindow( iface )->closed, token );
++}
++
++static HRESULT WINAPI window_add_SizeChanged( IWindow *iface, IWindowSizeChangedEventHandler *handler, EventRegistrationToken *token )
++{
++    FIXME( "iface %p, handler %p: handler is kept but never raised.\n", iface, handler );
++    return event_list_add( &impl_from_IWindow( iface )->size_changed, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI window_remove_SizeChanged( IWindow *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IWindow( iface )->size_changed, token );
++}
++
++static HRESULT WINAPI window_add_VisibilityChanged( IWindow *iface, IWindowVisibilityChangedEventHandler *handler, EventRegistrationToken *token )
++{
++    FIXME( "iface %p, handler %p: handler is kept but never raised.\n", iface, handler );
++    return event_list_add( &impl_from_IWindow( iface )->visibility_changed, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI window_remove_VisibilityChanged( IWindow *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IWindow( iface )->visibility_changed, token );
++}
++
++static HRESULT WINAPI window_Activate( IWindow *iface )
++{
++    struct xaml_window *impl = impl_from_IWindow( iface );
++    HRESULT hr;
++
++    TRACE( "iface %p.\n", iface );
++
++    hr = ICoreWindow_Activate( impl->core_window );
++    if (impl->hwnd)
++    {
++        InvalidateRect( impl->hwnd, NULL, FALSE );
++        UpdateWindow( impl->hwnd );
++    }
++    return hr;
++}
++
++static HRESULT WINAPI window_Close( IWindow *iface )
++{
++    struct xaml_window *impl = impl_from_IWindow( iface );
++
++    TRACE( "iface %p.\n", iface );
++
++    if (impl->hwnd) PostMessageW( impl->hwnd, WM_CLOSE, 0, 0 );
++    return S_OK;
++}
++
++
++static const struct IWindowVtbl window_vtbl =
++{
++    window_QueryInterface,
++    window_AddRef,
++    window_Release,
++    /* IInspectable methods */
++    window_GetIids,
++    window_GetRuntimeClassName,
++    window_GetTrustLevel,
++    /* IWindow methods */
++    window_get_Bounds,
++    window_get_Visible,
++    window_get_Content,
++    window_put_Content,
++    window_get_CoreWindow,
++    window_get_Dispatcher,
++    window_add_Activated,
++    window_remove_Activated,
++    window_add_Closed,
++    window_remove_Closed,
++    window_add_SizeChanged,
++    window_remove_SizeChanged,
++    window_add_VisibilityChanged,
++    window_remove_VisibilityChanged,
++    window_Activate,
++    window_Close
++};
++
++
++HRESULT window_create_for_core_window( ICoreWindow *core_window )
++{
++    struct xaml_window *impl;
++
++    if (current_window) return S_OK;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IWindow_iface.lpVtbl = &window_vtbl;
++    impl->ref = 1;
++    impl->core_window = core_window;
++    ICoreWindow_AddRef( core_window );
++
++    EnumThreadWindows( GetCurrentThreadId(), find_core_hwnd, (LPARAM)&impl->hwnd );
++    if (impl->hwnd)
++        impl->old_proc = (WNDPROC)SetWindowLongPtrW( impl->hwnd, GWLP_WNDPROC, (LONG_PTR)window_proc );
++    else
++        ERR( "CoreWindow %p has no HWND on this thread; nothing will be drawn.\n", core_window );
++
++    TRACE( "window %p, hwnd %p.\n", impl, impl->hwnd );
++    current_window = impl;
++    return S_OK;
++}
++
++void window_destroy_current(void)
++{
++    struct xaml_window *window = current_window;
++
++    if (!window) return;
++    current_window = NULL;
++    IWindow_Release( &window->IWindow_iface );
++}
++
++/* activation factory and Window.Current */
++
++struct window_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IWindowStatics IWindowStatics_iface;
++    LONG ref;
++};
++
++static inline struct window_statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct window_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct window_statics *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IWindowStatics ))
++        *out = &impl->IWindowStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    return InterlockedIncrement( &impl_from_IActivationFactory( iface )->ref );
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    return InterlockedDecrement( &impl_from_IActivationFactory( iface )->ref );
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    FIXME( "iface %p, instance %p: Window is not activatable.\n", iface, instance );
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( window_statics, IWindowStatics, struct window_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI window_statics_get_Current( IWindowStatics *iface, IWindow **value )
++{
++    TRACE( "iface %p, value %p -> %p.\n", iface, value, current_window );
++
++    if ((*value = current_window ? &current_window->IWindow_iface : NULL)) IWindow_AddRef( *value );
++    return S_OK;
++}
++
++static const struct IWindowStaticsVtbl window_statics_vtbl =
++{
++    window_statics_QueryInterface,
++    window_statics_AddRef,
++    window_statics_Release,
++    /* IInspectable methods */
++    window_statics_GetIids,
++    window_statics_GetRuntimeClassName,
++    window_statics_GetTrustLevel,
++    /* IWindowStatics methods */
++    window_statics_get_Current,
++};
++
++static struct window_statics window_statics =
++{
++    {&factory_vtbl},
++    {&window_statics_vtbl},
++    1,
++};
++
++IActivationFactory *window_factory = &window_statics.IActivationFactory_iface;

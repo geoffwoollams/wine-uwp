@@ -1,0 +1,14 @@
+Subject: widl: don't crash writing metadata for runtime classes that list generic interfaces
+
+diff --git a/tools/widl/metadata.c b/tools/widl/metadata.c
+index 04b4f08..1a62b72 100644
+--- a/tools/widl/metadata.c
++++ b/tools/widl/metadata.c
+@@ -2813,6 +2813,7 @@ static void add_method_contract_attrs( const type_t *class, const type_t *iface,
+     BYTE value[MAX_NAME + sizeof(UINT) + 5];
+     const attr_t *attr = get_attr( iface->attrs, ATTR_CONTRACT );
+ 
++    if (!attr) return; /* instantiated generic interfaces have no contract of their own */
+     parent = has_customattribute( TABLE_METHODDEF, method->md.def );
+     attr_type = customattribute_type( TABLE_MEMBERREF, attr->md_member );
+     value_size = make_contract_value( get_attr(class->attrs, ATTR_CONTRACT), value );

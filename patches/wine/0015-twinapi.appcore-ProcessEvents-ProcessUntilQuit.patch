@@ -1,0 +1,28 @@
+Subject: twinapi.appcore: CoreDispatcher.ProcessEvents(ProcessUntilQuit) blocks until WM_QUIT
+
+diff --git a/dlls/twinapi.appcore/core_gen.c b/dlls/twinapi.appcore/core_gen.c
+index 6b5c7c6..2f92f5e 100644
+--- a/dlls/twinapi.appcore/core_gen.c
++++ b/dlls/twinapi.appcore/core_gen.c
+@@ -528,7 +528,20 @@ static HRESULT WINAPI core_dispatcher_ProcessEvents(ICoreDispatcher *iface, __x_
+     struct core_dispatcher *impl __attribute__((unused)) = impl_from_core_dispatcher(iface);
+     MSG msg;
+     TRACE("iface %p, options %d.\n", iface, options);
+-    /* TODO: honour options (ProcessOneAndAllPending / ProcessAllIfPresent / ProcessUntilQuit) */
++    if (options == CoreProcessEventsOption_ProcessUntilQuit)
++    {
++        /* used by FrameworkView.Run (XAML): block until WM_QUIT, running RunAsync work as it is queued */
++        for (;;)
++        {
++            dispatcher_drain_queue(impl);
++            if (GetMessageW(&msg, NULL, 0, 0) <= 0) break;
++            TranslateMessage(&msg);
++            DispatchMessageW(&msg);
++        }
++        dispatcher_drain_queue(impl);
++        return S_OK;
++    }
++    /* TODO: honour ProcessOneAndAllPending / ProcessOneIfPresent */
+     while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
+     {
+         if (msg.message == WM_QUIT) { PostQuitMessage(msg.wParam); break; }
