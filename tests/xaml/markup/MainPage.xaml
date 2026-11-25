@@ -9,9 +9,12 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
         </Grid.RowDefinitions>
-        <StackPanel Margin="20">
+        <StackPanel Margin="20" Background="{ThemeResource PanelBrush}">
+            <!-- a local FontSize: the implicit TextBlock style must not override it -->
             <TextBlock x:Name="Title" Text="Hello from markup" FontSize="28"/>
-            <Button x:Name="ClickButton" Content="Click me" Click="OnClick" Margin="0,10,0,0"/>
+            <Button x:Name="ClickButton" Content="Click me" Click="OnClick" Margin="0,10,0,0"
+                    Style="{StaticResource AccentButton}"/>
+            <TextBlock x:Name="Styled" Text="Styled by the implicit TextBlock style"/>
         </StackPanel>
         <Border Grid.Row="1" Background="{StaticResource AccentBrush}" Margin="20" Padding="10">
             <TextBlock Text="Brush from Application.Resources" Foreground="White" FontSize="20"/>

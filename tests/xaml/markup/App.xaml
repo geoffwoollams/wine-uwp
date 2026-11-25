@@ -5,7 +5,20 @@
     xmlns:local="using:XamlMarkup"
     RequestedTheme="Light">
     <Application.Resources>
-        <SolidColorBrush x:Key="AccentBrush" Color="#FF0063B1"/>
-        <SolidColorBrush x:Key="CardBrush" Color="#FFE6E6E6"/>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ResourceDictionary Source="ms-appx:///Styles.xaml"/>
+            </ResourceDictionary.MergedDictionaries>
+            <ResourceDictionary.ThemeDictionaries>
+                <ResourceDictionary x:Key="Light">
+                    <SolidColorBrush x:Key="PanelBrush" Color="#FFDDEEFF"/>
+                </ResourceDictionary>
+                <ResourceDictionary x:Key="Dark">
+                    <SolidColorBrush x:Key="PanelBrush" Color="#FF102030"/>
+                </ResourceDictionary>
+            </ResourceDictionary.ThemeDictionaries>
+            <SolidColorBrush x:Key="AccentBrush" Color="#FF0063B1"/>
+            <SolidColorBrush x:Key="CardBrush" Color="#FFE6E6E6"/>
+        </ResourceDictionary>
     </Application.Resources>
 </Application>

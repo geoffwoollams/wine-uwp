@@ -115,6 +115,7 @@ struct main_page
     IInspectable *inner;
     LONG ref;
     ITextBlock *title;          /* x:Name="Title" */
+    ITextBlock *styled;         /* x:Name="Styled" */
     IButton *click_button;      /* x:Name="ClickButton" */
     int clicks;
 };
@@ -145,6 +146,7 @@ static ULONG WINAPI page_Release(IComponentConnector *iface)
     if (!ref)
     {
         if (page->title) ITextBlock_Release(page->title);
+        if (page->styled) ITextBlock_Release(page->styled);
         if (page->click_button) IButton_Release(page->click_button);
         IInspectable_Release(page->inner);
         if (the_page == page) the_page = NULL;
@@ -199,6 +201,9 @@ static HRESULT WINAPI page_Connect(IComponentConnector *iface, INT32 id, IInspec
         IInspectable_QueryInterface(target, &IID_IButtonBase, (void **)&base);
         IButtonBase_add_Click(base, &on_click, &token);
         IButtonBase_Release(base);
+        break;
+    case 3:
+        IInspectable_QueryInterface(target, &IID_ITextBlock, (void **)&page->styled);
         break;
     }
     return S_OK;
@@ -487,6 +492,75 @@ static double actual(void *element, BOOL want_height)
     return v;
 }
 
+static BOOL brush_color(IBrush *brush, UINT32 *argb)
+{
+    ISolidColorBrush *solid;
+    Color c;
+    if (!brush || FAILED(IBrush_QueryInterface(brush, &IID_ISolidColorBrush, (void **)&solid))) return FALSE;
+    ISolidColorBrush_get_Color(solid, &c);
+    ISolidColorBrush_Release(solid);
+    *argb = c.A << 24 | c.R << 16 | c.G << 8 | c.B;
+    return TRUE;
+}
+
+/* milestone 4: styles, theme and merged dictionaries */
+static void check_styles(struct main_page *page)
+{
+    IControl *control;
+    IFrameworkElement *fe;
+    IStyle *style, *based_on;
+    IBrush *brush;
+    Thickness padding;
+    TypeName target;
+    UINT32 argb = 0;
+    DOUBLE size;
+
+    check(page->styled != NULL, "Connect(3) gave us x:Name=\"Styled\"");
+    if (!page->styled) return;
+
+    /* implicit TextBlock style from the merged Styles.xaml */
+    ITextBlock_get_FontSize(page->styled, &size);
+    check(size == 18, "the implicit TextBlock style set FontSize 18 (%.1f)", size);
+    ITextBlock_get_Foreground(page->styled, &brush);
+    check(brush_color(brush, &argb) && argb == 0xff2b5797, "and Foreground #FF2B5797 (%08x)", argb);
+    if (brush) IBrush_Release(brush);
+    /* a local value beats the style */
+    ITextBlock_get_FontSize(page->title, &size);
+    check(size == 28, "Title keeps its local FontSize 28 over the implicit style (%.1f)", size);
+    ITextBlock_get_Foreground(page->title, &brush);
+    check(brush_color(brush, &argb) && argb == 0xff2b5797, "Title takes the style's Foreground, which it doesn't set (%08x)", argb);
+    if (brush) IBrush_Release(brush);
+
+    /* Style="{StaticResource AccentButton}", BasedOn BaseButton */
+    IButton_QueryInterface(page->click_button, &IID_IFrameworkElement, (void **)&fe);
+    IFrameworkElement_get_Style(fe, &style);
+    check(style != NULL, "ClickButton.Style is set");
+    if (style)
+    {
+        IStyle_get_TargetType(style, &target);
+        check(!wcscmp(WindowsGetStringRawBuffer(target.Name, NULL), L"Button"), "Style.TargetType is Button (%ls)",
+              WindowsGetStringRawBuffer(target.Name, NULL));
+        WindowsDeleteString(target.Name);
+        IStyle_get_BasedOn(style, &based_on);
+        check(based_on != NULL, "AccentButton is BasedOn BaseButton");
+        if (based_on) IStyle_Release(based_on);
+        IStyle_Release(style);
+    }
+    IFrameworkElement_Release(fe);
+    IButton_QueryInterface(page->click_button, &IID_IControl, (void **)&control);
+    IControl_get_Background(control, &brush);
+    check(brush_color(brush, &argb) && argb == 0xffc50f1f, "Background from the style's {StaticResource StyleAccentBrush} (%08x)", argb);
+    if (brush) IBrush_Release(brush);
+    IControl_get_Foreground(control, &brush);
+    check(brush_color(brush, &argb) && argb == 0xffffffff, "Foreground White from AccentButton (%08x)", argb);
+    if (brush) IBrush_Release(brush);
+    IControl_get_Padding(control, &padding);
+    check(padding.Left == 24 && padding.Top == 10, "Padding 24,10 from BaseButton (%.0f,%.0f)", padding.Left, padding.Top);
+    IControl_get_FontSize(control, &size);
+    check(size == 16, "FontSize 16 from BaseButton (%.1f)", size);
+    IControl_Release(control);
+}
+
 static void check_microsoft_xbf(const WCHAR *file, const WCHAR *component_class)
 {
     IActivationFactory *factory;
@@ -566,6 +640,8 @@ static void CALLBACK verify(HWND unused, UINT msg, UINT_PTR id, DWORD time)
     if (!the_page->title || !the_page->click_button) goto done;
     check(!wcscmp(text_of(the_page->title, buf, ARRAYSIZE(buf)), L"Hello from markup"), "Title.Text from markup (%ls)", buf);
 
+    check_styles(the_page);
+
     snapshot();
     printf("client %dx%d\n", width, height);
     tx = 20; ty = 20;
@@ -576,6 +652,9 @@ static void CALLBACK verify(HWND unused, UINT msg, UINT_PTR id, DWORD time)
     check(count_color(0x0063b1) > 50000, "the Border's {StaticResource AccentBrush} background is drawn (%d px)", count_color(0x0063b1));
     check(count_color(0xffffff) > 100000, "the page background {ThemeResource ApplicationPageBackgroundThemeBrush} is white (%d px)",
           count_color(0xffffff));
+    check(count_color(0xddeeff) > 20000, "the StackPanel's {ThemeResource PanelBrush} comes from the Light theme dictionary (%d px)",
+          count_color(0xddeeff));
+    check(count_color(0xc50f1f) > 2000, "the styled button is drawn in StyleAccentBrush (%d px)", count_color(0xc50f1f));
 
     /* click the button: Click="OnClick" was connected by Connect(2) */
     {
