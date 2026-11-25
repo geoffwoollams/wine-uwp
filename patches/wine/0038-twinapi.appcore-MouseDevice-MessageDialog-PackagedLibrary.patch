@@ -1,0 +1,2137 @@
+Subject: twinapi.appcore, kernelbase, windows.applicationmodel: MouseDevice, a real MessageDialog and UICommand,
+ AsyncCausalityTracer, LoadPackagedLibrary, the package root as InstalledLocation (Gears of War 4)
+
+diff --git a/dlls/kernelbase/loader.c b/dlls/kernelbase/loader.c
+index f6347c1..72809c1 100644
+--- a/dlls/kernelbase/loader.c
++++ b/dlls/kernelbase/loader.c
+@@ -30,6 +30,7 @@
+ #include "winternl.h"
+ #include "ddk/ntddk.h"
+ #include "kernelbase.h"
++#include "appmodel.h"
+ #include "wine/list.h"
+ #include "wine/asm.h"
+ #include "wine/debug.h"
+@@ -579,8 +580,41 @@ HMODULE WINAPI DECLSPEC_HOTPATCH LoadLibraryExW( LPCWSTR name, HANDLE file, DWOR
+  */
+ HMODULE WINAPI /* DECLSPEC_HOTPATCH */ LoadPackagedLibrary( LPCWSTR name, DWORD reserved )
+ {
+-    FIXME( "semi-stub, name %s, reserved %#lx.\n", debugstr_w(name), reserved );
+-    SetLastError( APPMODEL_ERROR_NO_PACKAGE );
++    WCHAR path[MAX_PATH];
++    UINT32 len = ARRAY_SIZE(path);
++    HMODULE module;
++    WCHAR *p;
++
++    TRACE( "name %s, reserved %#lx.\n", debugstr_w(name), reserved );
++
++    if (reserved || !name || !*name)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return NULL;
++    }
++    /* a path inside the package: relative, without a drive or ".." */
++    if (name[0] == '\\' || name[0] == '/' || (name[0] && name[1] == ':') || wcsstr( name, L".." ))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return NULL;
++    }
++    if (GetCurrentPackagePath( &len, path ))
++    {
++        SetLastError( APPMODEL_ERROR_NO_PACKAGE );
++        return NULL;
++    }
++    /* only the package itself is searched here, not its dependency packages */
++    if (wcslen( path ) + wcslen( name ) + 2 > ARRAY_SIZE(path))
++    {
++        SetLastError( ERROR_FILENAME_EXCED_RANGE );
++        return NULL;
++    }
++    wcscat( path, L"\\" );
++    wcscat( path, name );
++    for (p = path; *p; p++) if (*p == '/') *p = '\\';
++    if ((module = LoadLibraryExW( path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH ))) return module;
++    /* a bare file name can also come from the process's search path (the package root is its directory) */
++    if (!wcschr( name, '\\' ) && !wcschr( name, '/' )) return LoadLibraryExW( name, NULL, 0 );
+     return NULL;
+ }
+ 
+diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
+index 2c1d20c..868841e 100644
+--- a/dlls/twinapi.appcore/Makefile.in
++++ b/dlls/twinapi.appcore/Makefile.in
+@@ -10,6 +10,7 @@ SOURCES = \
+ 	auth_probe.c \
+ 	client_device_information.c \
+ 	current_app.c \
++	causality.c \
+ 	core_gen.c \
+ 	core_input_gen.c \
+ 	sink.c \
+@@ -25,6 +26,7 @@ SOURCES = \
+ 	extended_execution.c \
+ 	game_save.c \
+ 	message_dialog.c \
++	mouse.c \
+ 	hardware_identification.c \
+ 	main.c \
+ 	manifest.c
+diff --git a/dlls/twinapi.appcore/causality.c b/dlls/twinapi.appcore/causality.c
+new file mode 100644
+index 0000000..35a88d5
+--- /dev/null
++++ b/dlls/twinapi.appcore/causality.c
+@@ -0,0 +1,177 @@
++/* WinRT Windows.Foundation.Diagnostics.AsyncCausalityTracer implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
++
++/* The async causality tracer reports C++/CX and C# async operations to a debugger's timeline. Nothing listens
++ * here, so every trace is accepted and dropped. The interface isn't in Wine's IDL yet, so its vtable is written
++ * out by hand from Windows.winmd (IAsyncCausalityTracerStatics, 50850b26-267e-451b-a890-ab6a370245ee). The GUID
++ * arguments are by value, which the x64 ABI passes by reference. Xbox Live's chat libraries (Gears of War 4) call
++ * it from their worker threads. */
++
++static const GUID IID_IAsyncCausalityTracerStatics_local =
++    { 0x50850b26, 0x267e, 0x451b, { 0xa8, 0x90, 0xab, 0x6a, 0x37, 0x02, 0x45, 0xee } };
++
++typedef struct tracer_statics tracer_statics;
++struct tracer_statics_vtbl
++{
++    HRESULT (WINAPI *QueryInterface)( tracer_statics *iface, REFIID iid, void **out );
++    ULONG (WINAPI *AddRef)( tracer_statics *iface );
++    ULONG (WINAPI *Release)( tracer_statics *iface );
++    HRESULT (WINAPI *GetIids)( tracer_statics *iface, ULONG *count, IID **iids );
++    HRESULT (WINAPI *GetRuntimeClassName)( tracer_statics *iface, HSTRING *name );
++    HRESULT (WINAPI *GetTrustLevel)( tracer_statics *iface, TrustLevel *level );
++    HRESULT (WINAPI *TraceOperationCreation)( tracer_statics *iface, INT32 level, INT32 source, GUID platform,
++                                              UINT64 operation, HSTRING name, UINT64 related );
++    HRESULT (WINAPI *TraceOperationCompletion)( tracer_statics *iface, INT32 level, INT32 source, GUID platform,
++                                                UINT64 operation, INT32 status );
++    HRESULT (WINAPI *TraceOperationRelation)( tracer_statics *iface, INT32 level, INT32 source, GUID platform,
++                                              UINT64 operation, INT32 relation );
++    HRESULT (WINAPI *TraceSynchronousWorkStart)( tracer_statics *iface, INT32 level, INT32 source, GUID platform,
++                                                 UINT64 operation, INT32 work );
++    HRESULT (WINAPI *TraceSynchronousWorkCompletion)( tracer_statics *iface, INT32 level, INT32 source, INT32 work );
++    HRESULT (WINAPI *add_TracingStatusChanged)( tracer_statics *iface, IUnknown *handler, EventRegistrationToken *token );
++    HRESULT (WINAPI *remove_TracingStatusChanged)( tracer_statics *iface, EventRegistrationToken token );
++};
++struct tracer_statics { const struct tracer_statics_vtbl *lpVtbl; };
++
++struct tracer_factory
++{
++    IActivationFactory IActivationFactory_iface;
++    tracer_statics statics;
++};
++
++static struct tracer_factory tracer;
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &tracer.IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IAsyncCausalityTracerStatics_local ))
++        *out = &tracer.statics;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance ) { return E_NOTIMPL; }
++
++static const IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++static HRESULT WINAPI statics_QueryInterface( tracer_statics *iface, REFIID iid, void **out )
++{
++    return factory_QueryInterface( &tracer.IActivationFactory_iface, iid, out );
++}
++static ULONG WINAPI statics_AddRef( tracer_statics *iface ) { return 2; }
++static ULONG WINAPI statics_Release( tracer_statics *iface ) { return 1; }
++static HRESULT WINAPI statics_GetIids( tracer_statics *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI statics_GetRuntimeClassName( tracer_statics *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI statics_GetTrustLevel( tracer_statics *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI statics_TraceOperationCreation( tracer_statics *iface, INT32 level, INT32 source, GUID platform,
++                                                      UINT64 operation, HSTRING name, UINT64 related )
++{
++    TRACE( "level %d, source %d, operation %#I64x, name %s.\n", level, source, operation, debugstr_hstring(name) );
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_TraceOperationCompletion( tracer_statics *iface, INT32 level, INT32 source, GUID platform,
++                                                        UINT64 operation, INT32 status )
++{
++    TRACE( "level %d, source %d, operation %#I64x, status %d.\n", level, source, operation, status );
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_TraceOperationRelation( tracer_statics *iface, INT32 level, INT32 source, GUID platform,
++                                                      UINT64 operation, INT32 relation )
++{
++    TRACE( "level %d, source %d, operation %#I64x, relation %d.\n", level, source, operation, relation );
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_TraceSynchronousWorkStart( tracer_statics *iface, INT32 level, INT32 source, GUID platform,
++                                                         UINT64 operation, INT32 work )
++{
++    TRACE( "level %d, source %d, operation %#I64x, work %d.\n", level, source, operation, work );
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_TraceSynchronousWorkCompletion( tracer_statics *iface, INT32 level, INT32 source, INT32 work )
++{
++    TRACE( "level %d, source %d, work %d.\n", level, source, work );
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_add_TracingStatusChanged( tracer_statics *iface, IUnknown *handler, EventRegistrationToken *token )
++{
++    static LONG next_token;
++
++    TRACE( "handler %p (no tracer: the status never changes).\n", handler );
++    if (!handler || !token) return E_INVALIDARG;
++    token->value = InterlockedIncrement( &next_token );
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_remove_TracingStatusChanged( tracer_statics *iface, EventRegistrationToken token )
++{
++    return S_OK;
++}
++
++static const struct tracer_statics_vtbl statics_vtbl =
++{
++    statics_QueryInterface,
++    statics_AddRef,
++    statics_Release,
++    statics_GetIids,
++    statics_GetRuntimeClassName,
++    statics_GetTrustLevel,
++    statics_TraceOperationCreation,
++    statics_TraceOperationCompletion,
++    statics_TraceOperationRelation,
++    statics_TraceSynchronousWorkStart,
++    statics_TraceSynchronousWorkCompletion,
++    statics_add_TracingStatusChanged,
++    statics_remove_TracingStatusChanged,
++};
++
++static struct tracer_factory tracer = { { &factory_vtbl }, { &statics_vtbl } };
++IActivationFactory *async_causality_tracer_factory = &tracer.IActivationFactory_iface;
+diff --git a/dlls/twinapi.appcore/core_gen.c b/dlls/twinapi.appcore/core_gen.c
+index d012692..fbf8b46 100644
+--- a/dlls/twinapi.appcore/core_gen.c
++++ b/dlls/twinapi.appcore/core_gen.c
+@@ -1984,6 +1984,9 @@ static LRESULT CALLBACK core_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPA
+             core_input_raise_size(&window->ICoreWindow_iface, client.right, client.bottom);
+         }
+         return 0;
++    case WM_INPUT:
++        mouse_device_raw_input((HRAWINPUT)lparam);
++        return DefWindowProcW(hwnd, msg, wparam, lparam);
+     case WM_CLOSE:
+         FIXME("WM_CLOSE: posting quit.\n");
+         PostQuitMessage(0);
+diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
+index 838f41e..5d2d8d6 100644
+--- a/dlls/twinapi.appcore/main.c
++++ b/dlls/twinapi.appcore/main.c
+@@ -108,6 +108,12 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( core_window_factory, &IID_IActivationFactory, (void **)factory );
+     }
+ 
++    else if (!wcscmp( buffer, L"Windows.Devices.Input.MouseDevice" ))
++        IActivationFactory_QueryInterface( mouse_device_factory, &IID_IActivationFactory, (void **)factory );
++
++    else if (!wcscmp( buffer, L"Windows.UI.Popups.UICommand" ))
++        IActivationFactory_QueryInterface( ui_command_factory, &IID_IActivationFactory, (void **)factory );
++
+     else if (!wcscmp( buffer, L"Windows.UI.Popups.MessageDialog" ))
+     {
+         message_dialog_init();
+@@ -148,7 +154,7 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+     else if (!wcscmp( buffer, L"Windows.Foundation.Diagnostics.LoggingSession" ))
+         IActivationFactory_QueryInterface( loggingsession_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, L"Windows.Foundation.Diagnostics.AsyncCausalityTracer" ))
+-        IActivationFactory_QueryInterface( asynccausalitytracer_factory, &IID_IActivationFactory, (void **)factory );
++        IActivationFactory_QueryInterface( async_causality_tracer_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, L"Windows.Networking.PushNotifications.PushNotificationChannelManager" ))
+         IActivationFactory_QueryInterface( push_manager_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, L"Windows.Services.Store.StoreContext" ))
+diff --git a/dlls/twinapi.appcore/message_dialog.c b/dlls/twinapi.appcore/message_dialog.c
+index a626ab9..607d1d6 100644
+--- a/dlls/twinapi.appcore/message_dialog.c
++++ b/dlls/twinapi.appcore/message_dialog.c
+@@ -1,122 +1,1091 @@
+-/* WinRT Windows.UI.Popups.MessageDialog (prototype: logs the text and probes the interfaces) */
++/* WinRT Windows.UI.Popups.MessageDialog and UICommand implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
+ #include "private.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
+ 
+-struct probe_obj
++/* ShowAsync shows the dialog as a small topmost window of its own, on a thread of its own, with one button per
++ * command (up to three, as on desktop Windows; with none there is a single "Close"). The window is not owned by
++ * the CoreWindow, which belongs to another thread, so it is made topmost to show above a fullscreen game.
++ * Choosing a button calls that command's Invoked handler and then completes the operation with the command, as
++ * Windows does. Enter picks DefaultCommandIndex and Escape CancelCommandIndex (when it is a valid index). */
++
++#define MAX_COMMANDS 3
++
++/* ---- UICommand ---- */
++
++struct ui_command
+ {
+-    const void *const *lpVtbl;
+-    GUID iid;
+-    HSTRING content, title;
++    IUICommand IUICommand_iface;
++    LONG ref;
++    HSTRING label;
++    IUICommandInvokedHandler *invoked;
++    IInspectable *id;
+ };
+ 
+-extern const void *const dialog_vtbl[];
+-extern const void *const md_factory_probe_vtbl[];
+-
+-#define DSLOT(n) static HRESULT WINAPI dialog_slot##n(struct probe_obj *iface, void *a, void *b) \
+-    { FIXME("dialog iface %s slot %d called (a=%p b=%p) content %s title %s.\n", debugstr_guid(&iface->iid), n, a, b, \
+-            debugstr_hstring(iface->content), debugstr_hstring(iface->title)); return E_NOTIMPL; }
+-DSLOT(6) DSLOT(7) DSLOT(8) DSLOT(9) DSLOT(10) DSLOT(11) DSLOT(12) DSLOT(13) DSLOT(14) DSLOT(15)
++static inline struct ui_command *impl_from_IUICommand( IUICommand *iface )
++{
++    return CONTAINING_RECORD( iface, struct ui_command, IUICommand_iface );
++}
+ 
+-static HRESULT WINAPI dialog_QueryInterface(struct probe_obj *iface, REFIID iid, void **out)
++static HRESULT WINAPI command_QueryInterface( IUICommand *iface, REFIID iid, void **out )
+ {
+-    struct probe_obj *p;
+-    TRACE("iface %p, iid %s.\n", iface, debugstr_guid(iid));
+-    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) || IsEqualGUID(iid, &IID_IAgileObject))
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IUICommand ))
+     {
+         *out = iface;
++        IUICommand_AddRef( iface );
+         return S_OK;
+     }
+-    FIXME("probing dialog interface %s.\n", debugstr_guid(iid));
+-    if (!(p = calloc(1, sizeof(*p)))) return E_OUTOFMEMORY;
+-    *p = *iface;
+-    p->iid = *iid;
+-    *out = p;
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI command_AddRef( IUICommand *iface )
++{
++    return InterlockedIncrement( &impl_from_IUICommand( iface )->ref );
++}
++
++static ULONG WINAPI command_Release( IUICommand *iface )
++{
++    struct ui_command *impl = impl_from_IUICommand( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        WindowsDeleteString( impl->label );
++        if (impl->invoked) IUICommandInvokedHandler_Release( impl->invoked );
++        if (impl->id) IInspectable_Release( impl->id );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI command_GetIids( IUICommand *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI command_GetRuntimeClassName( IUICommand *iface, HSTRING *name )
++{
++    return WindowsCreateString( RuntimeClass_Windows_UI_Popups_UICommand,
++                                wcslen( RuntimeClass_Windows_UI_Popups_UICommand ), name );
++}
++
++static HRESULT WINAPI command_GetTrustLevel( IUICommand *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI command_get_Label( IUICommand *iface, HSTRING *value )
++{
++    return WindowsDuplicateString( impl_from_IUICommand( iface )->label, value );
++}
++
++static HRESULT WINAPI command_put_Label( IUICommand *iface, HSTRING value )
++{
++    struct ui_command *impl = impl_from_IUICommand( iface );
++    HSTRING copy;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %s.\n", iface, debugstr_hstring(value) );
++    if (FAILED(hr = WindowsDuplicateString( value, &copy ))) return hr;
++    WindowsDeleteString( impl->label );
++    impl->label = copy;
+     return S_OK;
+ }
+-static ULONG WINAPI dialog_AddRef(struct probe_obj *iface) { return 2; }
+-static ULONG WINAPI dialog_Release(struct probe_obj *iface) { return 1; }
+-static HRESULT WINAPI dialog_GetIids(struct probe_obj *iface, ULONG *c, IID **i) { return E_NOTIMPL; }
+-static HRESULT WINAPI dialog_GetRuntimeClassName(struct probe_obj *iface, HSTRING *n) { return E_NOTIMPL; }
+-static HRESULT WINAPI dialog_GetTrustLevel(struct probe_obj *iface, TrustLevel *l) { *l = BaseTrust; return S_OK; }
+ 
+-const void *const dialog_vtbl[] = { dialog_QueryInterface, dialog_AddRef, dialog_Release, dialog_GetIids,
+-    dialog_GetRuntimeClassName, dialog_GetTrustLevel,
+-    dialog_slot6, dialog_slot7, dialog_slot8, dialog_slot9, dialog_slot10, dialog_slot11, dialog_slot12,
+-    dialog_slot13, dialog_slot14, dialog_slot15 };
++static HRESULT WINAPI command_get_Invoked( IUICommand *iface, IUICommandInvokedHandler **value )
++{
++    struct ui_command *impl = impl_from_IUICommand( iface );
++    if ((*value = impl->invoked)) IUICommandInvokedHandler_AddRef( *value );
++    return S_OK;
++}
+ 
+-static HRESULT make_dialog(HSTRING content, HSTRING title, void **out)
++static HRESULT WINAPI command_put_Invoked( IUICommand *iface, IUICommandInvokedHandler *value )
+ {
+-    struct probe_obj *d;
++    struct ui_command *impl = impl_from_IUICommand( iface );
++    if (value) IUICommandInvokedHandler_AddRef( value );
++    if (impl->invoked) IUICommandInvokedHandler_Release( impl->invoked );
++    impl->invoked = value;
++    return S_OK;
++}
+ 
+-    if (!(d = calloc(1, sizeof(*d)))) return E_OUTOFMEMORY;
+-    d->lpVtbl = dialog_vtbl;
+-    WindowsDuplicateString(content, &d->content);
+-    WindowsDuplicateString(title, &d->title);
+-    *out = d;
++static HRESULT WINAPI command_get_Id( IUICommand *iface, IInspectable **value )
++{
++    struct ui_command *impl = impl_from_IUICommand( iface );
++    if ((*value = impl->id)) IInspectable_AddRef( *value );
+     return S_OK;
+ }
+ 
+-/* factory interface (IMessageDialogFactory): slot 6 Create(content), slot 7 CreateWithTitle(content, title) */
+-static HRESULT WINAPI factory_slot6(void *iface, HSTRING content, void **out)
++static HRESULT WINAPI command_put_Id( IUICommand *iface, IInspectable *value )
+ {
+-    FIXME("MessageDialog::Create content %s\n", debugstr_hstring(content));
+-    return make_dialog(content, NULL, out);
++    struct ui_command *impl = impl_from_IUICommand( iface );
++    if (value) IInspectable_AddRef( value );
++    if (impl->id) IInspectable_Release( impl->id );
++    impl->id = value;
++    return S_OK;
+ }
+-static HRESULT WINAPI factory_slot7(void *iface, HSTRING content, HSTRING title, void **out)
++
++static const struct IUICommandVtbl command_vtbl =
+ {
+-    FIXME("MessageDialog::CreateWithTitle title %s content %s\n", debugstr_hstring(title), debugstr_hstring(content));
+-    return make_dialog(content, title, out);
++    command_QueryInterface, command_AddRef, command_Release,
++    command_GetIids, command_GetRuntimeClassName, command_GetTrustLevel,
++    command_get_Label, command_put_Label, command_get_Invoked, command_put_Invoked, command_get_Id, command_put_Id,
++};
++
++static HRESULT create_command( HSTRING label, IUICommandInvokedHandler *invoked, IInspectable *id, IUICommand **out )
++{
++    struct ui_command *impl;
++    HRESULT hr;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IUICommand_iface.lpVtbl = &command_vtbl;
++    impl->ref = 1;
++    if (FAILED(hr = WindowsDuplicateString( label, &impl->label )))
++    {
++        free( impl );
++        return hr;
++    }
++    if ((impl->invoked = invoked)) IUICommandInvokedHandler_AddRef( invoked );
++    if ((impl->id = id)) IInspectable_AddRef( id );
++    *out = &impl->IUICommand_iface;
++    return S_OK;
+ }
+ 
+-struct md_factory
++struct command_factory
+ {
+     IActivationFactory IActivationFactory_iface;
+-    const void *const *factory_iface; /* second interface: lpVtbl first */
++    IUICommandFactory IUICommandFactory_iface;
++};
++
++static HRESULT WINAPI command_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out );
++
++static ULONG WINAPI static_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI static_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI static_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI static_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI static_GetTrustLevel( IActivationFactory *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI command_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++    return create_command( NULL, NULL, NULL, (IUICommand **)instance );
++}
++
++static const IActivationFactoryVtbl command_factory_vtbl =
++{
++    command_factory_QueryInterface, static_AddRef, static_Release,
++    static_GetIids, static_GetRuntimeClassName, static_GetTrustLevel,
++    command_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( command_statics, IUICommandFactory, struct command_factory, IActivationFactory_iface )
++
++static HRESULT WINAPI command_statics_Create( IUICommandFactory *iface, HSTRING label, IUICommand **value )
++{
++    TRACE( "iface %p, label %s.\n", iface, debugstr_hstring(label) );
++    return create_command( label, NULL, NULL, value );
++}
++
++static HRESULT WINAPI command_statics_CreateWithHandler( IUICommandFactory *iface, HSTRING label,
++                                                         IUICommandInvokedHandler *action, IUICommand **value )
++{
++    TRACE( "iface %p, label %s, action %p.\n", iface, debugstr_hstring(label), action );
++    return create_command( label, action, NULL, value );
++}
++
++static HRESULT WINAPI command_statics_CreateWithHandlerAndId( IUICommandFactory *iface, HSTRING label,
++                                                              IUICommandInvokedHandler *action, IInspectable *id,
++                                                              IUICommand **value )
++{
++    TRACE( "iface %p, label %s, action %p, id %p.\n", iface, debugstr_hstring(label), action, id );
++    return create_command( label, action, id, value );
++}
++
++static const struct IUICommandFactoryVtbl command_statics_vtbl =
++{
++    command_statics_QueryInterface, command_statics_AddRef, command_statics_Release,
++    command_statics_GetIids, command_statics_GetRuntimeClassName, command_statics_GetTrustLevel,
++    command_statics_Create, command_statics_CreateWithHandler, command_statics_CreateWithHandlerAndId,
++};
++
++static struct command_factory command_factory =
++{
++    { &command_factory_vtbl },
++    { &command_statics_vtbl },
++};
++
++static HRESULT WINAPI command_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &command_factory.IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IUICommandFactory ))
++        *out = &command_factory.IUICommandFactory_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++IActivationFactory *ui_command_factory = &command_factory.IActivationFactory_iface;
++
++/* ---- MessageDialog ---- */
++
++struct message_dialog
++{
++    IMessageDialog IMessageDialog_iface;
++    IVector_IUICommand IVector_IUICommand_iface;   /* Commands; shares the dialog's reference count */
++    LONG ref;
++    HSTRING title, content;
++    IUICommand *commands[MAX_COMMANDS + 1];
++    UINT32 count;
++    UINT32 default_index, cancel_index;
++    MessageDialogOptions options;
++};
++
++static inline struct message_dialog *impl_from_IMessageDialog( IMessageDialog *iface )
++{
++    return CONTAINING_RECORD( iface, struct message_dialog, IMessageDialog_iface );
++}
++
++static HRESULT WINAPI dialog_QueryInterface( IMessageDialog *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IMessageDialog ))
++    {
++        *out = iface;
++        IMessageDialog_AddRef( iface );
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI dialog_AddRef( IMessageDialog *iface )
++{
++    return InterlockedIncrement( &impl_from_IMessageDialog( iface )->ref );
++}
++
++static ULONG WINAPI dialog_Release( IMessageDialog *iface )
++{
++    struct message_dialog *impl = impl_from_IMessageDialog( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref ), i;
++
++    if (!ref)
++    {
++        for (i = 0; i < impl->count; i++) IUICommand_Release( impl->commands[i] );
++        WindowsDeleteString( impl->title );
++        WindowsDeleteString( impl->content );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI dialog_GetIids( IMessageDialog *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI dialog_GetRuntimeClassName( IMessageDialog *iface, HSTRING *name )
++{
++    return WindowsCreateString( RuntimeClass_Windows_UI_Popups_MessageDialog,
++                                wcslen( RuntimeClass_Windows_UI_Popups_MessageDialog ), name );
++}
++
++static HRESULT WINAPI dialog_GetTrustLevel( IMessageDialog *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT replace_string( HSTRING *dst, HSTRING value )
++{
++    HSTRING copy;
++    HRESULT hr;
++
++    if (FAILED(hr = WindowsDuplicateString( value, &copy ))) return hr;
++    WindowsDeleteString( *dst );
++    *dst = copy;
++    return S_OK;
++}
++
++static HRESULT WINAPI dialog_get_Title( IMessageDialog *iface, HSTRING *value )
++{
++    return WindowsDuplicateString( impl_from_IMessageDialog( iface )->title, value );
++}
++
++static HRESULT WINAPI dialog_put_Title( IMessageDialog *iface, HSTRING value )
++{
++    return replace_string( &impl_from_IMessageDialog( iface )->title, value );
++}
++
++static HRESULT WINAPI dialog_get_Commands( IMessageDialog *iface, IVector_IUICommand **value )
++{
++    struct message_dialog *impl = impl_from_IMessageDialog( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = &impl->IVector_IUICommand_iface;
++    IMessageDialog_AddRef( iface );
++    return S_OK;
++}
++
++static HRESULT WINAPI dialog_get_DefaultCommandIndex( IMessageDialog *iface, UINT32 *value )
++{
++    *value = impl_from_IMessageDialog( iface )->default_index;
++    return S_OK;
++}
++
++static HRESULT WINAPI dialog_put_DefaultCommandIndex( IMessageDialog *iface, UINT32 value )
++{
++    impl_from_IMessageDialog( iface )->default_index = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI dialog_get_CancelCommandIndex( IMessageDialog *iface, UINT32 *value )
++{
++    *value = impl_from_IMessageDialog( iface )->cancel_index;
++    return S_OK;
++}
++
++static HRESULT WINAPI dialog_put_CancelCommandIndex( IMessageDialog *iface, UINT32 value )
++{
++    impl_from_IMessageDialog( iface )->cancel_index = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI dialog_get_Content( IMessageDialog *iface, HSTRING *value )
++{
++    return WindowsDuplicateString( impl_from_IMessageDialog( iface )->content, value );
++}
++
++static HRESULT WINAPI dialog_put_Content( IMessageDialog *iface, HSTRING value )
++{
++    return replace_string( &impl_from_IMessageDialog( iface )->content, value );
++}
++
++static HRESULT show_dialog( struct message_dialog *dialog, IAsyncOperation_IUICommand **value );
++
++static HRESULT WINAPI dialog_ShowAsync( IMessageDialog *iface, IAsyncOperation_IUICommand **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return show_dialog( impl_from_IMessageDialog( iface ), value );
++}
++
++static HRESULT WINAPI dialog_get_Options( IMessageDialog *iface, MessageDialogOptions *value )
++{
++    *value = impl_from_IMessageDialog( iface )->options;
++    return S_OK;
++}
++
++static HRESULT WINAPI dialog_put_Options( IMessageDialog *iface, MessageDialogOptions value )
++{
++    impl_from_IMessageDialog( iface )->options = value;
++    return S_OK;
++}
++
++static const struct IMessageDialogVtbl dialog_vtbl =
++{
++    dialog_QueryInterface, dialog_AddRef, dialog_Release,
++    dialog_GetIids, dialog_GetRuntimeClassName, dialog_GetTrustLevel,
++    dialog_get_Title, dialog_put_Title, dialog_get_Commands,
++    dialog_get_DefaultCommandIndex, dialog_put_DefaultCommandIndex,
++    dialog_get_CancelCommandIndex, dialog_put_CancelCommandIndex,
++    dialog_get_Content, dialog_put_Content, dialog_ShowAsync,
++    dialog_get_Options, dialog_put_Options,
+ };
+-static struct md_factory md_factory_obj;
+-static GUID last_factory_iid;
+ 
+-static HRESULT WINAPI md_factory_QueryInterface(IActivationFactory *iface, REFIID iid, void **out)
++/* ---- MessageDialog.Commands: IVector<IUICommand> ---- */
++
++static inline struct message_dialog *impl_from_IVector_IUICommand( IVector_IUICommand *iface )
++{
++    return CONTAINING_RECORD( iface, struct message_dialog, IVector_IUICommand_iface );
++}
++
++static HRESULT WINAPI commands_QueryInterface( IVector_IUICommand *iface, REFIID iid, void **out )
+ {
+-    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
+-    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
+-        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IActivationFactory))
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IVector_IUICommand ))
+     {
+         *out = iface;
++        IVector_IUICommand_AddRef( iface );
+         return S_OK;
+     }
+-    FIXME("assuming %s is IMessageDialogFactory.\n", debugstr_guid(iid));
+-    last_factory_iid = *iid;
+-    *out = &md_factory_obj.factory_iface;
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI commands_AddRef( IVector_IUICommand *iface )
++{
++    return IMessageDialog_AddRef( &impl_from_IVector_IUICommand( iface )->IMessageDialog_iface );
++}
++
++static ULONG WINAPI commands_Release( IVector_IUICommand *iface )
++{
++    return IMessageDialog_Release( &impl_from_IVector_IUICommand( iface )->IMessageDialog_iface );
++}
++
++static HRESULT WINAPI commands_GetIids( IVector_IUICommand *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI commands_GetRuntimeClassName( IVector_IUICommand *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI commands_GetTrustLevel( IVector_IUICommand *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI commands_GetAt( IVector_IUICommand *iface, UINT32 index, IUICommand **value )
++{
++    struct message_dialog *impl = impl_from_IVector_IUICommand( iface );
++
++    *value = NULL;
++    if (index >= impl->count) return E_BOUNDS;
++    IUICommand_AddRef( (*value = impl->commands[index]) );
++    return S_OK;
++}
++
++static HRESULT WINAPI commands_get_Size( IVector_IUICommand *iface, UINT32 *value )
++{
++    *value = impl_from_IVector_IUICommand( iface )->count;
++    return S_OK;
++}
++
++static HRESULT WINAPI commands_GetView( IVector_IUICommand *iface, IVectorView_IUICommand **value )
++{
++    FIXME( "iface %p, value %p: not implemented.\n", iface, value );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI commands_IndexOf( IVector_IUICommand *iface, IUICommand *element, UINT32 *index, BOOLEAN *found )
++{
++    struct message_dialog *impl = impl_from_IVector_IUICommand( iface );
++
++    for (*index = 0; *index < impl->count; (*index)++)
++        if (impl->commands[*index] == element) return (*found = TRUE), S_OK;
++    *index = 0;
++    *found = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI commands_SetAt( IVector_IUICommand *iface, UINT32 index, IUICommand *value )
++{
++    struct message_dialog *impl = impl_from_IVector_IUICommand( iface );
++
++    if (index >= impl->count) return E_BOUNDS;
++    IUICommand_AddRef( value );
++    IUICommand_Release( impl->commands[index] );
++    impl->commands[index] = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI commands_InsertAt( IVector_IUICommand *iface, UINT32 index, IUICommand *value )
++{
++    struct message_dialog *impl = impl_from_IVector_IUICommand( iface );
++
++    TRACE( "iface %p, index %u, value %p.\n", iface, index, value );
++    if (index > impl->count) return E_BOUNDS;
++    if (!value) return E_POINTER;
++    /* Windows takes a fourth command here and fails ShowAsync instead; one more slot keeps that order of errors */
++    if (impl->count > MAX_COMMANDS) return E_UNEXPECTED;
++    memmove( &impl->commands[index + 1], &impl->commands[index], (impl->count - index) * sizeof(*impl->commands) );
++    IUICommand_AddRef( (impl->commands[index] = value) );
++    impl->count++;
++    return S_OK;
++}
++
++static HRESULT WINAPI commands_RemoveAt( IVector_IUICommand *iface, UINT32 index )
++{
++    struct message_dialog *impl = impl_from_IVector_IUICommand( iface );
++
++    if (index >= impl->count) return E_BOUNDS;
++    IUICommand_Release( impl->commands[index] );
++    impl->count--;
++    memmove( &impl->commands[index], &impl->commands[index + 1], (impl->count - index) * sizeof(*impl->commands) );
++    return S_OK;
++}
++
++static HRESULT WINAPI commands_Append( IVector_IUICommand *iface, IUICommand *value )
++{
++    return commands_InsertAt( iface, impl_from_IVector_IUICommand( iface )->count, value );
++}
++
++static HRESULT WINAPI commands_RemoveAtEnd( IVector_IUICommand *iface )
++{
++    struct message_dialog *impl = impl_from_IVector_IUICommand( iface );
++
++    if (!impl->count) return E_BOUNDS;
++    return commands_RemoveAt( iface, impl->count - 1 );
++}
++
++static HRESULT WINAPI commands_Clear( IVector_IUICommand *iface )
++{
++    struct message_dialog *impl = impl_from_IVector_IUICommand( iface );
++
++    while (impl->count) IUICommand_Release( impl->commands[--impl->count] );
++    return S_OK;
++}
++
++static HRESULT WINAPI commands_GetMany( IVector_IUICommand *iface, UINT32 start, UINT32 size, IUICommand **items,
++                                        UINT32 *count )
++{
++    struct message_dialog *impl = impl_from_IVector_IUICommand( iface );
++    UINT32 i;
++
++    for (i = 0; i < size && start + i < impl->count; i++)
++        IUICommand_AddRef( (items[i] = impl->commands[start + i]) );
++    *count = i;
++    return S_OK;
++}
++
++static HRESULT WINAPI commands_ReplaceAll( IVector_IUICommand *iface, UINT32 count, IUICommand **items )
++{
++    HRESULT hr = S_OK;
++    UINT32 i;
++
++    commands_Clear( iface );
++    for (i = 0; i < count && SUCCEEDED(hr); i++) hr = commands_Append( iface, items[i] );
++    return hr;
++}
++
++static const struct IVector_IUICommandVtbl commands_vtbl =
++{
++    commands_QueryInterface, commands_AddRef, commands_Release,
++    commands_GetIids, commands_GetRuntimeClassName, commands_GetTrustLevel,
++    commands_GetAt, commands_get_Size, commands_GetView, commands_IndexOf, commands_SetAt, commands_InsertAt,
++    commands_RemoveAt, commands_Append, commands_RemoveAtEnd, commands_Clear, commands_GetMany, commands_ReplaceAll,
++};
++
++static HRESULT create_dialog( HSTRING content, HSTRING title, IMessageDialog **out )
++{
++    struct message_dialog *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IMessageDialog_iface.lpVtbl = &dialog_vtbl;
++    impl->IVector_IUICommand_iface.lpVtbl = &commands_vtbl;
++    impl->ref = 1;
++    impl->cancel_index = ~0u;
++    WindowsDuplicateString( content, &impl->content );
++    WindowsDuplicateString( title, &impl->title );
++    *out = &impl->IMessageDialog_iface;
++    return S_OK;
++}
++
++/* ---- ShowAsync: IAsyncOperation<IUICommand> ---- */
++
++struct show_op
++{
++    IAsyncOperation_IUICommand IAsyncOperation_IUICommand_iface;
++    IAsyncInfo IAsyncInfo_iface;
++    LONG ref;
++    CRITICAL_SECTION cs;
++    AsyncStatus status;
++    IAsyncOperationCompletedHandler_IUICommand *handler;
++    BOOL handler_set;
++    IUICommand *result;
++    HWND hwnd;   /* the dialog window, while it is up */
++
++    /* what the dialog shows: a snapshot taken by ShowAsync */
++    HSTRING title, content;
++    IUICommand *commands[MAX_COMMANDS];
++    UINT32 count, default_index, cancel_index;
++};
++
++static inline struct show_op *impl_from_IAsyncOperation_IUICommand( IAsyncOperation_IUICommand *iface )
++{
++    return CONTAINING_RECORD( iface, struct show_op, IAsyncOperation_IUICommand_iface );
++}
++
++static HRESULT WINAPI op_QueryInterface( IAsyncOperation_IUICommand *iface, REFIID iid, void **out )
++{
++    struct show_op *impl = impl_from_IAsyncOperation_IUICommand( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IAsyncOperation_IUICommand ))
++        *out = &impl->IAsyncOperation_IUICommand_iface;
++    else if (IsEqualGUID( iid, &IID_IAsyncInfo ))
++        *out = &impl->IAsyncInfo_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI op_AddRef( IAsyncOperation_IUICommand *iface )
++{
++    return InterlockedIncrement( &impl_from_IAsyncOperation_IUICommand( iface )->ref );
++}
++
++static ULONG WINAPI op_Release( IAsyncOperation_IUICommand *iface )
++{
++    struct show_op *impl = impl_from_IAsyncOperation_IUICommand( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref ), i;
++
++    if (!ref)
++    {
++        if (impl->handler) IAsyncOperationCompletedHandler_IUICommand_Release( impl->handler );
++        if (impl->result) IUICommand_Release( impl->result );
++        for (i = 0; i < impl->count; i++) IUICommand_Release( impl->commands[i] );
++        WindowsDeleteString( impl->title );
++        WindowsDeleteString( impl->content );
++        impl->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection( &impl->cs );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI op_GetIids( IAsyncOperation_IUICommand *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI op_GetRuntimeClassName( IAsyncOperation_IUICommand *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI op_GetTrustLevel( IAsyncOperation_IUICommand *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI op_put_Completed( IAsyncOperation_IUICommand *iface, IAsyncOperationCompletedHandler_IUICommand *handler )
++{
++    struct show_op *impl = impl_from_IAsyncOperation_IUICommand( iface );
++    AsyncStatus status;
++
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++
++    EnterCriticalSection( &impl->cs );
++    if (impl->handler_set)
++    {
++        LeaveCriticalSection( &impl->cs );
++        return E_ILLEGAL_DELEGATE_ASSIGNMENT;
++    }
++    impl->handler_set = TRUE;
++    status = impl->status;
++    if (status == Started && handler)
++        IAsyncOperationCompletedHandler_IUICommand_AddRef( (impl->handler = handler) );
++    LeaveCriticalSection( &impl->cs );
++
++    /* already finished: the handler runs at once */
++    if (status != Started && handler)
++        IAsyncOperationCompletedHandler_IUICommand_Invoke( handler, iface, status );
++    return S_OK;
++}
++
++static HRESULT WINAPI op_get_Completed( IAsyncOperation_IUICommand *iface, IAsyncOperationCompletedHandler_IUICommand **handler )
++{
++    struct show_op *impl = impl_from_IAsyncOperation_IUICommand( iface );
++
++    EnterCriticalSection( &impl->cs );
++    if ((*handler = impl->handler)) IAsyncOperationCompletedHandler_IUICommand_AddRef( *handler );
++    LeaveCriticalSection( &impl->cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI op_GetResults( IAsyncOperation_IUICommand *iface, IUICommand **results )
++{
++    struct show_op *impl = impl_from_IAsyncOperation_IUICommand( iface );
++    HRESULT hr = S_OK;
++
++    TRACE( "iface %p, results %p.\n", iface, results );
++
++    EnterCriticalSection( &impl->cs );
++    *results = NULL;
++    if (impl->status == Started) hr = E_ILLEGAL_METHOD_CALL;
++    else if (impl->status == Completed && (*results = impl->result)) IUICommand_AddRef( *results );
++    LeaveCriticalSection( &impl->cs );
++    return hr;
++}
++
++static const struct IAsyncOperation_IUICommandVtbl op_vtbl =
++{
++    op_QueryInterface, op_AddRef, op_Release,
++    op_GetIids, op_GetRuntimeClassName, op_GetTrustLevel,
++    op_put_Completed, op_get_Completed, op_GetResults,
++};
++
++DEFINE_IINSPECTABLE( info, IAsyncInfo, struct show_op, IAsyncOperation_IUICommand_iface )
++
++static HRESULT WINAPI info_get_Id( IAsyncInfo *iface, UINT32 *id )
++{
++    *id = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI info_get_Status( IAsyncInfo *iface, AsyncStatus *status )
++{
++    struct show_op *impl = impl_from_IAsyncInfo( iface );
++
++    EnterCriticalSection( &impl->cs );
++    *status = impl->status;
++    LeaveCriticalSection( &impl->cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI info_get_ErrorCode( IAsyncInfo *iface, HRESULT *error )
++{
++    *error = S_OK;
++    return S_OK;
++}
++
++static HRESULT WINAPI info_Cancel( IAsyncInfo *iface )
++{
++    struct show_op *impl = impl_from_IAsyncInfo( iface );
++
++    TRACE( "iface %p.\n", iface );
++
++    /* the dialog thread sees the window go and completes the operation as cancelled */
++    EnterCriticalSection( &impl->cs );
++    if (impl->status == Started && impl->hwnd) PostMessageW( impl->hwnd, WM_CLOSE, 0, 0 );
++    LeaveCriticalSection( &impl->cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI info_Close( IAsyncInfo *iface )
++{
++    return S_OK;
++}
++
++static const struct IAsyncInfoVtbl info_vtbl =
++{
++    info_QueryInterface, info_AddRef, info_Release,
++    info_GetIids, info_GetRuntimeClassName, info_GetTrustLevel,
++    info_get_Id, info_get_Status, info_get_ErrorCode, info_Cancel, info_Close,
++};
++
++/* ---- the dialog window ---- */
++
++#define ID_BUTTON_FIRST 100
++#define WM_DIALOG_DONE (WM_APP + 1)
++
++static const WCHAR dialog_class[] = L"WineUwpMessageDialog";
++
++static LRESULT CALLBACK dialog_wnd_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
++{
++    switch (msg)
++    {
++    case WM_COMMAND:
++        if (LOWORD(wparam) >= ID_BUTTON_FIRST && LOWORD(wparam) < ID_BUTTON_FIRST + MAX_COMMANDS)
++        {
++            PostMessageW( hwnd, WM_DIALOG_DONE, LOWORD(wparam) - ID_BUTTON_FIRST, 0 );
++            return 0;
++        }
++        if (LOWORD(wparam) == IDCANCEL)   /* Escape, through IsDialogMessage */
++        {
++            struct show_op *op = (struct show_op *)GetWindowLongPtrW( hwnd, GWLP_USERDATA );
++            if (op->cancel_index < op->count) PostMessageW( hwnd, WM_DIALOG_DONE, op->cancel_index, 0 );
++            return 0;
++        }
++        break;
++    case WM_CTLCOLORSTATIC:
++        return (LRESULT)GetSysColorBrush( COLOR_WINDOW );
++    case WM_CLOSE:   /* only from IAsyncInfo::Cancel: the window has no close box */
++        PostMessageW( hwnd, WM_DIALOG_DONE, ~0u, 0 );
++        return 0;
++    }
++    return DefWindowProcW( hwnd, msg, wparam, lparam );
++}
++
++static HFONT dialog_font( UINT dpi, int scale )
++{
++    LOGFONTW font = { 0 };
++
++    /* the message font is 9 points at 96 dpi; scale 2 is that size, 3 is half as big again and semibold */
++    font.lfHeight = -MulDiv( 9 * scale / 2, dpi, 72 );
++    font.lfWeight = scale > 2 ? FW_SEMIBOLD : FW_NORMAL;
++    font.lfCharSet = DEFAULT_CHARSET;
++    font.lfQuality = CLEARTYPE_QUALITY;
++    wcscpy( font.lfFaceName, L"Tahoma" );
++    return CreateFontIndirectW( &font );
++}
++
++/* Runs the dialog on the current thread; returns the index of the chosen command, or ~0u when cancelled. */
++static UINT32 run_dialog( struct show_op *op, const WCHAR **labels, UINT32 count )
++{
++    WNDCLASSW cls = { 0 };
++    HMONITOR monitor;
++    MONITORINFO mi = { sizeof(mi) };
++    HFONT title_font, text_font;
++    HWND hwnd, title_wnd, text_wnd, buttons[MAX_COMMANDS];
++    RECT title_rc, text_rc, rc;
++    HDC hdc;
++    UINT dpi = GetDpiForSystem();
++    int margin = MulDiv( 24, dpi, 96 ), button_w = MulDiv( 120, dpi, 96 ), button_h = MulDiv( 32, dpi, 96 );
++    int gap = MulDiv( 8, dpi, 96 ), width, height, x, y;
++    const WCHAR *title = WindowsGetStringRawBuffer( op->title, NULL );
++    const WCHAR *content = WindowsGetStringRawBuffer( op->content, NULL );
++    UINT32 i, chosen = ~0u;
++    MSG msg;
++
++    cls.lpfnWndProc = dialog_wnd_proc;
++    cls.hInstance = GetModuleHandleW( NULL );
++    cls.hCursor = LoadCursorW( NULL, (const WCHAR *)IDC_ARROW );
++    cls.hbrBackground = GetSysColorBrush( COLOR_WINDOW );
++    cls.lpszClassName = dialog_class;
++    RegisterClassW( &cls );   /* fails harmlessly when a second dialog registers it again */
++
++    monitor = MonitorFromWindow( GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY );
++    GetMonitorInfoW( monitor, &mi );
++    width = min( MulDiv( 560, dpi, 96 ), mi.rcWork.right - mi.rcWork.left );
++
++    title_font = dialog_font( dpi, 3 );
++    text_font = dialog_font( dpi, 2 );
++    hdc = GetDC( NULL );
++    SetRect( &title_rc, 0, 0, width - 2 * margin, 0 );
++    SetRect( &text_rc, 0, 0, width - 2 * margin, 0 );
++    if (*title)
++    {
++        SelectObject( hdc, title_font );
++        DrawTextW( hdc, title, -1, &title_rc, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX );
++    }
++    SelectObject( hdc, text_font );
++    DrawTextW( hdc, content, -1, &text_rc, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX );
++    ReleaseDC( NULL, hdc );
++    text_rc.bottom = min( text_rc.bottom, (mi.rcWork.bottom - mi.rcWork.top) / 2 );
++
++    height = margin + title_rc.bottom + (*title ? gap * 2 : 0) + text_rc.bottom + margin + button_h + margin;
++    SetRect( &rc, 0, 0, width, height );
++    AdjustWindowRectEx( &rc, WS_POPUP | WS_BORDER, FALSE, WS_EX_TOPMOST | WS_EX_DLGMODALFRAME );
++    x = (mi.rcWork.left + mi.rcWork.right - (rc.right - rc.left)) / 2;
++    y = (mi.rcWork.top + mi.rcWork.bottom - (rc.bottom - rc.top)) / 2;
++
++    hwnd = CreateWindowExW( WS_EX_TOPMOST | WS_EX_DLGMODALFRAME, dialog_class, title, WS_POPUP | WS_BORDER | WS_CAPTION,
++                            x, y, rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, cls.hInstance, NULL );
++    if (!hwnd)
++    {
++        ERR( "could not create the dialog window, error %lu.\n", GetLastError() );
++        DeleteObject( title_font );
++        DeleteObject( text_font );
++        return op->default_index < count ? op->default_index : 0;
++    }
++    SetWindowLongPtrW( hwnd, GWLP_USERDATA, (LONG_PTR)op );
++
++    y = margin;
++    if (*title)
++    {
++        title_wnd = CreateWindowExW( 0, L"STATIC", title, WS_CHILD | WS_VISIBLE | SS_NOPREFIX, margin, y,
++                                     width - 2 * margin, title_rc.bottom, hwnd, NULL, cls.hInstance, NULL );
++        SendMessageW( title_wnd, WM_SETFONT, (WPARAM)title_font, FALSE );
++        y += title_rc.bottom + gap * 2;
++    }
++    text_wnd = CreateWindowExW( 0, L"STATIC", content, WS_CHILD | WS_VISIBLE | SS_NOPREFIX, margin, y,
++                                width - 2 * margin, text_rc.bottom, hwnd, NULL, cls.hInstance, NULL );
++    SendMessageW( text_wnd, WM_SETFONT, (WPARAM)text_font, FALSE );
++    y += text_rc.bottom + margin;
++
++    /* the buttons sit at the bottom right, in command order */
++    x = width - margin - count * button_w - (count - 1) * gap;
++    for (i = 0; i < count; i++)
++    {
++        BOOL is_default = (i == op->default_index);
++        buttons[i] = CreateWindowExW( 0, L"BUTTON", labels[i],
++                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | (is_default ? BS_DEFPUSHBUTTON : BS_PUSHBUTTON),
++                                      x + i * (button_w + gap), y, button_w, button_h, hwnd,
++                                      (HMENU)(UINT_PTR)(ID_BUTTON_FIRST + i), cls.hInstance, NULL );
++        SendMessageW( buttons[i], WM_SETFONT, (WPARAM)text_font, FALSE );
++    }
++
++    EnterCriticalSection( &op->cs );
++    op->hwnd = hwnd;
++    LeaveCriticalSection( &op->cs );
++
++    ShowWindow( hwnd, SW_SHOW );
++    SetForegroundWindow( hwnd );
++    SetFocus( buttons[op->default_index < count ? op->default_index : 0] );
++
++    while (GetMessageW( &msg, NULL, 0, 0 ) > 0)
++    {
++        if (msg.hwnd == hwnd && msg.message == WM_DIALOG_DONE)
++        {
++            chosen = (UINT32)msg.wParam;
++            break;
++        }
++        /* Enter presses the default button, Escape sends IDCANCEL */
++        if (IsDialogMessageW( hwnd, &msg )) continue;
++        TranslateMessage( &msg );
++        DispatchMessageW( &msg );
++    }
++
++    EnterCriticalSection( &op->cs );
++    op->hwnd = NULL;
++    LeaveCriticalSection( &op->cs );
++    DestroyWindow( hwnd );
++    DeleteObject( title_font );
++    DeleteObject( text_font );
++    return chosen;
++}
++
++static DWORD WINAPI dialog_thread( void *arg )
++{
++    struct show_op *op = arg;
++    IAsyncOperationCompletedHandler_IUICommand *handler;
++    const WCHAR *labels[MAX_COMMANDS];
++    IUICommand *command = NULL;
++    IUICommandInvokedHandler *invoked = NULL;
++    AsyncStatus status;
++    HSTRING close = NULL;
++    UINT32 count = op->count, chosen, i;
++
++    SetThreadDescription( GetCurrentThread(), L"wine_uwp_message_dialog" );
++
++    if (!count)
++    {
++        /* no commands: Windows shows a single "Close", and the operation's result is that implicit command */
++        WindowsCreateString( L"Close", 5, &close );
++        if (SUCCEEDED(create_command( close, NULL, NULL, &op->commands[0] ))) count = op->count = 1;
++        WindowsDeleteString( close );
++    }
++    for (i = 0; i < count; i++)
++    {
++        HSTRING label = NULL;
++        IUICommand_get_Label( op->commands[i], &label );
++        labels[i] = wcsdup( WindowsGetStringRawBuffer( label, NULL ) );
++        WindowsDeleteString( label );
++    }
++
++    chosen = run_dialog( op, labels, count );
++    for (i = 0; i < count; i++) free( (void *)labels[i] );
++
++    if (chosen < count)
++    {
++        IUICommand_AddRef( (command = op->commands[chosen]) );
++        IUICommand_get_Invoked( command, &invoked );
++    }
++    TRACE( "dialog closed: command %u of %u, invoked handler %p.\n", chosen, count, invoked );
++
++    /* the command's own handler runs before the operation completes */
++    if (invoked)
++    {
++        IUICommandInvokedHandler_Invoke( invoked, command );
++        IUICommandInvokedHandler_Release( invoked );
++    }
++
++    EnterCriticalSection( &op->cs );
++    op->result = command;
++    op->status = status = command ? Completed : Canceled;
++    handler = op->handler;
++    op->handler = NULL;
++    LeaveCriticalSection( &op->cs );
++
++    if (handler)
++    {
++        IAsyncOperationCompletedHandler_IUICommand_Invoke( handler, &op->IAsyncOperation_IUICommand_iface, status );
++        IAsyncOperationCompletedHandler_IUICommand_Release( handler );
++    }
++    IAsyncOperation_IUICommand_Release( &op->IAsyncOperation_IUICommand_iface );
++    return 0;
++}
++
++static HRESULT show_dialog( struct message_dialog *dialog, IAsyncOperation_IUICommand **value )
++{
++    struct show_op *op;
++    HANDLE thread;
++    UINT32 i;
++
++    *value = NULL;
++    if (dialog->count > MAX_COMMANDS) return E_UNEXPECTED;
++    if (!(op = calloc( 1, sizeof(*op) ))) return E_OUTOFMEMORY;
++    op->IAsyncOperation_IUICommand_iface.lpVtbl = &op_vtbl;
++    op->IAsyncInfo_iface.lpVtbl = &info_vtbl;
++    op->ref = 2;   /* the caller's and the dialog thread's */
++    op->status = Started;
++    InitializeCriticalSectionEx( &op->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    op->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": show_op.cs");
++    WindowsDuplicateString( dialog->title, &op->title );
++    WindowsDuplicateString( dialog->content, &op->content );
++    for (i = 0; i < dialog->count; i++) IUICommand_AddRef( (op->commands[i] = dialog->commands[i]) );
++    op->count = dialog->count;
++    op->default_index = dialog->default_index;
++    op->cancel_index = dialog->cancel_index;
++
++    FIXME( "showing dialog title %s, content %s, %u commands.\n", debugstr_hstring(op->title),
++           debugstr_hstring(op->content), op->count );
++
++    if (!(thread = CreateThread( NULL, 0, dialog_thread, op, 0, NULL )))
++    {
++        op->ref = 1;
++        IAsyncOperation_IUICommand_Release( &op->IAsyncOperation_IUICommand_iface );
++        return HRESULT_FROM_WIN32( GetLastError() );
++    }
++    CloseHandle( thread );
++    *value = &op->IAsyncOperation_IUICommand_iface;
+     return S_OK;
+ }
+-static ULONG WINAPI md_factory_AddRef(IActivationFactory *iface) { return 2; }
+-static ULONG WINAPI md_factory_Release(IActivationFactory *iface) { return 1; }
+-static HRESULT WINAPI md_factory_GetIids(IActivationFactory *iface, ULONG *c, IID **i) { return E_NOTIMPL; }
+-static HRESULT WINAPI md_factory_GetRuntimeClassName(IActivationFactory *iface, HSTRING *n) { return E_NOTIMPL; }
+-static HRESULT WINAPI md_factory_GetTrustLevel(IActivationFactory *iface, TrustLevel *l) { *l = BaseTrust; return S_OK; }
+-static HRESULT WINAPI md_factory_ActivateInstance(IActivationFactory *iface, IInspectable **i) { return E_NOTIMPL; }
+-static const IActivationFactoryVtbl md_factory_vtbl =
++
++/* ---- MessageDialog's factory ---- */
++
++struct dialog_factory
+ {
+-    md_factory_QueryInterface, md_factory_AddRef, md_factory_Release,
+-    md_factory_GetIids, md_factory_GetRuntimeClassName, md_factory_GetTrustLevel,
+-    md_factory_ActivateInstance,
++    IActivationFactory IActivationFactory_iface;
++    IMessageDialogFactory IMessageDialogFactory_iface;
+ };
+ 
+-static HRESULT WINAPI fi_QueryInterface(void *iface, REFIID iid, void **out)
+-{ return md_factory_QueryInterface(&md_factory_obj.IActivationFactory_iface, iid, out); }
+-static ULONG WINAPI fi_AddRef(void *iface) { return 2; }
+-static ULONG WINAPI fi_Release(void *iface) { return 1; }
+-static HRESULT WINAPI fi_GetIids(void *iface, ULONG *c, IID **i) { return E_NOTIMPL; }
+-static HRESULT WINAPI fi_GetRuntimeClassName(void *iface, HSTRING *n) { return E_NOTIMPL; }
+-static HRESULT WINAPI fi_GetTrustLevel(void *iface, TrustLevel *l) { *l = BaseTrust; return S_OK; }
+-const void *const md_factory_probe_vtbl[] = { fi_QueryInterface, fi_AddRef, fi_Release, fi_GetIids,
+-    fi_GetRuntimeClassName, fi_GetTrustLevel, factory_slot6, factory_slot7 };
++static HRESULT WINAPI dialog_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out );
++
++static HRESULT WINAPI dialog_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    return E_NOTIMPL;   /* MessageDialog has no default constructor */
++}
++
++static const IActivationFactoryVtbl dialog_factory_vtbl =
++{
++    dialog_factory_QueryInterface, static_AddRef, static_Release,
++    static_GetIids, static_GetRuntimeClassName, static_GetTrustLevel,
++    dialog_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( dialog_statics, IMessageDialogFactory, struct dialog_factory, IActivationFactory_iface )
++
++static HRESULT WINAPI dialog_statics_Create( IMessageDialogFactory *iface, HSTRING content, IMessageDialog **value )
++{
++    TRACE( "iface %p, content %s.\n", iface, debugstr_hstring(content) );
++    return create_dialog( content, NULL, value );
++}
++
++static HRESULT WINAPI dialog_statics_CreateWithTitle( IMessageDialogFactory *iface, HSTRING content, HSTRING title,
++                                                      IMessageDialog **value )
++{
++    TRACE( "iface %p, content %s, title %s.\n", iface, debugstr_hstring(content), debugstr_hstring(title) );
++    return create_dialog( content, title, value );
++}
++
++static const struct IMessageDialogFactoryVtbl dialog_statics_vtbl =
++{
++    dialog_statics_QueryInterface, dialog_statics_AddRef, dialog_statics_Release,
++    dialog_statics_GetIids, dialog_statics_GetRuntimeClassName, dialog_statics_GetTrustLevel,
++    dialog_statics_Create, dialog_statics_CreateWithTitle,
++};
++
++static struct dialog_factory dialog_factory =
++{
++    { &dialog_factory_vtbl },
++    { &dialog_statics_vtbl },
++};
++
++static HRESULT WINAPI dialog_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &dialog_factory.IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IMessageDialogFactory ))
++        *out = &dialog_factory.IMessageDialogFactory_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++IActivationFactory *message_dialog_factory = &dialog_factory.IActivationFactory_iface;
+ 
+-IActivationFactory *message_dialog_factory = &md_factory_obj.IActivationFactory_iface;
+ void message_dialog_init(void)
+ {
+-    md_factory_obj.IActivationFactory_iface.lpVtbl = &md_factory_vtbl;
+-    md_factory_obj.factory_iface = md_factory_probe_vtbl;
+ }
+diff --git a/dlls/twinapi.appcore/mouse.c b/dlls/twinapi.appcore/mouse.c
+new file mode 100644
+index 0000000..c2cfdc0
+--- /dev/null
++++ b/dlls/twinapi.appcore/mouse.c
+@@ -0,0 +1,305 @@
++/* WinRT Windows.Devices.Input.MouseDevice implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#include "windows.devices.input.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
++
++/* MouseDevice.GetForCurrentView().MouseMoved gives relative mouse motion (games use it for mouse look while the
++ * cursor is hidden). Adding the first handler registers the process for raw mouse input; the CoreWindow's window
++ * procedure passes each WM_INPUT here and the handlers run on the window's thread, as on Windows, while the app
++ * pumps the dispatcher. One device object serves every view. */
++
++struct mouse_args
++{
++    IMouseEventArgs IMouseEventArgs_iface;
++    LONG ref;
++    MouseDelta delta;
++};
++
++static inline struct mouse_args *impl_from_IMouseEventArgs( IMouseEventArgs *iface )
++{
++    return CONTAINING_RECORD( iface, struct mouse_args, IMouseEventArgs_iface );
++}
++
++static HRESULT WINAPI args_QueryInterface( IMouseEventArgs *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IMouseEventArgs ))
++    {
++        *out = iface;
++        IMouseEventArgs_AddRef( iface );
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI args_AddRef( IMouseEventArgs *iface )
++{
++    return InterlockedIncrement( &impl_from_IMouseEventArgs( iface )->ref );
++}
++
++static ULONG WINAPI args_Release( IMouseEventArgs *iface )
++{
++    struct mouse_args *impl = impl_from_IMouseEventArgs( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI args_GetIids( IMouseEventArgs *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI args_GetRuntimeClassName( IMouseEventArgs *iface, HSTRING *name )
++{
++    return WindowsCreateString( RuntimeClass_Windows_Devices_Input_MouseEventArgs,
++                                wcslen( RuntimeClass_Windows_Devices_Input_MouseEventArgs ), name );
++}
++
++static HRESULT WINAPI args_GetTrustLevel( IMouseEventArgs *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI args_get_MouseDelta( IMouseEventArgs *iface, MouseDelta *value )
++{
++    *value = impl_from_IMouseEventArgs( iface )->delta;
++    return S_OK;
++}
++
++static const struct IMouseEventArgsVtbl args_vtbl =
++{
++    args_QueryInterface, args_AddRef, args_Release,
++    args_GetIids, args_GetRuntimeClassName, args_GetTrustLevel,
++    args_get_MouseDelta,
++};
++
++struct mouse_handler
++{
++    ITypedEventHandler_MouseDevice_MouseEventArgs *handler;
++    INT64 token;
++};
++
++struct mouse_device
++{
++    IActivationFactory IActivationFactory_iface;
++    IMouseDeviceStatics IMouseDeviceStatics_iface;
++    IMouseDevice IMouseDevice_iface;
++    CRITICAL_SECTION cs;
++    struct mouse_handler *handlers;
++    UINT count, capacity;
++    INT64 next_token;
++    BOOL registered;
++};
++
++static struct mouse_device mouse;
++
++static CRITICAL_SECTION_DEBUG mouse_cs_debug =
++{
++    0, 0, &mouse.cs,
++    { &mouse_cs_debug.ProcessLocksList, &mouse_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": mouse.cs") }
++};
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &mouse.IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IMouseDeviceStatics ))
++        *out = &mouse.IMouseDeviceStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance ) { return E_NOTIMPL; }
++
++static const IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface, factory_AddRef, factory_Release,
++    factory_GetIids, factory_GetRuntimeClassName, factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( statics, IMouseDeviceStatics, struct mouse_device, IActivationFactory_iface )
++
++static HRESULT WINAPI statics_GetForCurrentView( IMouseDeviceStatics *iface, IMouseDevice **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = &mouse.IMouseDevice_iface;
++    return S_OK;
++}
++
++static const struct IMouseDeviceStaticsVtbl statics_vtbl =
++{
++    statics_QueryInterface, statics_AddRef, statics_Release,
++    statics_GetIids, statics_GetRuntimeClassName, statics_GetTrustLevel,
++    statics_GetForCurrentView,
++};
++
++static HRESULT WINAPI device_QueryInterface( IMouseDevice *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IMouseDevice ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI device_AddRef( IMouseDevice *iface ) { return 2; }
++static ULONG WINAPI device_Release( IMouseDevice *iface ) { return 1; }
++static HRESULT WINAPI device_GetIids( IMouseDevice *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI device_GetRuntimeClassName( IMouseDevice *iface, HSTRING *name )
++{
++    return WindowsCreateString( RuntimeClass_Windows_Devices_Input_MouseDevice,
++                                wcslen( RuntimeClass_Windows_Devices_Input_MouseDevice ), name );
++}
++
++static HRESULT WINAPI device_GetTrustLevel( IMouseDevice *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI device_add_MouseMoved( IMouseDevice *iface, ITypedEventHandler_MouseDevice_MouseEventArgs *handler,
++                                             EventRegistrationToken *token )
++{
++    RAWINPUTDEVICE rid = { 0x01 /* generic desktop */, 0x02 /* mouse */, 0, NULL };
++    struct mouse_handler *handlers;
++
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
++    if (!handler) return E_INVALIDARG;
++
++    EnterCriticalSection( &mouse.cs );
++    if (mouse.count == mouse.capacity)
++    {
++        UINT capacity = max( 4, mouse.capacity * 2 );
++        if (!(handlers = realloc( mouse.handlers, capacity * sizeof(*handlers) )))
++        {
++            LeaveCriticalSection( &mouse.cs );
++            return E_OUTOFMEMORY;
++        }
++        mouse.handlers = handlers;
++        mouse.capacity = capacity;
++    }
++    ITypedEventHandler_MouseDevice_MouseEventArgs_AddRef( handler );
++    mouse.handlers[mouse.count].handler = handler;
++    mouse.handlers[mouse.count].token = token->value = ++mouse.next_token;
++    mouse.count++;
++    /* WM_INPUT goes to the window with the keyboard focus, which is the CoreWindow */
++    if (!mouse.registered && !(mouse.registered = RegisterRawInputDevices( &rid, 1, sizeof(rid) )))
++        WARN( "RegisterRawInputDevices failed, error %lu.\n", GetLastError() );
++    LeaveCriticalSection( &mouse.cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI device_remove_MouseMoved( IMouseDevice *iface, EventRegistrationToken token )
++{
++    ITypedEventHandler_MouseDevice_MouseEventArgs *handler = NULL;
++    UINT i;
++
++    TRACE( "iface %p, token %#I64x.\n", iface, token.value );
++
++    EnterCriticalSection( &mouse.cs );
++    for (i = 0; i < mouse.count; i++)
++    {
++        if (mouse.handlers[i].token != token.value) continue;
++        handler = mouse.handlers[i].handler;
++        memmove( &mouse.handlers[i], &mouse.handlers[i + 1], (mouse.count - i - 1) * sizeof(*mouse.handlers) );
++        mouse.count--;
++        break;
++    }
++    LeaveCriticalSection( &mouse.cs );
++    if (handler) ITypedEventHandler_MouseDevice_MouseEventArgs_Release( handler );
++    return S_OK;
++}
++
++static const struct IMouseDeviceVtbl device_vtbl =
++{
++    device_QueryInterface, device_AddRef, device_Release,
++    device_GetIids, device_GetRuntimeClassName, device_GetTrustLevel,
++    device_add_MouseMoved, device_remove_MouseMoved,
++};
++
++/* Called by the CoreWindow's window procedure for WM_INPUT; the caller still passes the message to DefWindowProc. */
++void mouse_device_raw_input( HRAWINPUT input )
++{
++    ITypedEventHandler_MouseDevice_MouseEventArgs **handlers;
++    struct mouse_args *args;
++    RAWINPUT raw;
++    UINT size = sizeof(raw), count, i;
++
++    if (!mouse.count) return;
++    if (GetRawInputData( input, RID_INPUT, &raw, &size, sizeof(RAWINPUTHEADER) ) == (UINT)-1) return;
++    if (raw.header.dwType != RIM_TYPEMOUSE || (raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) return;
++    if (!raw.data.mouse.lLastX && !raw.data.mouse.lLastY) return;   /* a button or wheel change */
++
++    if (!(args = malloc( sizeof(*args) ))) return;
++    args->IMouseEventArgs_iface.lpVtbl = &args_vtbl;
++    args->ref = 1;
++    args->delta.X = raw.data.mouse.lLastX;
++    args->delta.Y = raw.data.mouse.lLastY;
++
++    /* call the handlers outside the lock: one may remove itself */
++    EnterCriticalSection( &mouse.cs );
++    count = mouse.count;
++    if ((handlers = malloc( count * sizeof(*handlers) )))
++        for (i = 0; i < count; i++)
++        {
++            handlers[i] = mouse.handlers[i].handler;
++            ITypedEventHandler_MouseDevice_MouseEventArgs_AddRef( handlers[i] );
++        }
++    LeaveCriticalSection( &mouse.cs );
++
++    if (handlers)
++    {
++        for (i = 0; i < count; i++)
++        {
++            ITypedEventHandler_MouseDevice_MouseEventArgs_Invoke( handlers[i], &mouse.IMouseDevice_iface,
++                                                                  &args->IMouseEventArgs_iface );
++            ITypedEventHandler_MouseDevice_MouseEventArgs_Release( handlers[i] );
++        }
++        free( handlers );
++    }
++    IMouseEventArgs_Release( &args->IMouseEventArgs_iface );
++}
++
++static struct mouse_device mouse =
++{
++    { &factory_vtbl },
++    { &statics_vtbl },
++    { &device_vtbl },
++    { &mouse_cs_debug, -1, 0, 0, 0, 0 },
++};
++
++IActivationFactory *mouse_device_factory = &mouse.IActivationFactory_iface;
+diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
+index f7ccfb4..f6afca3 100644
+--- a/dlls/twinapi.appcore/private.h
++++ b/dlls/twinapi.appcore/private.h
+@@ -42,9 +42,12 @@
+ #define WIDL_using_Windows_ApplicationModel_Activation
+ #define WIDL_using_Windows_UI_Core
+ #define WIDL_using_Windows_UI_Input
++#define WIDL_using_Windows_Devices_Input
++#define WIDL_using_Windows_UI_Popups
+ #define WIDL_using_Windows_System
+ #include "windows.ui.viewmanagement.h"
+ #include "windows.ui.core.h"
++#include "windows.ui.popups.h"
+ #include "windows.applicationmodel.core.h"
+ 
+ #include "wine/debug.h"
+@@ -59,7 +62,11 @@ extern void core_cursor_init(void);
+ extern IActivationFactory *message_dialog_factory;
+ extern void message_dialog_init(void);
+ extern IActivationFactory *hardware_identification_factory;
+-extern IActivationFactory *web_token_manager_factory, *web_token_request_factory, *web_account_provider_factory, *user_picker_factory, *system_user_factory, *launcher_factory, *web_account_factory, *web_token_response_factory, *thread_pool_timer_factory, *user_statics_factory, *store_context_real_factory, *message_websocket_factory, *store_context_factory, *logging_options_factory, *logging_fields_factory, *push_manager_factory, *logging_channel_factory, *loggingchanneloptions_factory, *loggingactivity_factory, *loggingsession_factory, *asynccausalitytracer_factory;
++extern IActivationFactory *web_token_manager_factory, *web_token_request_factory, *web_account_provider_factory, *user_picker_factory, *system_user_factory, *launcher_factory, *web_account_factory, *web_token_response_factory, *thread_pool_timer_factory, *user_statics_factory, *store_context_real_factory, *message_websocket_factory, *store_context_factory, *logging_options_factory, *logging_fields_factory, *push_manager_factory, *logging_channel_factory, *loggingchanneloptions_factory, *loggingactivity_factory, *loggingsession_factory;
++extern IActivationFactory *async_causality_tracer_factory;   /* causality.c */
++extern IActivationFactory *mouse_device_factory;   /* mouse.c */
++extern IActivationFactory *ui_command_factory;   /* message_dialog.c */
++extern void mouse_device_raw_input( HRAWINPUT input );
+ extern IActivationFactory *core_window_factory;
+ extern IActivationFactory *current_app_factory;
+ extern IActivationFactory *display_request_factory;
+diff --git a/dlls/twinapi.appcore/sink.c b/dlls/twinapi.appcore/sink.c
+index 4ae62ba..ae8f862 100644
+--- a/dlls/twinapi.appcore/sink.c
++++ b/dlls/twinapi.appcore/sink.c
+@@ -202,7 +202,6 @@ SFACTORY(logging_channel_factory, L"LoggingChannel")
+ SFACTORY(loggingchanneloptions_factory, L"LoggingChannelOptions")
+ SFACTORY(loggingactivity_factory, L"LoggingActivity")
+ SFACTORY(loggingsession_factory, L"LoggingSession")
+-SFACTORY(asynccausalitytracer_factory, L"AsyncCausalityTracer")
+ 
+ /* "Offline" statics: every method fails with a network error. */
+ #define NET_ERR ((HRESULT)0x80072ee7)
+diff --git a/dlls/twinapi.appcore/twinapi.appcore.rgs b/dlls/twinapi.appcore/twinapi.appcore.rgs
+index 84a4773..9c28d89 100644
+--- a/dlls/twinapi.appcore/twinapi.appcore.rgs
++++ b/dlls/twinapi.appcore/twinapi.appcore.rgs
+@@ -108,6 +108,14 @@ HKLM
+                     {
+                         val 'DllPath' = s '%MODULE%'
+                     }
++                    ForceRemove Windows.Devices.Input.MouseDevice
++                    {
++                        val 'DllPath' = s '%MODULE%'
++                    }
++                    ForceRemove Windows.UI.Popups.UICommand
++                    {
++                        val 'DllPath' = s '%MODULE%'
++                    }
+                     ForceRemove Windows.UI.Popups.MessageDialog
+                     {
+                         val 'DllPath' = s '%MODULE%'
+diff --git a/dlls/windows.applicationmodel/package.c b/dlls/windows.applicationmodel/package.c
+index 51b66df..3cfa294 100644
+--- a/dlls/windows.applicationmodel/package.c
++++ b/dlls/windows.applicationmodel/package.c
+@@ -324,10 +324,16 @@ static HRESULT WINAPI storage_item_get_Name( IStorageItem *iface, HSTRING *value
+ static HRESULT WINAPI storage_item_get_Path( IStorageItem *iface, HSTRING *value )
+ {
+     WCHAR buffer[MAX_PATH];
++    UINT32 len = ARRAY_SIZE(buffer);
+     HRESULT hr;
+ 
+     TRACE( "iface %p, value %p\n", iface, value );
+ 
++    /* the package root, which can be above the executable (Gears of War 4: GearGame\Binaries\UWP64\GearGame.exe);
++     * Unreal Engine finds its content from it */
++    if (!GetCurrentPackagePath( &len, buffer ))
++        return WindowsCreateString( buffer, wcslen(buffer), value );
++
+     if (!GetModuleFileNameW( NULL, buffer, MAX_PATH )) return HRESULT_FROM_WIN32( GetLastError() );
+     if (FAILED( hr = PathCchRemoveFileSpec( buffer, ARRAY_SIZE(buffer) ) )) return hr;
+ 
+diff --git a/include/Makefile.in b/include/Makefile.in
+index e0987ce..6f56227 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -949,6 +949,7 @@ SOURCES = \
+ 	windows.ui.core.idl \
+ 	windows.ui.idl \
+ 	windows.ui.input.idl \
++	windows.ui.popups.idl \
+ 	windows.ui.notifications.idl \
+ 	windows.ui.viewmanagement.core.idl \
+ 	windows.ui.viewmanagement.idl \
+diff --git a/include/windows.devices.input.idl b/include/windows.devices.input.idl
+index db390e5..ff7ebb6 100644
+--- a/include/windows.devices.input.idl
++++ b/include/windows.devices.input.idl
+@@ -113,3 +113,88 @@ namespace Windows.Devices.Input {
+         [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Devices.Input.IPointerDevice2;
+     }
+ }
++
++/* wine-uwp, generated by scripts/winmd2idl.py: Windows.Devices.Input.MouseDevice and MouseEventArgs. */
++
++namespace Windows.Devices.Input {
++    interface IMouseDevice;
++    interface IMouseDeviceStatics;
++    interface IMouseEventArgs;
++    typedef struct MouseDelta MouseDelta;
++    runtimeclass MouseDevice;
++    runtimeclass MouseEventArgs;
++}
++
++namespace Windows.Devices.Input {
++    declare {
++        interface Windows.Foundation.TypedEventHandler<Windows.Devices.Input.MouseDevice *, Windows.Devices.Input.MouseEventArgs *>;
++    }
++}
++
++namespace Windows.Devices.Input {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    struct MouseDelta
++    {
++        INT32 X;
++        INT32 Y;
++    };
++
++}
++
++namespace Windows.Devices.Input {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.Input.MouseDevice),
++        uuid(88edf458-f2c8-49f4-be1f-c256b388bc11)
++    ]
++    interface IMouseDevice : IInspectable
++    {
++        [eventadd] HRESULT MouseMoved([in] Windows.Foundation.TypedEventHandler<Windows.Devices.Input.MouseDevice *, Windows.Devices.Input.MouseEventArgs *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT MouseMoved([in] Windows.Foundation.EventRegistrationToken token);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.Input.MouseDevice),
++        uuid(484a9045-6d70-49db-8e68-46ffbd17d38d)
++    ]
++    interface IMouseDeviceStatics : IInspectable
++    {
++        HRESULT GetForCurrentView([out, retval] Windows.Devices.Input.MouseDevice * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.Input.MouseEventArgs),
++        uuid(f625aa5d-2354-4cc7-9230-96941c969fde)
++    ]
++    interface IMouseEventArgs : IInspectable
++    {
++        [propget] HRESULT MouseDelta([out, retval] Windows.Devices.Input.MouseDelta *value);
++    }
++
++}
++
++namespace Windows.Devices.Input {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(standard),
++        static(Windows.Devices.Input.IMouseDeviceStatics, Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass MouseDevice
++    {
++        [default] interface Windows.Devices.Input.IMouseDevice;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(standard)
++    ]
++    runtimeclass MouseEventArgs
++    {
++        [default] interface Windows.Devices.Input.IMouseEventArgs;
++    }
++
++}
+diff --git a/include/windows.ui.popups.idl b/include/windows.ui.popups.idl
+new file mode 100644
+index 0000000..9c01b9e
+--- /dev/null
++++ b/include/windows.ui.popups.idl
+@@ -0,0 +1,158 @@
++/*
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/* Generated from Windows.winmd by scripts/winmd2idl.py (Windows.UI.Popups.MessageDialog and UICommand). */
++
++#ifdef __WIDL__
++#pragma winrt ns_prefix
++#endif
++
++import "inspectable.idl";
++import "asyncinfo.idl";
++import "eventtoken.idl";
++import "windowscontracts.idl";
++import "windows.foundation.idl";
++
++namespace Windows.UI.Popups {
++    interface IMessageDialog;
++    interface IMessageDialogFactory;
++    interface IUICommand;
++    interface IUICommandFactory;
++    runtimeclass MessageDialog;
++    typedef enum MessageDialogOptions MessageDialogOptions;
++    runtimeclass UICommand;
++}
++
++namespace Windows.UI.Popups {
++    declare {
++        interface Windows.Foundation.Collections.IIterator<Windows.UI.Popups.IUICommand *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.UI.Popups.IUICommand *>;
++        interface Windows.Foundation.Collections.IVectorView<Windows.UI.Popups.IUICommand *>;
++        interface Windows.Foundation.Collections.IVector<Windows.UI.Popups.IUICommand *>;
++        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.UI.Popups.IUICommand *>;
++        interface Windows.Foundation.IAsyncOperation<Windows.UI.Popups.IUICommand *>;
++    }
++}
++
++namespace Windows.UI.Popups {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum MessageDialogOptions
++    {
++        None = 0,
++        AcceptUserInputAfterDelay = 1
++    };
++
++}
++
++namespace Windows.UI.Popups {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        uuid(daf77a4f-c27a-4298-9ac6-2922c45e7da6)
++    ]
++    delegate HRESULT UICommandInvokedHandler([in] Windows.UI.Popups.IUICommand * command);
++
++}
++
++namespace Windows.UI.Popups {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Popups.MessageDialog),
++        uuid(33f59b01-5325-43ab-9ab3-bdae440e4121)
++    ]
++    interface IMessageDialog : IInspectable
++    {
++        [propget] HRESULT Title([out, retval] HSTRING *value);
++        [propput] HRESULT Title([in] HSTRING value);
++        [propget] HRESULT Commands([out, retval] Windows.Foundation.Collections.IVector<Windows.UI.Popups.IUICommand *> * *value);
++        [propget] HRESULT DefaultCommandIndex([out, retval] UINT32 *value);
++        [propput] HRESULT DefaultCommandIndex([in] UINT32 value);
++        [propget] HRESULT CancelCommandIndex([out, retval] UINT32 *value);
++        [propput] HRESULT CancelCommandIndex([in] UINT32 value);
++        [propget] HRESULT Content([out, retval] HSTRING *value);
++        [propput] HRESULT Content([in] HSTRING value);
++        HRESULT ShowAsync([out, retval] Windows.Foundation.IAsyncOperation<Windows.UI.Popups.IUICommand *> * *value);
++        [propget] HRESULT Options([out, retval] Windows.UI.Popups.MessageDialogOptions *value);
++        [propput] HRESULT Options([in] Windows.UI.Popups.MessageDialogOptions value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Popups.MessageDialog),
++        uuid(2d161777-a66f-4ea5-bb87-793ffa4941f2)
++    ]
++    interface IMessageDialogFactory : IInspectable
++    {
++        HRESULT Create([in] HSTRING content, [out, retval] Windows.UI.Popups.MessageDialog * *value);
++        HRESULT CreateWithTitle([in] HSTRING content, [in] HSTRING title, [out, retval] Windows.UI.Popups.MessageDialog * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        uuid(4ff93a75-4145-47ff-ac7f-dff1c1fa5b0f)
++    ]
++    interface IUICommand : IInspectable
++    {
++        [propget] HRESULT Label([out, retval] HSTRING *value);
++        [propput] HRESULT Label([in] HSTRING value);
++        [propget] HRESULT Invoked([out, retval] Windows.UI.Popups.UICommandInvokedHandler * *value);
++        [propput] HRESULT Invoked([in] Windows.UI.Popups.UICommandInvokedHandler * value);
++        [propget] HRESULT Id([out, retval] IInspectable * *value);
++        [propput] HRESULT Id([in] IInspectable * value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Popups.UICommand),
++        uuid(a21a8189-26b0-4676-ae94-54041bc125e8)
++    ]
++    interface IUICommandFactory : IInspectable
++    {
++        HRESULT Create([in] HSTRING label, [out, retval] Windows.UI.Popups.UICommand * *value);
++        HRESULT CreateWithHandler([in] HSTRING label, [in] Windows.UI.Popups.UICommandInvokedHandler * action, [out, retval] Windows.UI.Popups.UICommand * *value);
++        HRESULT CreateWithHandlerAndId([in] HSTRING label, [in] Windows.UI.Popups.UICommandInvokedHandler * action, [in] IInspectable * commandId, [out, retval] Windows.UI.Popups.UICommand * *value);
++    }
++
++}
++
++namespace Windows.UI.Popups {
++    [
++        activatable(Windows.UI.Popups.IMessageDialogFactory, Windows.Foundation.UniversalApiContract, 1.0),
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(standard)
++    ]
++    runtimeclass MessageDialog
++    {
++        [default] interface Windows.UI.Popups.IMessageDialog;
++    }
++
++    [
++        activatable(Windows.Foundation.UniversalApiContract, 1.0),
++        activatable(Windows.UI.Popups.IUICommandFactory, Windows.Foundation.UniversalApiContract, 1.0),
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        threading(both)
++    ]
++    runtimeclass UICommand
++    {
++        [default] interface Windows.UI.Popups.IUICommand;
++    }
++
++}
++
