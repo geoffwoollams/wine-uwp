@@ -1,0 +1,2530 @@
+Subject: windows.ui.xaml: shapes, CornerRadius, CheckBox and RadioButton templates, theme changes while running, loose XAML (milestone 4, part 5)
+
+diff --git a/dlls/windows.ui.xaml/Makefile.in b/dlls/windows.ui.xaml/Makefile.in
+index 26bc321..ed23bdc 100644
+--- a/dlls/windows.ui.xaml/Makefile.in
++++ b/dlls/windows.ui.xaml/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE  = windows.ui.xaml.dll
+-IMPORTS = combase user32 gdi32
++IMPORTS = combase user32 gdi32 advapi32
+ 
+ SOURCES = \
+ 	application.c \
+@@ -16,6 +16,7 @@ SOURCES = \
+ 	panel.c \
+ 	presenter.c \
+ 	reader.c \
++	shapes.c \
+ 	resources.c \
+ 	text_block.c \
+ 	window.c \
+diff --git a/dlls/windows.ui.xaml/application.c b/dlls/windows.ui.xaml/application.c
+index ee3e01f..ab27d08 100644
+--- a/dlls/windows.ui.xaml/application.c
++++ b/dlls/windows.ui.xaml/application.c
+@@ -33,6 +33,7 @@ struct application
+     IInspectable *outer;              /* the app's object, or our own inner interface */
+     LONG ref;
+     ApplicationTheme theme;
++    BOOL theme_set;                   /* RequestedTheme was set; otherwise the theme follows the system's */
+     IResourceDictionary *resources;
+     struct event_list suspending, resuming, unhandled_exception;
+ };
+@@ -45,6 +46,44 @@ ApplicationTheme application_theme(void)
+     return current_app ? current_app->theme : ApplicationTheme_Light;
+ }
+ 
++/* the system's app theme: Settings > Colours, HKCU\...\Themes\Personalize AppsUseLightTheme */
++static ApplicationTheme system_theme(void)
++{
++    DWORD value = 1, size = sizeof(value);
++
++    if (RegGetValueW( HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
++                      L"AppsUseLightTheme", RRF_RT_REG_DWORD, NULL, &value, &size ))
++        return ApplicationTheme_Light;
++    return value ? ApplicationTheme_Light : ApplicationTheme_Dark;
++}
++
++/* WM_SETTINGCHANGE "ImmersiveColorSet": TRUE if the app's theme changed */
++BOOL application_system_theme_changed(void)
++{
++    ApplicationTheme theme;
++
++    if (!current_app || current_app->theme_set) return FALSE;
++    if ((theme = system_theme()) == current_app->theme) return FALSE;
++    TRACE( "the system theme is now %s.\n", theme == ApplicationTheme_Dark ? "dark" : "light" );
++    current_app->theme = theme;
++    return TRUE;
++}
++
++/* the theme resource lookups use: an element's RequestedTheme while its resources are being resolved, or the app's */
++static int theme_override = -1;
++
++int theme_override_set( int dark )
++{
++    int old = theme_override;
++    theme_override = dark;
++    return old;
++}
++
++BOOL lookup_theme_dark(void)
++{
++    return theme_override >= 0 ? theme_override : application_theme() == ApplicationTheme_Dark;
++}
++
+ IInspectable *application_resources(void)
+ {
+     return current_app ? (IInspectable *)current_app->resources : NULL;
+@@ -244,7 +283,8 @@ static HRESULT WINAPI application_put_RequestedTheme( IApplication *iface, Appli
+ {
+     TRACE( "iface %p, value %d.\n", iface, value );
+     impl_from_IApplication( iface )->theme = value;
+-    window_invalidate();
++    impl_from_IApplication( iface )->theme_set = TRUE;
++    window_theme_changed();
+     return S_OK;
+ }
+ 
+@@ -406,7 +446,7 @@ static HRESULT application_create( IInspectable *outer, IInspectable **inner, IA
+     impl->IInspectable_inner.lpVtbl = &inner_vtbl;
+     impl->outer = outer ? outer : &impl->IInspectable_inner;
+     impl->ref = 1;
+-    impl->theme = ApplicationTheme_Light;
++    impl->theme = system_theme();
+ 
+     if (current_app) FIXME( "an Application already exists, replacing %p.\n", current_app );
+     current_app = impl;
+diff --git a/dlls/windows.ui.xaml/border.c b/dlls/windows.ui.xaml/border.c
+index b9d944b..44845ed 100644
+--- a/dlls/windows.ui.xaml/border.c
++++ b/dlls/windows.ui.xaml/border.c
+@@ -87,8 +87,8 @@ static void border_render( struct xaml_element *element, struct layout_context *
+     struct border *impl = impl_from_element( element );
+     struct xaml_element *child = border_child( impl );
+ 
+-    element_fill( ctx, &element->bounds, impl->background );
+-    element_frame( ctx, &element->bounds, &impl->border_thickness, impl->border_brush );
++    element_draw_shape( ctx, &element->bounds, &impl->corner_radius, FALSE, impl->background, impl->border_brush,
++                        &impl->border_thickness );
+     if (child) element_render( child, ctx );
+ }
+ 
+diff --git a/dlls/windows.ui.xaml/brush.c b/dlls/windows.ui.xaml/brush.c
+index e302d01..a487a54 100644
+--- a/dlls/windows.ui.xaml/brush.c
++++ b/dlls/windows.ui.xaml/brush.c
+@@ -53,7 +53,8 @@ static HRESULT WINAPI solid_brush_iface_QueryInterface( ISolidColorBrush *iface,
+         *out = &impl->IDependencyObject_iface;
+     else
+     {
+-        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        if (report_missing_interface( RuntimeClass_Windows_UI_Xaml_Media_SolidColorBrush, iid ))
++            FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
+         *out = NULL;
+         return E_NOINTERFACE;
+     }
+diff --git a/dlls/windows.ui.xaml/classes.idl b/dlls/windows.ui.xaml/classes.idl
+index d56cb0e..3d04080 100644
+--- a/dlls/windows.ui.xaml/classes.idl
++++ b/dlls/windows.ui.xaml/classes.idl
+@@ -58,6 +58,12 @@ namespace Windows.UI.Xaml.Markup {
+     runtimeclass XamlReader;
+ }
+ 
++namespace Windows.UI.Xaml.Shapes {
++    runtimeclass Ellipse;
++    runtimeclass Path;
++    runtimeclass Rectangle;
++}
++
+ namespace Windows.UI.Xaml.Media {
+     runtimeclass SolidColorBrush;
+ }
+diff --git a/dlls/windows.ui.xaml/definitions.c b/dlls/windows.ui.xaml/definitions.c
+index d23c6d2..7f82efc 100644
+--- a/dlls/windows.ui.xaml/definitions.c
++++ b/dlls/windows.ui.xaml/definitions.c
+@@ -63,7 +63,8 @@ static HRESULT definition_query_interface( struct definition *def, REFIID iid, v
+         *out = &def->IDependencyObject_iface;
+     else
+     {
+-        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        /* not a FIXME: the markup writer probes definitions for element and shape interfaces a lot */
++        WARN( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
+         *out = NULL;
+         return E_NOINTERFACE;
+     }
+diff --git a/dlls/windows.ui.xaml/element.c b/dlls/windows.ui.xaml/element.c
+index b4ba3e6..9a5d07e 100644
+--- a/dlls/windows.ui.xaml/element.c
++++ b/dlls/windows.ui.xaml/element.c
+@@ -46,13 +46,17 @@ static HRESULT WINAPI inner_QueryInterface( IInspectable *iface, REFIID iid, voi
+         *out = &impl->IUIElement_iface;
+     else if (IsEqualGUID( iid, &IID_IFrameworkElement ))
+         *out = &impl->IFrameworkElement_iface;
++    else if (IsEqualGUID( iid, &IID_IFrameworkElement2 ))
++        *out = &impl->IFrameworkElement2_iface;
+     else if (IsEqualGUID( iid, &IID_IDependencyObject ))
+         *out = &impl->IDependencyObject_iface;
+     else if (impl->ops->query_interface && SUCCEEDED(impl->ops->query_interface( impl, iid, out )))
+         return S_OK;
+     else
+     {
+-        FIXME( "%s %s not implemented, returning E_NOINTERFACE.\n", debugstr_w(impl->class_name), debugstr_guid(iid) );
++        if (report_missing_interface( impl->class_name, iid ))
++            FIXME( "%s %s not implemented, returning E_NOINTERFACE.\n", debugstr_w(impl->class_name), debugstr_guid(iid) );
++        else TRACE( "%s %s not implemented.\n", debugstr_w(impl->class_name), debugstr_guid(iid) );
+         *out = NULL;
+         return E_NOINTERFACE;
+     }
+@@ -84,6 +88,8 @@ static ULONG WINAPI inner_Release( IInspectable *iface )
+         if (impl->visual_state_groups) IInspectable_Release( impl->visual_state_groups );
+         template_free( impl->template_instance );
+         if (impl->template) IInspectable_Release( impl->template );
++        if (impl->implicit_style) IInspectable_Release( impl->implicit_style );
++        element_free_theme_refs( impl );
+         while (impl->local_count) free( impl->local_properties[--impl->local_count] );
+         free( impl->local_properties );
+         impl->ops->destroy( impl );
+@@ -1109,10 +1115,33 @@ static HRESULT WINAPI framework_element_remove_LayoutUpdated(IFrameworkElement *
+     return E_NOTIMPL;
+ }
+ 
++static struct xaml_element *find_name( struct xaml_element *element, HSTRING name )
++{
++    struct xaml_element *found;
++    UINT32 i, count;
++    INT32 order;
++
++    if (element->name && SUCCEEDED(WindowsCompareStringOrdinal( element->name, name, &order )) && !order) return element;
++    if (!element->ops->child_count) return NULL;
++    count = element->ops->child_count( element );
++    for (i = 0; i < count; i++)
++    {
++        struct xaml_element *child = element->ops->child_at( element, i );
++        if (child && (found = find_name( child, name ))) return found;
++    }
++    return NULL;
++}
++
++/* the x:Name in the element's tree (one name scope for the whole tree, template parts included) */
+ static HRESULT WINAPI framework_element_FindName(IFrameworkElement *iface, HSTRING name, IInspectable **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    struct xaml_element *element = impl_from_IFrameworkElement( iface ), *found;
++
++    TRACE( "iface %p, name %s, value %p.\n", iface, debugstr_hstring(name), value );
++    while (element->parent) element = element->parent;
++    if ((found = find_name( element, name ))) IInspectable_AddRef( (*value = found->outer) );
++    else *value = NULL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI framework_element_SetBinding(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp, __x_ABI_CWindows_CUI_CXaml_CData_CIBindingBase *binding)
+@@ -1180,6 +1209,66 @@ static const struct IFrameworkElementVtbl framework_element_vtbl =
+     framework_element_SetBinding
+ };
+ 
++DEFINE_IINSPECTABLE(framework_element2, IFrameworkElement2, struct xaml_element, IUIElement_iface)
++
++static HRESULT WINAPI framework_element2_get_RequestedTheme( IFrameworkElement2 *iface, ElementTheme *value )
++{
++    *value = impl_from_IFrameworkElement2( iface )->requested_theme;
++    return S_OK;
++}
++
++static HRESULT WINAPI framework_element2_put_RequestedTheme( IFrameworkElement2 *iface, ElementTheme value )
++{
++    struct xaml_element *impl = impl_from_IFrameworkElement2( iface );
++
++    TRACE( "iface %p, value %d.\n", iface, value );
++    if (value > ElementTheme_Dark) return E_INVALIDARG;
++    if (impl->requested_theme == value) return S_OK;
++    impl->requested_theme = value;
++    impl->theme_dirty = TRUE;   /* its theme resources are looked up again on the next layout */
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI framework_element2_add_DataContextChanged( IFrameworkElement2 *iface,
++        __FITypedEventHandler_2_Windows__CUI__CXaml__CFrameworkElement_Windows__CUI__CXaml__CDataContextChangedEventArgs *handler,
++        EventRegistrationToken *token )
++{
++    FIXME( "iface %p, handler %p stub!\n", iface, handler );
++    token->value = 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI framework_element2_remove_DataContextChanged( IFrameworkElement2 *iface, EventRegistrationToken token )
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI framework_element2_GetBindingExpression( IFrameworkElement2 *iface,
++        __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp, __x_ABI_CWindows_CUI_CXaml_CData_CIBindingExpression **value )
++{
++    FIXME( "iface %p stub!\n", iface );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct IFrameworkElement2Vtbl framework_element2_vtbl =
++{
++    framework_element2_QueryInterface,
++    framework_element2_AddRef,
++    framework_element2_Release,
++    /* IInspectable methods */
++    framework_element2_GetIids,
++    framework_element2_GetRuntimeClassName,
++    framework_element2_GetTrustLevel,
++    /* IFrameworkElement2 methods */
++    framework_element2_get_RequestedTheme,
++    framework_element2_put_RequestedTheme,
++    framework_element2_add_DataContextChanged,
++    framework_element2_remove_DataContextChanged,
++    framework_element2_GetBindingExpression,
++};
++
+ DEFINE_IINSPECTABLE(element_dependency_object, IDependencyObject, struct xaml_element, IUIElement_iface)
+ 
+ static HRESULT WINAPI element_dependency_object_GetValue(IDependencyObject *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp, IInspectable **result)
+@@ -1236,6 +1325,24 @@ static const struct IDependencyObjectVtbl element_dependency_object_vtbl =
+     element_dependency_object_get_Dispatcher
+ };
+ 
++/* whether to FIXME an interface a class doesn't have: the first time only, since the markup writer probes objects
++ * for many interfaces */
++BOOL report_missing_interface( const WCHAR *class_name, REFIID iid )
++{
++    static struct { const WCHAR *class_name; GUID iid; } seen[256];
++    static UINT32 count;
++    UINT32 i;
++
++    for (i = 0; i < count; i++)
++        if (seen[i].class_name == class_name && IsEqualGUID( &seen[i].iid, iid )) return FALSE;
++    if (count < ARRAY_SIZE(seen))
++    {
++        seen[count].class_name = class_name;
++        seen[count++].iid = *iid;
++    }
++    return TRUE;
++}
++
+ struct xaml_element *element_from_object( IInspectable *object )
+ {
+     IUIElement *uielement;
+@@ -1270,6 +1377,7 @@ void element_init( struct xaml_element *element, const struct element_ops *ops,
+ {
+     element->IUIElement_iface.lpVtbl = &uielement_vtbl;
+     element->IFrameworkElement_iface.lpVtbl = &framework_element_vtbl;
++    element->IFrameworkElement2_iface.lpVtbl = &framework_element2_vtbl;
+     element->IDependencyObject_iface.lpVtbl = &element_dependency_object_vtbl;
+     element->IInspectable_inner.lpVtbl = &inner_vtbl;
+     element->outer = outer ? outer : &element->IInspectable_inner;
+@@ -1361,6 +1469,11 @@ void element_measure( struct xaml_element *element, struct layout_context *ctx,
+     float width, height, content_width, content_height;
+ 
+     element_apply_default_style( element );
++    if (element->theme_dirty)
++    {
++        element->theme_dirty = FALSE;
++        element_theme_refresh( element );
++    }
+     if (element->visibility != Visibility_Visible)
+     {
+         element->desired_width = element->desired_height = 0;
+@@ -1428,8 +1541,26 @@ void element_arrange( struct xaml_element *element, struct layout_context *ctx,
+ 
+ void element_render( struct xaml_element *element, struct layout_context *ctx )
+ {
++    BOOL dark = ctx->dark;
++    COLORREF foreground = ctx->foreground;
++
+     if (element->visibility != Visibility_Visible) return;
++    if (element->requested_theme != ElementTheme_Default)
++    {
++        /* the built-in looks and the default text colour follow the subtree's theme */
++        ctx->dark = element->requested_theme == ElementTheme_Dark;
++        if (ctx->dark != dark) ctx->foreground = ctx->dark ? RGB(255, 255, 255) : RGB(0, 0, 0);
++    }
+     element->ops->render( element, ctx );
++    ctx->dark = dark;
++    ctx->foreground = foreground;
++}
++
++BOOL element_is_dark( struct xaml_element *element )
++{
++    for (; element; element = element->parent)
++        if (element->requested_theme != ElementTheme_Default) return element->requested_theme == ElementTheme_Dark;
++    return application_theme() == ApplicationTheme_Dark;
+ }
+ 
+ struct xaml_element *element_hit_test( struct xaml_element *element, float x, float y )
+@@ -1506,6 +1637,147 @@ void element_fill( struct layout_context *ctx, const struct layout_rect *rect, I
+     fill_argb( ctx, rect, c );
+ }
+ 
++/* ---- shapes: rounded rectangles (one radius per corner) and ellipses, as GDI regions ---- */
++
++static BOOL corner_radius_zero( const CornerRadius *r )
++{
++    return !r || (r->TopLeft <= 0 && r->TopRight <= 0 && r->BottomRight <= 0 && r->BottomLeft <= 0);
++}
++
++#define ARC_STEPS 8
++#define PI_ 3.14159265358979323846
++
++static void add_arc( POINT *pt, UINT32 *n, double cx, double cy, double rx, double ry, double start )
++{
++    UINT32 i;
++    for (i = 0; i <= ARC_STEPS; i++)
++    {
++        double a = start + i * (PI_ / 2) / ARC_STEPS;
++        pt[*n].x = lround( cx + cos( a ) * rx );
++        pt[*n].y = lround( cy + sin( a ) * ry );
++        (*n)++;
++    }
++}
++
++/* a region for the shape in device pixels; radii in view pixels, clamped to fit */
++static HRGN shape_region( struct layout_context *ctx, double left, double top, double right, double bottom,
++                          const CornerRadius *radius, BOOL ellipse )
++{
++    POINT pt[4 * (ARC_STEPS + 1)];
++    double w = right - left, h = bottom - top, tl, tr, br, bl, s = ctx->scale;
++    UINT32 n = 0;
++
++    if (w <= 0 || h <= 0) return CreateRectRgn( 0, 0, 0, 0 );
++    if (ellipse) return CreateEllipticRgn( lround( left ), lround( top ), lround( right ) + 1, lround( bottom ) + 1 );
++    if (corner_radius_zero( radius )) return CreateRectRgn( lround( left ), lround( top ), lround( right ), lround( bottom ) );
++    tl = min( max( 0.0, radius->TopLeft * s ), min( w, h ) / 2 );
++    tr = min( max( 0.0, radius->TopRight * s ), min( w, h ) / 2 );
++    br = min( max( 0.0, radius->BottomRight * s ), min( w, h ) / 2 );
++    bl = min( max( 0.0, radius->BottomLeft * s ), min( w, h ) / 2 );
++    add_arc( pt, &n, right - tr, top + tr, tr, tr, -PI_ / 2 );
++    add_arc( pt, &n, right - br, bottom - br, br, br, 0 );
++    add_arc( pt, &n, left + bl, bottom - bl, bl, bl, PI_ / 2 );
++    add_arc( pt, &n, left + tl, top + tl, tl, tl, PI_ );
++    return CreatePolygonRgn( pt, n, WINDING );
++}
++
++static void fill_region( struct layout_context *ctx, HRGN region, Color c )
++{
++    HRGN saved = CreateRectRgn( 0, 0, 0, 0 );
++    BOOL had_clip = GetClipRgn( ctx->hdc, saved ) == 1;
++    struct layout_rect all;
++    RECT box;
++
++    if (!c.A) goto done;
++    if (c.A == 0xff)
++    {
++        HBRUSH brush = CreateSolidBrush( RGB( c.R, c.G, c.B ) );
++        FillRgn( ctx->hdc, region, brush );
++        DeleteObject( brush );
++        goto done;
++    }
++    GetRgnBox( region, &box );
++    if (had_clip) CombineRgn( region, region, saved, RGN_AND );
++    SelectClipRgn( ctx->hdc, region );
++    all.x = box.left / ctx->scale;
++    all.y = box.top / ctx->scale;
++    all.width = (box.right - box.left) / ctx->scale + 1;
++    all.height = (box.bottom - box.top) / ctx->scale + 1;
++    fill_argb( ctx, &all, c );
++    SelectClipRgn( ctx->hdc, had_clip ? saved : NULL );
++done:
++    DeleteObject( saved );
++}
++
++/* fill and/or stroke a shape: the fill covers the whole shape, the stroke is drawn inside its edge */
++void element_draw_shape( struct layout_context *ctx, const struct layout_rect *rect, const CornerRadius *radius,
++                         BOOL ellipse, IBrush *fill, IBrush *stroke, const Thickness *thickness )
++{
++    double s = ctx->scale, l = rect->x * s, t = rect->y * s, r = (rect->x + rect->width) * s, b = (rect->y + rect->height) * s;
++    CornerRadius inner_radius;
++    HRGN outer, inner;
++    Color c;
++
++    if (!ellipse && corner_radius_zero( radius ))
++    {
++        /* the plain rectangle code, pixel for pixel */
++        element_fill( ctx, rect, fill );
++        if (thickness) element_frame( ctx, rect, thickness, stroke );
++        return;
++    }
++    outer = shape_region( ctx, l, t, r, b, radius, ellipse );
++    if (fill && brush_get_color( fill, &c )) fill_region( ctx, outer, c );
++    if (stroke && thickness && brush_get_color( stroke, &c ) && c.A)
++    {
++        if (radius)
++        {
++            inner_radius.TopLeft = max( 0.0, radius->TopLeft - max( thickness->Left, thickness->Top ) / 2 );
++            inner_radius.TopRight = max( 0.0, radius->TopRight - max( thickness->Right, thickness->Top ) / 2 );
++            inner_radius.BottomRight = max( 0.0, radius->BottomRight - max( thickness->Right, thickness->Bottom ) / 2 );
++            inner_radius.BottomLeft = max( 0.0, radius->BottomLeft - max( thickness->Left, thickness->Bottom ) / 2 );
++        }
++        inner = shape_region( ctx, l + thickness->Left * s, t + thickness->Top * s, r - thickness->Right * s,
++                              b - thickness->Bottom * s, radius ? &inner_radius : NULL, ellipse );
++        CombineRgn( outer, outer, inner, RGN_DIFF );
++        DeleteObject( inner );
++        fill_region( ctx, outer, c );
++    }
++    DeleteObject( outer );
++}
++
++/* a polyline or polygon in view pixels relative to (x, y), for Path */
++void element_draw_lines( struct layout_context *ctx, float x, float y, const struct shape_point *points, UINT32 count,
++                         BOOL closed, IBrush *fill, IBrush *stroke, double thickness )
++{
++    POINT *pt;
++    Color c;
++    UINT32 i;
++
++    if (count < 2 || !(pt = malloc( count * sizeof(*pt) ))) return;
++    for (i = 0; i < count; i++)
++    {
++        pt[i].x = lroundf( (x + points[i].x) * ctx->scale );
++        pt[i].y = lroundf( (y + points[i].y) * ctx->scale );
++    }
++    if (closed && fill && brush_get_color( fill, &c ) && c.A)
++    {
++        HRGN region = CreatePolygonRgn( pt, count, WINDING );
++        fill_region( ctx, region, c );
++        DeleteObject( region );
++    }
++    if (stroke && thickness > 0 && brush_get_color( stroke, &c ) && c.A)
++    {
++        LOGBRUSH lb = { BS_SOLID, RGB( c.R, c.G, c.B ) };
++        HPEN pen = ExtCreatePen( PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_FLAT | PS_JOIN_MITER,
++                                 max( 1, lround( thickness * ctx->scale ) ), &lb, 0, NULL );
++        HGDIOBJ old = SelectObject( ctx->hdc, pen );
++        if (closed) Polygon( ctx->hdc, pt, count ); else Polyline( ctx->hdc, pt, count );
++        SelectObject( ctx->hdc, old );
++        DeleteObject( pen );
++    }
++    free( pt );
++}
++
+ /* a translucent text colour, blended over what is under the middle of rect (GDI text has no alpha) */
+ COLORREF element_text_color( struct layout_context *ctx, const struct layout_rect *rect, Color c )
+ {
+diff --git a/dlls/windows.ui.xaml/generic.xaml b/dlls/windows.ui.xaml/generic.xaml
+index a993572..928ad7e 100644
+--- a/dlls/windows.ui.xaml/generic.xaml
++++ b/dlls/windows.ui.xaml/generic.xaml
+@@ -19,8 +19,8 @@
+ 
+   Written for wine-uwp, following the structure apps rely on in Windows 10's default styles: the same resource
+   keys (so an app's ButtonBackgroundPointerOver overrides the one used here), visual state names and template
+-  part names, with the Windows 10 theme colours. CheckBox and RadioButton have no template yet; they draw
+-  themselves (button.c) and only get their default property values here.
++  part names, with the Windows 10 theme colours. CheckBox and RadioButton are drawn with shapes; the check mark is
++  a Path rather than the Segoe MDL2 Assets glyph Windows uses.
+ -->
+ <ResourceDictionary
+     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+@@ -92,6 +92,94 @@
+             <SolidColorBrush x:Key="ToggleButtonBorderBrushCheckedPointerOver" Color="#66000000"/>
+             <SolidColorBrush x:Key="ToggleButtonBorderBrushCheckedPressed" Color="#00FFFFFF"/>
+             <SolidColorBrush x:Key="ToggleButtonBorderBrushCheckedDisabled" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundUnchecked" Color="#FF000000"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundUnchecked" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeUnchecked" Color="#CC000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillUnchecked" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundUnchecked" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundUncheckedPointerOver" Color="#FF000000"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundUncheckedPointerOver" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeUncheckedPointerOver" Color="#FF000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillUncheckedPointerOver" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundUncheckedPointerOver" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundUncheckedPressed" Color="#FF000000"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundUncheckedPressed" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeUncheckedPressed" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillUncheckedPressed" Color="#99000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundUncheckedPressed" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundUncheckedDisabled" Color="#66000000"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundUncheckedDisabled" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeUncheckedDisabled" Color="#66000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillUncheckedDisabled" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundUncheckedDisabled" Color="#66000000"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundChecked" Color="#FF000000"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundChecked" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeChecked" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillChecked" Color="#FF0078D7"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundChecked" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundCheckedPointerOver" Color="#FF000000"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundCheckedPointerOver" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeCheckedPointerOver" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillCheckedPointerOver" Color="#FF0078D7"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundCheckedPointerOver" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundCheckedPressed" Color="#FF000000"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundCheckedPressed" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeCheckedPressed" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillCheckedPressed" Color="#99000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundCheckedPressed" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundCheckedDisabled" Color="#66000000"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundCheckedDisabled" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeCheckedDisabled" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillCheckedDisabled" Color="#66000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundCheckedDisabled" Color="#66000000"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundIndeterminate" Color="#FF000000"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundIndeterminate" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeIndeterminate" Color="#FF0078D7"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillIndeterminate" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundIndeterminate" Color="#FF000000"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundIndeterminatePointerOver" Color="#FF000000"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundIndeterminatePointerOver" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeIndeterminatePointerOver" Color="#FF0078D7"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillIndeterminatePointerOver" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundIndeterminatePointerOver" Color="#FF000000"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundIndeterminatePressed" Color="#FF000000"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundIndeterminatePressed" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeIndeterminatePressed" Color="#99000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillIndeterminatePressed" Color="#99000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundIndeterminatePressed" Color="#FF000000"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundIndeterminateDisabled" Color="#66000000"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundIndeterminateDisabled" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeIndeterminateDisabled" Color="#66000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillIndeterminateDisabled" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundIndeterminateDisabled" Color="#66000000"/>
++            <SolidColorBrush x:Key="RadioButtonForeground" Color="#FF000000"/>
++            <SolidColorBrush x:Key="RadioButtonBackground" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseStroke" Color="#CC000000"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseFill" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseCheckedStroke" Color="#FF0078D7"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseCheckedFill" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonCheckGlyphFill" Color="#CC000000"/>
++            <SolidColorBrush x:Key="RadioButtonForegroundPointerOver" Color="#FF000000"/>
++            <SolidColorBrush x:Key="RadioButtonBackgroundPointerOver" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseStrokePointerOver" Color="#FF000000"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseFillPointerOver" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseCheckedStrokePointerOver" Color="#FF0078D7"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseCheckedFillPointerOver" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonCheckGlyphFillPointerOver" Color="#FF000000"/>
++            <SolidColorBrush x:Key="RadioButtonForegroundPressed" Color="#FF000000"/>
++            <SolidColorBrush x:Key="RadioButtonBackgroundPressed" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseStrokePressed" Color="#99000000"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseFillPressed" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseCheckedStrokePressed" Color="#99000000"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseCheckedFillPressed" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonCheckGlyphFillPressed" Color="#99000000"/>
++            <SolidColorBrush x:Key="RadioButtonForegroundDisabled" Color="#66000000"/>
++            <SolidColorBrush x:Key="RadioButtonBackgroundDisabled" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseStrokeDisabled" Color="#66000000"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseFillDisabled" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseCheckedStrokeDisabled" Color="#66000000"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseCheckedFillDisabled" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonCheckGlyphFillDisabled" Color="#66000000"/>
+         </ResourceDictionary>
+         <ResourceDictionary x:Key="Dark">
+             <SolidColorBrush x:Key="ApplicationPageBackgroundThemeBrush" Color="#FF000000"/>
+@@ -158,6 +246,94 @@
+             <SolidColorBrush x:Key="ToggleButtonBorderBrushCheckedPointerOver" Color="#66FFFFFF"/>
+             <SolidColorBrush x:Key="ToggleButtonBorderBrushCheckedPressed" Color="#00000000"/>
+             <SolidColorBrush x:Key="ToggleButtonBorderBrushCheckedDisabled" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundUnchecked" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundUnchecked" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeUnchecked" Color="#CCFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillUnchecked" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundUnchecked" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundUncheckedPointerOver" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundUncheckedPointerOver" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeUncheckedPointerOver" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillUncheckedPointerOver" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundUncheckedPointerOver" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundUncheckedPressed" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundUncheckedPressed" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeUncheckedPressed" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillUncheckedPressed" Color="#99FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundUncheckedPressed" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundUncheckedDisabled" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundUncheckedDisabled" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeUncheckedDisabled" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillUncheckedDisabled" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundUncheckedDisabled" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundChecked" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundChecked" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeChecked" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillChecked" Color="#FF0078D7"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundChecked" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundCheckedPointerOver" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundCheckedPointerOver" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeCheckedPointerOver" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillCheckedPointerOver" Color="#FF0078D7"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundCheckedPointerOver" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundCheckedPressed" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundCheckedPressed" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeCheckedPressed" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillCheckedPressed" Color="#99FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundCheckedPressed" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundCheckedDisabled" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundCheckedDisabled" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeCheckedDisabled" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillCheckedDisabled" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundCheckedDisabled" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundIndeterminate" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundIndeterminate" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeIndeterminate" Color="#FF0078D7"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillIndeterminate" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundIndeterminate" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundIndeterminatePointerOver" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundIndeterminatePointerOver" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeIndeterminatePointerOver" Color="#FF0078D7"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillIndeterminatePointerOver" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundIndeterminatePointerOver" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundIndeterminatePressed" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundIndeterminatePressed" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeIndeterminatePressed" Color="#99FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillIndeterminatePressed" Color="#99FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundIndeterminatePressed" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxForegroundIndeterminateDisabled" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxBackgroundIndeterminateDisabled" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundStrokeIndeterminateDisabled" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillIndeterminateDisabled" Color="#00000000"/>
++            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundIndeterminateDisabled" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonForeground" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonBackground" Color="#00000000"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseStroke" Color="#CCFFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseFill" Color="#00000000"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseCheckedStroke" Color="#FF0078D7"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseCheckedFill" Color="#00000000"/>
++            <SolidColorBrush x:Key="RadioButtonCheckGlyphFill" Color="#CCFFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonForegroundPointerOver" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonBackgroundPointerOver" Color="#00000000"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseStrokePointerOver" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseFillPointerOver" Color="#00000000"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseCheckedStrokePointerOver" Color="#FF0078D7"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseCheckedFillPointerOver" Color="#00000000"/>
++            <SolidColorBrush x:Key="RadioButtonCheckGlyphFillPointerOver" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonForegroundPressed" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonBackgroundPressed" Color="#00000000"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseStrokePressed" Color="#99FFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseFillPressed" Color="#00000000"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseCheckedStrokePressed" Color="#99FFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseCheckedFillPressed" Color="#00000000"/>
++            <SolidColorBrush x:Key="RadioButtonCheckGlyphFillPressed" Color="#99FFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonForegroundDisabled" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonBackgroundDisabled" Color="#00000000"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseStrokeDisabled" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseFillDisabled" Color="#00000000"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseCheckedStrokeDisabled" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="RadioButtonOuterEllipseCheckedFillDisabled" Color="#00000000"/>
++            <SolidColorBrush x:Key="RadioButtonCheckGlyphFillDisabled" Color="#66FFFFFF"/>
+         </ResourceDictionary>
+     </ResourceDictionary.ThemeDictionaries>
+ 
+@@ -399,6 +575,290 @@
+         <Setter Property="HorizontalContentAlignment" Value="Left"/>
+         <Setter Property="VerticalContentAlignment" Value="Top"/>
+         <Setter Property="FontSize" Value="14"/>
++        <Setter Property="Template">
++            <Setter.Value>
++                <ControlTemplate TargetType="CheckBox">
++                    <Grid x:Name="RootGrid" Background="{TemplateBinding Background}">
++                        <VisualStateManager.VisualStateGroups>
++                            <VisualStateGroup x:Name="CombinedStates">
++                            <VisualState x:Name="UncheckedNormal">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundStrokeUnchecked}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundFillUnchecked}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckGlyph" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundUnchecked}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="IndeterminateGlyph" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundUnchecked}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxForegroundUnchecked}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="UncheckedPointerOver">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundStrokeUncheckedPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundFillUncheckedPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckGlyph" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundUncheckedPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="IndeterminateGlyph" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundUncheckedPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxForegroundUncheckedPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="UncheckedPressed">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundStrokeUncheckedPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundFillUncheckedPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckGlyph" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundUncheckedPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="IndeterminateGlyph" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundUncheckedPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxForegroundUncheckedPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="UncheckedDisabled">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundStrokeUncheckedDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundFillUncheckedDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckGlyph" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundUncheckedDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="IndeterminateGlyph" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundUncheckedDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxForegroundUncheckedDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="CheckedNormal">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundStrokeChecked}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundFillChecked}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckGlyph" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundChecked}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="IndeterminateGlyph" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundChecked}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxForegroundChecked}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckGlyph" Storyboard.TargetProperty="Visibility">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="Visible"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="CheckedPointerOver">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundStrokeCheckedPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundFillCheckedPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckGlyph" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundCheckedPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="IndeterminateGlyph" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundCheckedPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxForegroundCheckedPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckGlyph" Storyboard.TargetProperty="Visibility">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="Visible"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="CheckedPressed">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundStrokeCheckedPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundFillCheckedPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckGlyph" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundCheckedPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="IndeterminateGlyph" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundCheckedPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxForegroundCheckedPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckGlyph" Storyboard.TargetProperty="Visibility">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="Visible"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="CheckedDisabled">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundStrokeCheckedDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundFillCheckedDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckGlyph" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundCheckedDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="IndeterminateGlyph" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundCheckedDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxForegroundCheckedDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckGlyph" Storyboard.TargetProperty="Visibility">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="Visible"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="IndeterminateNormal">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundStrokeIndeterminate}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundFillIndeterminate}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckGlyph" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundIndeterminate}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="IndeterminateGlyph" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundIndeterminate}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxForegroundIndeterminate}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="IndeterminateGlyph" Storyboard.TargetProperty="Visibility">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="Visible"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="IndeterminatePointerOver">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundStrokeIndeterminatePointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundFillIndeterminatePointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckGlyph" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundIndeterminatePointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="IndeterminateGlyph" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundIndeterminatePointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxForegroundIndeterminatePointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="IndeterminateGlyph" Storyboard.TargetProperty="Visibility">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="Visible"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="IndeterminatePressed">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundStrokeIndeterminatePressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundFillIndeterminatePressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckGlyph" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundIndeterminatePressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="IndeterminateGlyph" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundIndeterminatePressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxForegroundIndeterminatePressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="IndeterminateGlyph" Storyboard.TargetProperty="Visibility">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="Visible"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="IndeterminateDisabled">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundStrokeIndeterminateDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="NormalRectangle" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckBackgroundFillIndeterminateDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckGlyph" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundIndeterminateDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="IndeterminateGlyph" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxCheckGlyphForegroundIndeterminateDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource CheckBoxForegroundIndeterminateDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="IndeterminateGlyph" Storyboard.TargetProperty="Visibility">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="Visible"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            </VisualStateGroup>
++                        </VisualStateManager.VisualStateGroups>
++                        <Grid.ColumnDefinitions>
++                            <ColumnDefinition Width="20"/>
++                            <ColumnDefinition Width="*"/>
++                        </Grid.ColumnDefinitions>
++                        <Grid Height="32" VerticalAlignment="Top">
++                            <Rectangle x:Name="NormalRectangle" Width="20" Height="20" StrokeThickness="2"
++                                       Fill="{ThemeResource CheckBoxCheckBackgroundFillUnchecked}"
++                                       Stroke="{ThemeResource CheckBoxCheckBackgroundStrokeUnchecked}"/>
++                            <Path x:Name="CheckGlyph" Width="20" Height="20" Data="M 4.5,10 L 8,13.5 L 15.5,6" StrokeThickness="2"
++                                  Stroke="{ThemeResource CheckBoxCheckGlyphForegroundUnchecked}" Visibility="Collapsed"/>
++                            <Rectangle x:Name="IndeterminateGlyph" Width="10" Height="10"
++                                       Fill="{ThemeResource CheckBoxCheckGlyphForegroundIndeterminate}" Visibility="Collapsed"/>
++                        </Grid>
++                        <ContentPresenter x:Name="ContentPresenter" Grid.Column="1"
++                                          Content="{TemplateBinding Content}"
++                                          Margin="{TemplateBinding Padding}"
++                                          FontSize="{TemplateBinding FontSize}"
++                                          Foreground="{ThemeResource CheckBoxForegroundUnchecked}"
++                                          HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
++                                          VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
++                    </Grid>
++                </ControlTemplate>
++            </Setter.Value>
++        </Setter>
+     </Style>
+ 
+     <Style TargetType="RadioButton">
+@@ -408,5 +868,143 @@
+         <Setter Property="HorizontalContentAlignment" Value="Left"/>
+         <Setter Property="VerticalContentAlignment" Value="Top"/>
+         <Setter Property="FontSize" Value="14"/>
++        <Setter Property="Template">
++            <Setter.Value>
++                <ControlTemplate TargetType="RadioButton">
++                    <Grid x:Name="RootGrid" Background="{TemplateBinding Background}">
++                        <VisualStateManager.VisualStateGroups>
++                            <VisualStateGroup x:Name="CommonStates">
++                            <VisualState x:Name="Normal">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="OuterEllipse" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonOuterEllipseStroke}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="OuterEllipse" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonOuterEllipseFill}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckOuterEllipse" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonOuterEllipseCheckedStroke}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckOuterEllipse" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonOuterEllipseCheckedFill}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckGlyph" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonCheckGlyphFill}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonForeground}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="PointerOver">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="OuterEllipse" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonOuterEllipseStrokePointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="OuterEllipse" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonOuterEllipseFillPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckOuterEllipse" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonOuterEllipseCheckedStrokePointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckOuterEllipse" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonOuterEllipseCheckedFillPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckGlyph" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonCheckGlyphFillPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonForegroundPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="Pressed">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="OuterEllipse" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonOuterEllipseStrokePressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="OuterEllipse" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonOuterEllipseFillPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckOuterEllipse" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonOuterEllipseCheckedStrokePressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckOuterEllipse" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonOuterEllipseCheckedFillPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckGlyph" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonCheckGlyphFillPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonForegroundPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="Disabled">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="OuterEllipse" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonOuterEllipseStrokeDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="OuterEllipse" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonOuterEllipseFillDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckOuterEllipse" Storyboard.TargetProperty="Stroke">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonOuterEllipseCheckedStrokeDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckOuterEllipse" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonOuterEllipseCheckedFillDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckGlyph" Storyboard.TargetProperty="Fill">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonCheckGlyphFillDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource RadioButtonForegroundDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            </VisualStateGroup>
++                            <VisualStateGroup x:Name="CheckStates">
++                            <VisualState x:Name="Checked">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckGlyph" Storyboard.TargetProperty="Visibility">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="Visible"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="OuterEllipse" Storyboard.TargetProperty="Visibility">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="Collapsed"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="CheckOuterEllipse" Storyboard.TargetProperty="Visibility">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="Visible"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="Unchecked"/>
++                            <VisualState x:Name="Indeterminate"/>
++                            </VisualStateGroup>
++                        </VisualStateManager.VisualStateGroups>
++                        <Grid.ColumnDefinitions>
++                            <ColumnDefinition Width="20"/>
++                            <ColumnDefinition Width="*"/>
++                        </Grid.ColumnDefinitions>
++                        <Grid Height="32" VerticalAlignment="Top">
++                            <Ellipse x:Name="OuterEllipse" Width="20" Height="20" StrokeThickness="2"
++                                     Stroke="{ThemeResource RadioButtonOuterEllipseStroke}"
++                                     Fill="{ThemeResource RadioButtonOuterEllipseFill}"/>
++                            <Ellipse x:Name="CheckOuterEllipse" Width="20" Height="20" StrokeThickness="2" Visibility="Collapsed"
++                                     Stroke="{ThemeResource RadioButtonOuterEllipseCheckedStroke}"
++                                     Fill="{ThemeResource RadioButtonOuterEllipseCheckedFill}"/>
++                            <Ellipse x:Name="CheckGlyph" Width="10" Height="10" Visibility="Collapsed"
++                                     Fill="{ThemeResource RadioButtonCheckGlyphFill}"/>
++                        </Grid>
++                        <ContentPresenter x:Name="ContentPresenter" Grid.Column="1"
++                                          Content="{TemplateBinding Content}"
++                                          Margin="{TemplateBinding Padding}"
++                                          FontSize="{TemplateBinding FontSize}"
++                                          Foreground="{ThemeResource RadioButtonForeground}"
++                                          HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
++                                          VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
++                    </Grid>
++                </ControlTemplate>
++            </Setter.Value>
++        </Setter>
+     </Style>
+ </ResourceDictionary>
+diff --git a/dlls/windows.ui.xaml/main.c b/dlls/windows.ui.xaml/main.c
+index f49e21e..2c53447 100644
+--- a/dlls/windows.ui.xaml/main.c
++++ b/dlls/windows.ui.xaml/main.c
+@@ -66,6 +66,12 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( page_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Frame ))
+         IActivationFactory_QueryInterface( frame_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Shapes_Rectangle ))
++        IActivationFactory_QueryInterface( rectangle_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Shapes_Ellipse ))
++        IActivationFactory_QueryInterface( ellipse_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Shapes_Path ))
++        IActivationFactory_QueryInterface( path_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Markup_XamlReader ))
+         IActivationFactory_QueryInterface( xaml_reader_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ContentPresenter ))
+diff --git a/dlls/windows.ui.xaml/presenter.c b/dlls/windows.ui.xaml/presenter.c
+index a55ae2c..e2e42ad 100644
+--- a/dlls/windows.ui.xaml/presenter.c
++++ b/dlls/windows.ui.xaml/presenter.c
+@@ -146,8 +146,8 @@ static void presenter_render( struct xaml_element *element, struct layout_contex
+     float w, h;
+     Color c;
+ 
+-    element_fill( ctx, &element->bounds, impl->background );
+-    element_frame( ctx, &element->bounds, &impl->border_thickness, impl->border_brush );
++    element_draw_shape( ctx, &element->bounds, &element->corner_radius, FALSE, impl->background, impl->border_brush,
++                        &impl->border_thickness );
+     if (impl->foreground && brush_get_color( impl->foreground, &c )) color = element_text_color( ctx, &element->bounds, c );
+     if (impl->child)
+     {
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index b1c2c0d..4b0d5f2 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -54,6 +54,7 @@
+ #define WIDL_using_Windows_UI_Xaml_Markup
+ #define WIDL_using_Windows_UI_Xaml_Interop
+ #define WIDL_using_Windows_UI_Xaml_Navigation
++#define WIDL_using_Windows_UI_Xaml_Shapes
+ #include "windows.ui.xaml.h"
+ 
+ extern IActivationFactory *color_helper_factory;
+@@ -76,6 +77,10 @@ extern IActivationFactory *page_factory;
+ extern IActivationFactory *frame_factory;
+ extern IActivationFactory *content_presenter_factory;
+ extern IActivationFactory *xaml_reader_factory;
++extern IActivationFactory *rectangle_factory;
++extern IActivationFactory *ellipse_factory;
++extern IActivationFactory *path_factory;
++BOOL path_set_data( IInspectable *object, const WCHAR *data );   /* shapes.c: Path.Data from path markup */
+ 
+ /* event handler lists (handlers are kept, tokens are indices + 1) */
+ struct event_list
+@@ -89,6 +94,9 @@ void event_list_clear( struct event_list *list );
+ 
+ /* application.c */
+ ApplicationTheme application_theme(void);
++BOOL application_system_theme_changed(void);
++int theme_override_set( int dark );   /* -1 for none; returns the previous one */
++BOOL lookup_theme_dark(void);
+ IApplicationOverrides *application_get_overrides(void);
+ IInspectable *application_resources(void);
+ HRESULT app_create_instance_from_type( TypeName type, IInspectable **out );
+@@ -178,6 +186,7 @@ struct xaml_element
+ {
+     IUIElement IUIElement_iface;
+     IFrameworkElement IFrameworkElement_iface;
++    IFrameworkElement2 IFrameworkElement2_iface;
+     IDependencyObject IDependencyObject_iface;
+     IInspectable IInspectable_inner;  /* non-delegating */
+     IInspectable *outer;              /* the controlling object, or &IInspectable_inner */
+@@ -189,6 +198,7 @@ struct xaml_element
+     /* FrameworkElement layout properties; NAN means Auto */
+     double width, height;
+     Thickness margin;
++    CornerRadius corner_radius;               /* Control, ContentPresenter, Grid (Border keeps its own) */
+     HorizontalAlignment horizontal_alignment;
+     VerticalAlignment vertical_alignment;
+     Visibility visibility;
+@@ -200,6 +210,11 @@ struct xaml_element
+     IInspectable *style;                       /* FrameworkElement.Style */
+     BOOL implicit_style_done;
+     BOOL default_style_done;
++    ElementTheme requested_theme;             /* FrameworkElement.RequestedTheme */
++    BOOL theme_dirty;                         /* re-resolve the subtree's theme resources on the next layout */
++    IInspectable *implicit_style;
++    struct theme_ref *theme_refs;             /* {ThemeResource} values set on the element (xbf.c) */
++    UINT32 theme_ref_count;
+     IInspectable *visual_state_groups;         /* VisualStateManager.VisualStateGroups (a template's root) */
+     IInspectable *template;                    /* Control.Template */
+     struct template_instance *template_instance;
+@@ -219,8 +234,12 @@ struct xaml_element *element_from_iinspectable( IInspectable *object );
+ struct xaml_element *element_from_object( IInspectable *object );   /* NULL without a FIXME if not ours */
+ IInspectable *element_resources( IInspectable *object );            /* FrameworkElement.Resources, not referenced */
+ void element_mark_local( struct xaml_element *element, const WCHAR *property );
++BOOL report_missing_interface( const WCHAR *class_name, REFIID iid );   /* FIXME once per class and interface */
+ void element_set_template( struct xaml_element *element, IInspectable *template );
+ void element_apply_default_style( struct xaml_element *element );
++BOOL element_is_dark( struct xaml_element *element );          /* the theme in effect for the element */
++void element_theme_refresh( struct xaml_element *element );    /* xbf.c: re-resolve the subtree's theme resources */
++void element_free_theme_refs( struct xaml_element *element );  /* xbf.c */
+ /* a resource in the element's or its ancestors' Resources, or the application's; referenced, or NULL */
+ IInspectable *element_lookup_resource( struct xaml_element *element, const WCHAR *key );
+ BOOL element_is_local( struct xaml_element *element, const WCHAR *property );
+@@ -254,6 +273,11 @@ void element_fill( struct layout_context *ctx, const struct layout_rect *rect, I
+ void element_frame( struct layout_context *ctx, const struct layout_rect *rect, const Thickness *thickness, IBrush *brush );
+ void element_fill_color( struct layout_context *ctx, const struct layout_rect *rect, COLORREF color );
+ COLORREF element_text_color( struct layout_context *ctx, const struct layout_rect *rect, Color color );
++struct shape_point { float x, y; };
++void element_draw_shape( struct layout_context *ctx, const struct layout_rect *rect, const CornerRadius *radius,
++                         BOOL ellipse, IBrush *fill, IBrush *stroke, const Thickness *thickness );
++void element_draw_lines( struct layout_context *ctx, float x, float y, const struct shape_point *points, UINT32 count,
++                         BOOL closed, IBrush *fill, IBrush *stroke, double thickness );
+ void element_frame_color( struct layout_context *ctx, const struct layout_rect *rect, const Thickness *thickness,
+                           COLORREF color );
+ BOOL definition_get( IInspectable *object, GridLength *length, double *min, double *max );
+@@ -276,6 +300,7 @@ void text_draw( struct layout_context *ctx, const struct text_format *format, HS
+                 COLORREF color );
+ 
+ void window_invalidate(void);
++void window_theme_changed(void);   /* re-resolve the whole tree's theme resources on the next layout */
+ BOOL brush_get_color( IBrush *brush, Color *color );
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+diff --git a/dlls/windows.ui.xaml/resources.c b/dlls/windows.ui.xaml/resources.c
+index 98c762f..5d9d616 100644
+--- a/dlls/windows.ui.xaml/resources.c
++++ b/dlls/windows.ui.xaml/resources.c
+@@ -142,7 +142,7 @@ IInspectable *resource_dictionary_lookup( IInspectable *object, const WCHAR *key
+     }
+     if (impl->theme_dictionaries)
+     {
+-        const WCHAR *name = application_theme() == ApplicationTheme_Dark ? L"Dark" : L"Light";
++        const WCHAR *name = lookup_theme_dark() ? L"Dark" : L"Light";
+         if ((theme = resource_dictionary_lookup( impl->theme_dictionaries, name )) ||
+             (theme = resource_dictionary_lookup( impl->theme_dictionaries, L"Default" )))
+         {
+@@ -182,7 +182,8 @@ static HRESULT WINAPI inner_QueryInterface( IInspectable *iface, REFIID iid, voi
+         *out = &impl->IDependencyObject_iface;
+     else
+     {
+-        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        if (report_missing_interface( RuntimeClass_Windows_UI_Xaml_ResourceDictionary, iid ))
++            FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
+         *out = NULL;
+         return E_NOINTERFACE;
+     }
+@@ -513,7 +514,7 @@ theme_brushes[] =
+ 
+ IInspectable *theme_resource_lookup( const WCHAR *key )
+ {
+-    BOOL dark = application_theme() == ApplicationTheme_Dark;
++    BOOL dark = lookup_theme_dark();
+     ISolidColorBrushFactory *factory;
+     ISolidColorBrush *brush;
+     UINT32 i, argb;
+diff --git a/dlls/windows.ui.xaml/shapes.c b/dlls/windows.ui.xaml/shapes.c
+new file mode 100644
+index 0000000..04def35
+--- /dev/null
++++ b/dlls/windows.ui.xaml/shapes.c
+@@ -0,0 +1,639 @@
++/* WinRT Windows.UI.Xaml.Shapes implementation: Rectangle, Ellipse and Path
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <math.h>
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* Rectangle and Ellipse fill their layout slot (Stretch Fill) and draw their stroke inside it. A Path's Data is
++ * path markup ("M 4,10 L 8,14 Z"), set from markup as a string; its lines are drawn at their own coordinates
++ * (Stretch None). Curves are reduced to their end points; Geometry objects from code aren't supported. */
++
++enum shape_kind
++{
++    SHAPE_RECTANGLE,
++    SHAPE_ELLIPSE,
++    SHAPE_PATH,
++};
++
++struct figure
++{
++    struct shape_point *points;
++    UINT32 count;
++    BOOL closed;
++};
++
++struct shape
++{
++    struct xaml_element element;
++    IShape IShape_iface;
++    IRectangle IRectangle_iface;
++    IEllipse IEllipse_iface;
++    IPath IPath_iface;
++    enum shape_kind kind;
++    IBrush *fill, *stroke;
++    double stroke_thickness, radius_x, radius_y;
++    Stretch stretch;
++    struct figure *figures;
++    UINT32 figure_count;
++};
++
++static const struct element_ops shape_ops;
++
++static inline struct shape *impl_from_element( struct xaml_element *element )
++{
++    return CONTAINING_RECORD( element, struct shape, element );
++}
++
++static struct shape *shape_from_object( IInspectable *object )
++{
++    struct xaml_element *element = object ? element_from_object( object ) : NULL;
++    return element && element->ops == &shape_ops ? impl_from_element( element ) : NULL;
++}
++
++static HRESULT shape_query_interface( struct xaml_element *element, REFIID iid, void **out )
++{
++    struct shape *impl = impl_from_element( element );
++
++    if (IsEqualGUID( iid, &IID_IShape )) *out = &impl->IShape_iface;
++    else if (impl->kind == SHAPE_RECTANGLE && IsEqualGUID( iid, &IID_IRectangle )) *out = &impl->IRectangle_iface;
++    else if (impl->kind == SHAPE_ELLIPSE && IsEqualGUID( iid, &IID_IEllipse )) *out = &impl->IEllipse_iface;
++    else if (impl->kind == SHAPE_PATH && IsEqualGUID( iid, &IID_IPath )) *out = &impl->IPath_iface;
++    else return E_NOINTERFACE;
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static void shape_measure( struct xaml_element *element, struct layout_context *ctx, float avail_width,
++                           float avail_height, float *width, float *height )
++{
++    struct shape *impl = impl_from_element( element );
++    UINT32 i, j;
++
++    *width = *height = 0;
++    if (impl->kind != SHAPE_PATH)
++    {
++        /* a stretching shape takes no room of its own, apart from its stroke */
++        *width = *height = impl->stroke ? impl->stroke_thickness : 0;
++        return;
++    }
++    for (i = 0; i < impl->figure_count; i++)
++        for (j = 0; j < impl->figures[i].count; j++)
++        {
++            *width = max( *width, impl->figures[i].points[j].x );
++            *height = max( *height, impl->figures[i].points[j].y );
++        }
++    if (impl->stroke)
++    {
++        *width += impl->stroke_thickness / 2;
++        *height += impl->stroke_thickness / 2;
++    }
++}
++
++static void shape_render( struct xaml_element *element, struct layout_context *ctx )
++{
++    struct shape *impl = impl_from_element( element );
++    double t = impl->stroke ? impl->stroke_thickness : 0;
++    Thickness thickness = { t, t, t, t };
++    CornerRadius radius;
++    UINT32 i;
++
++    switch (impl->kind)
++    {
++    case SHAPE_RECTANGLE:
++        radius.TopLeft = radius.TopRight = radius.BottomRight = radius.BottomLeft = max( impl->radius_x, impl->radius_y );
++        element_draw_shape( ctx, &element->bounds, &radius, FALSE, impl->fill, impl->stroke, &thickness );
++        break;
++    case SHAPE_ELLIPSE:
++        element_draw_shape( ctx, &element->bounds, NULL, TRUE, impl->fill, impl->stroke, &thickness );
++        break;
++    case SHAPE_PATH:
++        for (i = 0; i < impl->figure_count; i++)
++            element_draw_lines( ctx, element->bounds.x, element->bounds.y, impl->figures[i].points, impl->figures[i].count,
++                                impl->figures[i].closed, impl->fill, impl->stroke, t );
++        break;
++    }
++}
++
++static void free_figures( struct shape *impl )
++{
++    UINT32 i;
++    for (i = 0; i < impl->figure_count; i++) free( impl->figures[i].points );
++    free( impl->figures );
++    impl->figures = NULL;
++    impl->figure_count = 0;
++}
++
++static void shape_destroy( struct xaml_element *element )
++{
++    struct shape *impl = impl_from_element( element );
++
++    if (impl->fill) IBrush_Release( impl->fill );
++    if (impl->stroke) IBrush_Release( impl->stroke );
++    free_figures( impl );
++    free( impl );
++}
++
++static const struct element_ops shape_ops =
++{
++    .query_interface = shape_query_interface,
++    .measure = shape_measure,
++    .render = shape_render,
++    .destroy = shape_destroy,
++};
++
++/* path markup: M/L/H/V/Z, absolute and relative; C/S/Q/T/A go straight to their end point */
++static const WCHAR *path_number( const WCHAR *p, float *out, BOOL *ok )
++{
++    WCHAR *end;
++    while (*p == ' ' || *p == ',' || *p == '\t' || *p == '\r' || *p == '\n') p++;
++    *out = wcstod( p, &end );
++    *ok = end != p;
++    return end;
++}
++
++static BOOL add_point( struct figure *figure, float x, float y )
++{
++    struct shape_point *points = realloc( figure->points, (figure->count + 1) * sizeof(*points) );
++    if (!points) return FALSE;
++    figure->points = points;
++    points[figure->count].x = x;
++    points[figure->count++].y = y;
++    return TRUE;
++}
++
++static void path_parse( struct shape *impl, const WCHAR *data )
++{
++    static const struct { WCHAR cmd; UINT32 args; } counts[] =
++        { {'M', 2}, {'L', 2}, {'H', 1}, {'V', 1}, {'C', 6}, {'S', 4}, {'Q', 4}, {'T', 2}, {'A', 7} };
++    const WCHAR *p = data;
++    struct figure *figure = NULL, *figures;
++    float x = 0, y = 0, start_x = 0, start_y = 0, v[7];
++    WCHAR cmd = 0, upper;
++    UINT32 i, n;
++    BOOL ok, relative;
++
++    free_figures( impl );
++    while (*p == ' ') p++;
++    if ((p[0] == 'F' || p[0] == 'f') && (p[1] == '0' || p[1] == '1')) p += 2;   /* fill rule */
++    for (;;)
++    {
++        while (*p == ' ' || *p == ',' || *p == '\t' || *p == '\r' || *p == '\n') p++;
++        if (!*p) break;
++        if (iswalpha( *p )) cmd = *p++;
++        else if (!cmd) break;
++        upper = towupper( cmd );
++        relative = cmd != upper;
++        if (upper == 'Z')
++        {
++            if (figure) figure->closed = TRUE;
++            x = start_x;
++            y = start_y;
++            cmd = 0;
++            continue;
++        }
++        for (i = 0; i < ARRAY_SIZE(counts) && counts[i].cmd != upper; i++);
++        if (i == ARRAY_SIZE(counts))
++        {
++            FIXME( "path command %c in %s.\n", cmd, debugstr_w(data) );
++            break;
++        }
++        for (n = 0, ok = TRUE; n < counts[i].args && ok; n++) p = path_number( p, &v[n], &ok );
++        if (!ok) break;
++        switch (upper)
++        {
++        case 'H': x = relative ? x + v[0] : v[0]; break;
++        case 'V': y = relative ? y + v[0] : v[0]; break;
++        default:
++            x = relative ? x + v[counts[i].args - 2] : v[counts[i].args - 2];
++            y = relative ? y + v[counts[i].args - 1] : v[counts[i].args - 1];
++            break;
++        }
++        if (upper == 'M' || !figure)
++        {
++            if (!(figures = realloc( impl->figures, (impl->figure_count + 1) * sizeof(*figures) ))) break;
++            impl->figures = figures;
++            figure = &figures[impl->figure_count++];
++            memset( figure, 0, sizeof(*figure) );
++            start_x = x;
++            start_y = y;
++            if (upper == 'M') cmd = relative ? 'l' : 'L';   /* more pairs after M are lines */
++        }
++        if (!add_point( figure, x, y )) break;
++    }
++    TRACE( "%s: %u figures.\n", debugstr_w(data), impl->figure_count );
++    window_invalidate();
++}
++
++BOOL path_set_data( IInspectable *object, const WCHAR *data )
++{
++    struct shape *impl = shape_from_object( object );
++
++    if (!impl || impl->kind != SHAPE_PATH) return FALSE;
++    path_parse( impl, data );
++    return TRUE;
++}
++
++static void set_brush( IBrush **slot, IBrush *value )
++{
++    if (value) IBrush_AddRef( value );
++    if (*slot) IBrush_Release( *slot );
++    *slot = value;
++    window_invalidate();
++}
++
++/* IShape */
++
++DEFINE_IINSPECTABLE_( shape_iface, IShape, struct shape, impl_from_IShape, IShape_iface, impl->element.outer )
++
++static HRESULT WINAPI shape_iface_get_Fill( IShape *iface, IBrush **value )
++{
++    if ((*value = impl_from_IShape( iface )->fill)) IBrush_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI shape_iface_put_Fill( IShape *iface, IBrush *value )
++{
++    set_brush( &impl_from_IShape( iface )->fill, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI shape_iface_get_Stroke( IShape *iface, IBrush **value )
++{
++    if ((*value = impl_from_IShape( iface )->stroke)) IBrush_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI shape_iface_put_Stroke( IShape *iface, IBrush *value )
++{
++    set_brush( &impl_from_IShape( iface )->stroke, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI shape_iface_get_StrokeMiterLimit( IShape *iface, DOUBLE *value )
++{
++    *value = 10;
++    return S_OK;
++}
++
++static HRESULT WINAPI shape_iface_put_StrokeMiterLimit( IShape *iface, DOUBLE value )
++{
++    FIXME( "iface %p, value %f stub!\n", iface, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI shape_iface_get_StrokeThickness( IShape *iface, DOUBLE *value )
++{
++    *value = impl_from_IShape( iface )->stroke_thickness;
++    return S_OK;
++}
++
++static HRESULT WINAPI shape_iface_put_StrokeThickness( IShape *iface, DOUBLE value )
++{
++    impl_from_IShape( iface )->stroke_thickness = value;
++    window_invalidate();
++    return S_OK;
++}
++
++#define CAP_STUB( name, type ) \
++static HRESULT WINAPI shape_iface_get_##name( IShape *iface, type *value ) \
++{ \
++    *value = 0; \
++    return S_OK; \
++} \
++static HRESULT WINAPI shape_iface_put_##name( IShape *iface, type value ) \
++{ \
++    FIXME( "iface %p, value %d stub!\n", iface, (int)value ); \
++    return S_OK; \
++}
++
++CAP_STUB( StrokeStartLineCap, PenLineCap )
++CAP_STUB( StrokeEndLineCap, PenLineCap )
++CAP_STUB( StrokeLineJoin, PenLineJoin )
++CAP_STUB( StrokeDashCap, PenLineCap )
++
++static HRESULT WINAPI shape_iface_get_StrokeDashOffset( IShape *iface, DOUBLE *value )
++{
++    *value = 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI shape_iface_put_StrokeDashOffset( IShape *iface, DOUBLE value )
++{
++    FIXME( "iface %p, value %f stub!\n", iface, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI shape_iface_get_StrokeDashArray( IShape *iface, __FIVector_1_DOUBLE **value )
++{
++    FIXME( "iface %p stub!\n", iface );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI shape_iface_put_StrokeDashArray( IShape *iface, __FIVector_1_DOUBLE *value )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI shape_iface_get_Stretch( IShape *iface, Stretch *value )
++{
++    *value = impl_from_IShape( iface )->stretch;
++    return S_OK;
++}
++
++static HRESULT WINAPI shape_iface_put_Stretch( IShape *iface, Stretch value )
++{
++    struct shape *impl = impl_from_IShape( iface );
++    if (impl->kind == SHAPE_PATH && value != Stretch_None) FIXME( "stretched paths are drawn unstretched.\n" );
++    impl->stretch = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI shape_iface_get_GeometryTransform( IShape *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CITransform **value )
++{
++    FIXME( "iface %p stub!\n", iface );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct IShapeVtbl shape_iface_vtbl =
++{
++    shape_iface_QueryInterface,
++    shape_iface_AddRef,
++    shape_iface_Release,
++    /* IInspectable methods */
++    shape_iface_GetIids,
++    shape_iface_GetRuntimeClassName,
++    shape_iface_GetTrustLevel,
++    /* IShape methods */
++    shape_iface_get_Fill,
++    shape_iface_put_Fill,
++    shape_iface_get_Stroke,
++    shape_iface_put_Stroke,
++    shape_iface_get_StrokeMiterLimit,
++    shape_iface_put_StrokeMiterLimit,
++    shape_iface_get_StrokeThickness,
++    shape_iface_put_StrokeThickness,
++    shape_iface_get_StrokeStartLineCap,
++    shape_iface_put_StrokeStartLineCap,
++    shape_iface_get_StrokeEndLineCap,
++    shape_iface_put_StrokeEndLineCap,
++    shape_iface_get_StrokeLineJoin,
++    shape_iface_put_StrokeLineJoin,
++    shape_iface_get_StrokeDashOffset,
++    shape_iface_put_StrokeDashOffset,
++    shape_iface_get_StrokeDashCap,
++    shape_iface_put_StrokeDashCap,
++    shape_iface_get_StrokeDashArray,
++    shape_iface_put_StrokeDashArray,
++    shape_iface_get_Stretch,
++    shape_iface_put_Stretch,
++    shape_iface_get_GeometryTransform,
++};
++
++/* IRectangle */
++
++DEFINE_IINSPECTABLE_( rectangle, IRectangle, struct shape, impl_from_IRectangle, IRectangle_iface, impl->element.outer )
++
++static HRESULT WINAPI rectangle_get_RadiusX( IRectangle *iface, DOUBLE *value )
++{
++    *value = impl_from_IRectangle( iface )->radius_x;
++    return S_OK;
++}
++
++static HRESULT WINAPI rectangle_put_RadiusX( IRectangle *iface, DOUBLE value )
++{
++    impl_from_IRectangle( iface )->radius_x = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI rectangle_get_RadiusY( IRectangle *iface, DOUBLE *value )
++{
++    *value = impl_from_IRectangle( iface )->radius_y;
++    return S_OK;
++}
++
++static HRESULT WINAPI rectangle_put_RadiusY( IRectangle *iface, DOUBLE value )
++{
++    impl_from_IRectangle( iface )->radius_y = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static const struct IRectangleVtbl rectangle_vtbl =
++{
++    rectangle_QueryInterface,
++    rectangle_AddRef,
++    rectangle_Release,
++    /* IInspectable methods */
++    rectangle_GetIids,
++    rectangle_GetRuntimeClassName,
++    rectangle_GetTrustLevel,
++    /* IRectangle methods */
++    rectangle_get_RadiusX,
++    rectangle_put_RadiusX,
++    rectangle_get_RadiusY,
++    rectangle_put_RadiusY,
++};
++
++/* IEllipse has no methods of its own */
++
++DEFINE_IINSPECTABLE_( ellipse, IEllipse, struct shape, impl_from_IEllipse, IEllipse_iface, impl->element.outer )
++
++static const struct IEllipseVtbl ellipse_vtbl =
++{
++    ellipse_QueryInterface,
++    ellipse_AddRef,
++    ellipse_Release,
++    /* IInspectable methods */
++    ellipse_GetIids,
++    ellipse_GetRuntimeClassName,
++    ellipse_GetTrustLevel,
++};
++
++/* IPath */
++
++DEFINE_IINSPECTABLE_( path, IPath, struct shape, impl_from_IPath, IPath_iface, impl->element.outer )
++
++static HRESULT WINAPI path_get_Data( IPath *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIGeometry **value )
++{
++    FIXME( "iface %p: Geometry objects are not supported.\n", iface );
++    *value = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI path_put_Data( IPath *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIGeometry *value )
++{
++    FIXME( "iface %p, value %p: Geometry objects are not supported, only path markup.\n", iface, value );
++    return E_NOTIMPL;
++}
++
++static const struct IPathVtbl path_vtbl =
++{
++    path_QueryInterface,
++    path_AddRef,
++    path_Release,
++    /* IInspectable methods */
++    path_GetIids,
++    path_GetRuntimeClassName,
++    path_GetTrustLevel,
++    /* IPath methods */
++    path_get_Data,
++    path_put_Data,
++};
++
++static HRESULT shape_create( enum shape_kind kind, IInspectable *outer, IInspectable **inner, void **value )
++{
++    static const WCHAR *names[] =
++    {
++        RuntimeClass_Windows_UI_Xaml_Shapes_Rectangle,
++        RuntimeClass_Windows_UI_Xaml_Shapes_Ellipse,
++        RuntimeClass_Windows_UI_Xaml_Shapes_Path,
++    };
++    struct shape *impl;
++    void *iface;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    element_init( &impl->element, &shape_ops, names[kind], outer );
++    impl->IShape_iface.lpVtbl = &shape_iface_vtbl;
++    impl->IRectangle_iface.lpVtbl = &rectangle_vtbl;
++    impl->IEllipse_iface.lpVtbl = &ellipse_vtbl;
++    impl->IPath_iface.lpVtbl = &path_vtbl;
++    impl->kind = kind;
++    impl->stroke_thickness = 1.0;
++    impl->stretch = kind == SHAPE_PATH ? Stretch_None : Stretch_Fill;
++    switch (kind)
++    {
++    case SHAPE_RECTANGLE: iface = &impl->IRectangle_iface; break;
++    case SHAPE_ELLIPSE: iface = &impl->IEllipse_iface; break;
++    default: iface = &impl->IPath_iface; break;
++    }
++    return element_compose( &impl->element, outer, inner, iface, value );
++}
++
++/* activation factories */
++
++struct shape_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IPathFactory IPathFactory_iface;
++    enum shape_kind kind;
++};
++
++static inline struct shape_statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct shape_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct shape_statics *impl = impl_from_IActivationFactory( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (impl->kind == SHAPE_PATH && IsEqualGUID( iid, &IID_IPathFactory ))
++        *out = &impl->IPathFactory_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    return 2;
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    return 1;
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    return shape_create( impl_from_IActivationFactory( iface )->kind, NULL, NULL, (void **)instance );
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE_( path_factory, IPathFactory, struct shape_statics, impl_from_IPathFactory, IPathFactory_iface,
++                      &impl->IActivationFactory_iface )
++
++static HRESULT WINAPI path_factory_CreateInstance( IPathFactory *iface, IInspectable *outer, IInspectable **inner, IPath **value )
++{
++    return shape_create( SHAPE_PATH, outer, inner, (void **)value );
++}
++
++static const struct IPathFactoryVtbl path_factory_vtbl =
++{
++    path_factory_QueryInterface,
++    path_factory_AddRef,
++    path_factory_Release,
++    /* IInspectable methods */
++    path_factory_GetIids,
++    path_factory_GetRuntimeClassName,
++    path_factory_GetTrustLevel,
++    /* IPathFactory methods */
++    path_factory_CreateInstance,
++};
++
++static struct shape_statics rectangle_statics = { {&factory_vtbl}, {&path_factory_vtbl}, SHAPE_RECTANGLE };
++static struct shape_statics ellipse_statics = { {&factory_vtbl}, {&path_factory_vtbl}, SHAPE_ELLIPSE };
++static struct shape_statics path_statics = { {&factory_vtbl}, {&path_factory_vtbl}, SHAPE_PATH };
++
++IActivationFactory *rectangle_factory = &rectangle_statics.IActivationFactory_iface;
++IActivationFactory *ellipse_factory = &ellipse_statics.IActivationFactory_iface;
++IActivationFactory *path_factory = &path_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/window.c b/dlls/windows.ui.xaml/window.c
+index b9852e9..0a18234 100644
+--- a/dlls/windows.ui.xaml/window.c
++++ b/dlls/windows.ui.xaml/window.c
+@@ -61,6 +61,15 @@ void window_invalidate(void)
+     if (current_window && current_window->hwnd) InvalidateRect( current_window->hwnd, NULL, FALSE );
+ }
+ 
++void window_theme_changed(void)
++{
++    struct xaml_element *element;
++
++    if (!current_window || !current_window->content) return;
++    if ((element = element_from_iinspectable( (IInspectable *)current_window->content ))) element->theme_dirty = TRUE;
++    window_invalidate();
++}
++
+ static void window_layout( struct xaml_window *window, struct layout_context *ctx, HDC hdc )
+ {
+     struct xaml_element *element;
+@@ -188,6 +197,11 @@ static LRESULT CALLBACK window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM
+     case WM_SIZE:
+         InvalidateRect( hwnd, NULL, FALSE );
+         break;
++    case WM_SETTINGCHANGE:
++        /* the system's light / dark app theme changed (Settings > Colours) */
++        if (lparam && !wcscmp( (const WCHAR *)lparam, L"ImmersiveColorSet" ) && application_system_theme_changed())
++            window_theme_changed();
++        break;
+     case WM_MOUSEMOVE:
+     case WM_LBUTTONDOWN:
+     case WM_LBUTTONUP:
+diff --git a/dlls/windows.ui.xaml/xbf.c b/dlls/windows.ui.xaml/xbf.c
+index 21333a9..a61f4f8 100644
+--- a/dlls/windows.ui.xaml/xbf.c
++++ b/dlls/windows.ui.xaml/xbf.c
+@@ -803,6 +803,7 @@ struct style_setter
+     struct xprop prop;
+     struct xvalue value;
+     WCHAR *resource;     /* {StaticResource}/{ThemeResource} key looked up when applied (text markup), or NULL */
++    WCHAR *theme_key;    /* the value came from {ThemeResource theme_key}: looked up again when the theme changes */
+ };
+ 
+ struct style
+@@ -864,6 +865,7 @@ static ULONG WINAPI style_Release( IStyle *iface )
+         {
+             xvalue_clear( &impl->setters[i].value );
+             free( impl->setters[i].resource );
++            free( impl->setters[i].theme_key );
+         }
+         free( impl->setters );
+         if (impl->based_on) IInspectable_Release( impl->based_on );
+@@ -985,7 +987,8 @@ static void style_add_setter( struct style *impl, const struct xprop *prop, stru
+         if (wcscmp( impl->setters[i].prop.name, prop->name )) continue;
+         xvalue_clear( &impl->setters[i].value );   /* a later setter for the same property wins */
+         free( impl->setters[i].resource );
+-        impl->setters[i].resource = NULL;
++        free( impl->setters[i].theme_key );
++        impl->setters[i].resource = impl->setters[i].theme_key = NULL;
+         impl->setters[i].value = *value;
+         memset( value, 0, sizeof(*value) );
+         return;
+@@ -995,10 +998,62 @@ static void style_add_setter( struct style *impl, const struct xprop *prop, stru
+     setters[impl->count].prop = *prop;
+     setters[impl->count].value = *value;
+     setters[impl->count].resource = NULL;
++    setters[impl->count].theme_key = NULL;
+     memset( value, 0, sizeof(*value) );
+     impl->count++;
+ }
+ 
++/* the setter for prop came from {ThemeResource key}; takes ownership of key */
++static void style_set_theme_key( struct style *impl, const struct xprop *prop, WCHAR *key )
++{
++    UINT32 i;
++
++    for (i = 0; key && i < impl->count; i++)
++    {
++        if (wcscmp( impl->setters[i].prop.name, prop->name )) continue;
++        free( impl->setters[i].theme_key );
++        impl->setters[i].theme_key = key;
++        return;
++    }
++    free( key );
++}
++
++/* ---- {ThemeResource} values on elements: looked up again when the theme in effect changes ---- */
++
++struct theme_ref
++{
++    struct xprop prop;
++    WCHAR key[100];
++    enum set_mode mode;
++};
++
++static void add_theme_ref( IInspectable *target, const struct xprop *prop, const WCHAR *key, enum set_mode mode )
++{
++    struct xaml_element *element = target ? element_from_object( target ) : NULL;
++    struct theme_ref *refs;
++    UINT32 i;
++
++    if (!element) return;
++    for (i = 0; i < element->theme_ref_count; i++)
++        if (!wcscmp( element->theme_refs[i].prop.name, prop->name )) break;
++    if (i == element->theme_ref_count)
++    {
++        if (!(refs = realloc( element->theme_refs, (i + 1) * sizeof(*refs) ))) return;
++        element->theme_refs = refs;
++        element->theme_ref_count++;
++    }
++    element->theme_refs[i].prop = *prop;
++    lstrcpynW( element->theme_refs[i].key, key, ARRAY_SIZE(element->theme_refs[i].key) );
++    element->theme_refs[i].mode = mode;
++}
++
++void element_free_theme_refs( struct xaml_element *element )
++{
++    free( element->theme_refs );
++    element->theme_refs = NULL;
++    element->theme_ref_count = 0;
++}
++
+ /* apply BasedOn's setters, then the style's own; properties set directly on the element keep their values */
+ /* a resource for a style applied to target: the element's and its ancestors' resources, the application's, then
+  * the built-in ones; so an app's ButtonBackground overrides the one generic.xaml's Button style refers to */
+@@ -1046,12 +1101,33 @@ void style_apply( IInspectable *style, IInspectable *target )
+     style_apply_mode( style, target, SET_STYLE );
+ }
+ 
++/* the theme changed: set the style's theme-dependent setters again */
++static void style_apply_theme( IInspectable *style, IInspectable *target, enum set_mode mode )
++{
++    struct style *impl = style_from_object( style );
++    struct xvalue value = {0};
++    const WCHAR *key;
++    UINT32 i;
++
++    if (!impl) return;
++    if (impl->based_on) style_apply_theme( impl->based_on, target, mode );
++    for (i = 0; i < impl->count; i++)
++    {
++        if (!(key = impl->setters[i].resource ? impl->setters[i].resource : impl->setters[i].theme_key)) continue;
++        if (!(value.object = target_resource( target, key ))) continue;
++        value.kind = XV_OBJECT;
++        set_property( NULL, target, &impl->setters[i].prop, &value, mode );
++        xvalue_clear( &value );
++    }
++}
++
+ /* where a setter's {StaticResource}/{ThemeResource} value node puts Setter.Value */
+ struct value_sink
+ {
+     IInspectable IInspectable_iface;
+     LONG ref;
+     struct xvalue value;
++    WCHAR theme_key[100];   /* the value came from {ThemeResource theme_key} */
+ };
+ 
+ static const struct IInspectableVtbl value_sink_vtbl;
+@@ -1862,6 +1938,59 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+         return S_OK;
+     }
+ 
++    if (prop_is( prop, L"Fill" ) || prop_is( prop, L"Stroke" ))
++    {
++        IShape *shape;
++        if (QI( target, IShape, &shape ))
++        {
++            brush = value->kind == XV_NULL ? NULL : to_brush( value );
++            if (prop_is( prop, L"Fill" )) IShape_put_Fill( shape, brush );
++            else IShape_put_Stroke( shape, brush );
++            if (brush) IBrush_Release( brush );
++            IShape_Release( shape );
++            return S_OK;
++        }
++    }
++    if (prop_is( prop, L"StrokeThickness" ) && to_double( value, &d ))
++    {
++        IShape *shape;
++        if (QI( target, IShape, &shape ))
++        {
++            IShape_put_StrokeThickness( shape, d );
++            IShape_Release( shape );
++            return S_OK;
++        }
++    }
++    if ((prop_is( prop, L"RadiusX" ) || prop_is( prop, L"RadiusY" )) && to_double( value, &d ))
++    {
++        IRectangle *rectangle;
++        if (QI( target, IRectangle, &rectangle ))
++        {
++            if (prop_is( prop, L"RadiusX" )) IRectangle_put_RadiusX( rectangle, d );
++            else IRectangle_put_RadiusY( rectangle, d );
++            IRectangle_Release( rectangle );
++            return S_OK;
++        }
++    }
++    if (prop_is( prop, L"Data" ) && value->kind == XV_STRING && path_set_data( target, value->s )) return S_OK;
++    if (prop_is( prop, L"CornerRadius" ) && to_thickness( value, &t ))
++    {
++        /* CornerRadius is TopLeft, TopRight, BottomRight, BottomLeft; held in a Thickness's four fields */
++        CornerRadius radius = { t.Left, t.Top, t.Right, t.Bottom };
++        if (value->kind == XV_STRING && !wcschr( value->s, ',' )) radius.TopRight = radius.BottomRight = radius.BottomLeft = t.Left;
++        if (QI( target, IBorder, &border ))
++        {
++            IBorder_put_CornerRadius( border, radius );
++            IBorder_Release( border );
++            return S_OK;
++        }
++        if ((element = element_from_object( target )))
++        {
++            element->corner_radius = radius;
++            window_invalidate();
++            return S_OK;
++        }
++    }
+     if (prop_is( prop, L"Background" ) || prop_is( prop, L"BorderBrush" ) || prop_is( prop, L"Foreground" ))
+     {
+         if ((brush = to_brush( value )))
+@@ -2152,12 +2281,23 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+         }
+         IBorder_Release( border );
+     }
+-    else if (prop_is( prop, L"RequestedTheme" ) && to_enum( value, theme_names, 2, &e ))
++    else if (prop_is( prop, L"RequestedTheme" ) && to_enum( value, theme_names, 2, &e ) && QI( target, IApplication, &app ))
+     {
+-        if (QI( target, IApplication, &app )) { IApplication_put_RequestedTheme( app, e ); IApplication_Release( app ); done = TRUE; }
+-        else FIXME( "per-element RequestedTheme is not supported.\n" );
++        IApplication_put_RequestedTheme( app, e );
++        IApplication_Release( app );
+         return S_OK;
+     }
++    else if (prop_is( prop, L"RequestedTheme" ))
++    {
++        static const WCHAR *const element_theme_names[] = { L"Default", L"Light", L"Dark" };
++        IFrameworkElement2 *fe2;
++        if (to_enum( value, element_theme_names, 3, &e ) && QI( target, IFrameworkElement2, &fe2 ))
++        {
++            IFrameworkElement2_put_RequestedTheme( fe2, e );
++            IFrameworkElement2_Release( fe2 );
++            return S_OK;
++        }
++    }
+     else if (prop_is( prop, L"Resources" ) && value->kind == XV_OBJECT)
+     {
+         IResourceDictionary *dict = NULL;
+@@ -2274,6 +2414,9 @@ IInspectable *create_builtin( const WCHAR *name )
+         { L"SolidColorBrush", &solid_color_brush_factory },
+         { L"StackPanel", &stack_panel_factory },
+         { L"TextBlock", &text_block_factory },
++        { L"Rectangle", &rectangle_factory },
++        { L"Ellipse", &ellipse_factory },
++        { L"Path", &path_factory },
+         { L"ToggleButton", &toggle_button_factory },
+         { L"UserControl", &user_control_factory },
+     };
+@@ -2422,6 +2565,7 @@ static void run_custom_data( struct writer *w, UINT32 stream, struct custom_data
+     {
+         struct style *style = style_from_object( target );
+         struct value_sink *sink;
++        WCHAR *theme_key = NULL;
+ 
+         if (!style)
+         {
+@@ -2465,15 +2609,20 @@ static void run_custom_data( struct writer *w, UINT32 stream, struct custom_data
+                     run_stream( sub, stream, e->token, RUN_NODE );
+                     value = sink->value;
+                     memset( &sink->value, 0, sizeof(sink->value) );
++                    if (sink->theme_key[0]) theme_key = wcsdup( sink->theme_key );
+                 }
+                 while (sub->sp > w->sp) { struct xvalue v; pop( sub, &v ); xvalue_clear( &v ); }
+             }
+             if (!value.kind || (value.kind == XV_OBJECT && !value.object))
+             {
+                 TRACE( "setter %s.%s has no usable value.\n", debugstr_w(prop.owner), debugstr_w(prop.name) );
++                free( theme_key );
++                theme_key = NULL;
+                 continue;
+             }
+             style_add_setter( style, &prop, &value );
++            style_set_theme_key( style, &prop, theme_key );
++            theme_key = NULL;
+             xvalue_clear( &value );
+         }
+         break;
+@@ -2512,7 +2661,7 @@ static void finish_object( struct writer *w, IInspectable *object )
+     if (!(style = lookup_resource( w, key, FALSE, TRUE ))) return;
+     TRACE( "implicit style for %s.\n", debugstr_w(element->class_name) );
+     style_apply( style, object );
+-    IInspectable_Release( style );
++    element->implicit_style = style;
+ }
+ 
+ static void scope_push( struct writer *w, enum scope_kind kind )
+@@ -2736,6 +2885,12 @@ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, enum run
+                 set_property( w, top_object( w ), &prop, &value, SET_LOCAL );
+                 xvalue_clear( &value );
+             }
++            if (key.kind == XV_STRING && node == NODE_SET_VALUE_FROM_THEME_RESOURCE)
++            {
++                struct value_sink *sink = sink_from_object( top_object( w ) );
++                if (sink) lstrcpynW( sink->theme_key, key.s, ARRAY_SIZE(sink->theme_key) );
++                else add_theme_ref( top_object( w ), &prop, key.s, SET_LOCAL );
++            }
+             xvalue_clear( &key );
+             break;
+         case NODE_PROVIDE_STATIC_RESOURCE_VALUE:
+@@ -3312,6 +3467,12 @@ static void text_style_setter( struct writer *w, struct style *style, struct xml
+         return;
+     }
+     if (str && !text_value( w, str, &value )) return;
++    if (str && text_extension( str, arg, ARRAY_SIZE(arg) ) == EXT_THEME_RESOURCE && value.kind)
++    {
++        style_add_setter( style, &prop, &value );
++        style_set_theme_key( style, &prop, wcsdup( arg ) );
++        return;
++    }
+     for (i = 0; !str && i < node->child_count; i++)
+     {
+         struct xml_node *child = node->children[i];
+@@ -3525,6 +3686,14 @@ static void text_element( struct writer *w, struct xml_node *node, struct xvalue
+                 set_property( w, object, &prop, &value, SET_LOCAL );
+                 xvalue_clear( &value );
+             }
++            else if (!wcscmp( a->name, L"ConnectionId" ))
++            {
++                /* Visual Studio's processed markup, when it isn't compiled to XBF: as SetConnectionId */
++                INT32 id = wcstol( a->value, NULL, 10 );
++                HRESULT hr;
++                if (w->connector && FAILED(hr = IComponentConnector_Connect( w->connector, id, object )))
++                    WARN( "Connect(%d) failed, hr %#lx.\n", id, hr );
++            }
+             else if (wcscmp( a->name, L"Key" ) && wcscmp( a->name, L"Class" ))
+                 FIXME( "x:%s is not supported.\n", debugstr_w(a->name) );
+             continue;
+@@ -3537,7 +3706,8 @@ static void text_element( struct writer *w, struct xml_node *node, struct xvalue
+         for (j = 0; j < ARRAY_SIZE(event_names); j++) if (!wcscmp( a->name, event_names[j] )) break;
+         if (j < ARRAY_SIZE(event_names) && a->value[0] != '{')
+         {
+-            FIXME( "event handler %s=%s in text markup is ignored.\n", debugstr_w(a->name), debugstr_w(a->value) );
++            /* with a connector, x:ConnectionId lets the app's Connect hook it up */
++            if (!w->connector) FIXME( "event handler %s=%s in text markup is ignored.\n", debugstr_w(a->name), debugstr_w(a->value) );
+             continue;
+         }
+         text_prop( &prop, node->name, a->name );
+@@ -3549,6 +3719,7 @@ static void text_element( struct writer *w, struct xml_node *node, struct xvalue
+         if (!text_value( w, a->value, &value )) continue;
+         set_property( w, object, &prop, &value, SET_LOCAL );
+         xvalue_clear( &value );
++        if (text_extension( a->value, arg, ARRAY_SIZE(arg) ) == EXT_THEME_RESOURCE) add_theme_ref( object, &prop, arg, SET_LOCAL );
+     }
+ 
+     /* property elements, and content */
+@@ -3620,6 +3791,8 @@ static HRESULT text_load( const WCHAR *text, SIZE_T len, IInspectable *root, BOO
+     w->root = root;
+     w->names_owner = w;
+     w->defer_resources = generic;
++    if (root && FAILED(IInspectable_QueryInterface( root, &IID_IComponentConnector, (void **)&w->connector )))
++        w->connector = NULL;
+     text_element( w, doc->root, &value );
+     if (value.kind != XV_OBJECT || !value.object) hr = E_FAIL;
+     else if (out)
+@@ -3630,6 +3803,7 @@ static HRESULT text_load( const WCHAR *text, SIZE_T len, IInspectable *root, BOO
+     xvalue_clear( &value );
+     while (w->sp) { pop( w, &value ); xvalue_clear( &value ); }
+     for (i = 0; i < w->name_count; i++) IInspectable_Release( w->names[i].object );
++    if (w->connector) IComponentConnector_Release( w->connector );
+     free( w->names );
+     free( w );
+     xml_doc_release( doc );
+@@ -3686,16 +3860,65 @@ void element_apply_default_style( struct xaml_element *element )
+ {
+     IInspectable *style;
+     WCHAR key[100];
++    int old;
+ 
+     if (element->default_style_done) return;
+     element->default_style_done = TRUE;
+     implicit_key( element->class_name, key, ARRAY_SIZE(key) );
+     if (!(style = generic_resource_lookup( key ))) return;
+     TRACE( "default style for %s.\n", debugstr_w(element->class_name) );
++    old = theme_override_set( element_is_dark( element ) );
+     style_apply_mode( style, element->outer, SET_DEFAULT );
++    theme_override_set( old );
+     IInspectable_Release( style );
+ }
+ 
++/* the theme in effect changed (RequestedTheme, or the system's): look the subtree's {ThemeResource}s up again */
++void element_theme_refresh( struct xaml_element *element )
++{
++    struct xvalue value = {0};
++    IInspectable *style;
++    WCHAR key[100];
++    UINT32 i, count;
++    int old;
++
++    TRACE( "%s %p, %s.\n", debugstr_w(element->class_name), element, element_is_dark( element ) ? "dark" : "light" );
++    old = theme_override_set( element_is_dark( element ) );
++    if (element->default_style_done)
++    {
++        implicit_key( element->class_name, key, ARRAY_SIZE(key) );
++        if ((style = generic_resource_lookup( key )))
++        {
++            style_apply_theme( style, element->outer, SET_DEFAULT );
++            IInspectable_Release( style );
++        }
++    }
++    if (element->implicit_style) style_apply_theme( element->implicit_style, element->outer, SET_STYLE );
++    if (element->style) style_apply_theme( element->style, element->outer, SET_STYLE );
++    for (i = 0; i < element->theme_ref_count; i++)
++    {
++        struct theme_ref ref = element->theme_refs[i];
++        if (!(value.object = target_resource( element->outer, ref.key ))) continue;
++        value.kind = XV_OBJECT;
++        set_property( NULL, element->outer, &ref.prop, &value, ref.mode );
++        xvalue_clear( &value );
++    }
++    theme_override_set( old );
++
++    /* a template is built again on the next layout, with the new theme's resources and states */
++    if (element->template_instance) element_set_template( element, element->template );
++    if (element->ops->child_count)
++    {
++        count = element->ops->child_count( element );
++        for (i = 0; i < count; i++)
++        {
++            struct xaml_element *child = element->ops->child_at( element, i );
++            if (child) element_theme_refresh( child );
++        }
++    }
++    window_invalidate();
++}
++
+ HRESULT xbf_load( struct xbf *xbf, IInspectable *root, IInspectable **out )
+ {
+     struct writer *w;
+@@ -3753,6 +3976,33 @@ static BOOL get_value( IInspectable *target, const WCHAR *name, struct xvalue *o
+ 
+     memset( out, 0, sizeof(*out) );
+     if (!target) return FALSE;
++    if (!wcscmp( name, L"Fill" ) || !wcscmp( name, L"Stroke" ))
++    {
++        IShape *shape;
++        if (!QI( target, IShape, &shape )) return FALSE;
++        if (name[0] == 'F') IShape_get_Fill( shape, &brush ); else IShape_get_Stroke( shape, &brush );
++        IShape_Release( shape );
++        set_brush_value( out, brush );
++        return TRUE;
++    }
++    if (!wcscmp( name, L"CornerRadius" ))
++    {
++        struct xaml_element *element;
++        CornerRadius r;
++        if (QI( target, IBorder, &border ))
++        {
++            IBorder_get_CornerRadius( border, &r );
++            IBorder_Release( border );
++        }
++        else if ((element = element_from_object( target ))) r = element->corner_radius;
++        else return FALSE;
++        out->kind = XV_THICKNESS;
++        out->thickness.Left = r.TopLeft;
++        out->thickness.Top = r.TopRight;
++        out->thickness.Right = r.BottomRight;
++        out->thickness.Bottom = r.BottomLeft;
++        return TRUE;
++    }
+     if (!wcscmp( name, L"Background" ) || !wcscmp( name, L"Foreground" ) || !wcscmp( name, L"BorderBrush" ))
+     {
+         if (presenter_get_brush( target, name, &brush )) ok = TRUE;
+@@ -3918,6 +4168,7 @@ struct template_instance *template_instantiate( IInspectable *template, IInspect
+     struct template_instance *instance;
+     struct writer *w;
+     struct xvalue value;
++    int old_theme;
+ 
+     if (!impl || (!impl->xbf && !impl->doc)) return NULL;
+     if (!(instance = calloc( 1, sizeof(*instance) ))) return NULL;
+@@ -3931,6 +4182,7 @@ struct template_instance *template_instantiate( IInspectable *template, IInspect
+     w->root_used = TRUE;
+     w->templated_parent = templated_parent;
+     w->names_owner = w;
++    old_theme = theme_override_set( element_from_object( templated_parent ) ? element_is_dark( element_from_object( templated_parent ) ) : -1 );
+     if (impl->doc)
+     {
+         /* text markup: the template's one element child */
+@@ -3945,6 +4197,7 @@ struct template_instance *template_instantiate( IInspectable *template, IInspect
+         }
+     }
+     else run_stream( w, impl->stream, 0, RUN_OBJECT );
++    theme_override_set( old_theme );
+     if (w->sp)
+     {
+         pop( w, &value );
+@@ -4210,6 +4463,56 @@ void template_property_changed( struct template_instance *instance, const WCHAR
+     }
+ }
+ 
++/* a loose .xaml file: UTF-8 (with or without a BOM) or UTF-16 with a BOM */
++static HRESULT load_text_component( IInspectable *component, const WCHAR *file )
++{
++    LARGE_INTEGER size;
++    HANDLE handle;
++    WCHAR *text;
++    BYTE *data;
++    DWORD read;
++    HRESULT hr;
++    int len;
++
++    handle = CreateFileW( file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++    if (handle == INVALID_HANDLE_VALUE)
++    {
++        ERR( "cannot open %s.\n", debugstr_w(file) );
++        return HRESULT_FROM_WIN32( GetLastError() );
++    }
++    if (!GetFileSizeEx( handle, &size ) || size.QuadPart > 64 * 1024 * 1024 || !(data = malloc( size.QuadPart + 2 )))
++    {
++        CloseHandle( handle );
++        return E_OUTOFMEMORY;
++    }
++    if (!ReadFile( handle, data, size.QuadPart, &read, NULL ) || read != size.QuadPart)
++    {
++        CloseHandle( handle );
++        free( data );
++        return E_FAIL;
++    }
++    CloseHandle( handle );
++    TRACE( "loading loose XAML %s (%u bytes) into %p.\n", debugstr_w(file), (UINT)read, component );
++    if (read >= 2 && data[0] == 0xff && data[1] == 0xfe)
++        hr = xaml_text_load( (WCHAR *)(data + 2), (read - 2) / sizeof(WCHAR), component, NULL );
++    else
++    {
++        BYTE *start = data;
++        if (read >= 3 && data[0] == 0xef && data[1] == 0xbb && data[2] == 0xbf) { start += 3; read -= 3; }
++        len = MultiByteToWideChar( CP_UTF8, 0, (char *)start, read, NULL, 0 );
++        if (!(text = malloc( max( 1, len ) * sizeof(WCHAR) ))) hr = E_OUTOFMEMORY;
++        else
++        {
++            MultiByteToWideChar( CP_UTF8, 0, (char *)start, read, text, len );
++            hr = xaml_text_load( text, len, component, NULL );
++            free( text );
++        }
++    }
++    free( data );
++    if (FAILED(hr)) ERR( "loading %s failed, hr %#lx.\n", debugstr_w(file), hr );
++    return hr;
++}
++
+ /* Application.LoadComponent: ms-appx:///Folder/Page.xaml is compiled to Folder\Page.xbf in the package folder,
+  * which for wine-uwp is the folder of the app's executable. */
+ HRESULT load_component( IInspectable *component, HSTRING uri )
+@@ -4242,12 +4545,21 @@ HRESULT load_component( IInspectable *component, HSTRING uri )
+     p = file + wcslen( file );
+     lstrcpyW( p, path );
+     for (; *p; p++) if (*p == '/') *p = '\\';
+-    if ((ext = wcsrchr( file, '.' )) && !wcsicmp( ext, L".xaml" )) lstrcpyW( (WCHAR *)ext, L".xbf" );
++    if ((ext = wcsrchr( file, '.' )) && !wcsicmp( ext, L".xaml" ))
++    {
++        lstrcpyW( (WCHAR *)ext, L".xbf" );
++        if (GetFileAttributesW( file ) == INVALID_FILE_ATTRIBUTES)
++        {
++            /* no compiled markup: the loose .xaml file */
++            lstrcpyW( (WCHAR *)ext, L".xaml" );
++            return load_text_component( component, file );
++        }
++    }
+ 
+     handle = CreateFileW( file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
+     if (handle == INVALID_HANDLE_VALUE)
+     {
+-        ERR( "cannot open %s for %s: text XAML is not supported, only compiled .xbf.\n", debugstr_w(file), debugstr_hstring(uri) );
++        ERR( "cannot open %s for %s.\n", debugstr_w(file), debugstr_hstring(uri) );
+         return HRESULT_FROM_WIN32( GetLastError() );
+     }
+     if (!GetFileSizeEx( handle, &size ) || size.QuadPart > 64 * 1024 * 1024 || !(data = malloc( size.QuadPart )))
