@@ -1,0 +1,10 @@
+<!-- Loose markup, as Visual Studio writes it when XBF generation is off: x:ConnectionId instead of compiled
+     connection ids. tests/xaml/build.sh copies it as it is. -->
+<Page
+    x:Class="XamlMarkup.LoosePage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Border x:Name="LooseBorder" x:ConnectionId="1" Background="#FF2D7D9A" CornerRadius="12" Width="120" Height="40">
+        <TextBlock x:Name="LooseText" Text="Loose XAML" Foreground="White"/>
+    </Border>
+</Page>

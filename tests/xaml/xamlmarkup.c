@@ -24,6 +24,7 @@
 #include "winuser.h"
 #include "wingdi.h"
 #include "winstring.h"
+#include "winreg.h"
 
 #include "initguid.h"
 #include "roapi.h"
@@ -966,6 +967,239 @@ static void check_text_markup(struct main_page *page)
     IControl_Release(control);
 }
 
+/* milestone 4 part 5: shapes and the CheckBox/RadioButton templates, CornerRadius, theme changes while running,
+ * loose .xaml files */
+
+static IControlTemplate *template_of(void *control_object)
+{
+    IControlTemplate *template = NULL;
+    IControl *control;
+
+    if (FAILED(IUnknown_QueryInterface((IUnknown *)control_object, &IID_IControl, (void **)&control))) return NULL;
+    IControl_get_Template(control, (void *)&template);
+    IControl_Release(control);
+    return template;
+}
+
+static void check_glyph_templates(struct main_page *page)
+{
+    IControlTemplate *template;
+    RECT box;
+    int x, y, white = 0;
+
+    template = template_of(page->check);
+    check(template != NULL, "CheckBox has generic.xaml's default template");
+    if (template) IUnknown_Release((IUnknown *)template);
+    template = template_of(page->radio_a);
+    check(template != NULL, "RadioButton has generic.xaml's default template");
+    if (template) IUnknown_Release((IUnknown *)template);
+
+    /* the checked box: the template's Rectangle filled with the app's CheckBoxCheckBackgroundFillChecked, with the
+     * Path check mark in CheckBoxCheckGlyphForegroundChecked (white) over it */
+    IToggleButton_put_IsChecked(page->three_state, NULL);
+    {
+        IPropertyValueStatics *pv = get_factory(L"Windows.Foundation.PropertyValue", &IID_IPropertyValueStatics);
+        IReference_boolean *ref;
+        IInspectable *boxed;
+        IPropertyValueStatics_CreateBoolean(pv, TRUE, &boxed);
+        IInspectable_QueryInterface(boxed, &IID_IReference_boolean, (void **)&ref);
+        IToggleButton_put_IsChecked(page->three_state, ref);
+        IReference_boolean_Release(ref);
+        IInspectable_Release(boxed);
+        IPropertyValueStatics_Release(pv);
+    }
+    snapshot();
+    if (find_color(0x8e44ad, &box) > 200)
+    {
+        for (y = box.top; y <= box.bottom; y++) for (x = box.left; x <= box.right; x++)
+            if ((pixels[y * width + x] & 0xffffff) == 0xffffff) white++;
+        check(box.right - box.left >= 17 && box.right - box.left <= 21, "the template's 20 px box (%ld px)", box.right - box.left + 1);
+    }
+    check(white > 15, "the template's Path draws the check mark (%d white px in the box)", white);
+}
+
+static void check_corners(struct main_page *page)
+{
+    static const WCHAR xaml[] =
+        L"<Border xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\" Width=\"100\" Height=\"40\""
+        L" HorizontalAlignment=\"Left\" CornerRadius=\"10\" Background=\"#FF2D7D9A\" BorderBrush=\"#FFC239B3\""
+        L" BorderThickness=\"3\" Margin=\"0,8,0,0\"/>";
+    IVector_UIElement *children;
+    IInspectable *object;
+    IUIElement *ui;
+    RECT box, frame;
+    HRESULT hr;
+    int fill, ring;
+
+    if (!page->toggle_panel || !(object = xaml_load(xaml, &hr))) return;
+    IPanel_get_Children(page->toggle_panel, &children);
+    IInspectable_QueryInterface(object, &IID_IUIElement, (void **)&ui);
+    IVector_UIElement_Append(children, ui);
+    IUIElement_Release(ui);
+    IVector_UIElement_Release(children);
+    IInspectable_Release(object);
+    snapshot();
+    fill = find_color(0x2d7d9a, &box);
+    ring = find_color(0xc239b3, &frame);
+    check(ring > 400 && frame.right - frame.left == 99 && frame.bottom - frame.top == 39, "a Border with CornerRadius 10 draws its border (%d px, %ldx%ld)",
+          ring, frame.right - frame.left + 1, frame.bottom - frame.top + 1);
+    check((pixels[frame.top * width + frame.left] & 0xffffff) != 0xc239b3 &&
+          (pixels[frame.top * width + frame.left + 50] & 0xffffff) == 0xc239b3, "with rounded corners: the corner pixel is outside it, the top edge inside");
+    check(fill > 2500 && fill < 94 * 34, "the rounded background fills inside (%d px)", fill);
+}
+
+/* the page's root Grid as a FrameworkElement2 */
+static IFrameworkElement2 *page_root(struct main_page *page)
+{
+    IFrameworkElement2 *fe2 = NULL;
+    IUserControl *uc;
+    IUIElement *root = NULL;
+
+    if (FAILED(IInspectable_QueryInterface(page->inner, &IID_IUserControl, (void **)&uc))) return NULL;
+    IUserControl_get_Content(uc, &root);
+    IUserControl_Release(uc);
+    if (!root) return NULL;
+    IUIElement_QueryInterface(root, &IID_IFrameworkElement2, (void **)&fe2);
+    IUIElement_Release(root);
+    return fe2;
+}
+
+static void check_theme_change(struct main_page *page)
+{
+    IFrameworkElement2 *root = page_root(page);
+    IControl *control;
+    IBrush *brush = NULL;
+    UINT32 argb = 0;
+    HKEY key;
+    DWORD dark = 0;
+    int light_panel;
+
+    check(root != NULL, "the page's root Grid has IFrameworkElement2");
+    if (!root) return;
+    snapshot();
+    light_panel = count_color(0xddeeff);
+
+    IFrameworkElement2_put_RequestedTheme(root, ElementTheme_Dark);
+    snapshot();
+    check(count_color(0x102030) > 20000 && count_color(0xddeeff) == 0,
+          "RequestedTheme=Dark on the root: the StackPanel's {ThemeResource PanelBrush} comes from App.xaml's Dark dictionary (%d px)",
+          count_color(0x102030));
+    check(count_color(0x000000) > 100000, "and the page's {ThemeResource ApplicationPageBackgroundThemeBrush} is generic.xaml's dark one (%d px)",
+          count_color(0x000000));
+    IButton_QueryInterface(page->plain, &IID_IControl, (void **)&control);
+    IControl_get_Background(control, &brush);
+    check(brush_color(brush, &argb) && argb == 0x33ffffff, "the plain Button's default style now gives the dark ButtonBackground (%#x)", argb);
+    if (brush) IBrush_Release(brush);
+    brush = NULL;
+
+    IFrameworkElement2_put_RequestedTheme(root, ElementTheme_Default);
+    snapshot();
+    check(count_color(0xddeeff) == light_panel && count_color(0x102030) < 20000, "back to Default: the Light resources return (%d px)",
+          count_color(0xddeeff));
+    IControl_get_Background(control, &brush);
+    check(brush_color(brush, &argb) && argb == 0x33000000, "and the light ButtonBackground (%#x)", argb);
+    if (brush) IBrush_Release(brush);
+    IControl_Release(control);
+
+    /* the system going dark doesn't change an app whose App.xaml sets RequestedTheme="Light" */
+    if (!RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", 0, NULL, 0,
+                         KEY_ALL_ACCESS, NULL, &key, NULL))
+    {
+        RegSetValueExW(key, L"AppsUseLightTheme", 0, REG_DWORD, (BYTE *)&dark, sizeof(dark));
+        SendMessageW(hwnd, WM_SETTINGCHANGE, 0, (LPARAM)L"ImmersiveColorSet");
+        snapshot();
+        check(count_color(0xddeeff) == light_panel, "a system theme change leaves an app with an explicit RequestedTheme alone");
+        RegDeleteValueW(key, L"AppsUseLightTheme");
+        RegCloseKey(key);
+    }
+    IFrameworkElement2_Release(root);
+}
+
+/* a component for LoosePage.xaml: a Page aggregated by an IComponentConnector that records Connect calls */
+struct loose_page
+{
+    IComponentConnector IComponentConnector_iface;
+    IInspectable *inner;
+    LONG ref;
+    int connects;
+    IBorder *border;
+};
+
+static struct loose_page *loose_from_connector(IComponentConnector *iface)
+{
+    return CONTAINING_RECORD(iface, struct loose_page, IComponentConnector_iface);
+}
+
+static HRESULT WINAPI loose_QueryInterface(IComponentConnector *iface, REFIID iid, void **out)
+{
+    struct loose_page *page = loose_from_connector(iface);
+    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) || IsEqualGUID(iid, &IID_IComponentConnector))
+    {
+        *out = iface;
+        IComponentConnector_AddRef(iface);
+        return S_OK;
+    }
+    return IInspectable_QueryInterface(page->inner, iid, out);
+}
+static ULONG WINAPI loose_AddRef(IComponentConnector *iface) { return InterlockedIncrement(&loose_from_connector(iface)->ref); }
+static ULONG WINAPI loose_Release(IComponentConnector *iface) { return InterlockedDecrement(&loose_from_connector(iface)->ref); }
+static HRESULT WINAPI loose_GetIids(IComponentConnector *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
+static HRESULT WINAPI loose_GetRuntimeClassName(IComponentConnector *iface, HSTRING *name) { *name = hs(L"XamlMarkup.LoosePage"); return S_OK; }
+static HRESULT WINAPI loose_GetTrustLevel(IComponentConnector *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
+static HRESULT WINAPI loose_Connect(IComponentConnector *iface, INT32 id, IInspectable *target)
+{
+    struct loose_page *page = loose_from_connector(iface);
+    page->connects++;
+    if (id == 1 && !page->border) IInspectable_QueryInterface(target, &IID_IBorder, (void **)&page->border);
+    return S_OK;
+}
+static IComponentConnectorVtbl loose_vtbl =
+{
+    loose_QueryInterface, loose_AddRef, loose_Release, loose_GetIids, loose_GetRuntimeClassName, loose_GetTrustLevel, loose_Connect,
+};
+
+static void check_loose_xaml(void)
+{
+    IPageFactory *factory = get_factory(L"Windows.UI.Xaml.Controls.Page", &IID_IPageFactory);
+    struct loose_page page = { { &loose_vtbl }, NULL, 1 };
+    IFrameworkElement *fe;
+    IInspectable *found = NULL;
+    ITextBlock *tb;
+    CornerRadius radius = {0};
+    HSTRING name;
+    IPage *base;
+    HRESULT hr;
+    WCHAR buf[64];
+
+    if (!factory) return;
+    hr = IPageFactory_CreateInstance(factory, (IInspectable *)&page.IComponentConnector_iface, &page.inner, &base);
+    IPageFactory_Release(factory);
+    if (FAILED(hr)) return;
+    IPage_Release(base);
+    hr = load_component((IInspectable *)&page.IComponentConnector_iface, L"ms-appx:///LoosePage.xaml");
+    check(hr == S_OK, "LoadComponent of a loose LoosePage.xaml (no .xbf), hr %#lx", hr);
+    check(page.connects == 1 && page.border, "its x:ConnectionId=\"1\" reached Connect with the Border (%d)", page.connects);
+    if (page.border)
+    {
+        IBorder_get_CornerRadius(page.border, &radius);
+        check(radius.TopLeft == 12 && radius.BottomRight == 12, "CornerRadius=\"12\" (%.0f)", radius.TopLeft);
+        IBorder_Release(page.border);
+    }
+    IInspectable_QueryInterface(page.inner, &IID_IFrameworkElement, (void **)&fe);
+    name = hs(L"LooseText");
+    IFrameworkElement_FindName(fe, name, &found);
+    WindowsDeleteString(name);
+    check(found != NULL, "FindName(\"LooseText\") finds the TextBlock");
+    if (found && SUCCEEDED(IInspectable_QueryInterface(found, &IID_ITextBlock, (void **)&tb)))
+    {
+        check(!wcscmp(text_of(tb, buf, ARRAYSIZE(buf)), L"Loose XAML"), "with its Text (%ls)", buf);
+        ITextBlock_Release(tb);
+    }
+    if (found) IInspectable_Release(found);
+    IFrameworkElement_Release(fe);
+    IInspectable_Release(page.inner);
+}
+
 static void check_microsoft_xbf(const WCHAR *file, const WCHAR *component_class)
 {
     IActivationFactory *factory;
@@ -1072,6 +1306,10 @@ static void CALLBACK verify(HWND unused, UINT msg, UINT_PTR id, DWORD time)
     check_template(the_page);
     check_toggles(the_page);
     check_text_markup(the_page);
+    check_glyph_templates(the_page);
+    check_corners(the_page);
+    check_theme_change(the_page);
+    check_loose_xaml();
     check(!wcscmp(text_of(the_page->title, buf, ARRAYSIZE(buf)), L"Clicked!"), "OnClick changed Title (%ls)", buf);
     snapshot();
 
