@@ -1,0 +1,83 @@
+Subject: twinapi.appcore: add CoreApplication's ICoreApplicationUnhandledError (Gears of War 4)
+
+diff --git a/dlls/twinapi.appcore/core_gen.c b/dlls/twinapi.appcore/core_gen.c
+index ee0dca9..79ecdab 100644
+--- a/dlls/twinapi.appcore/core_gen.c
++++ b/dlls/twinapi.appcore/core_gen.c
+@@ -162,6 +162,7 @@ struct core_app
+     ICoreApplication ICoreApplication_iface;
+     ICoreApplicationExit ICoreApplicationExit_iface;
+     ICoreImmersiveApplication ICoreImmersiveApplication_iface;
++    ICoreApplicationUnhandledError ICoreApplicationUnhandledError_iface;
+     LONG ref;
+     struct core_view *view;
+     BOOL exit_requested;
+@@ -511,6 +512,8 @@ static HRESULT core_app_qi(struct core_app *impl, REFIID iid, void **out)
+         *out = &impl->ICoreApplicationExit_iface;
+     else if (IsEqualGUID(iid, &IID_ICoreImmersiveApplication))
+         *out = &impl->ICoreImmersiveApplication_iface;
++    else if (IsEqualGUID(iid, &IID_ICoreApplicationUnhandledError))
++        *out = &impl->ICoreApplicationUnhandledError_iface;
+     else
+     {
+         FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
+@@ -1677,6 +1680,51 @@ static const ICoreApplicationExitVtbl core_app_exit_vtbl =
+     core_app_exit_remove_Exiting,
+ };
+ 
++/* ---- ICoreApplicationUnhandledError on core_app ---- */
++/* Gears of War 4 subscribes to UnhandledErrorDetected in Initialize and stops if it can't. The event is never
++ * raised: errors that would raise it end the process here instead. */
++static inline struct core_app *impl_from_core_app_unhandled(ICoreApplicationUnhandledError *iface)
++{ return CONTAINING_RECORD(iface, struct core_app, ICoreApplicationUnhandledError_iface); }
++
++static HRESULT WINAPI core_app_unhandled_QueryInterface(ICoreApplicationUnhandledError *iface, REFIID iid, void **out)
++{ return core_app_qi(impl_from_core_app_unhandled(iface), iid, out); }
++static ULONG WINAPI core_app_unhandled_AddRef(ICoreApplicationUnhandledError *iface)
++{ return core_app_addref(impl_from_core_app_unhandled(iface)); }
++static ULONG WINAPI core_app_unhandled_Release(ICoreApplicationUnhandledError *iface)
++{ return core_app_release(impl_from_core_app_unhandled(iface)); }
++static HRESULT WINAPI core_app_unhandled_GetIids(ICoreApplicationUnhandledError *iface, ULONG *count, IID **iids)
++{ FIXME("iface %p stub!\n", iface); return E_NOTIMPL; }
++static HRESULT WINAPI core_app_unhandled_GetRuntimeClassName(ICoreApplicationUnhandledError *iface, HSTRING *name)
++{ FIXME("iface %p stub!\n", iface); return E_NOTIMPL; }
++static HRESULT WINAPI core_app_unhandled_GetTrustLevel(ICoreApplicationUnhandledError *iface, TrustLevel *level)
++{ *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI core_app_unhandled_add_UnhandledErrorDetected(ICoreApplicationUnhandledError *iface,
++        __FIEventHandler_1_Windows__CApplicationModel__CCore__CUnhandledErrorDetectedEventArgs *handler,
++        EventRegistrationToken *token)
++{
++    TRACE("iface %p, handler %p (event never raised).\n", iface, handler);
++    if (!handler) return E_INVALIDARG;
++    token->value = InterlockedIncrement(&event_token_counter);
++    return S_OK;
++}
++
++static HRESULT WINAPI core_app_unhandled_remove_UnhandledErrorDetected(ICoreApplicationUnhandledError *iface,
++        EventRegistrationToken token)
++{ return S_OK; }
++
++static const ICoreApplicationUnhandledErrorVtbl core_app_unhandled_vtbl =
++{
++    core_app_unhandled_QueryInterface,
++    core_app_unhandled_AddRef,
++    core_app_unhandled_Release,
++    core_app_unhandled_GetIids,
++    core_app_unhandled_GetRuntimeClassName,
++    core_app_unhandled_GetTrustLevel,
++    core_app_unhandled_add_UnhandledErrorDetected,
++    core_app_unhandled_remove_UnhandledErrorDetected,
++};
++
+ /* ---- ICoreImmersiveApplication on core_app ---- */
+ static inline struct core_app *impl_from_core_immersive(ICoreImmersiveApplication *iface)
+ { return CONTAINING_RECORD(iface, struct core_app, ICoreImmersiveApplication_iface); }
+@@ -1955,6 +2003,7 @@ void core_application_init(void)
+     core_app_instance.IActivationFactory_iface.lpVtbl = &factory_vtbl;
+     core_app_instance.ICoreApplication_iface.lpVtbl = &core_app_vtbl;
+     core_app_instance.ICoreApplicationExit_iface.lpVtbl = &core_app_exit_vtbl;
++    core_app_instance.ICoreApplicationUnhandledError_iface.lpVtbl = &core_app_unhandled_vtbl;
+     core_app_instance.ICoreImmersiveApplication_iface.lpVtbl = &core_immersive_vtbl;
+     core_app_instance.ref = 1;
+ }
