@@ -1,0 +1,2147 @@
+Subject: windows.ui.xaml: draw with Direct2D and DirectWrite, RenderTransform, Clip, LinearGradientBrush (Direct2D round, work in progress)
+
+diff --git a/dlls/windows.ui.xaml/Makefile.in b/dlls/windows.ui.xaml/Makefile.in
+index cf48f13..e2851b1 100644
+--- a/dlls/windows.ui.xaml/Makefile.in
++++ b/dlls/windows.ui.xaml/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE  = windows.ui.xaml.dll
+-IMPORTS = combase user32 gdi32 advapi32
++IMPORTS = combase user32 gdi32 advapi32 d2d1 dwrite uuid
+ 
+ SOURCES = \
+ 	animation.c \
+@@ -16,9 +16,11 @@ SOURCES = \
+ 	element.c \
+ 	items.c \
+ 	main.c \
++	media.c \
+ 	panel.c \
+ 	presenter.c \
+ 	range.c \
++	render.c \
+ 	reader.c \
+ 	shapes.c \
+ 	resources.c \
+diff --git a/dlls/windows.ui.xaml/animation.c b/dlls/windows.ui.xaml/animation.c
+index b520597..e094588 100644
+--- a/dlls/windows.ui.xaml/animation.c
++++ b/dlls/windows.ui.xaml/animation.c
+@@ -477,6 +477,7 @@ static HRESULT WINAPI storyboard_iface_Begin( IStoryboard *iface )
+     struct xaml_element *scope = bag_namescope( impl->bag ), *element;
+     WCHAR name[96], path[256], property[96];
+     UINT32 i, count = bag_get_item_count( impl->bag, L"Children" );
++    IInspectable *target;
+     BOOL brush_color;
+ 
+     TRACE( "iface %p, %u animations.\n", iface, count );
+@@ -491,12 +492,13 @@ static HRESULT WINAPI storyboard_iface_Begin( IStoryboard *iface )
+             WARN( "storyboard target %s not found.\n", debugstr_w(name) );
+             continue;
+         }
+-        if (!markup_property_path( path, property, ARRAY_SIZE(property), &brush_color ))
++        if (!markup_resolve_path( element->outer, path, &target, property, ARRAY_SIZE(property), &brush_color ))
+         {
+             FIXME( "animating %s.%s is not supported.\n", debugstr_w(name), debugstr_w(path) );
+             continue;
+         }
+-        animation_start_track( impl->bag, anim, element->outer, property, brush_color );
++        animation_start_track( impl->bag, anim, target, property, brush_color );
++        IInspectable_Release( target );
+     }
+     impl->state = ClockState_Active;
+     animation_tick_owner( impl->bag );
+diff --git a/dlls/windows.ui.xaml/brush.c b/dlls/windows.ui.xaml/brush.c
+index a487a54..fadaaa8 100644
+--- a/dlls/windows.ui.xaml/brush.c
++++ b/dlls/windows.ui.xaml/brush.c
+@@ -257,6 +257,15 @@ BOOL brush_get_color( IBrush *brush, Color *color )
+     ISolidColorBrush *solid;
+     DOUBLE opacity = 1.0;
+ 
++    struct gradient_info gradient;
++
++    if (brush_get_gradient( brush, &gradient ))
++    {
++        /* drawing without Direct2D, and colour animations: the first stop */
++        *color = gradient.stops[0].color;
++        color->A = (BYTE)(color->A * gradient.opacity);
++        return TRUE;
++    }
+     if (FAILED(IBrush_QueryInterface( brush, &IID_ISolidColorBrush, (void **)&solid )))
+     {
+         FIXME( "brush %p is not a SolidColorBrush.\n", brush );
+diff --git a/dlls/windows.ui.xaml/button.c b/dlls/windows.ui.xaml/button.c
+index 50fb48e..c49d082 100644
+--- a/dlls/windows.ui.xaml/button.c
++++ b/dlls/windows.ui.xaml/button.c
+@@ -274,41 +274,38 @@ const WCHAR *state_suffix( struct button *impl )
+     return wcscmp( state, L"Normal" ) ? state : L"";
+ }
+ 
++static IBrush *colour_brush( COLORREF color )
++{
++    Color c = { 0xff, GetRValue( color ), GetGValue( color ), GetBValue( color ) };
++    ISolidColorBrushFactory *factory;
++    ISolidColorBrush *brush = NULL;
++
++    if (FAILED(IActivationFactory_QueryInterface( solid_color_brush_factory, &IID_ISolidColorBrushFactory, (void **)&factory )))
++        return NULL;
++    ISolidColorBrushFactory_CreateInstanceWithColor( factory, c, &brush );
++    ISolidColorBrushFactory_Release( factory );
++    return (IBrush *)brush;
++}
++
+ static void fill_ellipse( struct layout_context *ctx, const struct layout_rect *rect, const struct look *fill,
+                           const struct look *stroke, float stroke_width )
+ {
+-    HPEN pen = stroke && stroke->paint ? CreatePen( PS_INSIDEFRAME, max( 1, (int)(stroke_width * ctx->scale + 0.5f) ), stroke->color )
+-                                       : GetStockObject( NULL_PEN );
+-    HBRUSH brush = fill && fill->paint ? CreateSolidBrush( fill->color ) : GetStockObject( NULL_BRUSH );
+-    HGDIOBJ old_pen = SelectObject( ctx->hdc, pen ), old_brush = SelectObject( ctx->hdc, brush );
+-    RECT r;
++    IBrush *fill_brush = fill && fill->paint ? colour_brush( fill->color ) : NULL;
++    IBrush *stroke_brush = stroke && stroke->paint ? colour_brush( stroke->color ) : NULL;
++    Thickness t = { stroke_width, stroke_width, stroke_width, stroke_width };
+ 
+-    element_device_rect( rect, ctx, &r );
+-    Ellipse( ctx->hdc, r.left, r.top, r.right, r.bottom );
+-    SelectObject( ctx->hdc, old_pen );
+-    SelectObject( ctx->hdc, old_brush );
+-    if (stroke && stroke->paint) DeleteObject( pen );
+-    if (fill && fill->paint) DeleteObject( brush );
++    element_draw_shape( ctx, rect, NULL, TRUE, fill_brush, stroke_brush, &t );
++    if (fill_brush) IBrush_Release( fill_brush );
++    if (stroke_brush) IBrush_Release( stroke_brush );
+ }
+ 
+ static void draw_check_mark( struct layout_context *ctx, const struct layout_rect *box, COLORREF color )
+ {
+-    static const float points[3][2] = { {4.5f, 10.0f}, {8.0f, 13.5f}, {15.5f, 6.0f} };
+-    HPEN pen = CreatePen( PS_SOLID, max( 1, (int)(2 * ctx->scale + 0.5f) ), color );
+-    HGDIOBJ old = SelectObject( ctx->hdc, pen );
+-    POINT pt[3];
+-    RECT r;
+-    int i;
++    static const struct shape_point points[3] = { {4.5f, 10.0f}, {8.0f, 13.5f}, {15.5f, 6.0f} };
++    IBrush *brush = colour_brush( color );
+ 
+-    element_device_rect( box, ctx, &r );
+-    for (i = 0; i < 3; i++)
+-    {
+-        pt[i].x = r.left + (int)(points[i][0] * ctx->scale + 0.5f);
+-        pt[i].y = r.top + (int)(points[i][1] * ctx->scale + 0.5f);
+-    }
+-    Polyline( ctx->hdc, pt, 3 );
+-    SelectObject( ctx->hdc, old );
+-    DeleteObject( pen );
++    element_draw_lines( ctx, box->x, box->y, points, 3, FALSE, NULL, brush, 2 );
++    if (brush) IBrush_Release( brush );
+ }
+ 
+ static void render_content( struct button *impl, struct layout_context *ctx, COLORREF text )
+@@ -322,6 +319,7 @@ static void render_content( struct button *impl, struct layout_context *ctx, COL
+     {
+         saved = ctx->foreground;
+         ctx->foreground = text;   /* inherited by a TextBlock content */
++        ctx->foreground_alpha = 255;
+         element_render( child, ctx );
+         ctx->foreground = saved;
+     }
+diff --git a/dlls/windows.ui.xaml/classes.idl b/dlls/windows.ui.xaml/classes.idl
+index 0123dd7..b0b72f5 100644
+--- a/dlls/windows.ui.xaml/classes.idl
++++ b/dlls/windows.ui.xaml/classes.idl
+@@ -73,8 +73,15 @@ namespace Windows.UI.Xaml.Shapes {
+ }
+ 
+ namespace Windows.UI.Xaml.Media {
++    runtimeclass CompositeTransform;
+     runtimeclass EllipseGeometry;
++    runtimeclass GradientStop;
+     runtimeclass LineGeometry;
++    runtimeclass LinearGradientBrush;
++    runtimeclass MatrixTransform;
+     runtimeclass RectangleGeometry;
++    runtimeclass RotateTransform;
++    runtimeclass ScaleTransform;
+     runtimeclass SolidColorBrush;
++    runtimeclass TranslateTransform;
+ }
+diff --git a/dlls/windows.ui.xaml/content.c b/dlls/windows.ui.xaml/content.c
+index c7c8422..e00a356 100644
+--- a/dlls/windows.ui.xaml/content.c
++++ b/dlls/windows.ui.xaml/content.c
+@@ -85,7 +85,11 @@ static void content_measure( struct xaml_element *element, struct layout_context
+     *width = p->Left + p->Right;
+     *height = p->Top + p->Bottom;
+     if (!impl->child) return;
+-    if (impl->foreground && brush_get_color( impl->foreground, &c )) ctx->foreground = RGB( c.R, c.G, c.B );
++    if (impl->foreground && brush_get_color( impl->foreground, &c ))
++    {
++        ctx->foreground = RGB( c.R, c.G, c.B );
++        ctx->foreground_alpha = c.A;
++    }
+     element_measure( impl->child, ctx, max( 0.0f, avail_width - *width ), max( 0.0f, avail_height - *height ) );
+     ctx->foreground = saved;
+     *width += impl->child->desired_width;
+@@ -111,7 +115,11 @@ static void content_render( struct xaml_element *element, struct layout_context
+ 
+     element_fill( ctx, &element->bounds, impl->background );
+     if (!impl->child) return;
+-    if (impl->foreground && brush_get_color( impl->foreground, &c )) ctx->foreground = RGB( c.R, c.G, c.B );
++    if (impl->foreground && brush_get_color( impl->foreground, &c ))
++    {
++        ctx->foreground = RGB( c.R, c.G, c.B );
++        ctx->foreground_alpha = c.A;
++    }
+     element_render( impl->child, ctx );
+     ctx->foreground = saved;
+ }
+diff --git a/dlls/windows.ui.xaml/element.c b/dlls/windows.ui.xaml/element.c
+index a2b3563..7447763 100644
+--- a/dlls/windows.ui.xaml/element.c
++++ b/dlls/windows.ui.xaml/element.c
+@@ -92,6 +92,8 @@ static ULONG WINAPI inner_Release( IInspectable *iface )
+         element_free_theme_refs( impl );
+         binding_detach_element( impl );
+         if (impl->data_context) IInspectable_Release( impl->data_context );
++        if (impl->render_transform) IInspectable_Release( impl->render_transform );
++        if (impl->clip) IInspectable_Release( impl->clip );
+         while (impl->local_count) free( impl->local_properties[--impl->local_count] );
+         free( impl->local_properties );
+         impl->ops->destroy( impl );
+@@ -218,26 +220,43 @@ static HRESULT WINAPI uielement_put_AllowDrop(IUIElement *iface, boolean value)
+ 
+ static HRESULT WINAPI uielement_get_Clip(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIRectangleGeometry **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    IInspectable *clip = impl_from_IUIElement( iface )->clip;
++    *value = NULL;
++    if (clip) IInspectable_QueryInterface( clip, &IID_IRectangleGeometry, (void **)value );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_put_Clip(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIRectangleGeometry *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    struct xaml_element *impl = impl_from_IUIElement( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (value) IUnknown_AddRef( (IUnknown *)value );
++    if (impl->clip) IInspectable_Release( impl->clip );
++    impl->clip = (IInspectable *)value;
++    window_invalidate();
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_get_RenderTransform(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CITransform **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    IInspectable *transform = impl_from_IUIElement( iface )->render_transform;
++    *value = NULL;
++    if (transform) IInspectable_QueryInterface( transform, &IID_ITransform, (void **)value );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_put_RenderTransform(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CITransform *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    struct xaml_element *impl = impl_from_IUIElement( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (value && !is_media_object( (IInspectable *)value )) FIXME( "transform %p (a TransformGroup?) is not supported.\n", value );
++    if (value) IUnknown_AddRef( (IUnknown *)value );
++    if (impl->render_transform) IInspectable_Release( impl->render_transform );
++    impl->render_transform = (IInspectable *)value;
++    window_invalidate();
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_get_Projection(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIProjection **value)
+@@ -254,14 +273,15 @@ static HRESULT WINAPI uielement_put_Projection(IUIElement *iface, __x_ABI_CWindo
+ 
+ static HRESULT WINAPI uielement_get_RenderTransformOrigin(IUIElement *iface, __x_ABI_CWindows_CFoundation_CPoint *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    *value = impl_from_IUIElement( iface )->render_transform_origin;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_put_RenderTransformOrigin(IUIElement *iface, __x_ABI_CWindows_CFoundation_CPoint value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    impl_from_IUIElement( iface )->render_transform_origin = value;
++    window_invalidate();
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_get_UseLayoutRounding(IUIElement *iface, boolean *value)
+@@ -1595,26 +1615,86 @@ static void render_with_opacity( struct xaml_element *element, struct layout_con
+     DeleteDC( mem );
+ }
+ 
++/* the element's RenderTransform about its RenderTransformOrigin, in window coordinates; FALSE for none */
++static BOOL element_matrix( struct xaml_element *element, float *m )
++{
++    float ox = element->bounds.x + element->render_transform_origin.X * element->bounds.width;
++    float oy = element->bounds.y + element->render_transform_origin.Y * element->bounds.height;
++    float t[6] = { 1, 0, 0, 1, -ox, -oy }, back[6] = { 1, 0, 0, 1, ox, oy }, r[6];
++
++    if (!element->render_transform || !transform_matrix( element->render_transform, r )) return FALSE;
++    matrix_multiply( t, r, m );
++    matrix_multiply( m, back, m );
++    return TRUE;
++}
++
+ void element_render( struct xaml_element *element, struct layout_context *ctx )
+ {
+-    BOOL dark = ctx->dark;
++    BOOL dark = ctx->dark, clipped = FALSE, transformed = FALSE;
+     COLORREF foreground = ctx->foreground;
++    BYTE foreground_alpha = ctx->foreground_alpha;
++    float saved_transform[6], m[6];
++    struct layout_rect clip;
++    void *saved_rt;
++    Rect r;
+ 
+     if (element->visibility != Visibility_Visible || element->opacity <= 0) return;
+-    if (element->opacity < 1 && ctx->opacity_element != element)
++    if (ctx->rt && element->opacity < 1 && ctx->opacity_element != element)
++    {
++        /* group opacity: the subtree into its own target, blended in */
++        struct xaml_element *saved = ctx->opacity_element;
++        if ((saved_rt = d2d_begin_opacity( ctx )))
++        {
++            ctx->opacity_element = element;
++            element_render( element, ctx );
++            ctx->opacity_element = saved;
++            d2d_end_opacity( ctx, saved_rt, element->opacity );
++            return;
++        }
++    }
++    else if (!ctx->rt && element->opacity < 1 && ctx->opacity_element != element)
+     {
+         render_with_opacity( element, ctx );
+         return;
+     }
++    if (ctx->rt && element_matrix( element, m ))
++    {
++        memcpy( saved_transform, ctx->transform, sizeof(saved_transform) );
++        matrix_multiply( m, saved_transform, m );
++        d2d_set_transform( ctx, m );
++        transformed = TRUE;
++    }
++    if (ctx->rt && element->clip)
++    {
++        IRectangleGeometry *geometry;
++        if (SUCCEEDED(IInspectable_QueryInterface( element->clip, &IID_IRectangleGeometry, (void **)&geometry )))
++        {
++            IRectangleGeometry_get_Rect( geometry, &r );
++            IRectangleGeometry_Release( geometry );
++            clip.x = element->bounds.x + r.X;
++            clip.y = element->bounds.y + r.Y;
++            clip.width = r.Width;
++            clip.height = r.Height;
++            d2d_push_clip( ctx, &clip );
++            clipped = TRUE;
++        }
++    }
+     if (element->requested_theme != ElementTheme_Default)
+     {
+         /* the built-in looks and the default text colour follow the subtree's theme */
+         ctx->dark = element->requested_theme == ElementTheme_Dark;
+-        if (ctx->dark != dark) ctx->foreground = ctx->dark ? RGB(255, 255, 255) : RGB(0, 0, 0);
++        if (ctx->dark != dark)
++        {
++            ctx->foreground = ctx->dark ? RGB(255, 255, 255) : RGB(0, 0, 0);
++            ctx->foreground_alpha = 255;
++        }
+     }
+     element->ops->render( element, ctx );
+     ctx->dark = dark;
+     ctx->foreground = foreground;
++    ctx->foreground_alpha = foreground_alpha;
++    if (clipped) d2d_pop_clip( ctx );
++    if (transformed) d2d_set_transform( ctx, saved_transform );
+ }
+ 
+ BOOL element_is_dark( struct xaml_element *element )
+@@ -1630,7 +1710,16 @@ struct xaml_element *element_hit_test( struct xaml_element *element, float x, fl
+     struct xaml_element *hit;
+     UINT32 i;
+ 
++    float m[6];
++
+     if (element->visibility != Visibility_Visible || !element->hit_test_visible) return NULL;
++    if (element_matrix( element, m ) && matrix_invert( m, m ))
++    {
++        /* into the element's untransformed layout space */
++        float tx = x * m[0] + y * m[2] + m[4], ty = x * m[1] + y * m[3] + m[5];
++        x = tx;
++        y = ty;
++    }
+     if (element->ops->child_count)
+     {
+         for (i = element->ops->child_count( element ); i > 0; i--)
+@@ -1655,9 +1744,16 @@ void element_device_rect( const struct layout_rect *rect, struct layout_context
+ 
+ void element_fill_color( struct layout_context *ctx, const struct layout_rect *rect, COLORREF color )
+ {
+-    HBRUSH brush = CreateSolidBrush( color );
++    HBRUSH brush;
+     RECT r;
+ 
++    if (ctx->rt)
++    {
++        Color c = { 0xff, GetRValue( color ), GetGValue( color ), GetBValue( color ) };
++        d2d_fill_color( ctx, rect, c );
++        return;
++    }
++    brush = CreateSolidBrush( color );
+     element_device_rect( rect, ctx, &r );
+     FillRect( ctx->hdc, &r, brush );
+     DeleteObject( brush );
+@@ -1673,6 +1769,11 @@ static void fill_argb( struct layout_context *ctx, const struct layout_rect *rec
+     HDC mem;
+     RECT r;
+ 
++    if (ctx->rt)
++    {
++        d2d_fill_color( ctx, rect, c );
++        return;
++    }
+     if (c.A == 0xff)
+     {
+         element_fill_color( ctx, rect, RGB( c.R, c.G, c.B ) );
+@@ -1694,6 +1795,11 @@ void element_fill( struct layout_context *ctx, const struct layout_rect *rect, I
+ {
+     Color c;
+ 
++    if (ctx->rt && brush)
++    {
++        d2d_draw_shape( ctx, rect, NULL, FALSE, brush, NULL, NULL );
++        return;
++    }
+     if (!brush || !brush_get_color( brush, &c ) || !c.A) return;
+     fill_argb( ctx, rect, c );
+ }
+@@ -1779,6 +1885,11 @@ void element_draw_shape( struct layout_context *ctx, const struct layout_rect *r
+     HRGN outer, inner;
+     Color c;
+ 
++    if (ctx->rt)
++    {
++        d2d_draw_shape( ctx, rect, radius, ellipse, fill, stroke, thickness );
++        return;
++    }
+     if (!ellipse && corner_radius_zero( radius ))
+     {
+         /* the plain rectangle code, pixel for pixel */
+@@ -1814,6 +1925,11 @@ void element_draw_lines( struct layout_context *ctx, float x, float y, const str
+     Color c;
+     UINT32 i;
+ 
++    if (ctx->rt)
++    {
++        d2d_draw_lines( ctx, x, y, points, count, closed, fill, stroke, thickness );
++        return;
++    }
+     if (count < 2 || !(pt = malloc( count * sizeof(*pt) ))) return;
+     for (i = 0; i < count; i++)
+     {
+@@ -1839,6 +1955,14 @@ void element_draw_lines( struct layout_context *ctx, float x, float y, const str
+     free( pt );
+ }
+ 
++/* text in a colour with alpha: Direct2D blends it; GDI gets it blended over what is under the text */
++void text_draw_argb( struct layout_context *ctx, const struct text_format *format, HSTRING text,
++                     const struct layout_rect *rect, Color color )
++{
++    if (ctx->rt && d2d_draw_text( ctx, format, text, rect, color )) return;
++    text_draw( ctx, format, text, rect, element_text_color( ctx, rect, color ) );
++}
++
+ /* a translucent text colour, blended over what is under the middle of rect (GDI text has no alpha) */
+ COLORREF element_text_color( struct layout_context *ctx, const struct layout_rect *rect, Color c )
+ {
+@@ -1877,6 +2001,11 @@ void element_frame( struct layout_context *ctx, const struct layout_rect *rect,
+     struct layout_rect side;
+     Color c;
+ 
++    if (ctx->rt && brush)
++    {
++        d2d_draw_shape( ctx, rect, NULL, FALSE, NULL, brush, t );
++        return;
++    }
+     if (!brush || !brush_get_color( brush, &c ) || !c.A) return;
+     if (c.A == 0xff)
+     {
+@@ -1934,9 +2063,12 @@ void text_measure( struct layout_context *ctx, const struct text_format *format,
+     UINT32 len;
+     const WCHAR *str = WindowsGetStringRawBuffer( text, &len );
+     RECT rect = { 0, 0, lroundf( min( avail_width, 1e6f ) * ctx->scale ), 0 };
+-    HFONT font = text_create_font( ctx, format ), old;
++    HFONT font, old;
+     TEXTMETRICW tm;
+ 
++    /* DirectWrite when it is there, so that measuring matches drawing */
++    if (dwrite_measure( format, text, avail_width, width, height )) return;
++    font = text_create_font( ctx, format );
+     old = SelectObject( ctx->hdc, font );
+     if (len) DrawTextW( ctx->hdc, str, len, &rect, text_flags( format ) | DT_CALCRECT );
+     else
+@@ -1959,8 +2091,10 @@ void text_draw( struct layout_context *ctx, const struct text_format *format, HS
+     const WCHAR *str = WindowsGetStringRawBuffer( text, &len );
+     HFONT font, old;
+     RECT r;
++    Color c = { 0xff, GetRValue( color ), GetGValue( color ), GetBValue( color ) };
+ 
+     if (!len) return;
++    if (ctx->rt && d2d_draw_text( ctx, format, text, rect, c )) return;
+     element_device_rect( rect, ctx, &r );
+     font = text_create_font( ctx, format );
+     old = SelectObject( ctx->hdc, font );
+diff --git a/dlls/windows.ui.xaml/main.c b/dlls/windows.ui.xaml/main.c
+index f5ffaaa..cd35fe4 100644
+--- a/dlls/windows.ui.xaml/main.c
++++ b/dlls/windows.ui.xaml/main.c
+@@ -80,6 +80,20 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( rectangle_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Shapes_Ellipse ))
+         IActivationFactory_QueryInterface( ellipse_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_TranslateTransform ))
++        IActivationFactory_QueryInterface( translate_transform_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_ScaleTransform ))
++        IActivationFactory_QueryInterface( scale_transform_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_RotateTransform ))
++        IActivationFactory_QueryInterface( rotate_transform_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_CompositeTransform ))
++        IActivationFactory_QueryInterface( composite_transform_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_MatrixTransform ))
++        IActivationFactory_QueryInterface( matrix_transform_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_LinearGradientBrush ))
++        IActivationFactory_QueryInterface( linear_gradient_brush_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_GradientStop ))
++        IActivationFactory_QueryInterface( gradient_stop_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_RectangleGeometry ))
+         IActivationFactory_QueryInterface( rectangle_geometry_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_EllipseGeometry ))
+diff --git a/dlls/windows.ui.xaml/media.c b/dlls/windows.ui.xaml/media.c
+new file mode 100644
+index 0000000..5ede920
+--- /dev/null
++++ b/dlls/windows.ui.xaml/media.c
+@@ -0,0 +1,735 @@
++/* Windows.UI.Xaml.Media transforms and LinearGradientBrush
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <math.h>
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* TranslateTransform, ScaleTransform, RotateTransform, CompositeTransform, MatrixTransform, LinearGradientBrush
++ * and GradientStop: one object with a kind. Transforms give a 3x2 matrix for UIElement.RenderTransform (element.c
++ * draws and hit-tests with it); gradients are drawn by render.c. Markup and animations reach their properties by
++ * name through media_set_property / media_get_property. TransformGroup, brush transforms and
++ * ColorInterpolationMode aren't supported. */
++
++enum media_kind
++{
++    MEDIA_TRANSLATE,
++    MEDIA_SCALE,
++    MEDIA_ROTATE,
++    MEDIA_COMPOSITE,
++    MEDIA_MATRIX,
++    MEDIA_LINEAR_GRADIENT,
++    MEDIA_GRADIENT_STOP,
++};
++
++struct media
++{
++    IInspectable IInspectable_inner;
++    IGeneralTransform IGeneralTransform_iface;
++    ITransform ITransform_iface;
++    ITranslateTransform ITranslateTransform_iface;
++    IScaleTransform IScaleTransform_iface;
++    IRotateTransform IRotateTransform_iface;
++    ICompositeTransform ICompositeTransform_iface;
++    IMatrixTransform IMatrixTransform_iface;
++    IBrush IBrush_iface;
++    IGradientBrush IGradientBrush_iface;
++    ILinearGradientBrush ILinearGradientBrush_iface;
++    IGradientStop IGradientStop_iface;
++    LONG ref;
++    enum media_kind kind;
++
++    double x, y, center_x, center_y, scale_x, scale_y, skew_x, skew_y, angle;
++    Matrix matrix;
++    double opacity, offset;
++    Point start, end;
++    BrushMappingMode mapping;
++    GradientSpreadMethod spread;
++    IInspectable *stops;     /* GradientStopCollection */
++    Color color;
++};
++
++static const IInspectableVtbl inner_vtbl;
++
++static struct media *media_from_object( IInspectable *object )
++{
++    IInspectable *inner;
++    struct media *impl = NULL;
++
++    /* every interface of ours answers IInspectable with the shared inner one */
++    if (!object || FAILED(IInspectable_QueryInterface( object, &IID_IInspectable, (void **)&inner ))) return NULL;
++    if (inner->lpVtbl == &inner_vtbl) impl = CONTAINING_RECORD( inner, struct media, IInspectable_inner );
++    IInspectable_Release( inner );
++    return impl;
++}
++
++BOOL is_media_object( IInspectable *object )
++{
++    return media_from_object( object ) != NULL;
++}
++
++/* ---- matrices: D2D's row-vector 3x2 { m11, m12, m21, m22, dx, dy } ---- */
++
++static void mat_identity( float *m )
++{
++    m[0] = m[3] = 1;
++    m[1] = m[2] = m[4] = m[5] = 0;
++}
++
++/* a then b */
++void matrix_multiply( const float *a, const float *b, float *out )
++{
++    float r[6];
++    r[0] = a[0] * b[0] + a[1] * b[2];
++    r[1] = a[0] * b[1] + a[1] * b[3];
++    r[2] = a[2] * b[0] + a[3] * b[2];
++    r[3] = a[2] * b[1] + a[3] * b[3];
++    r[4] = a[4] * b[0] + a[5] * b[2] + b[4];
++    r[5] = a[4] * b[1] + a[5] * b[3] + b[5];
++    memcpy( out, r, sizeof(r) );
++}
++
++BOOL matrix_invert( const float *m, float *out )
++{
++    float det = m[0] * m[3] - m[1] * m[2], r[6];
++
++    if (fabsf( det ) < 1e-12f) return FALSE;
++    r[0] = m[3] / det;
++    r[1] = -m[1] / det;
++    r[2] = -m[2] / det;
++    r[3] = m[0] / det;
++    r[4] = (m[2] * m[5] - m[3] * m[4]) / det;
++    r[5] = (m[1] * m[4] - m[0] * m[5]) / det;
++    memcpy( out, r, sizeof(r) );
++    return TRUE;
++}
++
++static void mat_translate( float *m, float x, float y )
++{
++    float t[6] = { 1, 0, 0, 1, x, y };
++    matrix_multiply( m, t, m );
++}
++
++static void mat_scale( float *m, float sx, float sy )
++{
++    float s[6] = { sx, 0, 0, sy, 0, 0 };
++    matrix_multiply( m, s, m );
++}
++
++static void mat_rotate( float *m, double degrees )
++{
++    double a = degrees * 3.14159265358979323846 / 180;
++    float r[6] = { cos( a ), sin( a ), -sin( a ), cos( a ), 0, 0 };
++    matrix_multiply( m, r, m );
++}
++
++/* the transform's matrix; FALSE if object isn't one of ours */
++BOOL transform_matrix( IInspectable *object, float *m )
++{
++    struct media *impl = media_from_object( object );
++    float skew[6];
++
++    mat_identity( m );
++    if (!impl || impl->kind > MEDIA_MATRIX) return FALSE;
++    switch (impl->kind)
++    {
++    case MEDIA_TRANSLATE:
++        mat_translate( m, impl->x, impl->y );
++        break;
++    case MEDIA_SCALE:
++        mat_translate( m, -impl->center_x, -impl->center_y );
++        mat_scale( m, impl->scale_x, impl->scale_y );
++        mat_translate( m, impl->center_x, impl->center_y );
++        break;
++    case MEDIA_ROTATE:
++        mat_translate( m, -impl->center_x, -impl->center_y );
++        mat_rotate( m, impl->angle );
++        mat_translate( m, impl->center_x, impl->center_y );
++        break;
++    case MEDIA_COMPOSITE:
++        /* scale, skew, rotate about the centre, then translate */
++        mat_translate( m, -impl->center_x, -impl->center_y );
++        mat_scale( m, impl->scale_x, impl->scale_y );
++        skew[0] = 1; skew[1] = tan( impl->skew_y * 3.14159265358979323846 / 180 );
++        skew[2] = tan( impl->skew_x * 3.14159265358979323846 / 180 ); skew[3] = 1; skew[4] = skew[5] = 0;
++        matrix_multiply( m, skew, m );
++        mat_rotate( m, impl->angle );
++        mat_translate( m, impl->center_x + impl->x, impl->center_y + impl->y );
++        break;
++    case MEDIA_MATRIX:
++        m[0] = impl->matrix.M11; m[1] = impl->matrix.M12; m[2] = impl->matrix.M21; m[3] = impl->matrix.M22;
++        m[4] = impl->matrix.OffsetX; m[5] = impl->matrix.OffsetY;
++        break;
++    default:
++        break;
++    }
++    return TRUE;
++}
++
++/* ---- gradients ---- */
++
++BOOL brush_get_gradient( IBrush *brush, struct gradient_info *info )
++{
++    struct media *impl = media_from_object( (IInspectable *)brush ), *stop;
++    UINT32 i, count;
++
++    if (!impl || impl->kind != MEDIA_LINEAR_GRADIENT) return FALSE;
++    memset( info, 0, sizeof(*info) );
++    count = impl->stops ? vector_size( impl->stops ) : 0;
++    for (i = 0; i < count && info->count < ARRAY_SIZE(info->stops); i++)
++    {
++        if (!(stop = media_from_object( vector_get( impl->stops, i ) ))) continue;
++        info->stops[info->count].offset = stop->offset;
++        info->stops[info->count].color = stop->color;
++        info->count++;
++    }
++    info->start = impl->start;
++    info->end = impl->end;
++    info->relative = impl->mapping == BrushMappingMode_RelativeToBoundingBox;
++    info->spread = impl->spread == GradientSpreadMethod_Reflect ? 2 : impl->spread == GradientSpreadMethod_Repeat ? 1 : 0;
++    info->opacity = max( 0.0, min( 1.0, impl->opacity ) );
++    return info->count > 0;
++}
++
++/* ---- properties by name, for markup and animations ---- */
++
++static BOOL parse_numbers( const WCHAR *str, double *v, int count )
++{
++    WCHAR *end;
++    int n = 0;
++
++    while (str && *str && n < count)
++    {
++        while (*str == ' ' || *str == ',') str++;
++        v[n] = wcstod( str, &end );
++        if (end == str) return FALSE;
++        str = end;
++        n++;
++    }
++    return n == count;
++}
++
++static double *double_field( struct media *impl, const WCHAR *name )
++{
++    if (!wcscmp( name, L"CenterX" ) && (impl->kind == MEDIA_SCALE || impl->kind == MEDIA_ROTATE || impl->kind == MEDIA_COMPOSITE)) return &impl->center_x;
++    if (!wcscmp( name, L"CenterY" ) && (impl->kind == MEDIA_SCALE || impl->kind == MEDIA_ROTATE || impl->kind == MEDIA_COMPOSITE)) return &impl->center_y;
++    if (!wcscmp( name, L"ScaleX" ) && (impl->kind == MEDIA_SCALE || impl->kind == MEDIA_COMPOSITE)) return &impl->scale_x;
++    if (!wcscmp( name, L"ScaleY" ) && (impl->kind == MEDIA_SCALE || impl->kind == MEDIA_COMPOSITE)) return &impl->scale_y;
++    if ((!wcscmp( name, L"Angle" ) && impl->kind == MEDIA_ROTATE) || (!wcscmp( name, L"Rotation" ) && impl->kind == MEDIA_COMPOSITE)) return &impl->angle;
++    if (impl->kind == MEDIA_COMPOSITE && !wcscmp( name, L"SkewX" )) return &impl->skew_x;
++    if (impl->kind == MEDIA_COMPOSITE && !wcscmp( name, L"SkewY" )) return &impl->skew_y;
++    if ((impl->kind == MEDIA_TRANSLATE && !wcscmp( name, L"X" )) || (impl->kind == MEDIA_COMPOSITE && !wcscmp( name, L"TranslateX" ))) return &impl->x;
++    if ((impl->kind == MEDIA_TRANSLATE && !wcscmp( name, L"Y" )) || (impl->kind == MEDIA_COMPOSITE && !wcscmp( name, L"TranslateY" ))) return &impl->y;
++    if (impl->kind == MEDIA_GRADIENT_STOP && !wcscmp( name, L"Offset" )) return &impl->offset;
++    if (impl->kind == MEDIA_LINEAR_GRADIENT && !wcscmp( name, L"Opacity" )) return &impl->opacity;
++    return NULL;
++}
++
++BOOL media_set_property( IInspectable *object, const WCHAR *name, const WCHAR *str, const double *number, const Color *color )
++{
++    struct media *impl = media_from_object( object );
++    double v[6], *field;
++
++    if (!impl) return FALSE;
++    if ((field = double_field( impl, name )))
++    {
++        if (number) *field = *number;
++        else if (str && parse_numbers( str, v, 1 )) *field = v[0];
++        else return FALSE;
++    }
++    else if (impl->kind == MEDIA_GRADIENT_STOP && !wcscmp( name, L"Color" ) && color) impl->color = *color;
++    else if (impl->kind == MEDIA_LINEAR_GRADIENT && (!wcscmp( name, L"StartPoint" ) || !wcscmp( name, L"EndPoint" )) &&
++             str && parse_numbers( str, v, 2 ))
++    {
++        Point *p = name[0] == 'S' ? &impl->start : &impl->end;
++        p->X = v[0];
++        p->Y = v[1];
++    }
++    else if (impl->kind == MEDIA_LINEAR_GRADIENT && !wcscmp( name, L"MappingMode" ) && str)
++        impl->mapping = !wcscmp( str, L"Absolute" ) ? BrushMappingMode_Absolute : BrushMappingMode_RelativeToBoundingBox;
++    else if (impl->kind == MEDIA_LINEAR_GRADIENT && !wcscmp( name, L"SpreadMethod" ) && str)
++        impl->spread = !wcscmp( str, L"Reflect" ) ? GradientSpreadMethod_Reflect : !wcscmp( str, L"Repeat" ) ? GradientSpreadMethod_Repeat : GradientSpreadMethod_Pad;
++    else if (impl->kind == MEDIA_MATRIX && !wcscmp( name, L"Matrix" ) && str && parse_numbers( str, v, 6 ))
++    {
++        impl->matrix.M11 = v[0]; impl->matrix.M12 = v[1]; impl->matrix.M21 = v[2];
++        impl->matrix.M22 = v[3]; impl->matrix.OffsetX = v[4]; impl->matrix.OffsetY = v[5];
++    }
++    else return FALSE;
++    window_invalidate();
++    return TRUE;
++}
++
++/* 1 for a number, 2 for a colour, 0 if not ours */
++int media_get_property( IInspectable *object, const WCHAR *name, double *number, Color *color )
++{
++    struct media *impl = media_from_object( object );
++    double *field;
++
++    if (!impl) return 0;
++    if ((field = double_field( impl, name ))) { *number = *field; return 1; }
++    if (impl->kind == MEDIA_GRADIENT_STOP && !wcscmp( name, L"Color" )) { *color = impl->color; return 2; }
++    return 0;
++}
++
++IInspectable *media_collection( IInspectable *object, const WCHAR *name )
++{
++    struct media *impl = media_from_object( object );
++    return impl && impl->kind == MEDIA_LINEAR_GRADIENT && !wcscmp( name, L"GradientStops" ) ? impl->stops : NULL;
++}
++
++/* ---- the non-delegating IInspectable ---- */
++
++static inline struct media *impl_from_inner( IInspectable *iface )
++{
++    return CONTAINING_RECORD( iface, struct media, IInspectable_inner );
++}
++
++static HRESULT WINAPI inner_QueryInterface( IInspectable *iface, REFIID iid, void **out )
++{
++    struct media *impl = impl_from_inner( iface );
++    BOOL transform = impl->kind <= MEDIA_MATRIX;
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ))
++        *out = &impl->IInspectable_inner;
++    else if (transform && IsEqualGUID( iid, &IID_IGeneralTransform )) *out = &impl->IGeneralTransform_iface;
++    else if (transform && IsEqualGUID( iid, &IID_ITransform )) *out = &impl->ITransform_iface;
++    else if (impl->kind == MEDIA_TRANSLATE && IsEqualGUID( iid, &IID_ITranslateTransform )) *out = &impl->ITranslateTransform_iface;
++    else if (impl->kind == MEDIA_SCALE && IsEqualGUID( iid, &IID_IScaleTransform )) *out = &impl->IScaleTransform_iface;
++    else if (impl->kind == MEDIA_ROTATE && IsEqualGUID( iid, &IID_IRotateTransform )) *out = &impl->IRotateTransform_iface;
++    else if (impl->kind == MEDIA_COMPOSITE && IsEqualGUID( iid, &IID_ICompositeTransform )) *out = &impl->ICompositeTransform_iface;
++    else if (impl->kind == MEDIA_MATRIX && IsEqualGUID( iid, &IID_IMatrixTransform )) *out = &impl->IMatrixTransform_iface;
++    else if (impl->kind == MEDIA_LINEAR_GRADIENT && IsEqualGUID( iid, &IID_IBrush )) *out = &impl->IBrush_iface;
++    else if (impl->kind == MEDIA_LINEAR_GRADIENT && IsEqualGUID( iid, &IID_IGradientBrush )) *out = &impl->IGradientBrush_iface;
++    else if (impl->kind == MEDIA_LINEAR_GRADIENT && IsEqualGUID( iid, &IID_ILinearGradientBrush )) *out = &impl->ILinearGradientBrush_iface;
++    else if (impl->kind == MEDIA_GRADIENT_STOP && IsEqualGUID( iid, &IID_IGradientStop )) *out = &impl->IGradientStop_iface;
++    else
++    {
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI inner_AddRef( IInspectable *iface )
++{
++    return InterlockedIncrement( &impl_from_inner( iface )->ref );
++}
++
++static ULONG WINAPI inner_Release( IInspectable *iface )
++{
++    struct media *impl = impl_from_inner( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        if (impl->stops)
++        {
++            vector_detach( impl->stops );
++            IInspectable_Release( impl->stops );
++        }
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI inner_GetIids( IInspectable *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI inner_GetRuntimeClassName( IInspectable *iface, HSTRING *name )
++{
++    static const WCHAR *names[] =
++    {
++        RuntimeClass_Windows_UI_Xaml_Media_TranslateTransform,
++        RuntimeClass_Windows_UI_Xaml_Media_ScaleTransform,
++        RuntimeClass_Windows_UI_Xaml_Media_RotateTransform,
++        RuntimeClass_Windows_UI_Xaml_Media_CompositeTransform,
++        RuntimeClass_Windows_UI_Xaml_Media_MatrixTransform,
++        RuntimeClass_Windows_UI_Xaml_Media_LinearGradientBrush,
++        RuntimeClass_Windows_UI_Xaml_Media_GradientStop,
++    };
++    const WCHAR *str = names[impl_from_inner( iface )->kind];
++    return WindowsCreateString( str, wcslen( str ), name );
++}
++
++static HRESULT WINAPI inner_GetTrustLevel( IInspectable *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static const IInspectableVtbl inner_vtbl =
++{
++    inner_QueryInterface,
++    inner_AddRef,
++    inner_Release,
++    inner_GetIids,
++    inner_GetRuntimeClassName,
++    inner_GetTrustLevel,
++};
++
++#define PROPERTY( prefix, Iface, name, field, type ) \
++static HRESULT WINAPI prefix##_get_##name( Iface *iface, type *value ) \
++{ \
++    *value = impl_from_##Iface( iface )->field; \
++    return S_OK; \
++} \
++static HRESULT WINAPI prefix##_put_##name( Iface *iface, type value ) \
++{ \
++    impl_from_##Iface( iface )->field = value; \
++    window_invalidate(); \
++    return S_OK; \
++}
++
++/* IGeneralTransform */
++
++DEFINE_IINSPECTABLE( general_transform, IGeneralTransform, struct media, IInspectable_inner )
++
++static HRESULT WINAPI general_transform_get_Inverse( IGeneralTransform *iface, IGeneralTransform **value )
++{
++    struct media *impl = impl_from_IGeneralTransform( iface ), *inverse;
++    float m[6];
++
++    *value = NULL;
++    transform_matrix( (IInspectable *)iface, m );
++    if (!matrix_invert( m, m )) return E_FAIL;
++    if (!(inverse = calloc( 1, sizeof(*inverse) ))) return E_OUTOFMEMORY;
++    *inverse = *impl;
++    inverse->ref = 1;
++    inverse->kind = MEDIA_MATRIX;
++    inverse->stops = NULL;
++    inverse->matrix.M11 = m[0]; inverse->matrix.M12 = m[1]; inverse->matrix.M21 = m[2]; inverse->matrix.M22 = m[3];
++    inverse->matrix.OffsetX = m[4]; inverse->matrix.OffsetY = m[5];
++    *value = &inverse->IGeneralTransform_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI general_transform_TransformPoint( IGeneralTransform *iface, Point point, Point *value )
++{
++    float m[6];
++    transform_matrix( (IInspectable *)iface, m );
++    value->X = point.X * m[0] + point.Y * m[2] + m[4];
++    value->Y = point.X * m[1] + point.Y * m[3] + m[5];
++    return S_OK;
++}
++
++static HRESULT WINAPI general_transform_TryTransform( IGeneralTransform *iface, Point in, Point *out, boolean *value )
++{
++    *value = TRUE;
++    return general_transform_TransformPoint( iface, in, out );
++}
++
++static HRESULT WINAPI general_transform_TransformBounds( IGeneralTransform *iface, Rect rect, Rect *value )
++{
++    Point corners[4] = { { rect.X, rect.Y }, { rect.X + rect.Width, rect.Y }, { rect.X, rect.Y + rect.Height },
++                         { rect.X + rect.Width, rect.Y + rect.Height } }, p;
++    float l = INFINITY, t = INFINITY, r = -INFINITY, b = -INFINITY;
++    int i;
++
++    for (i = 0; i < 4; i++)
++    {
++        general_transform_TransformPoint( iface, corners[i], &p );
++        l = min( l, p.X ); t = min( t, p.Y ); r = max( r, p.X ); b = max( b, p.Y );
++    }
++    value->X = l; value->Y = t; value->Width = r - l; value->Height = b - t;
++    return S_OK;
++}
++
++static const struct IGeneralTransformVtbl general_transform_vtbl =
++{
++    general_transform_QueryInterface, general_transform_AddRef, general_transform_Release,
++    general_transform_GetIids, general_transform_GetRuntimeClassName, general_transform_GetTrustLevel,
++    general_transform_get_Inverse, general_transform_TransformPoint, general_transform_TryTransform,
++    general_transform_TransformBounds,
++};
++
++DEFINE_IINSPECTABLE( transform, ITransform, struct media, IInspectable_inner )
++
++static const struct ITransformVtbl transform_vtbl =
++{
++    transform_QueryInterface, transform_AddRef, transform_Release,
++    transform_GetIids, transform_GetRuntimeClassName, transform_GetTrustLevel,
++};
++
++DEFINE_IINSPECTABLE( translate, ITranslateTransform, struct media, IInspectable_inner )
++PROPERTY( translate, ITranslateTransform, X, x, DOUBLE )
++PROPERTY( translate, ITranslateTransform, Y, y, DOUBLE )
++
++static const struct ITranslateTransformVtbl translate_vtbl =
++{
++    translate_QueryInterface, translate_AddRef, translate_Release,
++    translate_GetIids, translate_GetRuntimeClassName, translate_GetTrustLevel,
++    translate_get_X, translate_put_X, translate_get_Y, translate_put_Y,
++};
++
++DEFINE_IINSPECTABLE( scale, IScaleTransform, struct media, IInspectable_inner )
++PROPERTY( scale, IScaleTransform, CenterX, center_x, DOUBLE )
++PROPERTY( scale, IScaleTransform, CenterY, center_y, DOUBLE )
++PROPERTY( scale, IScaleTransform, ScaleX, scale_x, DOUBLE )
++PROPERTY( scale, IScaleTransform, ScaleY, scale_y, DOUBLE )
++
++static const struct IScaleTransformVtbl scale_vtbl =
++{
++    scale_QueryInterface, scale_AddRef, scale_Release, scale_GetIids, scale_GetRuntimeClassName, scale_GetTrustLevel,
++    scale_get_CenterX, scale_put_CenterX, scale_get_CenterY, scale_put_CenterY,
++    scale_get_ScaleX, scale_put_ScaleX, scale_get_ScaleY, scale_put_ScaleY,
++};
++
++DEFINE_IINSPECTABLE( rotate, IRotateTransform, struct media, IInspectable_inner )
++PROPERTY( rotate, IRotateTransform, CenterX, center_x, DOUBLE )
++PROPERTY( rotate, IRotateTransform, CenterY, center_y, DOUBLE )
++PROPERTY( rotate, IRotateTransform, Angle, angle, DOUBLE )
++
++static const struct IRotateTransformVtbl rotate_vtbl =
++{
++    rotate_QueryInterface, rotate_AddRef, rotate_Release, rotate_GetIids, rotate_GetRuntimeClassName, rotate_GetTrustLevel,
++    rotate_get_CenterX, rotate_put_CenterX, rotate_get_CenterY, rotate_put_CenterY, rotate_get_Angle, rotate_put_Angle,
++};
++
++DEFINE_IINSPECTABLE( composite, ICompositeTransform, struct media, IInspectable_inner )
++PROPERTY( composite, ICompositeTransform, CenterX, center_x, DOUBLE )
++PROPERTY( composite, ICompositeTransform, CenterY, center_y, DOUBLE )
++PROPERTY( composite, ICompositeTransform, ScaleX, scale_x, DOUBLE )
++PROPERTY( composite, ICompositeTransform, ScaleY, scale_y, DOUBLE )
++PROPERTY( composite, ICompositeTransform, SkewX, skew_x, DOUBLE )
++PROPERTY( composite, ICompositeTransform, SkewY, skew_y, DOUBLE )
++PROPERTY( composite, ICompositeTransform, Rotation, angle, DOUBLE )
++PROPERTY( composite, ICompositeTransform, TranslateX, x, DOUBLE )
++PROPERTY( composite, ICompositeTransform, TranslateY, y, DOUBLE )
++
++static const struct ICompositeTransformVtbl composite_vtbl =
++{
++    composite_QueryInterface, composite_AddRef, composite_Release,
++    composite_GetIids, composite_GetRuntimeClassName, composite_GetTrustLevel,
++    composite_get_CenterX, composite_put_CenterX, composite_get_CenterY, composite_put_CenterY,
++    composite_get_ScaleX, composite_put_ScaleX, composite_get_ScaleY, composite_put_ScaleY,
++    composite_get_SkewX, composite_put_SkewX, composite_get_SkewY, composite_put_SkewY,
++    composite_get_Rotation, composite_put_Rotation, composite_get_TranslateX, composite_put_TranslateX,
++    composite_get_TranslateY, composite_put_TranslateY,
++};
++
++DEFINE_IINSPECTABLE( matrix_transform, IMatrixTransform, struct media, IInspectable_inner )
++PROPERTY( matrix_transform, IMatrixTransform, Matrix, matrix, Matrix )
++
++static const struct IMatrixTransformVtbl matrix_transform_vtbl =
++{
++    matrix_transform_QueryInterface, matrix_transform_AddRef, matrix_transform_Release,
++    matrix_transform_GetIids, matrix_transform_GetRuntimeClassName, matrix_transform_GetTrustLevel,
++    matrix_transform_get_Matrix, matrix_transform_put_Matrix,
++};
++
++/* IBrush, IGradientBrush, ILinearGradientBrush */
++
++DEFINE_IINSPECTABLE( gradient_brush_base, IBrush, struct media, IInspectable_inner )
++PROPERTY( gradient_brush_base, IBrush, Opacity, opacity, DOUBLE )
++
++static HRESULT WINAPI gradient_brush_base_get_Transform( IBrush *iface, ITransform **value )
++{
++    *value = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI gradient_brush_base_put_Transform( IBrush *iface, ITransform *value )
++{
++    FIXME( "iface %p, value %p: brush transforms are not supported.\n", iface, value );
++    return S_OK;
++}
++
++static const struct IBrushVtbl gradient_brush_base_vtbl =
++{
++    gradient_brush_base_QueryInterface, gradient_brush_base_AddRef, gradient_brush_base_Release,
++    gradient_brush_base_GetIids, gradient_brush_base_GetRuntimeClassName, gradient_brush_base_GetTrustLevel,
++    gradient_brush_base_get_Opacity, gradient_brush_base_put_Opacity,
++    gradient_brush_base_get_Transform, gradient_brush_base_put_Transform,
++    gradient_brush_base_get_Transform, gradient_brush_base_put_Transform,
++};
++
++DEFINE_IINSPECTABLE( gradient_brush, IGradientBrush, struct media, IInspectable_inner )
++PROPERTY( gradient_brush, IGradientBrush, SpreadMethod, spread, GradientSpreadMethod )
++PROPERTY( gradient_brush, IGradientBrush, MappingMode, mapping, BrushMappingMode )
++
++static HRESULT WINAPI gradient_brush_get_ColorInterpolationMode( IGradientBrush *iface, ColorInterpolationMode *value )
++{
++    *value = ColorInterpolationMode_SRgbLinearInterpolation;
++    return S_OK;
++}
++
++static HRESULT WINAPI gradient_brush_put_ColorInterpolationMode( IGradientBrush *iface, ColorInterpolationMode value )
++{
++    if (value != ColorInterpolationMode_SRgbLinearInterpolation) FIXME( "iface %p, value %d stub!\n", iface, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI gradient_brush_get_GradientStops( IGradientBrush *iface, IVector_GradientStop **value )
++{
++    struct media *impl = impl_from_IGradientBrush( iface );
++    *value = (IVector_GradientStop *)impl->stops;
++    IInspectable_AddRef( impl->stops );
++    return S_OK;
++}
++
++static HRESULT WINAPI gradient_brush_put_GradientStops( IGradientBrush *iface, IVector_GradientStop *value )
++{
++    FIXME( "iface %p, value %p: replacing GradientStops is not supported.\n", iface, value );
++    return E_NOTIMPL;
++}
++
++static const struct IGradientBrushVtbl gradient_brush_vtbl =
++{
++    gradient_brush_QueryInterface, gradient_brush_AddRef, gradient_brush_Release,
++    gradient_brush_GetIids, gradient_brush_GetRuntimeClassName, gradient_brush_GetTrustLevel,
++    gradient_brush_get_SpreadMethod, gradient_brush_put_SpreadMethod,
++    gradient_brush_get_MappingMode, gradient_brush_put_MappingMode,
++    gradient_brush_get_ColorInterpolationMode, gradient_brush_put_ColorInterpolationMode,
++    gradient_brush_get_GradientStops, gradient_brush_put_GradientStops,
++};
++
++DEFINE_IINSPECTABLE( linear_gradient, ILinearGradientBrush, struct media, IInspectable_inner )
++PROPERTY( linear_gradient, ILinearGradientBrush, StartPoint, start, Point )
++PROPERTY( linear_gradient, ILinearGradientBrush, EndPoint, end, Point )
++
++static const struct ILinearGradientBrushVtbl linear_gradient_vtbl =
++{
++    linear_gradient_QueryInterface, linear_gradient_AddRef, linear_gradient_Release,
++    linear_gradient_GetIids, linear_gradient_GetRuntimeClassName, linear_gradient_GetTrustLevel,
++    linear_gradient_get_StartPoint, linear_gradient_put_StartPoint, linear_gradient_get_EndPoint, linear_gradient_put_EndPoint,
++};
++
++/* IGradientStop */
++
++DEFINE_IINSPECTABLE( gradient_stop, IGradientStop, struct media, IInspectable_inner )
++PROPERTY( gradient_stop, IGradientStop, Color, color, Color )
++PROPERTY( gradient_stop, IGradientStop, Offset, offset, DOUBLE )
++
++static const struct IGradientStopVtbl gradient_stop_vtbl =
++{
++    gradient_stop_QueryInterface, gradient_stop_AddRef, gradient_stop_Release,
++    gradient_stop_GetIids, gradient_stop_GetRuntimeClassName, gradient_stop_GetTrustLevel,
++    gradient_stop_get_Color, gradient_stop_put_Color, gradient_stop_get_Offset, gradient_stop_put_Offset,
++};
++
++static const struct vector_iids stops_iids =
++{
++    &IID___FIVector_1_Windows__CUI__CXaml__CMedia__CGradientStop,
++    &IID___FIVectorView_1_Windows__CUI__CXaml__CMedia__CGradientStop,
++    &IID___FIIterable_1_Windows__CUI__CXaml__CMedia__CGradientStop,
++    &IID___FIIterator_1_Windows__CUI__CXaml__CMedia__CGradientStop,
++    &IID_IGradientStop,
++};
++
++static HRESULT media_create( enum media_kind kind, IInspectable **out )
++{
++    struct media *impl;
++    HRESULT hr;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IInspectable_inner.lpVtbl = &inner_vtbl;
++    impl->IGeneralTransform_iface.lpVtbl = &general_transform_vtbl;
++    impl->ITransform_iface.lpVtbl = &transform_vtbl;
++    impl->ITranslateTransform_iface.lpVtbl = &translate_vtbl;
++    impl->IScaleTransform_iface.lpVtbl = &scale_vtbl;
++    impl->IRotateTransform_iface.lpVtbl = &rotate_vtbl;
++    impl->ICompositeTransform_iface.lpVtbl = &composite_vtbl;
++    impl->IMatrixTransform_iface.lpVtbl = &matrix_transform_vtbl;
++    impl->IBrush_iface.lpVtbl = &gradient_brush_base_vtbl;
++    impl->IGradientBrush_iface.lpVtbl = &gradient_brush_vtbl;
++    impl->ILinearGradientBrush_iface.lpVtbl = &linear_gradient_vtbl;
++    impl->IGradientStop_iface.lpVtbl = &gradient_stop_vtbl;
++    impl->ref = 1;
++    impl->kind = kind;
++    impl->scale_x = impl->scale_y = 1;
++    impl->matrix.M11 = impl->matrix.M22 = 1;
++    impl->opacity = 1;
++    impl->end.X = impl->end.Y = 1;
++    impl->mapping = BrushMappingMode_RelativeToBoundingBox;
++    if (kind == MEDIA_LINEAR_GRADIENT && FAILED(hr = vector_create( &stops_iids, NULL, impl, &impl->stops )))
++    {
++        free( impl );
++        return hr;
++    }
++    *out = &impl->IInspectable_inner;
++    return S_OK;
++}
++
++/* activation factories */
++
++struct media_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    enum media_kind kind;
++};
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    return media_create( CONTAINING_RECORD( iface, struct media_statics, IActivationFactory_iface )->kind, instance );
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++static struct media_statics translate_statics = { {&factory_vtbl}, MEDIA_TRANSLATE };
++static struct media_statics scale_statics = { {&factory_vtbl}, MEDIA_SCALE };
++static struct media_statics rotate_statics = { {&factory_vtbl}, MEDIA_ROTATE };
++static struct media_statics composite_statics = { {&factory_vtbl}, MEDIA_COMPOSITE };
++static struct media_statics matrix_statics = { {&factory_vtbl}, MEDIA_MATRIX };
++static struct media_statics linear_gradient_statics = { {&factory_vtbl}, MEDIA_LINEAR_GRADIENT };
++static struct media_statics gradient_stop_statics = { {&factory_vtbl}, MEDIA_GRADIENT_STOP };
++
++IActivationFactory *translate_transform_factory = &translate_statics.IActivationFactory_iface;
++IActivationFactory *scale_transform_factory = &scale_statics.IActivationFactory_iface;
++IActivationFactory *rotate_transform_factory = &rotate_statics.IActivationFactory_iface;
++IActivationFactory *composite_transform_factory = &composite_statics.IActivationFactory_iface;
++IActivationFactory *matrix_transform_factory = &matrix_statics.IActivationFactory_iface;
++IActivationFactory *linear_gradient_brush_factory = &linear_gradient_statics.IActivationFactory_iface;
++IActivationFactory *gradient_stop_factory = &gradient_stop_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/presenter.c b/dlls/windows.ui.xaml/presenter.c
+index c75ec0e..f4365db 100644
+--- a/dlls/windows.ui.xaml/presenter.c
++++ b/dlls/windows.ui.xaml/presenter.c
+@@ -142,20 +142,23 @@ static void presenter_arrange( struct xaml_element *element, struct layout_conte
+ static void presenter_render( struct xaml_element *element, struct layout_context *ctx )
+ {
+     struct presenter *impl = impl_from_element( element );
+-    COLORREF saved = ctx->foreground, color = ctx->foreground;
++    COLORREF saved = ctx->foreground;
++    BYTE saved_alpha = ctx->foreground_alpha;
+     struct layout_rect inner, rect;
+     struct text_format format;
+     float w, h;
+-    Color c;
++    Color c = { ctx->foreground_alpha, GetRValue( ctx->foreground ), GetGValue( ctx->foreground ), GetBValue( ctx->foreground ) };
+ 
+     element_draw_shape( ctx, &element->bounds, &element->corner_radius, FALSE, impl->background, impl->border_brush,
+                         &impl->border_thickness );
+-    if (impl->foreground && brush_get_color( impl->foreground, &c )) color = element_text_color( ctx, &element->bounds, c );
++    if (impl->foreground) brush_get_color( impl->foreground, &c );
+     if (impl->child)
+     {
+-        ctx->foreground = color;
++        ctx->foreground = RGB( c.R, c.G, c.B );
++        ctx->foreground_alpha = c.A;
+         element_render( impl->child, ctx );
+         ctx->foreground = saved;
++        ctx->foreground_alpha = saved_alpha;
+     }
+     else if (impl->text)
+     {
+@@ -163,7 +166,7 @@ static void presenter_render( struct xaml_element *element, struct layout_contex
+         text_format( impl, &format );
+         text_measure( ctx, &format, impl->text, INFINITY, &w, &h );
+         align( impl, &inner, w, h, &rect );
+-        text_draw( ctx, &format, impl->text, &rect, color );
++        text_draw_argb( ctx, &format, impl->text, &rect, c );
+     }
+ }
+ 
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index 6e529e3..5d5440c 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -144,6 +144,8 @@ void markup_set_value( IInspectable *target, const WCHAR *name, IInspectable *va
+ void markup_set_string( IInspectable *target, const WCHAR *name, const WCHAR *value, BOOL animated );
+ BOOL markup_set_color( IInspectable *target, const WCHAR *name, Color c, BOOL animated );
+ BOOL markup_property_path( const WCHAR *path, WCHAR *property, SIZE_T len, BOOL *brush_color );
++BOOL markup_resolve_path( IInspectable *target, const WCHAR *path, IInspectable **out, WCHAR *property, SIZE_T len,
++                          BOOL *brush_color );
+ BOOL is_template_kind( IInspectable *object, const WCHAR *kind );   /* DataTemplate, ItemsPanelTemplate, ... */
+ IInspectable *template_load_content( IInspectable *template );      /* referenced */
+ 
+@@ -204,7 +206,10 @@ struct layout_context
+     float scale;         /* physical pixels per view pixel */
+     BOOL dark;           /* application theme */
+     COLORREF foreground; /* inherited text colour */
++    BYTE foreground_alpha;
+     struct xaml_element *opacity_element;   /* being drawn into its own bitmap for its Opacity < 1 */
++    void *rt;            /* render.c: the Direct2D render target, or NULL to draw with GDI */
++    float transform[6];  /* the render target's current transform */
+ };
+ 
+ struct xaml_element;
+@@ -250,6 +255,9 @@ struct xaml_element
+     double width, height;
+     Thickness margin;
+     CornerRadius corner_radius;               /* Control, ContentPresenter, Grid (Border keeps its own) */
++    IInspectable *render_transform;           /* UIElement.RenderTransform */
++    Point render_transform_origin;
++    IInspectable *clip;                       /* UIElement.Clip, a RectangleGeometry */
+     HorizontalAlignment horizontal_alignment;
+     VerticalAlignment vertical_alignment;
+     Visibility visibility;
+@@ -329,6 +337,51 @@ void element_frame( struct layout_context *ctx, const struct layout_rect *rect,
+ void element_fill_color( struct layout_context *ctx, const struct layout_rect *rect, COLORREF color );
+ COLORREF element_text_color( struct layout_context *ctx, const struct layout_rect *rect, Color color );
+ struct shape_point { float x, y; };
++
++/* render.c: Direct2D and DirectWrite */
++BOOL render_begin( struct layout_context *ctx, HDC hdc, const RECT *rect );
++void render_end( struct layout_context *ctx );
++void d2d_clear( struct layout_context *ctx, COLORREF color );
++void d2d_fill_color( struct layout_context *ctx, const struct layout_rect *rect, Color c );
++void d2d_draw_shape( struct layout_context *ctx, const struct layout_rect *rect, const CornerRadius *radius,
++                     BOOL ellipse, IBrush *fill, IBrush *stroke, const Thickness *thickness );
++void d2d_draw_lines( struct layout_context *ctx, float x, float y, const struct shape_point *points, UINT32 count,
++                     BOOL closed, IBrush *fill, IBrush *stroke, double thickness );
++struct text_format;
++BOOL dwrite_measure( const struct text_format *format, HSTRING text, float avail_width, float *width, float *height );
++BOOL d2d_draw_text( struct layout_context *ctx, const struct text_format *format, HSTRING text,
++                    const struct layout_rect *rect, Color color );
++void d2d_set_transform( struct layout_context *ctx, const float *m );
++void d2d_push_clip( struct layout_context *ctx, const struct layout_rect *rect );
++void d2d_pop_clip( struct layout_context *ctx );
++void *d2d_begin_opacity( struct layout_context *ctx );
++void d2d_end_opacity( struct layout_context *ctx, void *saved, float opacity );
++
++/* media.c: transforms and gradients */
++struct gradient_info
++{
++    struct { float offset; Color color; } stops[16];
++    UINT32 count;
++    Point start, end;
++    BOOL relative;
++    int spread;      /* D2D1_EXTEND_MODE */
++    float opacity;
++};
++BOOL brush_get_gradient( IBrush *brush, struct gradient_info *info );
++BOOL is_media_object( IInspectable *object );
++BOOL transform_matrix( IInspectable *transform, float *m );
++void matrix_multiply( const float *a, const float *b, float *out );
++BOOL matrix_invert( const float *m, float *out );
++BOOL media_set_property( IInspectable *object, const WCHAR *name, const WCHAR *str, const double *number, const Color *color );
++int media_get_property( IInspectable *object, const WCHAR *name, double *number, Color *color );
++IInspectable *media_collection( IInspectable *object, const WCHAR *name );
++extern IActivationFactory *translate_transform_factory;
++extern IActivationFactory *scale_transform_factory;
++extern IActivationFactory *rotate_transform_factory;
++extern IActivationFactory *composite_transform_factory;
++extern IActivationFactory *matrix_transform_factory;
++extern IActivationFactory *linear_gradient_brush_factory;
++extern IActivationFactory *gradient_stop_factory;
+ void element_draw_shape( struct layout_context *ctx, const struct layout_rect *rect, const CornerRadius *radius,
+                          BOOL ellipse, IBrush *fill, IBrush *stroke, const Thickness *thickness );
+ void element_draw_lines( struct layout_context *ctx, float x, float y, const struct shape_point *points, UINT32 count,
+@@ -353,6 +406,8 @@ void text_measure( struct layout_context *ctx, const struct text_format *format,
+                    float *width, float *height );
+ void text_draw( struct layout_context *ctx, const struct text_format *format, HSTRING text, const struct layout_rect *rect,
+                 COLORREF color );
++void text_draw_argb( struct layout_context *ctx, const struct text_format *format, HSTRING text,
++                     const struct layout_rect *rect, Color color );
+ 
+ void window_invalidate(void);
+ void window_theme_changed(void);   /* re-resolve the whole tree's theme resources on the next layout */
+diff --git a/dlls/windows.ui.xaml/render.c b/dlls/windows.ui.xaml/render.c
+new file mode 100644
+index 0000000..653390a
+--- /dev/null
++++ b/dlls/windows.ui.xaml/render.c
+@@ -0,0 +1,471 @@
++/* Windows.UI.Xaml drawing with Direct2D and DirectWrite
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <math.h>
++
++/* before private.h: d2d1.h brings urlmon's IBinding, which Windows.UI.Xaml.Data's IBinding macro would rename */
++#define COBJMACROS
++#include "d2d1.h"
++#include "dwrite.h"
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* A frame is drawn with one Direct2D DC render target bound to the window's back buffer (a memory DC), in view
++ * pixels (its DPI is 96 x the view scale): anti-aliased shapes, real curves, transforms, clips, gradients, and
++ * DirectWrite text. Where Wine's Direct2D lacks something (layers, geometry combining), the code works around it:
++ * opacity draws into an offscreen target then blends it, and strokes are two-figure alternate-fill geometries.
++ * If Direct2D can't start, element.c draws with GDI as before. */
++
++/* no import library has it */
++static const GUID iid_dwrite_factory = { 0xb859ee5a, 0xd838, 0x4b5b, { 0xa2, 0xe8, 0x1a, 0xdc, 0x7d, 0x93, 0xdb, 0x48 } };
++
++static ID2D1Factory *factory;
++static IDWriteFactory *dwrite;
++static ID2D1DCRenderTarget *dc_target;
++static BOOL disabled;
++
++#define RT(ctx) ((ID2D1RenderTarget *)(ctx)->rt)
++
++static BOOL init(void)
++{
++    if (factory || disabled) return factory != NULL;
++    if (FAILED(D2D1CreateFactory( D2D1_FACTORY_TYPE_SINGLE_THREADED, &IID_ID2D1Factory, NULL, (void **)&factory )))
++    {
++        ERR( "no Direct2D: drawing with GDI.\n" );
++        disabled = TRUE;
++        return FALSE;
++    }
++    if (FAILED(DWriteCreateFactory( DWRITE_FACTORY_TYPE_SHARED, &iid_dwrite_factory, (IUnknown **)&dwrite ))) dwrite = NULL;
++    return TRUE;
++}
++
++BOOL render_begin( struct layout_context *ctx, HDC hdc, const RECT *rect )
++{
++    D2D1_RENDER_TARGET_PROPERTIES props = { D2D1_RENDER_TARGET_TYPE_DEFAULT,
++                                            { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE }, 0, 0,
++                                            D2D1_RENDER_TARGET_USAGE_NONE, D2D1_FEATURE_LEVEL_DEFAULT };
++    D2D1_MATRIX_3X2_F identity = {{{ 1, 0, 0, 1, 0, 0 }}};
++
++    ctx->rt = NULL;
++    if (!init()) return FALSE;
++    if (!dc_target && FAILED(ID2D1Factory_CreateDCRenderTarget( factory, &props, &dc_target )))
++    {
++        ERR( "no Direct2D DC render target: drawing with GDI.\n" );
++        disabled = TRUE;
++        return FALSE;
++    }
++    if (FAILED(ID2D1DCRenderTarget_BindDC( dc_target, hdc, rect ))) return FALSE;
++    ID2D1DCRenderTarget_SetDpi( dc_target, 96 * ctx->scale, 96 * ctx->scale );
++    ID2D1DCRenderTarget_BeginDraw( dc_target );
++    ID2D1DCRenderTarget_SetTransform( dc_target, &identity );
++    ctx->rt = dc_target;
++    memcpy( ctx->transform, &identity, sizeof(ctx->transform) );
++    return TRUE;
++}
++
++void render_end( struct layout_context *ctx )
++{
++    HRESULT hr;
++
++    if (!ctx->rt) return;
++    if ((hr = ID2D1DCRenderTarget_EndDraw( dc_target, NULL, NULL )) == D2DERR_RECREATE_TARGET)
++    {
++        ID2D1DCRenderTarget_Release( dc_target );
++        dc_target = NULL;
++    }
++    else if (FAILED(hr)) WARN( "EndDraw failed, hr %#lx.\n", hr );
++    ctx->rt = NULL;
++}
++
++static D2D1_COLOR_F color_f( Color c )
++{
++    D2D1_COLOR_F f = { c.R / 255.0f, c.G / 255.0f, c.B / 255.0f, c.A / 255.0f };
++    return f;
++}
++
++static D2D1_RECT_F rect_f( const struct layout_rect *r )
++{
++    D2D1_RECT_F f = { r->x, r->y, r->x + r->width, r->y + r->height };
++    return f;
++}
++
++static ID2D1Brush *solid( struct layout_context *ctx, Color c )
++{
++    D2D1_COLOR_F f = color_f( c );
++    ID2D1SolidColorBrush *brush = NULL;
++    ID2D1RenderTarget_CreateSolidColorBrush( RT(ctx), &f, NULL, &brush );
++    return (ID2D1Brush *)brush;
++}
++
++/* our Brush as a Direct2D one for drawing over bounds (a gradient's relative points are mapped to them) */
++static ID2D1Brush *d2d_brush( struct layout_context *ctx, IBrush *brush, const struct layout_rect *bounds )
++{
++    struct gradient_info info;
++    D2D1_GRADIENT_STOP stops[16];
++    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES props;
++    D2D1_BRUSH_PROPERTIES brush_props = { 1.0f, {{{ 1, 0, 0, 1, 0, 0 }}} };
++    ID2D1GradientStopCollection *collection;
++    ID2D1LinearGradientBrush *linear = NULL;
++    UINT32 i;
++    Color c;
++
++    if (!brush) return NULL;
++    if (brush_get_gradient( brush, &info ))
++    {
++        for (i = 0; i < info.count && i < ARRAY_SIZE(stops); i++)
++        {
++            stops[i].position = info.stops[i].offset;
++            stops[i].color = color_f( info.stops[i].color );
++        }
++        if (FAILED(ID2D1RenderTarget_CreateGradientStopCollection( RT(ctx), stops, i, D2D1_GAMMA_2_2,
++                                                                   info.spread, &collection ))) return NULL;
++        props.startPoint.x = info.relative ? bounds->x + info.start.X * bounds->width : info.start.X;
++        props.startPoint.y = info.relative ? bounds->y + info.start.Y * bounds->height : info.start.Y;
++        props.endPoint.x = info.relative ? bounds->x + info.end.X * bounds->width : info.end.X;
++        props.endPoint.y = info.relative ? bounds->y + info.end.Y * bounds->height : info.end.Y;
++        brush_props.opacity = info.opacity;
++        ID2D1RenderTarget_CreateLinearGradientBrush( RT(ctx), &props, &brush_props, collection, &linear );
++        ID2D1GradientStopCollection_Release( collection );
++        return (ID2D1Brush *)linear;
++    }
++    if (!brush_get_color( brush, &c ) || !c.A) return NULL;
++    return solid( ctx, c );
++}
++
++void d2d_fill_color( struct layout_context *ctx, const struct layout_rect *rect, Color c )
++{
++    ID2D1Brush *brush = solid( ctx, c );
++    D2D1_RECT_F r = rect_f( rect );
++
++    if (!brush) return;
++    ID2D1RenderTarget_FillRectangle( RT(ctx), &r, brush );
++    ID2D1Brush_Release( brush );
++}
++
++/* a quarter ellipse from p0 to p1 whose tangents meet at corner, as a cubic Bezier (Wine's AddArc is a stub) */
++static void add_quarter( ID2D1GeometrySink *sink, float x0, float y0, float cx, float cy, float x1, float y1 )
++{
++    static const float k = 0.5522847f;
++    D2D1_BEZIER_SEGMENT bezier;
++
++    bezier.point1.x = x0 + k * (cx - x0);
++    bezier.point1.y = y0 + k * (cy - y0);
++    bezier.point2.x = x1 + k * (cx - x1);
++    bezier.point2.y = y1 + k * (cy - y1);
++    bezier.point3.x = x1;
++    bezier.point3.y = y1;
++    ID2D1GeometrySink_AddBezier( sink, &bezier );
++}
++
++static void add_line( ID2D1GeometrySink *sink, float x, float y )
++{
++    D2D1_POINT_2F p = { x, y };
++    ID2D1GeometrySink_AddLine( sink, p );
++}
++
++/* a rectangle with per-corner radii, or an ellipse, as one figure of sink; reverse winds it the other way */
++static void add_shape_figure( ID2D1GeometrySink *sink, float l, float t, float r, float b, const CornerRadius *radius,
++                              BOOL ellipse, BOOL reverse )
++{
++    float w = r - l, h = b - t, lim = min( w, h ) / 2, tl = 0, tr = 0, br = 0, bl = 0;
++    float tlx, tly, trx, try_, brx, bry, blx, bly;
++    D2D1_POINT_2F p;
++
++    if (w <= 0 || h <= 0) return;
++    if (ellipse)
++    {
++        /* the corner radii of an ellipse are its half axes */
++        tlx = trx = brx = blx = w / 2;
++        tly = try_ = bry = bly = h / 2;
++    }
++    else
++    {
++        if (radius)
++        {
++            tl = min( max( 0.0, radius->TopLeft ), lim );
++            tr = min( max( 0.0, radius->TopRight ), lim );
++            br = min( max( 0.0, radius->BottomRight ), lim );
++            bl = min( max( 0.0, radius->BottomLeft ), lim );
++        }
++        tlx = tly = tl; trx = try_ = tr; brx = bry = br; blx = bly = bl;
++    }
++    p.x = l + tlx;
++    p.y = t;
++    ID2D1GeometrySink_BeginFigure( sink, p, D2D1_FIGURE_BEGIN_FILLED );
++    if (!reverse)
++    {
++        add_line( sink, r - trx, t );
++        if (trx) add_quarter( sink, r - trx, t, r, t, r, t + try_ );
++        add_line( sink, r, b - bry );
++        if (brx) add_quarter( sink, r, b - bry, r, b, r - brx, b );
++        add_line( sink, l + blx, b );
++        if (blx) add_quarter( sink, l + blx, b, l, b, l, b - bly );
++        add_line( sink, l, t + tly );
++        if (tlx) add_quarter( sink, l, t + tly, l, t, l + tlx, t );
++    }
++    else
++    {
++        if (tlx) add_quarter( sink, l + tlx, t, l, t, l, t + tly );
++        add_line( sink, l, b - bly );
++        if (blx) add_quarter( sink, l, b - bly, l, b, l + blx, b );
++        add_line( sink, r - brx, b );
++        if (brx) add_quarter( sink, r - brx, b, r, b, r, b - bry );
++        add_line( sink, r, t + try_ );
++        if (trx) add_quarter( sink, r, t + try_, r, t, r - trx, t );
++        add_line( sink, l + tlx, t );
++    }
++    ID2D1GeometrySink_EndFigure( sink, D2D1_FIGURE_END_CLOSED );
++}
++
++static ID2D1PathGeometry *shape_geometry( const struct layout_rect *rect, const CornerRadius *radius, BOOL ellipse,
++                                          const Thickness *ring )
++{
++    float l = rect->x, t = rect->y, r = rect->x + rect->width, b = rect->y + rect->height;
++    ID2D1PathGeometry *geometry;
++    ID2D1GeometrySink *sink;
++    CornerRadius inner;
++
++    if (FAILED(ID2D1Factory_CreatePathGeometry( factory, &geometry ))) return NULL;
++    if (FAILED(ID2D1PathGeometry_Open( geometry, &sink )))
++    {
++        ID2D1PathGeometry_Release( geometry );
++        return NULL;
++    }
++    ID2D1GeometrySink_SetFillMode( sink, D2D1_FILL_MODE_ALTERNATE );
++    add_shape_figure( sink, l, t, r, b, radius, ellipse, FALSE );
++    if (ring)
++    {
++        /* the stroke inside the edge: the outer shape minus the inner one */
++        if (radius)
++        {
++            inner.TopLeft = max( 0.0, radius->TopLeft - max( ring->Left, ring->Top ) / 2 );
++            inner.TopRight = max( 0.0, radius->TopRight - max( ring->Right, ring->Top ) / 2 );
++            inner.BottomRight = max( 0.0, radius->BottomRight - max( ring->Right, ring->Bottom ) / 2 );
++            inner.BottomLeft = max( 0.0, radius->BottomLeft - max( ring->Left, ring->Bottom ) / 2 );
++        }
++        add_shape_figure( sink, l + ring->Left, t + ring->Top, r - ring->Right, b - ring->Bottom,
++                          radius ? &inner : NULL, ellipse, TRUE );
++    }
++    ID2D1GeometrySink_Close( sink );
++    ID2D1GeometrySink_Release( sink );
++    return geometry;
++}
++
++void d2d_draw_shape( struct layout_context *ctx, const struct layout_rect *rect, const CornerRadius *radius,
++                     BOOL ellipse, IBrush *fill, IBrush *stroke, const Thickness *thickness )
++{
++    ID2D1PathGeometry *geometry;
++    ID2D1Brush *brush;
++
++    if ((brush = d2d_brush( ctx, fill, rect )))
++    {
++        if ((geometry = shape_geometry( rect, radius, ellipse, NULL )))
++        {
++            ID2D1RenderTarget_FillGeometry( RT(ctx), (ID2D1Geometry *)geometry, brush, NULL );
++            ID2D1PathGeometry_Release( geometry );
++        }
++        ID2D1Brush_Release( brush );
++    }
++    if (thickness && (thickness->Left > 0 || thickness->Top > 0 || thickness->Right > 0 || thickness->Bottom > 0) &&
++        (brush = d2d_brush( ctx, stroke, rect )))
++    {
++        if ((geometry = shape_geometry( rect, radius, ellipse, thickness )))
++        {
++            ID2D1RenderTarget_FillGeometry( RT(ctx), (ID2D1Geometry *)geometry, brush, NULL );
++            ID2D1PathGeometry_Release( geometry );
++        }
++        ID2D1Brush_Release( brush );
++    }
++}
++
++void d2d_draw_lines( struct layout_context *ctx, float x, float y, const struct shape_point *points, UINT32 count,
++                     BOOL closed, IBrush *fill, IBrush *stroke, double thickness )
++{
++    struct layout_rect bounds = { x, y, 0, 0 };
++    ID2D1PathGeometry *geometry;
++    ID2D1GeometrySink *sink;
++    ID2D1Brush *brush;
++    D2D1_POINT_2F p;
++    float max_x = 0, max_y = 0;
++    UINT32 i;
++
++    if (count < 2 || FAILED(ID2D1Factory_CreatePathGeometry( factory, &geometry ))) return;
++    if (FAILED(ID2D1PathGeometry_Open( geometry, &sink ))) { ID2D1PathGeometry_Release( geometry ); return; }
++    p.x = x + points[0].x;
++    p.y = y + points[0].y;
++    ID2D1GeometrySink_BeginFigure( sink, p, closed ? D2D1_FIGURE_BEGIN_FILLED : D2D1_FIGURE_BEGIN_HOLLOW );
++    for (i = 1; i < count; i++)
++    {
++        p.x = x + points[i].x;
++        p.y = y + points[i].y;
++        ID2D1GeometrySink_AddLine( sink, p );
++        max_x = max( max_x, points[i].x );
++        max_y = max( max_y, points[i].y );
++    }
++    ID2D1GeometrySink_EndFigure( sink, closed ? D2D1_FIGURE_END_CLOSED : D2D1_FIGURE_END_OPEN );
++    ID2D1GeometrySink_Close( sink );
++    ID2D1GeometrySink_Release( sink );
++    bounds.width = max_x;
++    bounds.height = max_y;
++    if (closed && (brush = d2d_brush( ctx, fill, &bounds )))
++    {
++        ID2D1RenderTarget_FillGeometry( RT(ctx), (ID2D1Geometry *)geometry, brush, NULL );
++        ID2D1Brush_Release( brush );
++    }
++    if (thickness > 0 && (brush = d2d_brush( ctx, stroke, &bounds )))
++    {
++        ID2D1RenderTarget_DrawGeometry( RT(ctx), (ID2D1Geometry *)geometry, brush, thickness, NULL );
++        ID2D1Brush_Release( brush );
++    }
++    ID2D1PathGeometry_Release( geometry );
++}
++
++/* ---- text ---- */
++
++static IDWriteTextLayout *text_layout( const struct text_format *format, HSTRING text, float width, float height )
++{
++    UINT32 len;
++    const WCHAR *str = WindowsGetStringRawBuffer( text, &len );
++    IDWriteTextFormat *text_format;
++    IDWriteTextLayout *layout = NULL;
++    DWRITE_TEXT_ALIGNMENT alignment;
++
++    if (!init() || !dwrite) return NULL;
++    if (FAILED(IDWriteFactory_CreateTextFormat( dwrite, L"Segoe UI", NULL, format->weight ? format->weight : 400,
++                                                format->italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL,
++                                                DWRITE_FONT_STRETCH_NORMAL, format->font_size, L"", &text_format )))
++        return NULL;
++    IDWriteTextFormat_SetWordWrapping( text_format, format->wrap ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP );
++    switch (format->alignment)
++    {
++    case TextAlignment_Center: alignment = DWRITE_TEXT_ALIGNMENT_CENTER; break;
++    case TextAlignment_Right: alignment = DWRITE_TEXT_ALIGNMENT_TRAILING; break;
++    default: alignment = DWRITE_TEXT_ALIGNMENT_LEADING; break;
++    }
++    IDWriteTextFormat_SetTextAlignment( text_format, alignment );
++    IDWriteFactory_CreateTextLayout( dwrite, len ? str : L"", len, text_format, width, height, &layout );
++    IDWriteTextFormat_Release( text_format );
++    return layout;
++}
++
++BOOL dwrite_measure( const struct text_format *format, HSTRING text, float avail_width, float *width, float *height )
++{
++    IDWriteTextLayout *layout = text_layout( format, text, min( avail_width, 1e6f ), 1e6f );
++    DWRITE_TEXT_METRICS metrics;
++
++    if (!layout) return FALSE;
++    if (FAILED(IDWriteTextLayout_GetMetrics( layout, &metrics )))
++    {
++        IDWriteTextLayout_Release( layout );
++        return FALSE;
++    }
++    *width = ceilf( metrics.widthIncludingTrailingWhitespace );
++    *height = ceilf( metrics.height );
++    IDWriteTextLayout_Release( layout );
++    return TRUE;
++}
++
++BOOL d2d_draw_text( struct layout_context *ctx, const struct text_format *format, HSTRING text,
++                    const struct layout_rect *rect, Color color )
++{
++    IDWriteTextLayout *layout;
++    ID2D1Brush *brush;
++    D2D1_POINT_2F origin = { rect->x, rect->y };
++
++    if (!WindowsGetStringLen( text )) return TRUE;
++    if (!(layout = text_layout( format, text, max( rect->width, 1.0f ), max( rect->height, 1.0f ) ))) return FALSE;
++    if ((brush = solid( ctx, color )))
++    {
++        ID2D1RenderTarget_DrawTextLayout( RT(ctx), origin, layout, brush, D2D1_DRAW_TEXT_OPTIONS_NONE );
++        ID2D1Brush_Release( brush );
++    }
++    IDWriteTextLayout_Release( layout );
++    return TRUE;
++}
++
++/* ---- transforms, clips, opacity ---- */
++
++void d2d_set_transform( struct layout_context *ctx, const float *m )
++{
++    memcpy( ctx->transform, m, sizeof(ctx->transform) );
++    ID2D1RenderTarget_SetTransform( RT(ctx), (const D2D1_MATRIX_3X2_F *)m );
++}
++
++void d2d_push_clip( struct layout_context *ctx, const struct layout_rect *rect )
++{
++    D2D1_RECT_F r = rect_f( rect );
++    ID2D1RenderTarget_PushAxisAlignedClip( RT(ctx), &r, D2D1_ANTIALIAS_MODE_ALIASED );
++}
++
++void d2d_pop_clip( struct layout_context *ctx )
++{
++    ID2D1RenderTarget_PopAxisAlignedClip( RT(ctx) );
++}
++
++/* Opacity: draw into an offscreen target of the same size and transform, then blend that in.
++ * (Wine's Direct2D has no layers yet.) */
++void *d2d_begin_opacity( struct layout_context *ctx )
++{
++    ID2D1BitmapRenderTarget *target;
++    D2D1_SIZE_F size;
++    D2D1_COLOR_F clear = { 0, 0, 0, 0 };
++    D2D1_PIXEL_FORMAT format = { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED };
++    void *saved = ctx->rt;
++
++    size = ID2D1RenderTarget_GetSize( RT(ctx) );
++    if (FAILED(ID2D1RenderTarget_CreateCompatibleRenderTarget( RT(ctx), &size, NULL, &format,
++                                                               D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE, &target )))
++        return NULL;
++    ID2D1BitmapRenderTarget_BeginDraw( target );
++    ID2D1BitmapRenderTarget_Clear( target, &clear );
++    ID2D1BitmapRenderTarget_SetTransform( target, (const D2D1_MATRIX_3X2_F *)ctx->transform );
++    ctx->rt = target;
++    return saved;
++}
++
++void d2d_end_opacity( struct layout_context *ctx, void *saved, float opacity )
++{
++    ID2D1BitmapRenderTarget *target = ctx->rt;
++    D2D1_MATRIX_3X2_F identity = {{{ 1, 0, 0, 1, 0, 0 }}};
++    ID2D1Bitmap *bitmap;
++    D2D1_SIZE_F size;
++    D2D1_RECT_F all;
++
++    ID2D1BitmapRenderTarget_EndDraw( target, NULL, NULL );
++    ctx->rt = saved;
++    if (SUCCEEDED(ID2D1BitmapRenderTarget_GetBitmap( target, &bitmap )))
++    {
++        size = ID2D1Bitmap_GetSize( bitmap );
++        all.left = all.top = 0;
++        all.right = size.width;
++        all.bottom = size.height;
++        ID2D1RenderTarget_SetTransform( RT(ctx), &identity );
++        ID2D1RenderTarget_DrawBitmap( RT(ctx), bitmap, &all, opacity, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &all );
++        ID2D1RenderTarget_SetTransform( RT(ctx), (const D2D1_MATRIX_3X2_F *)ctx->transform );
++        ID2D1Bitmap_Release( bitmap );
++    }
++    ID2D1BitmapRenderTarget_Release( target );
++}
++
++void d2d_clear( struct layout_context *ctx, COLORREF color )
++{
++    D2D1_COLOR_F f = { GetRValue( color ) / 255.0f, GetGValue( color ) / 255.0f, GetBValue( color ) / 255.0f, 1 };
++    ID2D1RenderTarget_Clear( RT(ctx), &f );
++}
+diff --git a/dlls/windows.ui.xaml/text_block.c b/dlls/windows.ui.xaml/text_block.c
+index 4404409..3b2bf83 100644
+--- a/dlls/windows.ui.xaml/text_block.c
++++ b/dlls/windows.ui.xaml/text_block.c
+@@ -430,20 +430,15 @@ static void text_block_render( struct xaml_element *element, struct layout_conte
+     const Thickness *p = &impl->padding;
+     struct layout_rect rect = element->bounds;
+     struct text_format format;
+-    COLORREF color = ctx->foreground;
+-    Color c;
++    Color c = { ctx->foreground_alpha, GetRValue( ctx->foreground ), GetGValue( ctx->foreground ), GetBValue( ctx->foreground ) };
+ 
+-    if (impl->foreground)
+-    {
+-        if (!brush_get_color( impl->foreground, &c ) || !c.A) return;
+-        color = element_text_color( ctx, &element->bounds, c );
+-    }
++    if (impl->foreground && (!brush_get_color( impl->foreground, &c ) || !c.A)) return;
+     rect.x += p->Left;
+     rect.y += p->Top;
+     rect.width = max( 0.0f, rect.width - p->Left - p->Right );
+     rect.height = max( 0.0f, rect.height - p->Top - p->Bottom );
+     text_block_format( impl, &format );
+-    text_draw( ctx, &format, impl->text, &rect, color );
++    text_draw_argb( ctx, &format, impl->text, &rect, c );
+ }
+ 
+ static BOOL text_block_hit_self( struct xaml_element *element, float x, float y )
+diff --git a/dlls/windows.ui.xaml/window.c b/dlls/windows.ui.xaml/window.c
+index 0a18234..548daf2 100644
+--- a/dlls/windows.ui.xaml/window.c
++++ b/dlls/windows.ui.xaml/window.c
+@@ -20,6 +20,7 @@
+ #include "private.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++WINE_DECLARE_DEBUG_CHANNEL(xamlframe);
+ 
+ /* The XAML Window wraps the view's CoreWindow. Content is drawn with GDI into the CoreWindow's HWND, which is
+  * subclassed for WM_PAINT; everything else goes on to twinapi.appcore's window procedure. */
+@@ -81,6 +82,7 @@ static void window_layout( struct xaml_window *window, struct layout_context *ct
+     ctx->scale = view_scale();
+     ctx->dark = application_theme() == ApplicationTheme_Dark;
+     ctx->foreground = ctx->dark ? RGB(255, 255, 255) : RGB(0, 0, 0);
++    ctx->foreground_alpha = 255;
+     if (!window->content || !(element = element_from_iinspectable( (IInspectable *)window->content ))) return;
+ 
+     width = client.right / ctx->scale;
+@@ -99,20 +101,29 @@ static void window_paint( struct xaml_window *window )
+     RECT client;
+     HDC hdc, mem;
+ 
++    ULONGLONG start = GetTickCount64();
++
+     hdc = BeginPaint( window->hwnd, &ps );
+     GetClientRect( window->hwnd, &client );
+     mem = CreateCompatibleDC( hdc );
+     bitmap = CreateCompatibleBitmap( hdc, max( 1, client.right ), max( 1, client.bottom ) );
+     old = SelectObject( mem, bitmap );
+ 
++    memset( &ctx, 0, sizeof(ctx) );
+     window_layout( window, &ctx, mem );
+     background = CreateSolidBrush( ctx.dark ? RGB(0, 0, 0) : RGB(255, 255, 255) );
+     FillRect( mem, &client, background );
+     DeleteObject( background );
+     if (window->content && (element = element_from_iinspectable( (IInspectable *)window->content )))
++    {
++        /* Direct2D draws the frame into the back buffer; without it, GDI does */
++        render_begin( &ctx, mem, &client );
+         element_render( element, &ctx );
++        render_end( &ctx );
++    }
+ 
+     BitBlt( hdc, 0, 0, client.right, client.bottom, mem, 0, 0, SRCCOPY );
++    TRACE_(xamlframe)( "frame of %ldx%ld in %I64u ms.\n", client.right, client.bottom, GetTickCount64() - start );
+     SelectObject( mem, old );
+     DeleteObject( bitmap );
+     DeleteDC( mem );
+diff --git a/dlls/windows.ui.xaml/xbf.c b/dlls/windows.ui.xaml/xbf.c
+index 38aff3f..ae1f140 100644
+--- a/dlls/windows.ui.xaml/xbf.c
++++ b/dlls/windows.ui.xaml/xbf.c
+@@ -2125,6 +2125,44 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+         return S_OK;
+     }
+ 
++    if (is_media_object( target ))
++    {
++        Color c;
++        double dd;
++        BOOL has_c = to_color( value, &c ), has_d = value->kind != XV_STRING && to_double( value, &dd );
++        if (media_set_property( target, prop->name, value->kind == XV_STRING ? value->s : NULL, has_d ? &dd : NULL,
++                                has_c ? &c : NULL ))
++            return S_OK;
++    }
++    if (prop_is( prop, L"RenderTransform" ) && value->kind == XV_OBJECT && QI( target, IUIElement, &ui ))
++    {
++        ITransform *transform = NULL;
++        if (value->object) IInspectable_QueryInterface( value->object, &IID_ITransform, (void **)&transform );
++        IUIElement_put_RenderTransform( ui, transform );
++        if (transform) ITransform_Release( transform );
++        IUIElement_Release( ui );
++        return S_OK;
++    }
++    if (prop_is( prop, L"RenderTransformOrigin" ) && value->kind == XV_STRING && QI( target, IUIElement, &ui ))
++    {
++        Point origin = {0};
++        WCHAR *end;
++        origin.X = wcstod( value->s, &end );
++        while (*end == ',' || *end == ' ') end++;
++        origin.Y = wcstod( end, NULL );
++        IUIElement_put_RenderTransformOrigin( ui, origin );
++        IUIElement_Release( ui );
++        return S_OK;
++    }
++    if (prop_is( prop, L"Clip" ) && value->kind == XV_OBJECT && QI( target, IUIElement, &ui ))
++    {
++        IRectangleGeometry *geometry = NULL;
++        if (value->object) IInspectable_QueryInterface( value->object, &IID_IRectangleGeometry, (void **)&geometry );
++        IUIElement_put_Clip( ui, geometry );
++        if (geometry) IRectangleGeometry_Release( geometry );
++        IUIElement_Release( ui );
++        return S_OK;
++    }
+     if (prop_is( prop, L"ContentTemplate" ) && (value->kind == XV_NULL || (value->kind == XV_OBJECT && (!value->object ||
+         is_template_kind( value->object, L"DataTemplate" )))))
+     {
+@@ -2629,6 +2667,11 @@ static IInspectable *get_property( IInspectable *target, const struct xprop *pro
+ 
+     if (!target) return NULL;
+     if (bag_from_object( target )) return bag_collection( bag_from_object( target ), prop->name );
++    if ((result = media_collection( target, prop->name )))
++    {
++        IInspectable_AddRef( result );
++        return result;
++    }
+     if (prop_is( prop, L"Items" ) && (result = items_control_items( target )))
+     {
+         IInspectable_AddRef( result );
+@@ -2728,6 +2771,13 @@ IInspectable *create_builtin( const WCHAR *name )
+         { L"RectangleGeometry", &rectangle_geometry_factory },
+         { L"EllipseGeometry", &ellipse_geometry_factory },
+         { L"LineGeometry", &line_geometry_factory },
++        { L"TranslateTransform", &translate_transform_factory },
++        { L"ScaleTransform", &scale_transform_factory },
++        { L"RotateTransform", &rotate_transform_factory },
++        { L"CompositeTransform", &composite_transform_factory },
++        { L"MatrixTransform", &matrix_transform_factory },
++        { L"LinearGradientBrush", &linear_gradient_brush_factory },
++        { L"GradientStop", &gradient_stop_factory },
+         { L"ToggleButton", &toggle_button_factory },
+         { L"ToggleSwitch", &toggle_switch_factory },
+         { L"Slider", &slider_factory },
+@@ -3883,7 +3933,7 @@ static BOOL is_collection_property( IInspectable *target, const WCHAR *name )
+     static const WCHAR *names[] =
+     {
+         L"Children", L"RowDefinitions", L"ColumnDefinitions", L"VisualStateGroups", L"MergedDictionaries", L"States",
+-        L"KeyFrames", L"Setters", L"Items",
++        L"KeyFrames", L"Setters", L"Items", L"GradientStops",
+     };
+     UINT32 i;
+ 
+@@ -3951,6 +4001,11 @@ static BOOL content_property( IInspectable *object, const WCHAR *type, struct xp
+         else if (wcsstr( bag->type, L"UsingKeyFrames" )) name = L"KeyFrames";
+         else if (!wcscmp( bag->type, L"Collection" )) name = L"Items";
+     }
++    else if (media_collection( object, L"GradientStops" ))
++    {
++        text_prop( prop, type, L"GradientStops" );
++        return TRUE;
++    }
+     else if (items_control_items( object ))
+     {
+         text_prop( prop, type, L"Items" );
+@@ -4371,6 +4426,23 @@ static BOOL get_value( IInspectable *target, const WCHAR *name, struct xvalue *o
+ 
+     memset( out, 0, sizeof(*out) );
+     if (!target) return FALSE;
++    {
++        Color c;
++        switch (media_get_property( target, name, &d, &c ))
++        {
++        case 1: out->kind = XV_FLOAT; out->f = d; return TRUE;
++        case 2: out->kind = XV_COLOR; out->color = c.A << 24 | c.R << 16 | c.G << 8 | c.B; return TRUE;
++        }
++    }
++    if (!wcscmp( name, L"RenderTransform" ) && QI( target, IUIElement, &ui ))
++    {
++        ITransform *transform = NULL;
++        IUIElement_get_RenderTransform( ui, &transform );
++        IUIElement_Release( ui );
++        out->kind = XV_OBJECT;
++        out->object = (IInspectable *)transform;
++        return TRUE;
++    }
+     if (!wcscmp( name, L"Fill" ) || !wcscmp( name, L"Stroke" ))
+     {
+         IShape *shape;
+@@ -4809,9 +4881,37 @@ static BOOL parse_property_path( const WCHAR *path, WCHAR *property, SIZE_T len,
+     return TRUE;
+ }
+ 
+-BOOL markup_property_path( const WCHAR *path, WCHAR *property, SIZE_T len, BOOL *brush_color )
++/* Storyboard.TargetProperty on target: "Opacity", "(UIElement.Opacity)", "(Border.Background).(SolidColorBrush.Color)"
++ * (a new brush with the colour), or "(UIElement.RenderTransform).(RotateTransform.Angle)" (a property of the object
++ * the first one holds: *out is that object, referenced) */
++BOOL markup_resolve_path( IInspectable *target, const WCHAR *path, IInspectable **out, WCHAR *property, SIZE_T len,
++                          BOOL *brush_color )
+ {
+-    return parse_property_path( path, property, len, brush_color );
++    const WCHAR *end, *second, *dot;
++    WCHAR first[96];
++    IInspectable *object;
++
++    *out = NULL;
++    *brush_color = FALSE;
++    if (*path == '(' && (end = wcschr( path, ')' )) && end[1] == '.' && end[2] == '(' &&
++        wcscmp( end + 2, L"(SolidColorBrush.Color)" ))
++    {
++        if (!(dot = wcschr( path, '.' )) || dot > end) return FALSE;
++        lstrcpynW( first, dot + 1, min( ARRAY_SIZE(first), end - dot ) );
++        second = end + 2;
++        if (!(end = wcschr( second, ')' )) || end[1] || !(dot = wcschr( second, '.' )) || dot > end) return FALSE;
++        lstrcpynW( property, dot + 1, min( len, end - dot ) );
++        if (!(object = markup_get_value( target, first )))
++        {
++            WARN( "%s has no %s to animate %s on.\n", debugstr_w(path), debugstr_w(first), debugstr_w(property) );
++            return FALSE;
++        }
++        *out = object;
++        return TRUE;
++    }
++    if (!parse_property_path( path, property, len, brush_color )) return FALSE;
++    IInspectable_AddRef( (*out = target) );
++    return TRUE;
+ }
+ 
+ /* a Color property (SolidColorBrush.Color): FALSE if target has none */
+@@ -4835,15 +4935,17 @@ static void apply_animation( struct template_instance *instance, IInspectable *g
+     struct xvalue *to = bag_get( anim, L"To" ), value;
+     struct bag *frames;
+     WCHAR property[96];
+-    IInspectable *target;
++    IInspectable *target, *resolved = NULL;
+     BOOL brush_color;
+ 
+     if (!target_name || !path || !(target = find_name( instance, target_name ))) return;
+-    if (!parse_property_path( path, property, ARRAY_SIZE(property), &brush_color ))
++    if (!markup_resolve_path( target, path, &resolved, property, ARRAY_SIZE(property), &brush_color ))
+     {
+         FIXME( "animating %s.%s is not supported.\n", debugstr_w(target_name), debugstr_w(path) );
+         return;
+     }
++    target = resolved;
++    IInspectable_Release( resolved );   /* the element or its RenderTransform: kept alive by the template */
+     /* key frame animations: the last frame's value */
+     if (!to && (frames = bag_value( anim, L"KeyFrames" )) && frames->item_count)
+         to = bag_get( bag_from_object( frames->items[frames->item_count - 1] ), L"Value" );

@@ -1213,7 +1213,8 @@ static void pump(DWORD ms)
 
     while ((int)(end - GetTickCount()) > 0)
     {
-        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
+        /* frames can take longer than the animation timer: don't let a full queue run past the end */
+        while ((int)(end - GetTickCount()) > 0 && PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
         {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -1929,6 +1930,8 @@ int main(void)
 {
     IApplicationStatics *statics;
     HRESULT hr;
+
+    setvbuf( stdout, NULL, _IONBF, 0 );   /* in step with Wine's debug output */
 
     setvbuf(stdout, NULL, _IONBF, 0);
     RoInitialize(RO_INIT_SINGLETHREADED);
