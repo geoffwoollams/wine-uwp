@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <limits.h>
 
 #define COBJMACROS
 #include "windef.h"
@@ -116,6 +117,7 @@ struct main_page
     LONG ref;
     ITextBlock *title;          /* x:Name="Title" */
     ITextBlock *styled;         /* x:Name="Styled" */
+    IButton *templated;         /* x:Name="TemplatedButton" */
     IButton *click_button;      /* x:Name="ClickButton" */
     int clicks;
 };
@@ -147,6 +149,7 @@ static ULONG WINAPI page_Release(IComponentConnector *iface)
     {
         if (page->title) ITextBlock_Release(page->title);
         if (page->styled) ITextBlock_Release(page->styled);
+        if (page->templated) IButton_Release(page->templated);
         if (page->click_button) IButton_Release(page->click_button);
         IInspectable_Release(page->inner);
         if (the_page == page) the_page = NULL;
@@ -204,6 +207,9 @@ static HRESULT WINAPI page_Connect(IComponentConnector *iface, INT32 id, IInspec
         break;
     case 3:
         IInspectable_QueryInterface(target, &IID_ITextBlock, (void **)&page->styled);
+        break;
+    case 4:
+        IInspectable_QueryInterface(target, &IID_IButton, (void **)&page->templated);
         break;
     }
     return S_OK;
@@ -561,6 +567,67 @@ static void check_styles(struct main_page *page)
     IControl_Release(control);
 }
 
+/* the bounding box of a colour in the last snapshot */
+static int find_color(DWORD rgb, RECT *box)
+{
+    int x, y, n = 0;
+    SetRect(box, INT_MAX, INT_MAX, -1, -1);
+    for (y = 0; y < height; y++) for (x = 0; x < width; x++)
+    {
+        if ((pixels[y * width + x] & 0xffffff) != rgb) continue;
+        n++;
+        box->left = min(box->left, x); box->top = min(box->top, y);
+        box->right = max(box->right, x); box->bottom = max(box->bottom, y);
+    }
+    return n;
+}
+
+/* milestone 4 part 2: a control template with visual states */
+static void check_template(struct main_page *page)
+{
+    RECT box, frame;
+    int n, cx, cy, white;
+
+    check(page->templated != NULL, "Connect(4) gave us x:Name=\"TemplatedButton\"");
+    if (!page->templated) return;
+    snapshot();
+    n = find_color(0x107c10, &box);
+    check(n > 1500, "the template's Grid draws {TemplateBinding Background} #107C10 (%d px)", n);
+    if (n <= 0) return;
+    cx = (box.left + box.right) / 2;
+    cy = (box.top + box.bottom) / 2;
+    {
+        int x, y;
+        for (white = 0, y = box.top; y <= box.bottom; y++) for (x = box.left; x <= box.right; x++)
+            if ((pixels[y * width + x] & 0xffffff) == 0xffffff) white++;
+    }
+    check(white > 30, "the ContentPresenter draws the button's Content in its {TemplateBinding Foreground} white (%d px)", white);
+    check(box.right - box.left > 80 && box.bottom - box.top > 30, "the template is sized by the presenter's padding 16,8 (%ldx%ld)",
+          box.right - box.left + 1, box.bottom - box.top + 1);
+
+    SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(cx, cy));
+    snapshot();
+    check(find_color(0x0b5a0b, &box) > 1500 && find_color(0x107c10, &box) == 0,
+          "PointerOver: the state's Setter changes RootGrid.Background to #0B5A0B");
+
+    SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(cx, cy));
+    snapshot();
+    check(find_color(0x052e05, &box) > 1000, "Pressed: ObjectAnimationUsingKeyFrames sets RootGrid.Background #052E05 (%d px)",
+          find_color(0x052e05, &box));
+    n = find_color(0xffd700, &frame);
+    check(n > 200, "Pressed: ColorAnimation turns Frame's BorderBrush gold (%d px)", n);
+
+    SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(cx, cy));
+    snapshot();
+    check(find_color(0xffd700, &frame) == 0 && find_color(0x0b5a0b, &box) > 1500,
+          "back to PointerOver: the Pressed values are restored (border transparent) and the hover colour is back");
+
+    SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(cx, cy - 200 > 0 ? 5 : 5));
+    SendMessageW(hwnd, WM_MOUSELEAVE, 0, 0);
+    snapshot();
+    check(find_color(0x107c10, &box) > 1500 && find_color(0x0b5a0b, &box) == 0, "Normal again: the original background is restored");
+}
+
 static void check_microsoft_xbf(const WCHAR *file, const WCHAR *component_class)
 {
     IActivationFactory *factory;
@@ -664,6 +731,7 @@ static void CALLBACK verify(HWND unused, UINT msg, UINT_PTR id, DWORD time)
         SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM((int)cx, (int)cy));
     }
     check(the_page->clicks == 1, "clicking ClickButton ran OnClick (%d)", the_page->clicks);
+    check_template(the_page);
     check(!wcscmp(text_of(the_page->title, buf, ARRAYSIZE(buf)), L"Clicked!"), "OnClick changed Title (%ls)", buf);
     snapshot();
 

@@ -19,4 +19,43 @@
         <Setter Property="Background" Value="{StaticResource StyleAccentBrush}"/>
         <Setter Property="Foreground" Value="White"/>
     </Style>
+
+    <!-- a control template with visual states, like the ones in generic.xaml -->
+    <Style x:Key="TemplatedButton" TargetType="Button">
+        <Setter Property="Background" Value="#FF107C10"/>
+        <Setter Property="Foreground" Value="White"/>
+        <Setter Property="Padding" Value="16,8,16,8"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Grid x:Name="RootGrid" Background="{TemplateBinding Background}">
+                        <VisualStateManager.VisualStateGroups>
+                            <VisualStateGroup x:Name="CommonStates">
+                                <VisualState x:Name="Normal"/>
+                                <VisualState x:Name="PointerOver">
+                                    <VisualState.Setters>
+                                        <Setter Target="RootGrid.Background" Value="#FF0B5A0B"/>
+                                    </VisualState.Setters>
+                                </VisualState>
+                                <VisualState x:Name="Pressed">
+                                    <Storyboard>
+                                        <ObjectAnimationUsingKeyFrames Storyboard.TargetName="RootGrid" Storyboard.TargetProperty="Background">
+                                            <DiscreteObjectKeyFrame KeyTime="0" Value="#FF052E05"/>
+                                        </ObjectAnimationUsingKeyFrames>
+                                        <ColorAnimation Storyboard.TargetName="Frame" Duration="0" To="#FFFFD700"
+                                                        Storyboard.TargetProperty="(Border.BorderBrush).(SolidColorBrush.Color)"/>
+                                    </Storyboard>
+                                </VisualState>
+                            </VisualStateGroup>
+                        </VisualStateManager.VisualStateGroups>
+                        <Border x:Name="Frame" BorderBrush="Transparent" BorderThickness="3">
+                            <ContentPresenter x:Name="ContentPresenter" Content="{TemplateBinding Content}"
+                                              Padding="{TemplateBinding Padding}" Foreground="{TemplateBinding Foreground}"
+                                              HorizontalContentAlignment="Center" VerticalContentAlignment="Center"/>
+                        </Border>
+                    </Grid>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
 </ResourceDictionary>
