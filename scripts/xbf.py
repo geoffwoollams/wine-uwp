@@ -266,8 +266,11 @@ XAML = 'http://schemas.microsoft.com/winfx/2006/xaml'
 # content properties of the built-in types the tests use
 CONTENT = {'Grid': 'Panel_Children', 'StackPanel': 'Panel_Children', 'Border': 'Border_Child',
            'Button': 'ContentControl_Content', 'Page': 'UserControl_Content', 'UserControl': 'UserControl_Content',
-           'Frame': 'ContentControl_Content'}
-COLLECTION_CONTENT = {'Panel_Children'}
+           'Frame': 'ContentControl_Content', 'ContentPresenter': 'ContentPresenter_Content',
+           'VisualStateGroup': 'VisualStateGroup_States', 'VisualState': 'VisualState_Storyboard',
+           'Storyboard': 'Storyboard_Children', 'ObjectAnimationUsingKeyFrames': 'ObjectAnimationUsingKeyFrames_KeyFrames'}
+COLLECTION_CONTENT = {'Panel_Children', 'VisualStateGroup_States', 'Storyboard_Children', 'ObjectAnimationUsingKeyFrames_KeyFrames',
+                      'VisualState_Setters'}
 ENUMS = {'HorizontalAlignment': ['Left', 'Center', 'Right', 'Stretch'], 'VerticalAlignment': ['Top', 'Center', 'Bottom', 'Stretch'],
          'Orientation': ['Vertical', 'Horizontal'], 'Visibility': ['Visible', 'Collapsed'],
          'TextWrapping': [None, 'NoWrap', 'Wrap', 'WrapWholeWords'], 'TextAlignment': ['Center', 'Left', 'Right', 'Justify'],
@@ -304,7 +307,9 @@ def compile_xaml(src, out):
         if entry not in types: types.append(entry)
         return types.index(entry)
 
-    bases = {'Button': ['ButtonBase', 'ContentControl', 'Control'], 'Frame': ['ContentControl', 'Control'],
+    bases = {'DiscreteObjectKeyFrame': ['ObjectKeyFrame'], 'DoubleAnimation': ['Timeline'], 'ColorAnimation': ['Timeline'],
+             'ObjectAnimationUsingKeyFrames': ['Timeline'], 'Storyboard': ['Timeline'],
+             'Button': ['ButtonBase', 'ContentControl', 'Control'], 'Frame': ['ContentControl', 'Control'],
              'Page': ['UserControl', 'Control'], 'UserControl': ['Control'], 'Grid': ['Panel'], 'StackPanel': ['Panel'],
              'ContentControl': ['Control']}
 
@@ -382,10 +387,13 @@ def compile_xaml(src, out):
         else:
             w(stream, 'BH', NODE['SetValueTypeConvertedConstant'], pref); constant(stream, value, pfull)
 
+    template_target = []   # the TargetType while compiling a ControlTemplate's content
+
     def element(stream, el, is_root):
         ns, name = el.tag[1:].split('}')
         if name == 'ResourceDictionary': return dictionary_element(stream, el, is_root)
         if name == 'Style': return style_element(stream, el)
+        if name == 'ControlTemplate': return template_element(stream, el)
         attrs = dict(el.attrib)
         attrs.pop('{%s}Class' % XAML, None)
         attrs.pop('{%s}Key' % XAML, None)
@@ -398,7 +406,7 @@ def compile_xaml(src, out):
         if xname:
             w(stream, 'BBH', NODE['SetName'], C_SHARED, s(xname))
         events = {k: attrs.pop(k) for k in list(attrs) if k == 'Click'}
-        if xname or events:
+        if (xname or events) and not template_target:   # template parts aren't connected to the page
             conn[0] += 1
             w(stream, 'BBi', NODE['SetConnectionId'], C_SIGNED, conn[0])
             connections.append((conn[0], xname, events))
@@ -406,6 +414,10 @@ def compile_xaml(src, out):
             if key.startswith('{'): continue
             owner, _, pname = key.rpartition('.')
             pref, pfull = prop_ref(owner or name, pname)
+            m = re.match(r'\{TemplateBinding (\w+)\}', value)
+            if m:
+                w(stream, 'BHH', NODE['SetValueFromTemplateBinding'], pref, prop_ref(template_target[-1], m.group(1))[0])
+                continue
             value_node(stream, pref, pfull, value)
         content = []
         for child in el:
@@ -422,7 +434,10 @@ def compile_xaml(src, out):
                         dictionary_element(stream, None, False, entries=items)
                     w(stream, 'BH', NODE['SetValue'], pref)
                     continue
-                if pfull in ('Grid_RowDefinitions', 'Grid_ColumnDefinitions'):
+                if pfull == 'VisualStateManager_VisualStateGroups':
+                    visual_state_groups(stream, items)
+                    continue
+                if pfull in ('Grid_RowDefinitions', 'Grid_ColumnDefinitions', 'VisualState_Setters'):
                     w(stream, 'BH', NODE['PushScopeGetValue'], pref)
                     for item in items:
                         element(stream, item, False); w(stream, 'B', NODE['AddToCollection'])
@@ -446,6 +461,41 @@ def compile_xaml(src, out):
             else:
                 w(stream, 'BH', NODE['SetValueConstant'], pref); w(stream, 'BH', C_SHARED, s(el.text.strip()))
         w(stream, 'B', NODE['EndInitPopScope'])
+
+    def template_element(stream, el):
+        """A ControlTemplate: its content goes in its own node stream, set as the deferred FrameworkTemplate.Template."""
+        target = el.attrib['TargetType']
+        w(stream, 'BH', NODE['PushScopeCreateTypeBeginInit'], 0x8000 | stable_type['ControlTemplate'])
+        w(stream, 'BHH', NODE['SetValueTypeConvertedResolvedType'], 0x8000 | stable_prop['ControlTemplate_TargetType'],
+          type_ref(PRESENTATION, target))
+        sub = new_stream()
+        template_target.append(target)
+        element(streams[sub], list(el)[0], False)
+        template_target.pop()
+        w(stream, 'BH', NODE['SetDeferredProperty'], 0x8000 | stable_prop['FrameworkTemplate_Template'])
+        u7(stream, sub); u7(stream, 0); u7(stream, 0)
+        w(stream, 'B', NODE['EndInitPopScope'])
+
+    def visual_state_groups(stream, groups):
+        """VisualStateManager.VisualStateGroups: VisualStateGroupCollection_v1 custom data whose 'entire collection'
+        token points at the groups as ordinary objects in its own node stream, after a repeat of the GetValue node."""
+        vsg = 0x8000 | stable_prop['VisualStateManager_VisualStateGroups']
+        sub = new_stream()
+        w(streams[sub], 'B', NODE['PushScope'])
+        token = len(streams[sub])
+        w(streams[sub], 'BH', NODE['PushScopeGetValue'], vsg)
+        for g in groups:
+            element(streams[sub], g, False); w(streams[sub], 'B', NODE['AddToCollection'])
+        w(streams[sub], 'B', NODE['PopScope'])
+        w(streams[sub], 'B', NODE['PopScope'])
+        w(stream, 'BH', NODE['PushScopeGetValue'], vsg)
+        w(stream, 'B', NODE['SetCustomRuntimeData']); u7(stream, sub); u7(stream, 0); u7(stream, 0)
+        u7(stream, 420)                                       # VisualStateGroupCollection_v1
+        for _ in range(4): u7(stream, 0)                      # state->group map, states, groups, transitions
+        w(stream, 'B', 0)                                     # unexpected tokens
+        u7(stream, 0); u7(stream, 0)                          # transition lookup
+        u7(stream, token)                                     # the entire collection
+        w(stream, 'B', NODE['PopScope'])
 
     def dictionary_element(stream, el, is_root, entries=None):
         """A ResourceDictionary: Source, MergedDictionaries, ThemeDictionaries, and its entries in their own node
@@ -517,6 +567,13 @@ def compile_xaml(src, out):
         for setter in setters:
             owner, _, pname = setter.attrib['Property'].rpartition('.')
             pref, pfull = prop_ref(owner or target, pname)
+            if 'Value' not in setter.attrib:
+                # <Setter.Value><ControlTemplate .../></Setter.Value>: an object value in the style's node stream
+                obj = list(list(setter)[0])[0]
+                u7(data, 0x10 | 0x08); w(data, 'H', pref); u7(data, len(streams[sub]))
+                element(streams[sub], obj, False)
+                w(streams[sub], 'BH', NODE['SetValue'], setter_value)
+                continue
             value = setter.attrib['Value']
             m = re.match(r'\{(Static|Theme)Resource (\w+)\}', value)
             if m:

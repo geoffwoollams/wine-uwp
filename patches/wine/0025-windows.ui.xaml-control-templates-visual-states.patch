@@ -1,0 +1,1956 @@
+Subject: windows.ui.xaml: control templates, TemplateBinding, ContentPresenter and VisualStateManager (milestone 4, part 2)
+
+diff --git a/dlls/windows.ui.xaml/Makefile.in b/dlls/windows.ui.xaml/Makefile.in
+index 815b75c..96647a9 100644
+--- a/dlls/windows.ui.xaml/Makefile.in
++++ b/dlls/windows.ui.xaml/Makefile.in
+@@ -14,6 +14,7 @@ SOURCES = \
+ 	element.c \
+ 	main.c \
+ 	panel.c \
++	presenter.c \
+ 	resources.c \
+ 	text_block.c \
+ 	window.c \
+diff --git a/dlls/windows.ui.xaml/button.c b/dlls/windows.ui.xaml/button.c
+index 5d515de..3c992db 100644
+--- a/dlls/windows.ui.xaml/button.c
++++ b/dlls/windows.ui.xaml/button.c
+@@ -60,6 +60,34 @@ static struct xaml_element *button_content_element( struct button *impl )
+     return impl->content_element;
+ }
+ 
++/* the control template, if the button has one: instantiated on first layout, like WinUI's ApplyTemplate */
++static struct xaml_element *button_template_root( struct button *impl )
++{
++    struct xaml_element *root;
++
++    if (!impl->element.template) return NULL;
++    if (!impl->element.template_instance)
++    {
++        if (!(impl->element.template_instance = template_instantiate( impl->element.template, impl->element.outer )))
++            return NULL;
++        if ((root = template_root( impl->element.template_instance ))) element_set_parent( root, &impl->element );
++        template_go_to_state( impl->element.template_instance, impl->enabled ? L"Normal" : L"Disabled" );
++    }
++    return template_root( impl->element.template_instance );
++}
++
++static void button_update_state( struct button *impl )
++{
++    const WCHAR *state;
++
++    if (!impl->element.template_instance) return;
++    if (!impl->enabled) state = L"Disabled";
++    else if (impl->pressed) state = L"Pressed";
++    else if (impl->pointer_over) state = L"PointerOver";
++    else state = L"Normal";
++    template_go_to_state( impl->element.template_instance, state );
++}
++
+ static void button_text_format( struct button *impl, struct text_format *format )
+ {
+     format->font_size = impl->font_size;
+@@ -88,10 +116,17 @@ static void button_measure( struct xaml_element *element, struct layout_context
+     struct button *impl = impl_from_element( element );
+     const Thickness *b = &impl->border_thickness, *p = &impl->padding;
+     float extra_width = b->Left + b->Right + p->Left + p->Right, extra_height = b->Top + b->Bottom + p->Top + p->Bottom;
+-    struct xaml_element *child = button_content_element( impl );
++    struct xaml_element *child = button_content_element( impl ), *root = button_template_root( impl );
+     struct text_format format;
+ 
+     *width = *height = 0;
++    if (root)
++    {
++        element_measure( root, ctx, avail_width, avail_height );
++        *width = root->desired_width;
++        *height = root->desired_height;
++        return;
++    }
+     if (child)
+     {
+         element_measure( child, ctx, max( 0.0f, avail_width - extra_width ), max( 0.0f, avail_height - extra_height ) );
+@@ -121,10 +156,15 @@ static void button_inner_rect( struct button *impl, struct layout_rect *rect )
+ static void button_arrange( struct xaml_element *element, struct layout_context *ctx )
+ {
+     struct button *impl = impl_from_element( element );
+-    struct xaml_element *child = button_content_element( impl );
++    struct xaml_element *child = button_content_element( impl ), *root = button_template_root( impl );
+     struct layout_rect inner;
+     float x, y, w, h;
+ 
++    if (root)
++    {
++        element_arrange( root, ctx, element->bounds.x, element->bounds.y, element->bounds.width, element->bounds.height );
++        return;
++    }
+     if (!child) return;
+     button_inner_rect( impl, &inner );
+     /* the content presenter: Stretch fills, otherwise the content's desired size placed by the content alignment */
+@@ -157,7 +197,7 @@ static BOOL brush_colorref( IBrush *brush, COLORREF *color )
+ static void button_render( struct xaml_element *element, struct layout_context *ctx )
+ {
+     struct button *impl = impl_from_element( element );
+-    struct xaml_element *child = button_content_element( impl );
++    struct xaml_element *child = button_content_element( impl ), *root = button_template_root( impl );
+     /* Windows 10 theme colours, as #33/#66 black or white over the page background */
+     COLORREF base_low = ctx->dark ? RGB(51, 51, 51) : RGB(204, 204, 204);
+     COLORREF base_medium_low = ctx->dark ? RGB(102, 102, 102) : RGB(153, 153, 153);
+@@ -167,6 +207,11 @@ static void button_render( struct xaml_element *element, struct layout_context *
+     struct layout_rect inner;
+     COLORREF saved;
+ 
++    if (root)
++    {
++        element_render( root, ctx );   /* the template draws the button */
++        return;
++    }
+     if (!impl->enabled)
+         text = base_medium_low;
+     else if (impl->pressed)
+@@ -204,12 +249,16 @@ static void button_render( struct xaml_element *element, struct layout_context *
+ 
+ static UINT32 button_child_count( struct xaml_element *element )
+ {
+-    return button_content_element( impl_from_element( element ) ) ? 1 : 0;
++    struct button *impl = impl_from_element( element );
++    if (impl->element.template_instance) return template_root( impl->element.template_instance ) ? 1 : 0;
++    return button_content_element( impl ) ? 1 : 0;
+ }
+ 
+ static struct xaml_element *button_child_at( struct xaml_element *element, UINT32 index )
+ {
+-    return button_content_element( impl_from_element( element ) );
++    struct button *impl = impl_from_element( element );
++    if (impl->element.template_instance) return template_root( impl->element.template_instance );
++    return button_content_element( impl );
+ }
+ 
+ static BOOL button_hit_self( struct xaml_element *element, float x, float y )
+@@ -274,6 +323,7 @@ static void button_pointer( struct xaml_element *element, UINT msg, float x, flo
+         impl->captured = impl->pressed = FALSE;
+         break;
+     }
++    button_update_state( impl );
+     window_invalidate();
+ }
+ 
+@@ -319,7 +369,7 @@ static void get_brush( IBrush *brush, IBrush **value )
+ }
+ 
+ /* text for non-UIElement content: strings, IStringable, or the runtime class name like Windows does */
+-static HSTRING content_to_text( IInspectable *content )
++HSTRING object_to_text( IInspectable *content )
+ {
+     IPropertyValue *value;
+     IStringable *stringable;
+@@ -475,7 +525,7 @@ static HRESULT WINAPI content_control_put_Content( IContentControl *iface, IInsp
+         impl->content_element = element_from_iinspectable( value );
+     }
+     if ((child = impl->content_element)) element_set_parent( child, &impl->element );
+-    else if (value) impl->content_text = content_to_text( value );
++    else if (value) impl->content_text = object_to_text( value );
+     window_invalidate();
+     return S_OK;
+ }
+@@ -605,6 +655,7 @@ static HRESULT WINAPI control_put_IsEnabled( IControl *iface, boolean value )
+     TRACE( "iface %p, value %d.\n", iface, value );
+     impl->enabled = value;
+     if (!value) impl->pressed = impl->captured = FALSE;
++    button_update_state( impl );
+     window_invalidate();
+     return S_OK;
+ }
+diff --git a/dlls/windows.ui.xaml/classes.idl b/dlls/windows.ui.xaml/classes.idl
+index 8f0cee8..2fb3d9a 100644
+--- a/dlls/windows.ui.xaml/classes.idl
++++ b/dlls/windows.ui.xaml/classes.idl
+@@ -38,6 +38,7 @@ namespace Windows.UI.Xaml.Controls {
+     runtimeclass Border;
+     runtimeclass Button;
+     runtimeclass ColumnDefinition;
++    runtimeclass ContentPresenter;
+     runtimeclass Frame;
+     runtimeclass Grid;
+     runtimeclass Page;
+diff --git a/dlls/windows.ui.xaml/element.c b/dlls/windows.ui.xaml/element.c
+index 30a6112..476b29c 100644
+--- a/dlls/windows.ui.xaml/element.c
++++ b/dlls/windows.ui.xaml/element.c
+@@ -81,6 +81,9 @@ static ULONG WINAPI inner_Release( IInspectable *iface )
+         WindowsDeleteString( impl->name );
+         if (impl->resources) IInspectable_Release( impl->resources );
+         if (impl->style) IInspectable_Release( impl->style );
++        if (impl->visual_state_groups) IInspectable_Release( impl->visual_state_groups );
++        template_free( impl->template_instance );
++        if (impl->template) IInspectable_Release( impl->template );
+         while (impl->local_count) free( impl->local_properties[--impl->local_count] );
+         free( impl->local_properties );
+         impl->ops->destroy( impl );
+diff --git a/dlls/windows.ui.xaml/main.c b/dlls/windows.ui.xaml/main.c
+index 16491c0..4e68712 100644
+--- a/dlls/windows.ui.xaml/main.c
++++ b/dlls/windows.ui.xaml/main.c
+@@ -60,6 +60,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( page_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Frame ))
+         IActivationFactory_QueryInterface( frame_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ContentPresenter ))
++        IActivationFactory_QueryInterface( content_presenter_factory, &IID_IActivationFactory, (void **)factory );
+ 
+     if (*factory) return S_OK;
+     return CLASS_E_CLASSNOTAVAILABLE;
+diff --git a/dlls/windows.ui.xaml/presenter.c b/dlls/windows.ui.xaml/presenter.c
+new file mode 100644
+index 0000000..da3a86b
+--- /dev/null
++++ b/dlls/windows.ui.xaml/presenter.c
+@@ -0,0 +1,529 @@
++/* WinRT Windows.UI.Xaml.Controls.ContentPresenter implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <math.h>
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* A ContentPresenter shows content in a control template: a UIElement, or anything else as text. Background, border
++ * and padding (IContentPresenter4 on Windows) are set from markup through presenter_set_*. */
++
++struct presenter
++{
++    struct xaml_element element;
++    IContentPresenter IContentPresenter_iface;
++    IInspectable *content;
++    struct xaml_element *child;
++    HSTRING text;
++    IBrush *background, *border_brush, *foreground;
++    Thickness border_thickness, padding;
++    double font_size;
++    HorizontalAlignment content_horizontal;
++    VerticalAlignment content_vertical;
++};
++
++static const struct element_ops presenter_ops;
++
++static inline struct presenter *impl_from_element( struct xaml_element *element )
++{
++    return CONTAINING_RECORD( element, struct presenter, element );
++}
++
++static struct presenter *presenter_from_object( IInspectable *object )
++{
++    struct xaml_element *element = element_from_object( object );
++    return element && element->ops == &presenter_ops ? impl_from_element( element ) : NULL;
++}
++
++static HRESULT presenter_query_interface( struct xaml_element *element, REFIID iid, void **out )
++{
++    struct presenter *impl = impl_from_element( element );
++
++    if (!IsEqualGUID( iid, &IID_IContentPresenter )) return E_NOINTERFACE;
++    *out = &impl->IContentPresenter_iface;
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static void inner_rect( struct presenter *impl, struct layout_rect *rect )
++{
++    const Thickness *b = &impl->border_thickness, *p = &impl->padding;
++    const struct layout_rect *r = &impl->element.bounds;
++
++    rect->x = r->x + b->Left + p->Left;
++    rect->y = r->y + b->Top + p->Top;
++    rect->width = max( 0.0f, r->width - b->Left - b->Right - p->Left - p->Right );
++    rect->height = max( 0.0f, r->height - b->Top - b->Bottom - p->Top - p->Bottom );
++}
++
++static void text_format( struct presenter *impl, struct text_format *format )
++{
++    format->font_size = impl->font_size;
++    format->weight = FW_NORMAL;
++    format->italic = FALSE;
++    format->wrap = FALSE;
++    format->alignment = TextAlignment_Left;
++}
++
++static void presenter_measure( struct xaml_element *element, struct layout_context *ctx, float avail_width,
++                               float avail_height, float *width, float *height )
++{
++    struct presenter *impl = impl_from_element( element );
++    const Thickness *b = &impl->border_thickness, *p = &impl->padding;
++    float extra_width = b->Left + b->Right + p->Left + p->Right, extra_height = b->Top + b->Bottom + p->Top + p->Bottom;
++    struct text_format format;
++
++    *width = *height = 0;
++    if (impl->child)
++    {
++        element_measure( impl->child, ctx, max( 0.0f, avail_width - extra_width ), max( 0.0f, avail_height - extra_height ) );
++        *width = impl->child->desired_width;
++        *height = impl->child->desired_height;
++    }
++    else if (impl->text)
++    {
++        text_format( impl, &format );
++        text_measure( ctx, &format, impl->text, INFINITY, width, height );
++    }
++    *width += extra_width;
++    *height += extra_height;
++}
++
++/* place content of size w x h in the inner rect by the content alignment */
++static void align( struct presenter *impl, const struct layout_rect *inner, float w, float h, struct layout_rect *out )
++{
++    out->width = impl->content_horizontal == HorizontalAlignment_Stretch ? inner->width : min( w, inner->width );
++    out->height = impl->content_vertical == VerticalAlignment_Stretch ? inner->height : min( h, inner->height );
++    switch (impl->content_horizontal)
++    {
++    case HorizontalAlignment_Left: out->x = inner->x; break;
++    case HorizontalAlignment_Right: out->x = inner->x + inner->width - out->width; break;
++    default: out->x = inner->x + (inner->width - out->width) / 2; break;
++    }
++    switch (impl->content_vertical)
++    {
++    case VerticalAlignment_Top: out->y = inner->y; break;
++    case VerticalAlignment_Bottom: out->y = inner->y + inner->height - out->height; break;
++    default: out->y = inner->y + (inner->height - out->height) / 2; break;
++    }
++}
++
++static void presenter_arrange( struct xaml_element *element, struct layout_context *ctx )
++{
++    struct presenter *impl = impl_from_element( element );
++    struct layout_rect inner, rect;
++
++    if (!impl->child) return;
++    inner_rect( impl, &inner );
++    align( impl, &inner, impl->child->desired_width, impl->child->desired_height, &rect );
++    element_arrange( impl->child, ctx, rect.x, rect.y, rect.width, rect.height );
++}
++
++static void presenter_render( struct xaml_element *element, struct layout_context *ctx )
++{
++    struct presenter *impl = impl_from_element( element );
++    COLORREF saved = ctx->foreground, color = ctx->foreground;
++    struct layout_rect inner, rect;
++    struct text_format format;
++    float w, h;
++    Color c;
++
++    element_fill( ctx, &element->bounds, impl->background );
++    element_frame( ctx, &element->bounds, &impl->border_thickness, impl->border_brush );
++    if (impl->foreground && brush_get_color( impl->foreground, &c )) color = RGB( c.R, c.G, c.B );
++    if (impl->child)
++    {
++        ctx->foreground = color;
++        element_render( impl->child, ctx );
++        ctx->foreground = saved;
++    }
++    else if (impl->text)
++    {
++        inner_rect( impl, &inner );
++        text_format( impl, &format );
++        text_measure( ctx, &format, impl->text, INFINITY, &w, &h );
++        align( impl, &inner, w, h, &rect );
++        text_draw( ctx, &format, impl->text, &rect, color );
++    }
++}
++
++static UINT32 presenter_child_count( struct xaml_element *element )
++{
++    return impl_from_element( element )->child ? 1 : 0;
++}
++
++static struct xaml_element *presenter_child_at( struct xaml_element *element, UINT32 index )
++{
++    return impl_from_element( element )->child;
++}
++
++static BOOL presenter_hit_self( struct xaml_element *element, float x, float y )
++{
++    return impl_from_element( element )->background != NULL || impl_from_element( element )->text != NULL;
++}
++
++static void presenter_set_content( struct presenter *impl, IInspectable *value )
++{
++    struct xaml_element *child = value ? element_from_object( value ) : NULL;
++
++    if (impl->child && impl->child->parent == &impl->element) element_set_parent( impl->child, NULL );
++    if (value) IInspectable_AddRef( value );
++    if (impl->content) IInspectable_Release( impl->content );
++    impl->content = value;
++    impl->child = NULL;
++    WindowsDeleteString( impl->text );
++    impl->text = NULL;
++    if (child)
++    {
++        /* a templated control's own UIElement content is shown by its template's presenter */
++        impl->child = child;
++        element_set_parent( child, &impl->element );
++    }
++    else if (value) impl->text = object_to_text( value );
++    window_invalidate();
++}
++
++static void presenter_destroy( struct xaml_element *element )
++{
++    struct presenter *impl = impl_from_element( element );
++
++    presenter_set_content( impl, NULL );
++    if (impl->background) IBrush_Release( impl->background );
++    if (impl->border_brush) IBrush_Release( impl->border_brush );
++    if (impl->foreground) IBrush_Release( impl->foreground );
++    free( impl );
++}
++
++static const struct element_ops presenter_ops =
++{
++    .query_interface = presenter_query_interface,
++    .measure = presenter_measure,
++    .arrange = presenter_arrange,
++    .render = presenter_render,
++    .child_count = presenter_child_count,
++    .child_at = presenter_child_at,
++    .hit_self = presenter_hit_self,
++    .destroy = presenter_destroy,
++};
++
++static void set_brush( IBrush **slot, IBrush *value )
++{
++    if (value) IBrush_AddRef( value );
++    if (*slot) IBrush_Release( *slot );
++    *slot = value;
++    window_invalidate();
++}
++
++BOOL presenter_set_brush( IInspectable *object, const WCHAR *property, IBrush *brush )
++{
++    struct presenter *impl = presenter_from_object( object );
++
++    if (!impl) return FALSE;
++    if (!wcscmp( property, L"Background" )) set_brush( &impl->background, brush );
++    else if (!wcscmp( property, L"BorderBrush" )) set_brush( &impl->border_brush, brush );
++    else if (!wcscmp( property, L"Foreground" )) set_brush( &impl->foreground, brush );
++    else return FALSE;
++    return TRUE;
++}
++
++BOOL presenter_get_brush( IInspectable *object, const WCHAR *property, IBrush **brush )
++{
++    struct presenter *impl = presenter_from_object( object );
++    IBrush *value;
++
++    if (!impl) return FALSE;
++    if (!wcscmp( property, L"Background" )) value = impl->background;
++    else if (!wcscmp( property, L"BorderBrush" )) value = impl->border_brush;
++    else if (!wcscmp( property, L"Foreground" )) value = impl->foreground;
++    else return FALSE;
++    if ((*brush = value)) IBrush_AddRef( value );
++    return TRUE;
++}
++
++BOOL presenter_set_thickness( IInspectable *object, const WCHAR *property, Thickness value )
++{
++    struct presenter *impl = presenter_from_object( object );
++
++    if (!impl) return FALSE;
++    if (!wcscmp( property, L"Padding" )) impl->padding = value;
++    else if (!wcscmp( property, L"BorderThickness" )) impl->border_thickness = value;
++    else return FALSE;
++    window_invalidate();
++    return TRUE;
++}
++
++BOOL presenter_set_alignment( IInspectable *object, const WCHAR *property, INT32 value )
++{
++    struct presenter *impl = presenter_from_object( object );
++
++    if (!impl) return FALSE;
++    if (!wcscmp( property, L"HorizontalContentAlignment" )) impl->content_horizontal = value;
++    else if (!wcscmp( property, L"VerticalContentAlignment" )) impl->content_vertical = value;
++    else return FALSE;
++    window_invalidate();
++    return TRUE;
++}
++
++/* IContentPresenter */
++
++DEFINE_IINSPECTABLE_( content_presenter, IContentPresenter, struct presenter, impl_from_IContentPresenter,
++                      IContentPresenter_iface, impl->element.outer )
++
++static HRESULT WINAPI content_presenter_get_Content( IContentPresenter *iface, IInspectable **value )
++{
++    if ((*value = impl_from_IContentPresenter( iface )->content)) IInspectable_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI content_presenter_put_Content( IContentPresenter *iface, IInspectable *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    presenter_set_content( impl_from_IContentPresenter( iface ), value );
++    return S_OK;
++}
++
++static HRESULT WINAPI content_presenter_get_FontSize( IContentPresenter *iface, DOUBLE *value )
++{
++    *value = impl_from_IContentPresenter( iface )->font_size;
++    return S_OK;
++}
++
++static HRESULT WINAPI content_presenter_put_FontSize( IContentPresenter *iface, DOUBLE value )
++{
++    impl_from_IContentPresenter( iface )->font_size = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI content_presenter_get_Foreground( IContentPresenter *iface, IBrush **value )
++{
++    if ((*value = impl_from_IContentPresenter( iface )->foreground)) IBrush_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI content_presenter_put_Foreground( IContentPresenter *iface, IBrush *value )
++{
++    set_brush( &impl_from_IContentPresenter( iface )->foreground, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI content_presenter_get_ContentTemplate(IContentPresenter *iface, __x_ABI_CWindows_CUI_CXaml_CIDataTemplate **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_presenter_put_ContentTemplate(IContentPresenter *iface, __x_ABI_CWindows_CUI_CXaml_CIDataTemplate *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_presenter_get_ContentTemplateSelector(IContentPresenter *iface, __x_ABI_CWindows_CUI_CXaml_CControls_CIDataTemplateSelector **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_presenter_put_ContentTemplateSelector(IContentPresenter *iface, __x_ABI_CWindows_CUI_CXaml_CControls_CIDataTemplateSelector *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_presenter_get_ContentTransitions(IContentPresenter *iface, __FIVector_1_Windows__CUI__CXaml__CMedia__CAnimation__CTransition **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_presenter_put_ContentTransitions(IContentPresenter *iface, __FIVector_1_Windows__CUI__CXaml__CMedia__CAnimation__CTransition *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_presenter_get_FontFamily(IContentPresenter *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIFontFamily **value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_presenter_put_FontFamily(IContentPresenter *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIFontFamily *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_presenter_get_FontWeight(IContentPresenter *iface, __x_ABI_CWindows_CUI_CText_CFontWeight *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_presenter_put_FontWeight(IContentPresenter *iface, __x_ABI_CWindows_CUI_CText_CFontWeight value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_presenter_get_FontStyle(IContentPresenter *iface, __x_ABI_CWindows_CUI_CText_CFontStyle *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_presenter_put_FontStyle(IContentPresenter *iface, __x_ABI_CWindows_CUI_CText_CFontStyle value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_presenter_get_FontStretch(IContentPresenter *iface, __x_ABI_CWindows_CUI_CText_CFontStretch *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_presenter_put_FontStretch(IContentPresenter *iface, __x_ABI_CWindows_CUI_CText_CFontStretch value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_presenter_get_CharacterSpacing(IContentPresenter *iface, INT32 *value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_presenter_put_CharacterSpacing(IContentPresenter *iface, INT32 value)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static const struct IContentPresenterVtbl content_presenter_vtbl =
++{
++    content_presenter_QueryInterface,
++    content_presenter_AddRef,
++    content_presenter_Release,
++    /* IInspectable methods */
++    content_presenter_GetIids,
++    content_presenter_GetRuntimeClassName,
++    content_presenter_GetTrustLevel,
++    /* IContentPresenter methods */
++    content_presenter_get_Content,
++    content_presenter_put_Content,
++    content_presenter_get_ContentTemplate,
++    content_presenter_put_ContentTemplate,
++    content_presenter_get_ContentTemplateSelector,
++    content_presenter_put_ContentTemplateSelector,
++    content_presenter_get_ContentTransitions,
++    content_presenter_put_ContentTransitions,
++    content_presenter_get_FontSize,
++    content_presenter_put_FontSize,
++    content_presenter_get_FontFamily,
++    content_presenter_put_FontFamily,
++    content_presenter_get_FontWeight,
++    content_presenter_put_FontWeight,
++    content_presenter_get_FontStyle,
++    content_presenter_put_FontStyle,
++    content_presenter_get_FontStretch,
++    content_presenter_put_FontStretch,
++    content_presenter_get_CharacterSpacing,
++    content_presenter_put_CharacterSpacing,
++    content_presenter_get_Foreground,
++    content_presenter_put_Foreground
++};
++
++static HRESULT presenter_create( IInspectable *outer, IInspectable **inner, void **value )
++{
++    struct presenter *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    element_init( &impl->element, &presenter_ops, RuntimeClass_Windows_UI_Xaml_Controls_ContentPresenter, outer );
++    impl->IContentPresenter_iface.lpVtbl = &content_presenter_vtbl;
++    impl->font_size = 14.0;
++    impl->content_horizontal = HorizontalAlignment_Left;
++    impl->content_vertical = VerticalAlignment_Top;
++    return element_compose( &impl->element, outer, inner, &impl->IContentPresenter_iface, value );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    return 2;
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    return 1;
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    return presenter_create( NULL, NULL, (void **)instance );
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++static IActivationFactory presenter_statics = { &factory_vtbl };
++IActivationFactory *content_presenter_factory = &presenter_statics;
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index 643eb21..1ff4936 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -71,6 +71,7 @@ extern IActivationFactory *resource_dictionary_factory;
+ extern IActivationFactory *user_control_factory;
+ extern IActivationFactory *page_factory;
+ extern IActivationFactory *frame_factory;
++extern IActivationFactory *content_presenter_factory;
+ 
+ /* event handler lists (handlers are kept, tokens are indices + 1) */
+ struct event_list
+@@ -192,6 +193,9 @@ struct xaml_element
+     IInspectable *resources;                   /* FrameworkElement.Resources */
+     IInspectable *style;                       /* FrameworkElement.Style */
+     BOOL implicit_style_done;
++    IInspectable *visual_state_groups;         /* VisualStateManager.VisualStateGroups (a template's root) */
++    IInspectable *template;                    /* Control.Template */
++    struct template_instance *template_instance;
+     WCHAR **local_properties;                  /* set directly (not by a style): styles don't override them */
+     UINT32 local_count;
+ 
+@@ -210,6 +214,21 @@ IInspectable *element_resources( IInspectable *object );            /* Framework
+ void element_mark_local( struct xaml_element *element, const WCHAR *property );
+ BOOL element_is_local( struct xaml_element *element, const WCHAR *property );
+ void style_apply( IInspectable *style, IInspectable *target );
++HSTRING object_to_text( IInspectable *object );   /* text for non-UIElement content */
++
++/* presenter.c: ContentPresenter properties set from markup (IContentPresenter4 on Windows) */
++BOOL presenter_set_brush( IInspectable *object, const WCHAR *property, IBrush *brush );
++BOOL presenter_get_brush( IInspectable *object, const WCHAR *property, IBrush **brush );
++BOOL presenter_set_thickness( IInspectable *object, const WCHAR *property, Thickness value );
++BOOL presenter_set_alignment( IInspectable *object, const WCHAR *property, INT32 value );
++
++/* xbf.c: control templates and visual states */
++struct template_instance;
++BOOL is_control_template( IInspectable *object );
++struct template_instance *template_instantiate( IInspectable *template, IInspectable *templated_parent );
++struct xaml_element *template_root( struct template_instance *instance );
++void template_go_to_state( struct template_instance *instance, const WCHAR *state );
++void template_free( struct template_instance *instance );
+ void element_set_parent( struct xaml_element *child, struct xaml_element *parent );
+ void element_measure( struct xaml_element *element, struct layout_context *ctx, float avail_width, float avail_height );
+ void element_arrange( struct xaml_element *element, struct layout_context *ctx, float x, float y, float width, float height );
+diff --git a/dlls/windows.ui.xaml/xbf.c b/dlls/windows.ui.xaml/xbf.c
+index 7511c8a..468cba4 100644
+--- a/dlls/windows.ui.xaml/xbf.c
++++ b/dlls/windows.ui.xaml/xbf.c
+@@ -92,6 +92,7 @@ struct xbf_stream { const BYTE *start, *end; };
+ 
+ struct xbf
+ {
++    LONG ref;                  /* control templates keep the file */
+     const BYTE *data;
+     SIZE_T size;
+     UINT32 major, minor;
+@@ -171,11 +172,16 @@ static const WCHAR *xbf_string( struct xbf *xbf, UINT32 index )
+     return index < xbf->string_count ? xbf->strings[index] : L"";
+ }
+ 
++static void xbf_addref( struct xbf *xbf )
++{
++    InterlockedIncrement( &xbf->ref );
++}
++
+ void xbf_free( struct xbf *xbf )
+ {
+     UINT32 i;
+ 
+-    if (!xbf) return;
++    if (!xbf || InterlockedDecrement( &xbf->ref )) return;
+     for (i = 0; i < xbf->string_count; i++) free( xbf->strings[i] );
+     free( xbf->strings );
+     free( xbf->type_namespaces );
+@@ -207,6 +213,7 @@ HRESULT xbf_parse( BYTE *data, SIZE_T size, struct xbf **out )
+         free( data );
+         return E_OUTOFMEMORY;
+     }
++    xbf->ref = 1;
+     xbf->data = data;
+     xbf->size = size;
+     r.xbf = xbf;
+@@ -518,6 +525,7 @@ struct custom_data
+     UINT32 resource_count;
+     struct style_essence *setters;
+     UINT32 setter_count;
++    UINT32 token;
+ };
+ 
+ static void skip_predicates( struct reader *r )
+@@ -662,7 +670,7 @@ static void read_custom_data( struct reader *r, struct custom_data *data )
+         read_u8( r );
+         for (i = 0, n = read_7bit( r ); i < n && !r->error; i++) { read_7bit( r ); read_7bit( r ); read_7bit( r ); }
+         skip_7bit_vector( r );
+-        read_7bit( r );
++        data->token = read_7bit( r );   /* the whole collection, in the custom data's node stream */
+         if (kind == 4 || kind == 5) skip_u16_vector( r );
+         break;
+     case 745: case 6: case 9:     /* DeferredElement v1, v2, v3 */
+@@ -700,8 +708,26 @@ struct writer
+     enum scope_kind scopes[MAX_STACK];
+     int scope_count;
+     BOOL failed;
++    IInspectable *templated_parent;  /* while instantiating a control template: the control */
++    struct writer *names_owner;      /* collects x:Name objects (a template's name scope), or NULL */
++    struct name_entry { WCHAR name[64]; IInspectable *object; } *names;
++    UINT32 name_count;
+ };
+ 
++static void register_name( struct writer *w, const WCHAR *name, IInspectable *object )
++{
++    struct writer *owner = w->names_owner;
++    struct name_entry *names;
++
++    if (!owner || !object) return;
++    if (!(names = realloc( owner->names, (owner->name_count + 1) * sizeof(*names) ))) return;
++    owner->names = names;
++    lstrcpynW( names[owner->name_count].name, name, ARRAY_SIZE(names->name) );
++    names[owner->name_count].object = object;
++    IInspectable_AddRef( object );
++    owner->name_count++;
++}
++
+ static void push( struct writer *w, struct xvalue *v )
+ {
+     if (w->sp >= MAX_STACK)
+@@ -741,8 +767,16 @@ static void push_object( struct writer *w, IInspectable *object )
+ 
+ /* ---- Style (created by markup) ---- */
+ 
++enum set_mode
++{
++    SET_LOCAL,   /* markup or app code: the value wins over styles */
++    SET_STYLE,   /* a style setter: skipped where a local value is set */
++    SET_STATE,   /* a visual state: neither */
++};
++
+ static HRESULT set_property( struct writer *w, IInspectable *target, const struct xprop *prop, struct xvalue *value,
+-                             BOOL from_style );
++                             enum set_mode mode );
++static BOOL get_value( IInspectable *target, const WCHAR *name, struct xvalue *out );
+ 
+ static void xvalue_copy( struct xvalue *dst, const struct xvalue *src )
+ {
+@@ -957,7 +991,7 @@ void style_apply( IInspectable *style, IInspectable *target )
+     for (i = 0; i < impl->count; i++)
+     {
+         xvalue_copy( &copy, &impl->setters[i].value );
+-        set_property( NULL, target, &impl->setters[i].prop, &copy, TRUE );
++        set_property( NULL, target, &impl->setters[i].prop, &copy, SET_STYLE );
+         xvalue_clear( &copy );
+     }
+ }
+@@ -1023,6 +1057,279 @@ static void implicit_key( const WCHAR *type, WCHAR *key, SIZE_T len )
+     lstrcpynW( key + 1, dot ? dot + 1 : type, len - 1 );
+ }
+ 
++/* ---- objects only markup uses: visual state groups, states, storyboards, animations, VSM setters ----
++ * These are property bags: what markup sets is kept by name, collection properties hold child bags, and
++ * VisualStateManager reads them back. */
++
++struct bag_property
++{
++    WCHAR name[96];
++    struct xvalue value;
++};
++
++struct bag
++{
++    IInspectable IInspectable_iface;
++    LONG ref;
++    WCHAR type[64];
++    WCHAR name[64];             /* x:Name */
++    struct bag_property *props;
++    UINT32 prop_count;
++    IInspectable **items;       /* a collection's items */
++    UINT32 item_count;
++};
++
++static const struct IInspectableVtbl bag_vtbl;
++
++static struct bag *bag_from_object( IInspectable *object )
++{
++    return object && object->lpVtbl == &bag_vtbl ? CONTAINING_RECORD( object, struct bag, IInspectable_iface ) : NULL;
++}
++
++static HRESULT WINAPI bag_QueryInterface( IInspectable *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ))
++    {
++        *out = iface;
++        IInspectable_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI bag_AddRef( IInspectable *iface )
++{
++    return InterlockedIncrement( &bag_from_object( iface )->ref );
++}
++
++static ULONG WINAPI bag_Release( IInspectable *iface )
++{
++    struct bag *impl = bag_from_object( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    UINT32 i;
++
++    if (!ref)
++    {
++        for (i = 0; i < impl->prop_count; i++) xvalue_clear( &impl->props[i].value );
++        for (i = 0; i < impl->item_count; i++) IInspectable_Release( impl->items[i] );
++        free( impl->props );
++        free( impl->items );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI bag_GetIids( IInspectable *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI bag_GetRuntimeClassName( IInspectable *iface, HSTRING *name )
++{
++    WCHAR full[96];
++    swprintf( full, ARRAY_SIZE(full), L"Windows.UI.Xaml.%s", bag_from_object( iface )->type );
++    return WindowsCreateString( full, wcslen( full ), name );
++}
++
++static HRESULT WINAPI bag_GetTrustLevel( IInspectable *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static const struct IInspectableVtbl bag_vtbl =
++{
++    bag_QueryInterface, bag_AddRef, bag_Release, bag_GetIids, bag_GetRuntimeClassName, bag_GetTrustLevel,
++};
++
++static IInspectable *bag_create( const WCHAR *type )
++{
++    struct bag *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return NULL;
++    impl->IInspectable_iface.lpVtbl = &bag_vtbl;
++    impl->ref = 1;
++    lstrcpynW( impl->type, type, ARRAY_SIZE(impl->type) );
++    return &impl->IInspectable_iface;
++}
++
++static struct xvalue *bag_get( struct bag *bag, const WCHAR *name )
++{
++    UINT32 i;
++    if (!bag) return NULL;
++    for (i = 0; i < bag->prop_count; i++) if (!wcscmp( bag->props[i].name, name )) return &bag->props[i].value;
++    return NULL;
++}
++
++static void bag_set( struct bag *bag, const WCHAR *name, const struct xvalue *value )
++{
++    struct bag_property *props;
++    struct xvalue *slot = bag_get( bag, name );
++
++    if (!slot)
++    {
++        if (!(props = realloc( bag->props, (bag->prop_count + 1) * sizeof(*props) ))) return;
++        bag->props = props;
++        memset( &props[bag->prop_count], 0, sizeof(*props) );
++        lstrcpynW( props[bag->prop_count].name, name, ARRAY_SIZE(props->name) );
++        slot = &props[bag->prop_count++].value;
++    }
++    xvalue_clear( slot );
++    xvalue_copy( slot, value );
++}
++
++static void bag_add_item( struct bag *bag, IInspectable *item )
++{
++    IInspectable **items;
++
++    if (!(items = realloc( bag->items, (bag->item_count + 1) * sizeof(*items) ))) return;
++    bag->items = items;
++    items[bag->item_count++] = item;
++    IInspectable_AddRef( item );
++}
++
++/* a collection property of a bag (States, Children, Setters, KeyFrames...), created on demand */
++static IInspectable *bag_collection( struct bag *bag, const WCHAR *name )
++{
++    struct xvalue *slot = bag_get( bag, name ), v = { XV_OBJECT };
++
++    if (slot && slot->kind == XV_OBJECT && slot->object)
++    {
++        IInspectable_AddRef( slot->object );
++        return slot->object;
++    }
++    if (!(v.object = bag_create( L"Collection" ))) return NULL;
++    bag_set( bag, name, &v );
++    return v.object;   /* bag_set added its own reference */
++}
++
++static const WCHAR *const bag_types[] =
++{
++    L"VisualStateGroup", L"VisualState", L"VisualTransition", L"Storyboard", L"DoubleAnimation", L"ColorAnimation",
++    L"PointAnimation", L"ObjectAnimationUsingKeyFrames", L"DiscreteObjectKeyFrame", L"DoubleAnimationUsingKeyFrames",
++    L"DiscreteDoubleKeyFrame", L"EasingDoubleKeyFrame", L"LinearDoubleKeyFrame", L"SplineDoubleKeyFrame",
++    L"ColorAnimationUsingKeyFrames", L"DiscreteColorKeyFrame", L"EasingColorKeyFrame", L"LinearColorKeyFrame",
++    L"SplineColorKeyFrame", L"Setter", L"StateTrigger", L"AdaptiveTrigger", L"FadeInThemeAnimation",
++    L"FadeOutThemeAnimation", L"PointerUpThemeAnimation", L"PointerDownThemeAnimation", L"KeySpline",
++    L"CubicEase", L"QuadraticEase", L"ExponentialEase", L"SineEase", L"CircleEase", L"BackEase", L"ElasticEase",
++};
++
++static BOOL is_bag_type( const WCHAR *name )
++{
++    UINT32 i;
++    for (i = 0; i < ARRAY_SIZE(bag_types); i++) if (!wcscmp( name, bag_types[i] )) return TRUE;
++    return FALSE;
++}
++
++/* ---- ControlTemplate: a deferred node stream, instantiated for each templated control ---- */
++
++struct control_template
++{
++    IControlTemplate IControlTemplate_iface;
++    LONG ref;
++    WCHAR target[96];
++    struct xbf *xbf;     /* referenced */
++    UINT32 stream;
++    BOOL has_content;
++};
++
++static const struct IControlTemplateVtbl control_template_vtbl;
++
++static struct control_template *template_from_object( IInspectable *object )
++{
++    IControlTemplate *template;
++    struct control_template *impl = NULL;
++
++    if (!object || FAILED(IInspectable_QueryInterface( object, &IID_IControlTemplate, (void **)&template ))) return NULL;
++    if (template->lpVtbl == &control_template_vtbl)
++        impl = CONTAINING_RECORD( template, struct control_template, IControlTemplate_iface );
++    IControlTemplate_Release( template );
++    return impl;
++}
++
++BOOL is_control_template( IInspectable *object )
++{
++    return template_from_object( object ) != NULL;
++}
++
++static inline struct control_template *impl_from_IControlTemplate( IControlTemplate *iface )
++{
++    return CONTAINING_RECORD( iface, struct control_template, IControlTemplate_iface );
++}
++
++static HRESULT WINAPI control_template_QueryInterface( IControlTemplate *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IControlTemplate ))
++    {
++        *out = iface;
++        IControlTemplate_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI control_template_AddRef( IControlTemplate *iface )
++{
++    return InterlockedIncrement( &impl_from_IControlTemplate( iface )->ref );
++}
++
++static ULONG WINAPI control_template_Release( IControlTemplate *iface )
++{
++    struct control_template *impl = impl_from_IControlTemplate( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        if (impl->xbf) xbf_free( impl->xbf );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI control_template_GetIids( IControlTemplate *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI control_template_GetRuntimeClassName( IControlTemplate *iface, HSTRING *name )
++{
++    const WCHAR *class_name = RuntimeClass_Windows_UI_Xaml_Controls_ControlTemplate;
++    return WindowsCreateString( class_name, wcslen( class_name ), name );
++}
++
++static HRESULT WINAPI control_template_GetTrustLevel( IControlTemplate *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI control_template_get_TargetType( IControlTemplate *iface, TypeName *value )
++{
++    struct control_template *impl = impl_from_IControlTemplate( iface );
++    value->Kind = TypeKind_Metadata;
++    return WindowsCreateString( impl->target, wcslen( impl->target ), &value->Name );
++}
++
++static HRESULT WINAPI control_template_put_TargetType( IControlTemplate *iface, TypeName value )
++{
++    const WCHAR *name = WindowsGetStringRawBuffer( value.Name, NULL ), *dot = wcsrchr( name, '.' );
++    lstrcpynW( impl_from_IControlTemplate( iface )->target, dot ? dot + 1 : name, 96 );
++    return S_OK;
++}
++
++static const struct IControlTemplateVtbl control_template_vtbl =
++{
++    control_template_QueryInterface,
++    control_template_AddRef,
++    control_template_Release,
++    /* IInspectable methods */
++    control_template_GetIids,
++    control_template_GetRuntimeClassName,
++    control_template_GetTrustLevel,
++    /* IControlTemplate methods */
++    control_template_get_TargetType,
++    control_template_put_TargetType,
++};
++
++static IInspectable *control_template_create(void)
++{
++    struct control_template *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return NULL;
++    impl->IControlTemplate_iface.lpVtbl = &control_template_vtbl;
++    impl->ref = 1;
++    return (IInspectable *)&impl->IControlTemplate_iface;
++}
++
+ /* ---- values to properties ---- */
+ 
+ /* the value inside a boxed IPropertyValue, as a constant */
+@@ -1033,6 +1340,15 @@ static void unbox_value( struct xvalue *v )
+     struct xvalue out = {0};
+ 
+     if (v->kind != XV_OBJECT || !v->object) return;
++    if (bag_from_object( v->object ) && !wcscmp( bag_from_object( v->object )->type, L"Value" ))
++    {
++        struct xvalue *boxed = bag_get( bag_from_object( v->object ), L"Value" );
++        if (!boxed) return;
++        xvalue_copy( &out, boxed );
++        xvalue_clear( v );
++        *v = out;
++        return;
++    }
+     if (FAILED(IInspectable_QueryInterface( v->object, &IID_IPropertyValue, (void **)&pv ))) return;
+     if (SUCCEEDED(IPropertyValue_get_Type( pv, &type )))
+     {
+@@ -1271,6 +1587,30 @@ static IInspectable *to_content( const struct xvalue *v )
+     return NULL;
+ }
+ 
++/* a value resource (<x:Double>, <Thickness>, ...) as an object: numbers, strings and booleans as PropertyValues,
++ * anything else in a "Value" bag that unbox_value opens again */
++static void box_value( struct xvalue *v )
++{
++    static const WCHAR name[] = L"Windows.Foundation.PropertyValue";
++    IPropertyValueStatics *statics = NULL;
++    IInspectable *object = NULL;
++    HSTRING_HEADER header;
++    HSTRING class_name;
++
++    if (v->kind == XV_OBJECT || v->kind == XV_NONE) return;
++    WindowsCreateStringReference( name, wcslen( name ), &header, &class_name );
++    RoGetActivationFactory( class_name, &IID_IPropertyValueStatics, (void **)&statics );
++    if (statics && v->kind == XV_FLOAT) IPropertyValueStatics_CreateDouble( statics, v->f, &object );
++    else if (statics && v->kind == XV_SIGNED) IPropertyValueStatics_CreateInt32( statics, v->i, &object );
++    else if (statics && v->kind == XV_BOOL) IPropertyValueStatics_CreateBoolean( statics, v->b, &object );
++    else if (v->kind == XV_STRING) object = box_string( v->s );
++    else if ((object = bag_create( L"Value" ))) bag_set( bag_from_object( object ), L"Value", v );
++    if (statics) IPropertyValueStatics_Release( statics );
++    xvalue_clear( v );
++    v->kind = XV_OBJECT;
++    v->object = object;
++}
++
+ /* CreateTypeWith(TypeConverted)Constant: turn the constant into an object of the type where we can */
+ static void convert_to_type( const struct xtype *type, struct xvalue *v )
+ {
+@@ -1302,8 +1642,9 @@ static BOOL prop_is( const struct xprop *prop, const WCHAR *name )
+ 
+ /* Set prop on target from a markup value. Unsupported properties are logged and skipped. */
+ static HRESULT set_property( struct writer *w, IInspectable *target, const struct xprop *prop, struct xvalue *value,
+-                             BOOL from_style )
++                             enum set_mode mode )
+ {
++    struct bag *bag;
+     struct value_sink *sink;
+     struct style *style;
+     IFrameworkElement *fe;
+@@ -1343,6 +1684,32 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+         xvalue_copy( &sink->value, value );
+         return S_OK;
+     }
++    if ((bag = bag_from_object( target )))
++    {
++        if (prop_is( prop, L"Name" ) && value->kind == XV_STRING) lstrcpynW( bag->name, value->s, ARRAY_SIZE(bag->name) );
++        else bag_set( bag, prop->name, value );
++        return S_OK;
++    }
++    if (template_from_object( target ))
++    {
++        if (prop_is( prop, L"TargetType" ) && value->kind == XV_STRING)
++            lstrcpynW( template_from_object( target )->target, wcsrchr( value->s, '.' ) ? wcsrchr( value->s, '.' ) + 1 : value->s, 96 );
++        return S_OK;
++    }
++    if (prop_is( prop, L"Template" ) && (element = element_from_object( target )))
++    {
++        if (mode == SET_STYLE && element_is_local( element, prop->name )) return S_OK;
++        if (mode == SET_LOCAL) element_mark_local( element, prop->name );
++        if (value->kind == XV_OBJECT && template_from_object( value->object ))
++        {
++            if (element->template_instance) template_free( element->template_instance );
++            element->template_instance = NULL;
++            if (element->template) IInspectable_Release( element->template );
++            IInspectable_AddRef( (element->template = value->object) );
++            window_invalidate();
++        }
++        return S_OK;
++    }
+     if ((style = style_from_object( target )))
+     {
+         if (prop_is( prop, L"TargetType" ) && value->kind == XV_STRING) style_set_target( style, value->s );
+@@ -1356,8 +1723,8 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+     }
+     if ((element = element_from_object( target )) && !prop->directive && !prop_is( prop, L"Name" ) && !prop_is( prop, L"Style" ))
+     {
+-        if (!from_style) element_mark_local( element, prop->name );
+-        else if (element_is_local( element, prop->name ))
++        if (mode == SET_LOCAL) element_mark_local( element, prop->name );
++        else if (mode == SET_STYLE && element_is_local( element, prop->name ))
+         {
+             TRACE( "%s is set locally, the style doesn't change it.\n", debugstr_w(prop->name) );
+             return S_OK;
+@@ -1419,6 +1786,47 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+         return S_OK;
+     }
+ 
++    if (prop_is( prop, L"Background" ) || prop_is( prop, L"BorderBrush" ) || prop_is( prop, L"Foreground" ))
++    {
++        if ((brush = to_brush( value )))
++        {
++            BOOL ok = presenter_set_brush( target, prop->name, brush );
++            IBrush_Release( brush );
++            if (ok) return S_OK;
++        }
++    }
++    if ((prop_is( prop, L"Padding" ) || prop_is( prop, L"BorderThickness" )) && to_thickness( value, &t ) &&
++        presenter_set_thickness( target, prop->name, t ))
++        return S_OK;
++    if (prop_is( prop, L"HorizontalContentAlignment" ) && to_enum( value, horizontal_names, 4, &e ) &&
++        presenter_set_alignment( target, prop->name, e ))
++        return S_OK;
++    if (prop_is( prop, L"VerticalContentAlignment" ) && to_enum( value, vertical_names, 4, &e ) &&
++        presenter_set_alignment( target, prop->name, e ))
++        return S_OK;
++    if (prop_is( prop, L"Content" ))
++    {
++        IContentPresenter *presenter;
++        if (QI( target, IContentPresenter, &presenter ))
++        {
++            content = to_content( value );
++            IContentPresenter_put_Content( presenter, content );
++            if (content) IInspectable_Release( content );
++            IContentPresenter_Release( presenter );
++            return S_OK;
++        }
++    }
++    if (prop_is( prop, L"FontSize" ) && to_double( value, &d ))
++    {
++        IContentPresenter *presenter;
++        if (QI( target, IContentPresenter, &presenter ))
++        {
++            IContentPresenter_put_FontSize( presenter, d );
++            IContentPresenter_Release( presenter );
++            return S_OK;
++        }
++    }
++
+     if (prop_is( prop, L"Text" ) && value->kind == XV_STRING && QI( target, ITextBlock, &tb ))
+     {
+         WindowsCreateString( value->s, wcslen( value->s ), &str );
+@@ -1527,6 +1935,12 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+         IUIElement_Release( ui );
+         done = TRUE;
+     }
++    else if (prop_is( prop, L"Opacity" ) && to_double( value, &d ) && QI( target, IBrush, &brush ))
++    {
++        IBrush_put_Opacity( brush, d );
++        IBrush_Release( brush );
++        done = TRUE;
++    }
+     else if (prop_is( prop, L"Opacity" ) && to_double( value, &d ) && QI( target, IUIElement, &ui ))
+     {
+         IUIElement_put_Opacity( ui, d );
+@@ -1628,6 +2042,15 @@ static IInspectable *get_property( IInspectable *target, const struct xprop *pro
+     IResourceDictionary *dict = NULL;
+ 
+     if (!target) return NULL;
++    if (bag_from_object( target )) return bag_collection( bag_from_object( target ), prop->name );
++    if (prop_is( prop, L"VisualStateGroups" ))
++    {
++        struct xaml_element *element = element_from_object( target );
++        if (!element) return NULL;
++        if (!element->visual_state_groups) element->visual_state_groups = bag_create( L"Collection" );
++        if (element->visual_state_groups) IInspectable_AddRef( element->visual_state_groups );
++        return element->visual_state_groups;
++    }
+     if (prop_is( prop, L"Children" ) && QI( target, IPanel, &panel ))
+     {
+         IPanel_get_Children( panel, (__FIVector_1_Windows__CUI__CXaml__CUIElement **)&result );
+@@ -1709,6 +2132,10 @@ IInspectable *create_builtin( const WCHAR *name )
+     UINT32 i;
+ 
+     if (!wcscmp( name, L"Style" )) return style_create();
++    if (!wcscmp( name, L"ControlTemplate" )) return control_template_create();
++    if (!wcscmp( name, L"ContentPresenter" ))
++        return SUCCEEDED(IActivationFactory_ActivateInstance( content_presenter_factory, &object )) ? object : NULL;
++    if (is_bag_type( name )) return bag_create( name );
+     for (i = 0; i < ARRAY_SIZE(classes); i++)
+     {
+         if (wcscmp( name, classes[i].name )) continue;
+@@ -1743,6 +2170,7 @@ enum run_mode
+     RUN_ALL,       /* the whole stream */
+     RUN_OBJECT,    /* one complete object (a resource, a deferred element, a setter's object value) */
+     RUN_NODE,      /* one node (a setter's resource reference) */
++    RUN_SCOPE,     /* one scope (a visual state group collection) */
+ };
+ 
+ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, enum run_mode mode );
+@@ -1752,6 +2180,11 @@ static void add_to_collection( IInspectable *collection, struct xvalue *value )
+     IVector_IInspectable *vector;
+ 
+     if (!collection || value->kind != XV_OBJECT || !value->object) return;
++    if (bag_from_object( collection ))
++    {
++        bag_add_item( bag_from_object( collection ), value->object );
++        return;
++    }
+     if (vector_is_ours( collection ))
+     {
+         vector = (IVector_IInspectable *)collection;
+@@ -1782,6 +2215,8 @@ static void run_custom_data( struct writer *w, UINT32 stream, struct custom_data
+             sub->xbf = w->xbf;
+             sub->root_used = TRUE;
+             sub->connector = w->connector;
++            sub->templated_parent = w->templated_parent;
++            sub->names_owner = w->names_owner;
+             /* resources may refer to earlier ones: the sub-writer sees this writer's stack, without owning it */
+             memcpy( sub->stack, w->stack, w->sp * sizeof(*w->stack) );
+             sub->sp = w->sp;
+@@ -1789,10 +2224,9 @@ static void run_custom_data( struct writer *w, UINT32 stream, struct custom_data
+             if (sub->sp > w->sp)
+             {
+                 pop( sub, &value );
++                if (value.kind != XV_OBJECT) box_value( &value );
+                 if (value.kind == XV_OBJECT && value.object && target)
+                     resource_dictionary_insert( target, key, value.object );
+-                else if (value.kind != XV_OBJECT)
+-                    FIXME( "resource %s isn't an object.\n", debugstr_w(data->resources[i].key) );
+                 xvalue_clear( &value );
+             }
+             while (sub->sp > w->sp) { pop( sub, &value ); xvalue_clear( &value ); }
+@@ -1805,6 +2239,8 @@ static void run_custom_data( struct writer *w, UINT32 stream, struct custom_data
+         sub->xbf = w->xbf;
+         sub->root_used = TRUE;
+         sub->connector = w->connector;
++        sub->templated_parent = w->templated_parent;
++        sub->names_owner = w->names_owner;
+         run_stream( sub, stream, 0, RUN_OBJECT );
+         if (sub->sp) { pop( sub, &value ); push( w, &value ); }
+         while (sub->sp) { pop( sub, &value ); xvalue_clear( &value ); }
+@@ -1839,6 +2275,8 @@ static void run_custom_data( struct writer *w, UINT32 stream, struct custom_data
+                 sub->root_used = TRUE;
+                 memcpy( sub->stack, w->stack, w->sp * sizeof(*w->stack) );
+                 sub->sp = w->sp;
++                sub->templated_parent = w->templated_parent;
++                sub->names_owner = w->names_owner;
+                 if (e->flags & 0x08)
+                 {
+                     /* an object value (often a ControlTemplate, which isn't supported yet) */
+@@ -1867,8 +2305,22 @@ static void run_custom_data( struct writer *w, UINT32 stream, struct custom_data
+         }
+         break;
+     }
++    case 420: case 1: case 3: case 4: case 5:
++        /* the node stream repeats the enclosing PushScopeGetValue(VisualStateGroups), so run it on the stack
++         * without that collection */
++        TRACE( "visual state groups in stream %u at %u.\n", stream, data->token );
++        if (w->sp < 1) break;
++        sub->xbf = w->xbf;
++        sub->root_used = TRUE;
++        sub->templated_parent = w->templated_parent;
++        sub->names_owner = w->names_owner;
++        memcpy( sub->stack, w->stack, (w->sp - 1) * sizeof(*w->stack) );
++        sub->sp = w->sp - 1;
++        run_stream( sub, stream, data->token, RUN_SCOPE );
++        while (sub->sp > w->sp - 1) { pop( sub, &value ); xvalue_clear( &value ); }
++        break;
+     default:
+-        FIXME( "custom runtime data type %u (visual states) is ignored.\n", data->kind );
++        FIXME( "custom runtime data type %u is ignored.\n", data->kind );
+         break;
+     }
+     free( sub );
+@@ -1922,6 +2374,7 @@ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, enum run
+     BYTE node;
+     UINT32 sub, i, n;
+     int start_scopes = w->scope_count, start_sp = w->sp;
++    BOOL entered = FALSE;
+ 
+     if (stream >= w->xbf->stream_count) { w->failed = TRUE; return; }
+     r.xbf = w->xbf;
+@@ -1960,7 +2413,7 @@ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, enum run
+             pop( w, &value );
+             if (node == NODE_SET_VALUE_FROM_MARKUP_EXTENSION && value.kind == XV_OBJECT && !value.object)
+                 FIXME( "markup extension for %s.%s (Binding?) is not supported.\n", debugstr_w(prop.owner), debugstr_w(prop.name) );
+-            else set_property( w, top_object( w ), &prop, &value, FALSE );
++            else set_property( w, top_object( w ), &prop, &value, SET_LOCAL );
+             xvalue_clear( &value );
+             break;
+         case NODE_ADD_TO_COLLECTION:
+@@ -2006,12 +2459,13 @@ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, enum run
+             break;
+         case NODE_SET_NAME:
+             read_constant( &r, &value );
++            if (value.kind == XV_STRING && (object = top_object( w ))) register_name( w, value.s, object );
+             if (value.kind == XV_STRING && (object = top_object( w )))
+             {
+                 prop.directive = FALSE;
+                 lstrcpyW( prop.owner, L"FrameworkElement" );
+                 lstrcpyW( prop.name, L"Name" );
+-                set_property( w, object, &prop, &value, FALSE );
++                set_property( w, object, &prop, &value, SET_LOCAL );
+             }
+             xvalue_clear( &value );
+             break;
+@@ -2034,7 +2488,17 @@ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, enum run
+             sub = read_7bit( &r );
+             n = read_7bit( &r ) + read_7bit( &r );
+             for (i = 0; i < n; i++) read_u16( &r );
+-            FIXME( "deferred property %s.%s (templates) is not supported.\n", debugstr_w(prop.owner), debugstr_w(prop.name) );
++            if (prop_is( &prop, L"Template" ) && template_from_object( top_object( w ) ))
++            {
++                struct control_template *template = template_from_object( top_object( w ) );
++                if (template->xbf) xbf_free( template->xbf );
++                xbf_addref( (template->xbf = w->xbf) );
++                template->stream = sub;
++                template->has_content = TRUE;
++                TRACE( "template for %s in stream %u.\n", debugstr_w(template->target), sub );
++            }
++            else
++                FIXME( "deferred property %s.%s (data templates) is not supported.\n", debugstr_w(prop.owner), debugstr_w(prop.name) );
+             break;
+         case NODE_PUSH_SCOPE_GET_VALUE:
+             read_property( &r, &prop );
+@@ -2064,11 +2528,24 @@ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, enum run
+         case NODE_SET_VALUE_CONVERTED_CONSTANT:
+             read_property( &r, &prop );
+             read_constant( &r, &value );
+-            set_property( w, top_object( w ), &prop, &value, FALSE );
++            set_property( w, top_object( w ), &prop, &value, SET_LOCAL );
+             xvalue_clear( &value );
+             break;
+-        case NODE_SET_VALUE_CONVERTED_RESOLVED_PROPERTY:
+         case NODE_SET_VALUE_FROM_TEMPLATE_BINDING:
++            read_property( &r, &prop );
++            read_property( &r, &prop2 );
++            if (w->templated_parent)
++            {
++                /* evaluated once, when the template is applied */
++                if (get_value( w->templated_parent, prop2.name, &value ))
++                {
++                    set_property( w, top_object( w ), &prop, &value, SET_LOCAL );
++                    xvalue_clear( &value );
++                }
++                else FIXME( "TemplateBinding from %s.%s is not supported.\n", debugstr_w(prop2.owner), debugstr_w(prop2.name) );
++            }
++            break;
++        case NODE_SET_VALUE_CONVERTED_RESOLVED_PROPERTY:
+             read_property( &r, &prop );
+             read_property( &r, &prop2 );
+             FIXME( "%s.%s = property %s.%s (setters, template bindings) is not supported.\n", debugstr_w(prop.owner),
+@@ -2079,6 +2556,8 @@ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, enum run
+             read_type( &r, &type );
+             if (prop_is( &prop, L"TargetType" ) && style_from_object( top_object( w ) ))
+                 style_set_target( style_from_object( top_object( w ) ), type.name );
++            else if (prop_is( &prop, L"TargetType" ) && template_from_object( top_object( w ) ))
++                lstrcpynW( template_from_object( top_object( w ) )->target, type.name, 96 );
+             else
+                 FIXME( "%s.%s = type %s is not supported.\n", debugstr_w(prop.owner), debugstr_w(prop.name), debugstr_w(type.name) );
+             break;
+@@ -2090,7 +2569,7 @@ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, enum run
+             {
+                 value.kind = XV_OBJECT;
+                 value.object = object;
+-                set_property( w, top_object( w ), &prop, &value, FALSE );
++                set_property( w, top_object( w ), &prop, &value, SET_LOCAL );
+                 xvalue_clear( &value );
+             }
+             xvalue_clear( &key );
+@@ -2118,6 +2597,8 @@ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, enum run
+         /* one complete object: back at the starting scope depth with something new on the stack */
+         if (mode == RUN_OBJECT && w->scope_count == start_scopes && w->sp > start_sp) return;
+         if (mode == RUN_NODE) return;
++        if (mode == RUN_SCOPE && w->scope_count > start_scopes) entered = TRUE;
++        if (mode == RUN_SCOPE && entered && w->scope_count == start_scopes) return;
+     }
+     if (r.error)
+     {
+@@ -2160,6 +2641,407 @@ HRESULT xbf_load( struct xbf *xbf, IInspectable *root, IInspectable **out )
+     return hr;
+ }
+ 
++
++/* ---- reading properties back: TemplateBinding sources, and values a visual state replaces ---- */
++
++static void set_brush_value( struct xvalue *out, IBrush *brush )
++{
++    out->kind = XV_OBJECT;
++    out->object = (IInspectable *)brush;
++}
++
++static BOOL get_value( IInspectable *target, const WCHAR *name, struct xvalue *out )
++{
++    IFrameworkElement *fe;
++    IUIElement *ui;
++    IControl *control;
++    IContentControl *cc;
++    ITextBlock *tb;
++    IBorder *border;
++    IPanel *panel;
++    IBrush *brush = NULL;
++    HSTRING str;
++    DOUBLE d;
++    BOOL ok = FALSE;
++
++    memset( out, 0, sizeof(*out) );
++    if (!target) return FALSE;
++    if (!wcscmp( name, L"Background" ) || !wcscmp( name, L"Foreground" ) || !wcscmp( name, L"BorderBrush" ))
++    {
++        if (presenter_get_brush( target, name, &brush )) ok = TRUE;
++        else if (QI( target, IControl, &control ))
++        {
++            if (!wcscmp( name, L"Background" )) IControl_get_Background( control, &brush );
++            else if (!wcscmp( name, L"Foreground" )) IControl_get_Foreground( control, &brush );
++            else IControl_get_BorderBrush( control, &brush );
++            IControl_Release( control );
++            ok = TRUE;
++        }
++        else if (QI( target, IBorder, &border ))
++        {
++            if (!wcscmp( name, L"Background" )) { IBorder_get_Background( border, &brush ); ok = TRUE; }
++            else if (!wcscmp( name, L"BorderBrush" )) { IBorder_get_BorderBrush( border, &brush ); ok = TRUE; }
++            IBorder_Release( border );
++        }
++        else if (!wcscmp( name, L"Background" ) && QI( target, IPanel, &panel ))
++        {
++            IPanel_get_Background( panel, &brush );
++            IPanel_Release( panel );
++            ok = TRUE;
++        }
++        else if (!wcscmp( name, L"Foreground" ) && QI( target, ITextBlock, &tb ))
++        {
++            ITextBlock_get_Foreground( tb, &brush );
++            ITextBlock_Release( tb );
++            ok = TRUE;
++        }
++        if (ok) set_brush_value( out, brush );
++        return ok;
++    }
++    if (!wcscmp( name, L"BorderThickness" ) || !wcscmp( name, L"Padding" ))
++    {
++        out->kind = XV_THICKNESS;
++        if (QI( target, IControl, &control ))
++        {
++            if (!wcscmp( name, L"Padding" )) IControl_get_Padding( control, &out->thickness );
++            else IControl_get_BorderThickness( control, &out->thickness );
++            IControl_Release( control );
++            return TRUE;
++        }
++        if (QI( target, IBorder, &border ))
++        {
++            if (!wcscmp( name, L"Padding" )) IBorder_get_Padding( border, &out->thickness );
++            else IBorder_get_BorderThickness( border, &out->thickness );
++            IBorder_Release( border );
++            return TRUE;
++        }
++        out->kind = XV_NONE;
++        return FALSE;
++    }
++    if (!wcscmp( name, L"Content" ) && QI( target, IContentControl, &cc ))
++    {
++        out->kind = XV_OBJECT;
++        IContentControl_get_Content( cc, &out->object );
++        IContentControl_Release( cc );
++        return TRUE;
++    }
++    if ((!wcscmp( name, L"HorizontalContentAlignment" ) || !wcscmp( name, L"VerticalContentAlignment" )) &&
++        QI( target, IControl, &control ))
++    {
++        HorizontalAlignment h;
++        VerticalAlignment v;
++        out->kind = XV_SIGNED;
++        if (name[0] == 'H') { IControl_get_HorizontalContentAlignment( control, &h ); out->i = h; }
++        else { IControl_get_VerticalContentAlignment( control, &v ); out->i = v; }
++        IControl_Release( control );
++        return TRUE;
++    }
++    if (!wcscmp( name, L"FontSize" ))
++    {
++        if (QI( target, IControl, &control )) { IControl_get_FontSize( control, &d ); IControl_Release( control ); ok = TRUE; }
++        else if (QI( target, ITextBlock, &tb )) { ITextBlock_get_FontSize( tb, &d ); ITextBlock_Release( tb ); ok = TRUE; }
++        if (ok) { out->kind = XV_FLOAT; out->f = d; }
++        return ok;
++    }
++    if ((!wcscmp( name, L"Opacity" ) || !wcscmp( name, L"Visibility" )) && QI( target, IUIElement, &ui ))
++    {
++        Visibility visibility;
++        if (name[0] == 'O') { IUIElement_get_Opacity( ui, &d ); out->kind = XV_FLOAT; out->f = d; }
++        else { IUIElement_get_Visibility( ui, &visibility ); out->kind = XV_SIGNED; out->i = visibility; }
++        IUIElement_Release( ui );
++        return TRUE;
++    }
++    if ((!wcscmp( name, L"Width" ) || !wcscmp( name, L"Height" ) || !wcscmp( name, L"Margin" )) && QI( target, IFrameworkElement, &fe ))
++    {
++        if (!wcscmp( name, L"Margin" )) { out->kind = XV_THICKNESS; IFrameworkElement_get_Margin( fe, &out->thickness ); }
++        else
++        {
++            if (name[0] == 'W') IFrameworkElement_get_Width( fe, &d ); else IFrameworkElement_get_Height( fe, &d );
++            out->kind = isnan( d ) ? XV_STRING : XV_FLOAT;
++            if (isnan( d )) out->s = wcsdup( L"Auto" ); else out->f = d;
++        }
++        IFrameworkElement_Release( fe );
++        return TRUE;
++    }
++    if (!wcscmp( name, L"Text" ) && QI( target, ITextBlock, &tb ))
++    {
++        ITextBlock_get_Text( tb, &str );
++        out->kind = XV_STRING;
++        out->s = wcsdup( WindowsGetStringRawBuffer( str, NULL ) );
++        WindowsDeleteString( str );
++        ITextBlock_Release( tb );
++        return TRUE;
++    }
++    if (!wcscmp( name, L"IsEnabled" ) && QI( target, IControl, &control ))
++    {
++        boolean b;
++        IControl_get_IsEnabled( control, &b );
++        IControl_Release( control );
++        out->kind = XV_BOOL;
++        out->b = b;
++        return TRUE;
++    }
++    return FALSE;
++}
++
++/* ---- template instances and VisualStateManager ---- */
++
++struct applied_value
++{
++    IInspectable *group;      /* the visual state group that changed it */
++    IInspectable *target;
++    struct xprop prop;
++    struct xvalue old;
++};
++
++struct template_instance
++{
++    IInspectable *root;
++    struct name_entry *names;
++    UINT32 name_count;
++    struct applied_value *applied;
++    UINT32 applied_count;
++};
++
++struct template_instance *template_instantiate( IInspectable *template, IInspectable *templated_parent )
++{
++    struct control_template *impl = template_from_object( template );
++    struct template_instance *instance;
++    struct writer *w;
++    struct xvalue value;
++
++    if (!impl || !impl->xbf) return NULL;
++    if (!(instance = calloc( 1, sizeof(*instance) ))) return NULL;
++    if (!(w = calloc( 1, sizeof(*w) )))
++    {
++        free( instance );
++        return NULL;
++    }
++    TRACE( "instantiating the %s template for %p.\n", debugstr_w(impl->target), templated_parent );
++    w->xbf = impl->xbf;
++    w->root_used = TRUE;
++    w->templated_parent = templated_parent;
++    w->names_owner = w;
++    run_stream( w, impl->stream, 0, RUN_OBJECT );
++    if (w->sp)
++    {
++        pop( w, &value );
++        if (value.kind == XV_OBJECT && element_from_object( value.object ))
++        {
++            instance->root = value.object;
++            value.object = NULL;
++        }
++        xvalue_clear( &value );
++    }
++    while (w->sp) { pop( w, &value ); xvalue_clear( &value ); }
++    instance->names = w->names;
++    instance->name_count = w->name_count;
++    free( w );
++    if (!instance->root)
++    {
++        WARN( "the template produced no element.\n" );
++        template_free( instance );
++        return NULL;
++    }
++    return instance;
++}
++
++struct xaml_element *template_root( struct template_instance *instance )
++{
++    return instance ? element_from_object( instance->root ) : NULL;
++}
++
++void template_free( struct template_instance *instance )
++{
++    UINT32 i;
++
++    if (!instance) return;
++    for (i = 0; i < instance->applied_count; i++)
++    {
++        IInspectable_Release( instance->applied[i].target );
++        xvalue_clear( &instance->applied[i].old );
++    }
++    for (i = 0; i < instance->name_count; i++) IInspectable_Release( instance->names[i].object );
++    if (instance->root) IInspectable_Release( instance->root );
++    free( instance->applied );
++    free( instance->names );
++    free( instance );
++}
++
++static IInspectable *find_name( struct template_instance *instance, const WCHAR *name )
++{
++    UINT32 i;
++    for (i = 0; i < instance->name_count; i++) if (!wcscmp( instance->names[i].name, name )) return instance->names[i].object;
++    return NULL;
++}
++
++static struct bag *bag_value( struct bag *bag, const WCHAR *name )
++{
++    struct xvalue *v = bag_get( bag, name );
++    return v && v->kind == XV_OBJECT ? bag_from_object( v->object ) : NULL;
++}
++
++static const WCHAR *bag_string( struct bag *bag, const WCHAR *name )
++{
++    struct xvalue *v = bag_get( bag, name );
++    return v && v->kind == XV_STRING ? v->s : NULL;
++}
++
++/* set target.property for a state, remembering the old value to restore when the group leaves the state */
++static void state_set( struct template_instance *instance, IInspectable *group, IInspectable *target,
++                       const WCHAR *property, struct xvalue *value )
++{
++    struct applied_value *applied;
++    struct xprop prop = {0};
++
++    lstrcpynW( prop.name, property, ARRAY_SIZE(prop.name) );
++    if ((applied = realloc( instance->applied, (instance->applied_count + 1) * sizeof(*applied) )))
++    {
++        instance->applied = applied;
++        applied += instance->applied_count;
++        if (get_value( target, property, &applied->old ))
++        {
++            applied->group = group;
++            applied->target = target;
++            IInspectable_AddRef( target );
++            applied->prop = prop;
++            instance->applied_count++;
++        }
++        else FIXME( "can't read %s back; leaving the state won't restore it.\n", debugstr_w(property) );
++    }
++    set_property( NULL, target, &prop, value, SET_STATE );
++}
++
++/* "Opacity", "(UIElement.Opacity)", "(Border.Background).(SolidColorBrush.Color)" -> the target's property, and
++ * whether the value is the color of a brush in it */
++static BOOL parse_property_path( const WCHAR *path, WCHAR *property, SIZE_T len, BOOL *brush_color )
++{
++    const WCHAR *p = path, *end, *dot;
++
++    *brush_color = FALSE;
++    if (wcschr( path, '[' )) return FALSE;
++    if (*p == '(')
++    {
++        if (!(end = wcschr( p, ')' ))) return FALSE;
++        dot = wcschr( p, '.' );
++        if (!dot || dot > end) return FALSE;
++        lstrcpynW( property, dot + 1, min( len, end - dot ) );
++        if (end[1] == '.')
++        {
++            if (wcscmp( end + 2, L"(SolidColorBrush.Color)" )) return FALSE;
++            *brush_color = TRUE;
++        }
++        return TRUE;
++    }
++    if (wcschr( p, '.' )) return FALSE;
++    lstrcpynW( property, p, len );
++    return TRUE;
++}
++
++static void apply_animation( struct template_instance *instance, IInspectable *group, struct bag *anim )
++{
++    const WCHAR *target_name = bag_string( anim, L"TargetName" ), *path = bag_string( anim, L"TargetProperty" );
++    struct xvalue *to = bag_get( anim, L"To" ), value;
++    struct bag *frames;
++    WCHAR property[96];
++    IInspectable *target;
++    BOOL brush_color;
++
++    if (!target_name || !path || !(target = find_name( instance, target_name ))) return;
++    if (!parse_property_path( path, property, ARRAY_SIZE(property), &brush_color ))
++    {
++        FIXME( "animating %s.%s is not supported.\n", debugstr_w(target_name), debugstr_w(path) );
++        return;
++    }
++    /* key frame animations: the last frame's value */
++    if (!to && (frames = bag_value( anim, L"KeyFrames" )) && frames->item_count)
++        to = bag_get( bag_from_object( frames->items[frames->item_count - 1] ), L"Value" );
++    if (!to)
++    {
++        FIXME( "%s animation of %s.%s without To/KeyFrames.\n", debugstr_w(anim->type), debugstr_w(target_name), debugstr_w(path) );
++        return;
++    }
++    TRACE( "%s: %s.%s.\n", debugstr_w(anim->type), debugstr_w(target_name), debugstr_w(property) );
++    xvalue_copy( &value, to );
++    if (brush_color)
++    {
++        IBrush *brush = to_brush( &value );   /* a new brush with the color, rather than changing a shared one */
++        xvalue_clear( &value );
++        if (!brush) return;
++        value.kind = XV_OBJECT;
++        value.object = (IInspectable *)brush;
++    }
++    state_set( instance, group, target, property, &value );
++    xvalue_clear( &value );
++}
++
++void template_go_to_state( struct template_instance *instance, const WCHAR *state_name )
++{
++    struct xaml_element *root = template_root( instance );
++    struct bag *groups, *group, *states, *state = NULL, *board, *children, *setters;
++    UINT32 i, j;
++
++    if (!root || !(groups = bag_from_object( root->visual_state_groups ))) return;
++    for (i = 0; i < groups->item_count && !state; i++)
++    {
++        if (!(group = bag_from_object( groups->items[i] )) || !(states = bag_value( group, L"States" ))) continue;
++        for (j = 0; j < states->item_count; j++)
++        {
++            struct bag *s = bag_from_object( states->items[j] );
++            if (s && !wcscmp( s->name, state_name )) { state = s; break; }
++        }
++    }
++    if (!state)
++    {
++        TRACE( "no state %s.\n", debugstr_w(state_name) );
++        return;
++    }
++    TRACE( "going to state %s of group %s.\n", debugstr_w(state_name), debugstr_w(group->name) );
++
++    /* leave the group's current state: restore what it changed, newest first */
++    for (i = instance->applied_count; i > 0; i--)
++    {
++        struct applied_value *a = &instance->applied[i - 1];
++        if (a->group != &group->IInspectable_iface) continue;
++        set_property( NULL, a->target, &a->prop, &a->old, SET_STATE );
++        IInspectable_Release( a->target );
++        xvalue_clear( &a->old );
++        memmove( a, a + 1, (instance->applied + instance->applied_count - a - 1) * sizeof(*a) );
++        instance->applied_count--;
++    }
++
++    /* storyboard animations jump to their final values */
++    if ((board = bag_value( state, L"Storyboard" )) && (children = bag_value( board, L"Children" )))
++        for (i = 0; i < children->item_count; i++)
++            if (bag_from_object( children->items[i] ))
++                apply_animation( instance, &group->IInspectable_iface, bag_from_object( children->items[i] ) );
++
++    /* <VisualState.Setters><Setter Target="Name.Property" Value="..."/> */
++    if ((setters = bag_value( state, L"Setters" )))
++    {
++        for (i = 0; i < setters->item_count; i++)
++        {
++            struct bag *setter = bag_from_object( setters->items[i] );
++            const WCHAR *target_path = bag_string( setter, L"Target" ), *dot;
++            struct xvalue *v = bag_get( setter, L"Value" ), value;
++            WCHAR name[64];
++            IInspectable *target;
++
++            if (!target_path || !v || !(dot = wcschr( target_path, '.' ))) continue;
++            lstrcpynW( name, target_path, min( ARRAY_SIZE(name), dot - target_path + 1 ) );
++            if (!(target = find_name( instance, name )))
++            {
++                WARN( "setter target %s not found.\n", debugstr_w(target_path) );
++                continue;
++            }
++            xvalue_copy( &value, v );
++            state_set( instance, &group->IInspectable_iface, target, dot + 1, &value );
++            xvalue_clear( &value );
++        }
++    }
++    window_invalidate();
++}
++
+ /* Application.LoadComponent: ms-appx:///Folder/Page.xaml is compiled to Folder\Page.xbf in the package folder,
+  * which for wine-uwp is the folder of the app's executable. */
+ HRESULT load_component( IInspectable *component, HSTRING uri )
