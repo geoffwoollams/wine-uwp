@@ -356,3 +356,47 @@ Milestone 4 is the largest rung (3 to 6 months in the ladder), so it lands in pa
 - `DataTemplate`/`ItemsPanelTemplate`.
 - `{Binding}`.
 - Direct2D rendering.
+
+## 13. Milestone 4, part 4: XAML text, XamlReader and a built-in generic.xaml (patches 0028-0029)
+
+**What was built:**
+
+- **A XAML text reader.** A small XML parser builds a tree (namespaces, attributes, entities, comments, CDATA), which drives the same object writer as XBF.
+  - **Attributes and elements:** attributes set properties, with `Owner.Property` for attached ones. Property elements set or fill properties. Other children go to the type's content property (Panel children, Border child, `Content`, `Text`, dictionary items, style setters, visual states, storyboard children, key frames).
+  - **Markup extensions:** `{StaticResource}`, `{ThemeResource}`, `{TemplateBinding}` and `{x:Null}`. `x:Name`, `x:Key` and implicit style keys work.
+  - **Value elements:** `x:String`, `x:Double`, `x:Int32`, `x:Boolean`, `Thickness` and `Color`.
+  - **Templates:** a text `ControlTemplate` keeps its part of the tree and builds it for each control.
+  - **Not supported:** event handler attributes are ignored, as `XamlReader` doesn't allow them; `{Binding}` is not supported.
+- **`XamlReader.Load`** (patch 0028 is its IDL, generated with `winmd2idl.py ... Windows.UI.Xaml.Markup.XamlReader`).
+- **`generic.xaml`**, an `RCDATA` resource of `windows.ui.xaml.dll`, written for wine-uwp rather than copied from Microsoft. It follows the structure apps depend on: WinUI's resource keys, visual state names and template part names, with the Windows 10 values.
+  - Light and Dark `ThemeDictionaries` with the `SystemControl*` brushes and the Button and ToggleButton keys.
+  - `BaseTextBlockStyle`, `HeaderTextBlockStyle`, `SubheaderTextBlockStyle`, `TitleTextBlockStyle`, `SubtitleTextBlockStyle`, `BodyTextBlockStyle` and `CaptionTextBlockStyle`.
+  - Default styles for Button and ToggleButton, with a `ContentPresenter` template whose states animate `{ThemeResource ButtonBackgroundPointerOver}` and the like. CheckBox and RadioButton get default property values; they still draw themselves.
+  - Resource lookups go: the markup's scope, the templated control's ancestors, the application, then `generic.xaml`, then the old built-in table.
+- **Default styles** (`DefaultStyleKey`) apply on first layout at a new, lowest precedence: local values, then style values (now marked), then the default style.
+  - `generic.xaml`'s setter resources are looked up when applied, from the element up, so an app's `ButtonBackground` wins over the built-in one.
+  - In app markup, `{StaticResource}` in setters resolves where it is written, as on Windows.
+- **Translucent brushes:** fills and borders are alpha-blended (`GdiAlphaBlend`). Translucent text is blended against the pixel under it, since GDI text has no alpha.
+- **`FontWeight`** from markup (names or numbers) for TextBlock and controls.
+
+**Tests:**
+
+- **`xamlmarkup`: 86/86 checks pass** (79 without Microsoft's sample files). New checks:
+  - `XamlReader.Load` refuses malformed XML.
+  - It loads a StackPanel with resources, a Style and a text ControlTemplate, and the children and decoded entities are right.
+  - A TextBlock with `TitleTextBlockStyle` (BasedOn `BaseTextBlockStyle`) is 24 px SemiLight.
+  - The loaded content shown in the page draws the template with the style's resource, and its PointerOver state.
+  - A plain Button has generic.xaml's template and `{ThemeResource ButtonBackground}` (#33000000).
+- **`xamllayout`: 34/34 checks pass.** Its hover check now expects 0x7a7a7a, the default template's `#66000000` border drawn over the `#33000000` background (Windows 10's Button paints its background under the border), where the earlier hand-drawn approximation had 0x999999.
+- **`xamlhello`:** 34/34.
+
+**Still to do in milestone 4:**
+
+- CheckBox and RadioButton templates (they need `Rectangle`/`Ellipse` shapes and a glyph font or `Path`), and ToggleSwitch, Slider, ProgressBar.
+- `CornerRadius`.
+- `{ThemeResource}` updates when the theme changes at run time.
+- `LoadComponent` of loose `.xaml` files.
+- Animation timing.
+- `DataTemplate`.
+- `{Binding}`.
+- Direct2D rendering.

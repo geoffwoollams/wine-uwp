@@ -84,7 +84,9 @@ Wine has no `Windows.UI.Xaml`, the UI framework most non-game UWP apps are built
 
 **Milestone 4, part 3 (done): toggle controls.** `ToggleButton`, `CheckBox` (including three-state) and `RadioButton` (groups by parent or `GroupName`), with `Checked`/`Unchecked`/`Indeterminate` events and templates whose check states follow WinUI's naming. `TemplateBinding` now follows later changes on the control. Built-in looks use the WinUI resource keys an app overrides, such as `ButtonBackgroundPointerOver` or `CheckBoxCheckBackgroundFillChecked`.
 
-**Not yet:** the built-in controls' full default templates, animation timing, data templates, data binding (`{Binding}`), `TextBox`, scrolling, keyboard focus, localized `x:Uid` strings and navigation history. Real Store apps will mostly still look wrong or stop where they need these; see [docs/xaml-plan.md](docs/xaml-plan.md).
+**Milestone 4, part 4 (done): XAML text and default styles.** `XamlReader.Load` reads XAML text. A `generic.xaml` built into the DLL supplies Windows 10's theme brushes, the standard text styles (`TitleTextBlockStyle` and the rest) and default styles. Button and ToggleButton get real default templates, so apps that override their resource keys or restyle them see the right result. Translucent theme brushes are blended.
+
+**Not yet:** default templates for CheckBox, RadioButton and other controls, animation timing, data templates, data binding (`{Binding}`), `TextBox`, scrolling, keyboard focus, localized `x:Uid` strings and navigation history. Real Store apps will mostly still look wrong or stop where they need these; see [docs/xaml-plan.md](docs/xaml-plan.md).
 
 To try it, build the test clients and run them in a throwaway prefix (each opens a window for a few seconds and checks what was drawn):
 
@@ -177,7 +179,7 @@ patches/wine/   patches against the wine-11.0 tag (apply in order with git apply
                 0019-0022 milestone 3 (widl registration fix, IDL, launch args, markup loading),
                 0023 milestone 4 part 1 (styles, theme and merged dictionaries), 0024-0025 part 2 (control
                 templates, visual states), 0026-0027 part 3 (ToggleButton, CheckBox, RadioButton, live
-                TemplateBinding)
+                TemplateBinding), 0028-0029 part 4 (XAML text, XamlReader, generic.xaml)
 patches/dxvk/   patch against DXVK f90f1bf1 (v3.1.1-235)
 docker/         build containers
 apps/           optional per-app settings
