@@ -16,7 +16,10 @@ Windows.UI.Xaml.Media.Brush Windows.UI.Xaml.Media.SolidColorBrush; the output's 
 patches/wine/0017 is the extra output, with --have pointing at a tree that has 0014 applied, of those types plus
 Windows.UI.Xaml.Controls.Panel StackPanel Grid Border Button Primitives.ButtonBase ContentControl Control
 UIElementCollection RowDefinition ColumnDefinition RowDefinitionCollection ColumnDefinitionCollection and
-Windows.UI.Xaml.RoutedEventArgs (each with its full namespace).
+Windows.UI.Xaml.RoutedEventArgs (each with its full namespace). The milestone 3 IDL adds Controls.Page, UserControl, Frame,
+ResourceDictionary, Markup.IXamlMetadataProvider, IXamlType, IXamlMember, IComponentConnector,
+ApplicationModel.Activation.ILaunchActivatedEventArgs2 and IResourceDictionaryFactory; ResourceDictionary's runtime class
+was then given its full definition by hand (it had been emitted only with its default interface).
 """
 import struct, sys, collections
 

@@ -1,0 +1,86 @@
+Subject: twinapi.appcore: implement IPrelaunchActivatedEventArgs and the other LaunchActivatedEventArgs interfaces
+
+diff --git a/dlls/twinapi.appcore/core_gen.c b/dlls/twinapi.appcore/core_gen.c
+index 34be97e..ee0dca9 100644
+--- a/dlls/twinapi.appcore/core_gen.c
++++ b/dlls/twinapi.appcore/core_gen.c
+@@ -70,11 +70,25 @@ struct core_view
+ static const GUID IID_ILaunchActivatedEventArgs_local =
+     { 0xfbc93e26, 0xa14a, 0x4b4f, { 0x82, 0xb0, 0x33, 0xbe, 0xd9, 0x20, 0xaf, 0x52 } };
+ 
++/* the other interfaces of LaunchActivatedEventArgs, each with one getter */
++static const GUID IID_IPrelaunchActivatedEventArgs_local =
++    { 0x0c44717b, 0x19f7, 0x48d6, { 0xb0, 0x46, 0xcf, 0x22, 0x82, 0x6e, 0xaa, 0x74 } };
++static const GUID IID_ILaunchActivatedEventArgs2_local =
++    { 0x0fd37ebc, 0x9dc9, 0x46b5, { 0x9a, 0xce, 0xbd, 0x95, 0xd4, 0x56, 0x53, 0x45 } };
++static const GUID IID_IApplicationViewActivatedEventArgs_local =
++    { 0x930cef4b, 0xb829, 0x40fc, { 0x88, 0xf4, 0x85, 0x13, 0xe8, 0xa6, 0x47, 0x38 } };
++static const GUID IID_IViewSwitcherProvider_local =
++    { 0x33f288a6, 0x5c2c, 0x4d27, { 0xba, 0xc7, 0x75, 0x36, 0x08, 0x8f, 0x12, 0x19 } };
++
+ struct core_args
+ {
+     IActivatedEventArgs IActivatedEventArgs_iface;
+     const void *const *launch_vtbl; /* ILaunchActivatedEventArgs, hand-declared: Arguments, TileId */
+     LONG ref;
++    const void *const *prelaunch_vtbl;   /* IPrelaunchActivatedEventArgs: PrelaunchActivated */
++    const void *const *launch2_vtbl;     /* ILaunchActivatedEventArgs2: TileActivatedInfo */
++    const void *const *view_vtbl;        /* IApplicationViewActivatedEventArgs: CurrentlyShownApplicationViewId */
++    const void *const *switcher_vtbl;    /* IViewSwitcherProvider: ViewSwitcher */
+ };
+ 
+ 
+@@ -109,6 +123,19 @@ static HRESULT core_args_qi(struct core_args *impl, REFIID iid, void **out)
+         InterlockedIncrement(&impl->ref);
+         return S_OK;
+     }
++    if (impl->prelaunch_vtbl)
++    {
++        if (IsEqualGUID(iid, &IID_IPrelaunchActivatedEventArgs_local)) *out = &impl->prelaunch_vtbl;
++        else if (IsEqualGUID(iid, &IID_ILaunchActivatedEventArgs2_local)) *out = &impl->launch2_vtbl;
++        else if (IsEqualGUID(iid, &IID_IApplicationViewActivatedEventArgs_local)) *out = &impl->view_vtbl;
++        else if (IsEqualGUID(iid, &IID_IViewSwitcherProvider_local)) *out = &impl->switcher_vtbl;
++        else *out = NULL;
++        if (*out)
++        {
++            InterlockedIncrement(&impl->ref);
++            return S_OK;
++        }
++    }
+     {
+         /* Unknown interface: hand out a logging probe object so the call pattern shows up in the log. */
+         struct core_probe { const void *const *lpVtbl; GUID iid; } *p;
+@@ -1073,6 +1100,22 @@ static HRESULT WINAPI launch_get_TileId(void *iface, HSTRING *value) { return Wi
+ static const void *const launch_vtbl[] = { launch_QueryInterface, launch_AddRef, launch_Release, launch_GetIids,
+     launch_GetRuntimeClassName, launch_GetTrustLevel, launch_get_Arguments, launch_get_TileId };
+ 
++/* IPrelaunchActivatedEventArgs, ILaunchActivatedEventArgs2, IApplicationViewActivatedEventArgs and
++ * IViewSwitcherProvider: the getters XAML app templates read on launch (e.g. "if (!e->PrelaunchActivated)") */
++#define ARGS_IFACE(name, field, getter_type, getter_body) \
++static struct core_args *args_from_##name(void *iface) { return CONTAINING_RECORD(iface, struct core_args, field); } \
++static HRESULT WINAPI name##_QueryInterface(void *iface, REFIID iid, void **out) \
++{ return core_args_qi(args_from_##name(iface), iid, out); } \
++static ULONG WINAPI name##_AddRef(void *iface) { return core_args_addref(args_from_##name(iface)); } \
++static ULONG WINAPI name##_Release(void *iface) { return core_args_release(args_from_##name(iface)); } \
++static HRESULT WINAPI name##_get(void *iface, getter_type *value) { getter_body; return S_OK; } \
++static const void *const name##_vtbl[] = { name##_QueryInterface, name##_AddRef, name##_Release, launch_GetIids, \
++    launch_GetRuntimeClassName, launch_GetTrustLevel, name##_get };
++ARGS_IFACE(prelaunch, prelaunch_vtbl, boolean, *value = FALSE)
++ARGS_IFACE(launch2, launch2_vtbl, IInspectable *, *value = NULL)
++ARGS_IFACE(view_args, view_vtbl, INT32, *value = 1)
++ARGS_IFACE(switcher, switcher_vtbl, IInspectable *, *value = NULL)
++
+ 
+ /* ---- ICoreWindow2 on core_window ---- */
+ static inline struct core_window *impl_from_core_window2(ICoreWindow2 *iface)
+@@ -1534,6 +1577,10 @@ static HRESULT WINAPI core_app_Run(ICoreApplication *iface, __x_ABI_CWindows_CAp
+             {
+                 args->IActivatedEventArgs_iface.lpVtbl = &core_args_vtbl;
+                 args->launch_vtbl = launch_vtbl;
++                args->prelaunch_vtbl = prelaunch_vtbl;
++                args->launch2_vtbl = launch2_vtbl;
++                args->view_vtbl = view_args_vtbl;
++                args->switcher_vtbl = switcher_vtbl;
+                 args->ref = 1;
+                 for (i = 0; i < view->activated_count; i++)
+                 {
