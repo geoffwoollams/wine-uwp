@@ -1,0 +1,2058 @@
+Subject: windows.ui.xaml: XAML text, XamlReader.Load and a built-in generic.xaml with default styles and templates (milestone 4, part 4)
+
+diff --git a/dlls/windows.ui.xaml/Makefile.in b/dlls/windows.ui.xaml/Makefile.in
+index 96647a9..26bc321 100644
+--- a/dlls/windows.ui.xaml/Makefile.in
++++ b/dlls/windows.ui.xaml/Makefile.in
+@@ -15,7 +15,9 @@ SOURCES = \
+ 	main.c \
+ 	panel.c \
+ 	presenter.c \
++	reader.c \
+ 	resources.c \
+ 	text_block.c \
+ 	window.c \
++	windows.ui.xaml.rc \
+ 	xbf.c
+diff --git a/dlls/windows.ui.xaml/classes.idl b/dlls/windows.ui.xaml/classes.idl
+index cb916d5..d56cb0e 100644
+--- a/dlls/windows.ui.xaml/classes.idl
++++ b/dlls/windows.ui.xaml/classes.idl
+@@ -54,6 +54,10 @@ namespace Windows.UI.Xaml.Controls.Primitives {
+     runtimeclass ToggleButton;
+ }
+ 
++namespace Windows.UI.Xaml.Markup {
++    runtimeclass XamlReader;
++}
++
+ namespace Windows.UI.Xaml.Media {
+     runtimeclass SolidColorBrush;
+ }
+diff --git a/dlls/windows.ui.xaml/element.c b/dlls/windows.ui.xaml/element.c
+index 3e4be56..b4ba3e6 100644
+--- a/dlls/windows.ui.xaml/element.c
++++ b/dlls/windows.ui.xaml/element.c
+@@ -1360,6 +1360,7 @@ void element_measure( struct xaml_element *element, struct layout_context *ctx,
+     const Thickness *m = &element->margin;
+     float width, height, content_width, content_height;
+ 
++    element_apply_default_style( element );
+     if (element->visibility != Visibility_Visible)
+     {
+         element->desired_width = element->desired_height = 0;
+@@ -1470,12 +1471,54 @@ void element_fill_color( struct layout_context *ctx, const struct layout_rect *r
+     DeleteObject( brush );
+ }
+ 
++/* a fill with alpha: theme brushes such as SystemControlBackgroundBaseLowBrush are translucent black or white */
++static void fill_argb( struct layout_context *ctx, const struct layout_rect *rect, Color c )
++{
++    BLENDFUNCTION blend = { AC_SRC_OVER, 0, c.A, 0 };
++    BITMAPINFO info = {{ sizeof(info.bmiHeader), 1, 1, 1, 32 }};
++    HBITMAP bitmap, old;
++    DWORD *bits;
++    HDC mem;
++    RECT r;
++
++    if (c.A == 0xff)
++    {
++        element_fill_color( ctx, rect, RGB( c.R, c.G, c.B ) );
++        return;
++    }
++    element_device_rect( rect, ctx, &r );
++    if (r.right <= r.left || r.bottom <= r.top) return;
++    mem = CreateCompatibleDC( ctx->hdc );
++    bitmap = CreateDIBSection( mem, &info, DIB_RGB_COLORS, (void **)&bits, NULL, 0 );
++    *bits = c.R << 16 | c.G << 8 | c.B;
++    old = SelectObject( mem, bitmap );
++    GdiAlphaBlend( ctx->hdc, r.left, r.top, r.right - r.left, r.bottom - r.top, mem, 0, 0, 1, 1, blend );
++    SelectObject( mem, old );
++    DeleteObject( bitmap );
++    DeleteDC( mem );
++}
++
+ void element_fill( struct layout_context *ctx, const struct layout_rect *rect, IBrush *brush )
+ {
+     Color c;
+ 
+     if (!brush || !brush_get_color( brush, &c ) || !c.A) return;
+-    element_fill_color( ctx, rect, RGB( c.R, c.G, c.B ) );
++    fill_argb( ctx, rect, c );
++}
++
++/* a translucent text colour, blended over what is under the middle of rect (GDI text has no alpha) */
++COLORREF element_text_color( struct layout_context *ctx, const struct layout_rect *rect, Color c )
++{
++    COLORREF under;
++    RECT r;
++
++    if (c.A == 0xff) return RGB( c.R, c.G, c.B );
++    element_device_rect( rect, ctx, &r );
++    under = GetPixel( ctx->hdc, (r.left + r.right) / 2, (r.top + r.bottom) / 2 );
++    if (under == CLR_INVALID) under = ctx->dark ? RGB(0, 0, 0) : RGB(255, 255, 255);
++    return RGB( (c.R * c.A + GetRValue( under ) * (255 - c.A)) / 255,
++                (c.G * c.A + GetGValue( under ) * (255 - c.A)) / 255,
++                (c.B * c.A + GetBValue( under ) * (255 - c.A)) / 255 );
+ }
+ 
+ void element_frame_color( struct layout_context *ctx, const struct layout_rect *rect, const Thickness *t, COLORREF color )
+@@ -1498,10 +1541,29 @@ void element_frame_color( struct layout_context *ctx, const struct layout_rect *
+ 
+ void element_frame( struct layout_context *ctx, const struct layout_rect *rect, const Thickness *t, IBrush *brush )
+ {
++    struct layout_rect side;
+     Color c;
+ 
+     if (!brush || !brush_get_color( brush, &c ) || !c.A) return;
+-    element_frame_color( ctx, rect, t, RGB( c.R, c.G, c.B ) );
++    if (c.A == 0xff)
++    {
++        element_frame_color( ctx, rect, t, RGB( c.R, c.G, c.B ) );
++        return;
++    }
++    side = *rect;
++    side.height = min( (float)t->Top, rect->height );
++    fill_argb( ctx, &side, c );
++    side.y = rect->y + rect->height - min( (float)t->Bottom, rect->height );
++    side.height = min( (float)t->Bottom, rect->height );
++    fill_argb( ctx, &side, c );
++    side = *rect;
++    side.y += t->Top;
++    side.height = max( 0.0f, rect->height - t->Top - t->Bottom );
++    side.width = min( (float)t->Left, rect->width );
++    fill_argb( ctx, &side, c );
++    side.x = rect->x + rect->width - min( (float)t->Right, rect->width );
++    side.width = min( (float)t->Right, rect->width );
++    fill_argb( ctx, &side, c );
+ }
+ 
+ /* text */
+diff --git a/dlls/windows.ui.xaml/generic.xaml b/dlls/windows.ui.xaml/generic.xaml
+new file mode 100644
+index 0000000..a993572
+--- /dev/null
++++ b/dlls/windows.ui.xaml/generic.xaml
+@@ -0,0 +1,412 @@
++<!--
++  Built-in theme resources and default styles for windows.ui.xaml, loaded from this DLL's resources.
++
++  Copyright 2026 wine-uwp contributors
++
++  This library is free software; you can redistribute it and/or
++  modify it under the terms of the GNU Lesser General Public
++  License as published by the Free Software Foundation; either
++  version 2.1 of the License, or (at your option) any later version.
++
++  This library is distributed in the hope that it will be useful,
++  but WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  Lesser General Public License for more details.
++
++  You should have received a copy of the GNU Lesser General Public
++  License along with this library; if not, write to the Free Software
++  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++
++  Written for wine-uwp, following the structure apps rely on in Windows 10's default styles: the same resource
++  keys (so an app's ButtonBackgroundPointerOver overrides the one used here), visual state names and template
++  part names, with the Windows 10 theme colours. CheckBox and RadioButton have no template yet; they draw
++  themselves (button.c) and only get their default property values here.
++-->
++<ResourceDictionary
++    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
++    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
++
++    <ResourceDictionary.ThemeDictionaries>
++        <ResourceDictionary x:Key="Light">
++            <SolidColorBrush x:Key="ApplicationPageBackgroundThemeBrush" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="ApplicationForegroundThemeBrush" Color="#FF000000"/>
++            <SolidColorBrush x:Key="ApplicationSecondaryForegroundThemeBrush" Color="#FF5F5F5F"/>
++            <SolidColorBrush x:Key="SystemControlForegroundBaseHighBrush" Color="#FF000000"/>
++            <SolidColorBrush x:Key="SystemControlForegroundBaseMediumHighBrush" Color="#CC000000"/>
++            <SolidColorBrush x:Key="SystemControlForegroundBaseMediumBrush" Color="#99000000"/>
++            <SolidColorBrush x:Key="SystemControlForegroundBaseMediumLowBrush" Color="#66000000"/>
++            <SolidColorBrush x:Key="SystemControlForegroundBaseLowBrush" Color="#33000000"/>
++            <SolidColorBrush x:Key="SystemControlForegroundTransparentBrush" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="SystemControlBackgroundBaseHighBrush" Color="#FF000000"/>
++            <SolidColorBrush x:Key="SystemControlBackgroundBaseMediumBrush" Color="#99000000"/>
++            <SolidColorBrush x:Key="SystemControlBackgroundBaseMediumLowBrush" Color="#66000000"/>
++            <SolidColorBrush x:Key="SystemControlBackgroundBaseLowBrush" Color="#33000000"/>
++            <SolidColorBrush x:Key="SystemControlBackgroundAltHighBrush" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="SystemControlBackgroundChromeMediumLowBrush" Color="#FFF2F2F2"/>
++            <SolidColorBrush x:Key="SystemControlBackgroundTransparentBrush" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="SystemControlHighlightBaseHighBrush" Color="#FF000000"/>
++            <SolidColorBrush x:Key="SystemControlHighlightBaseMediumBrush" Color="#99000000"/>
++            <SolidColorBrush x:Key="SystemControlHighlightBaseMediumLowBrush" Color="#66000000"/>
++            <SolidColorBrush x:Key="SystemControlHighlightBaseLowBrush" Color="#33000000"/>
++            <SolidColorBrush x:Key="SystemControlHighlightAltChromeWhiteBrush" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="SystemControlHighlightTransparentBrush" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="SystemControlDisabledBaseMediumLowBrush" Color="#66000000"/>
++            <SolidColorBrush x:Key="SystemControlDisabledBaseLowBrush" Color="#33000000"/>
++            <SolidColorBrush x:Key="SystemControlDisabledTransparentBrush" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="SystemControlForegroundAccentBrush" Color="#FF0078D7"/>
++            <SolidColorBrush x:Key="SystemControlHighlightAccentBrush" Color="#FF0078D7"/>
++            <SolidColorBrush x:Key="SystemControlBackgroundAccentBrush" Color="#FF0078D7"/>
++            <SolidColorBrush x:Key="ButtonBackground" Color="#33000000"/>
++            <SolidColorBrush x:Key="ButtonBackgroundPointerOver" Color="#33000000"/>
++            <SolidColorBrush x:Key="ButtonBackgroundPressed" Color="#66000000"/>
++            <SolidColorBrush x:Key="ButtonBackgroundDisabled" Color="#33000000"/>
++            <SolidColorBrush x:Key="ButtonForeground" Color="#FF000000"/>
++            <SolidColorBrush x:Key="ButtonForegroundPointerOver" Color="#FF000000"/>
++            <SolidColorBrush x:Key="ButtonForegroundPressed" Color="#FF000000"/>
++            <SolidColorBrush x:Key="ButtonForegroundDisabled" Color="#66000000"/>
++            <SolidColorBrush x:Key="ButtonBorderBrush" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="ButtonBorderBrushPointerOver" Color="#66000000"/>
++            <SolidColorBrush x:Key="ButtonBorderBrushPressed" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="ButtonBorderBrushDisabled" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonBackground" Color="#33000000"/>
++            <SolidColorBrush x:Key="ToggleButtonBackgroundPointerOver" Color="#33000000"/>
++            <SolidColorBrush x:Key="ToggleButtonBackgroundPressed" Color="#66000000"/>
++            <SolidColorBrush x:Key="ToggleButtonBackgroundDisabled" Color="#33000000"/>
++            <SolidColorBrush x:Key="ToggleButtonBackgroundChecked" Color="#FF0078D7"/>
++            <SolidColorBrush x:Key="ToggleButtonBackgroundCheckedPointerOver" Color="#FF0078D7"/>
++            <SolidColorBrush x:Key="ToggleButtonBackgroundCheckedPressed" Color="#66000000"/>
++            <SolidColorBrush x:Key="ToggleButtonBackgroundCheckedDisabled" Color="#33000000"/>
++            <SolidColorBrush x:Key="ToggleButtonForeground" Color="#FF000000"/>
++            <SolidColorBrush x:Key="ToggleButtonForegroundPointerOver" Color="#FF000000"/>
++            <SolidColorBrush x:Key="ToggleButtonForegroundPressed" Color="#FF000000"/>
++            <SolidColorBrush x:Key="ToggleButtonForegroundDisabled" Color="#66000000"/>
++            <SolidColorBrush x:Key="ToggleButtonForegroundChecked" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonForegroundCheckedPointerOver" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonForegroundCheckedPressed" Color="#FF000000"/>
++            <SolidColorBrush x:Key="ToggleButtonForegroundCheckedDisabled" Color="#66000000"/>
++            <SolidColorBrush x:Key="ToggleButtonBorderBrush" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonBorderBrushPointerOver" Color="#66000000"/>
++            <SolidColorBrush x:Key="ToggleButtonBorderBrushPressed" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonBorderBrushDisabled" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonBorderBrushChecked" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonBorderBrushCheckedPointerOver" Color="#66000000"/>
++            <SolidColorBrush x:Key="ToggleButtonBorderBrushCheckedPressed" Color="#00FFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonBorderBrushCheckedDisabled" Color="#00FFFFFF"/>
++        </ResourceDictionary>
++        <ResourceDictionary x:Key="Dark">
++            <SolidColorBrush x:Key="ApplicationPageBackgroundThemeBrush" Color="#FF000000"/>
++            <SolidColorBrush x:Key="ApplicationForegroundThemeBrush" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="ApplicationSecondaryForegroundThemeBrush" Color="#FFA0A0A0"/>
++            <SolidColorBrush x:Key="SystemControlForegroundBaseHighBrush" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="SystemControlForegroundBaseMediumHighBrush" Color="#CCFFFFFF"/>
++            <SolidColorBrush x:Key="SystemControlForegroundBaseMediumBrush" Color="#99FFFFFF"/>
++            <SolidColorBrush x:Key="SystemControlForegroundBaseMediumLowBrush" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="SystemControlForegroundBaseLowBrush" Color="#33FFFFFF"/>
++            <SolidColorBrush x:Key="SystemControlForegroundTransparentBrush" Color="#00000000"/>
++            <SolidColorBrush x:Key="SystemControlBackgroundBaseHighBrush" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="SystemControlBackgroundBaseMediumBrush" Color="#99FFFFFF"/>
++            <SolidColorBrush x:Key="SystemControlBackgroundBaseMediumLowBrush" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="SystemControlBackgroundBaseLowBrush" Color="#33FFFFFF"/>
++            <SolidColorBrush x:Key="SystemControlBackgroundAltHighBrush" Color="#FF000000"/>
++            <SolidColorBrush x:Key="SystemControlBackgroundChromeMediumLowBrush" Color="#FF171717"/>
++            <SolidColorBrush x:Key="SystemControlBackgroundTransparentBrush" Color="#00000000"/>
++            <SolidColorBrush x:Key="SystemControlHighlightBaseHighBrush" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="SystemControlHighlightBaseMediumBrush" Color="#99FFFFFF"/>
++            <SolidColorBrush x:Key="SystemControlHighlightBaseMediumLowBrush" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="SystemControlHighlightBaseLowBrush" Color="#33FFFFFF"/>
++            <SolidColorBrush x:Key="SystemControlHighlightAltChromeWhiteBrush" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="SystemControlHighlightTransparentBrush" Color="#00000000"/>
++            <SolidColorBrush x:Key="SystemControlDisabledBaseMediumLowBrush" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="SystemControlDisabledBaseLowBrush" Color="#33FFFFFF"/>
++            <SolidColorBrush x:Key="SystemControlDisabledTransparentBrush" Color="#00000000"/>
++            <SolidColorBrush x:Key="SystemControlForegroundAccentBrush" Color="#FF0078D7"/>
++            <SolidColorBrush x:Key="SystemControlHighlightAccentBrush" Color="#FF0078D7"/>
++            <SolidColorBrush x:Key="SystemControlBackgroundAccentBrush" Color="#FF0078D7"/>
++            <SolidColorBrush x:Key="ButtonBackground" Color="#33FFFFFF"/>
++            <SolidColorBrush x:Key="ButtonBackgroundPointerOver" Color="#33FFFFFF"/>
++            <SolidColorBrush x:Key="ButtonBackgroundPressed" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="ButtonBackgroundDisabled" Color="#33FFFFFF"/>
++            <SolidColorBrush x:Key="ButtonForeground" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="ButtonForegroundPointerOver" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="ButtonForegroundPressed" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="ButtonForegroundDisabled" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="ButtonBorderBrush" Color="#00000000"/>
++            <SolidColorBrush x:Key="ButtonBorderBrushPointerOver" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="ButtonBorderBrushPressed" Color="#00000000"/>
++            <SolidColorBrush x:Key="ButtonBorderBrushDisabled" Color="#00000000"/>
++            <SolidColorBrush x:Key="ToggleButtonBackground" Color="#33FFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonBackgroundPointerOver" Color="#33FFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonBackgroundPressed" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonBackgroundDisabled" Color="#33FFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonBackgroundChecked" Color="#FF0078D7"/>
++            <SolidColorBrush x:Key="ToggleButtonBackgroundCheckedPointerOver" Color="#FF0078D7"/>
++            <SolidColorBrush x:Key="ToggleButtonBackgroundCheckedPressed" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonBackgroundCheckedDisabled" Color="#33FFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonForeground" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonForegroundPointerOver" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonForegroundPressed" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonForegroundDisabled" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonForegroundChecked" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonForegroundCheckedPointerOver" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonForegroundCheckedPressed" Color="#FFFFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonForegroundCheckedDisabled" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonBorderBrush" Color="#00000000"/>
++            <SolidColorBrush x:Key="ToggleButtonBorderBrushPointerOver" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonBorderBrushPressed" Color="#00000000"/>
++            <SolidColorBrush x:Key="ToggleButtonBorderBrushDisabled" Color="#00000000"/>
++            <SolidColorBrush x:Key="ToggleButtonBorderBrushChecked" Color="#00000000"/>
++            <SolidColorBrush x:Key="ToggleButtonBorderBrushCheckedPointerOver" Color="#66FFFFFF"/>
++            <SolidColorBrush x:Key="ToggleButtonBorderBrushCheckedPressed" Color="#00000000"/>
++            <SolidColorBrush x:Key="ToggleButtonBorderBrushCheckedDisabled" Color="#00000000"/>
++        </ResourceDictionary>
++    </ResourceDictionary.ThemeDictionaries>
++
++    <Style x:Key="BaseTextBlockStyle" TargetType="TextBlock">
++        <Setter Property="FontSize" Value="14"/>
++        <Setter Property="FontWeight" Value="SemiBold"/>
++        <Setter Property="TextWrapping" Value="Wrap"/>
++    </Style>
++    <Style x:Key="HeaderTextBlockStyle" TargetType="TextBlock" BasedOn="{StaticResource BaseTextBlockStyle}">
++        <Setter Property="FontSize" Value="46"/>
++        <Setter Property="FontWeight" Value="Light"/>
++    </Style>
++    <Style x:Key="SubheaderTextBlockStyle" TargetType="TextBlock" BasedOn="{StaticResource BaseTextBlockStyle}">
++        <Setter Property="FontSize" Value="34"/>
++        <Setter Property="FontWeight" Value="Light"/>
++    </Style>
++    <Style x:Key="TitleTextBlockStyle" TargetType="TextBlock" BasedOn="{StaticResource BaseTextBlockStyle}">
++        <Setter Property="FontSize" Value="24"/>
++        <Setter Property="FontWeight" Value="SemiLight"/>
++    </Style>
++    <Style x:Key="SubtitleTextBlockStyle" TargetType="TextBlock" BasedOn="{StaticResource BaseTextBlockStyle}">
++        <Setter Property="FontSize" Value="20"/>
++        <Setter Property="FontWeight" Value="Normal"/>
++    </Style>
++    <Style x:Key="BodyTextBlockStyle" TargetType="TextBlock" BasedOn="{StaticResource BaseTextBlockStyle}">
++        <Setter Property="FontWeight" Value="Normal"/>
++    </Style>
++    <Style x:Key="CaptionTextBlockStyle" TargetType="TextBlock" BasedOn="{StaticResource BaseTextBlockStyle}">
++        <Setter Property="FontSize" Value="12"/>
++        <Setter Property="FontWeight" Value="Normal"/>
++    </Style>
++
++    <Style TargetType="Button">
++        <Setter Property="Background" Value="{ThemeResource ButtonBackground}"/>
++        <Setter Property="Foreground" Value="{ThemeResource ButtonForeground}"/>
++        <Setter Property="BorderBrush" Value="{ThemeResource ButtonBorderBrush}"/>
++        <Setter Property="BorderThickness" Value="2"/>
++        <Setter Property="Padding" Value="8,4,8,5"/>
++        <Setter Property="HorizontalAlignment" Value="Left"/>
++        <Setter Property="VerticalAlignment" Value="Center"/>
++        <Setter Property="HorizontalContentAlignment" Value="Center"/>
++        <Setter Property="VerticalContentAlignment" Value="Center"/>
++        <Setter Property="FontWeight" Value="Normal"/>
++        <Setter Property="FontSize" Value="14"/>
++        <Setter Property="Template">
++            <Setter.Value>
++                <ControlTemplate TargetType="Button">
++                    <ContentPresenter x:Name="ContentPresenter"
++                                      Background="{TemplateBinding Background}"
++                                      BorderBrush="{TemplateBinding BorderBrush}"
++                                      BorderThickness="{TemplateBinding BorderThickness}"
++                                      Content="{TemplateBinding Content}"
++                                      Padding="{TemplateBinding Padding}"
++                                      Foreground="{TemplateBinding Foreground}"
++                                      FontSize="{TemplateBinding FontSize}"
++                                      HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}"
++                                      VerticalContentAlignment="{TemplateBinding VerticalContentAlignment}">
++                        <VisualStateManager.VisualStateGroups>
++                            <VisualStateGroup x:Name="CommonStates">
++                            <VisualState x:Name="Normal"/>
++                            <VisualState x:Name="PointerOver">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Background">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ButtonBackgroundPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="BorderBrush">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ButtonBorderBrushPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ButtonForegroundPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="Pressed">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Background">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ButtonBackgroundPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="BorderBrush">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ButtonBorderBrushPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ButtonForegroundPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="Disabled">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Background">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ButtonBackgroundDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="BorderBrush">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ButtonBorderBrushDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ButtonForegroundDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            </VisualStateGroup>
++                        </VisualStateManager.VisualStateGroups>
++                    </ContentPresenter>
++                </ControlTemplate>
++            </Setter.Value>
++        </Setter>
++    </Style>
++
++    <Style TargetType="ToggleButton">
++        <Setter Property="Background" Value="{ThemeResource ToggleButtonBackground}"/>
++        <Setter Property="Foreground" Value="{ThemeResource ToggleButtonForeground}"/>
++        <Setter Property="BorderBrush" Value="{ThemeResource ToggleButtonBorderBrush}"/>
++        <Setter Property="BorderThickness" Value="2"/>
++        <Setter Property="Padding" Value="8,4,8,5"/>
++        <Setter Property="HorizontalAlignment" Value="Left"/>
++        <Setter Property="VerticalAlignment" Value="Center"/>
++        <Setter Property="HorizontalContentAlignment" Value="Center"/>
++        <Setter Property="VerticalContentAlignment" Value="Center"/>
++        <Setter Property="FontWeight" Value="Normal"/>
++        <Setter Property="FontSize" Value="14"/>
++        <Setter Property="Template">
++            <Setter.Value>
++                <ControlTemplate TargetType="ToggleButton">
++                    <ContentPresenter x:Name="ContentPresenter"
++                                      Background="{TemplateBinding Background}"
++                                      BorderBrush="{TemplateBinding BorderBrush}"
++                                      BorderThickness="{TemplateBinding BorderThickness}"
++                                      Content="{TemplateBinding Content}"
++                                      Padding="{TemplateBinding Padding}"
++                                      Foreground="{TemplateBinding Foreground}"
++                                      FontSize="{TemplateBinding FontSize}"
++                                      HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}"
++                                      VerticalContentAlignment="{TemplateBinding VerticalContentAlignment}">
++                        <VisualStateManager.VisualStateGroups>
++                            <VisualStateGroup x:Name="CommonStates">
++                            <VisualState x:Name="Normal"/>
++                            <VisualState x:Name="PointerOver">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Background">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ToggleButtonBackgroundPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="BorderBrush">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ToggleButtonBorderBrushPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ToggleButtonForegroundPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="Pressed">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Background">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ToggleButtonBackgroundPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="BorderBrush">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ToggleButtonBorderBrushPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ToggleButtonForegroundPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="Disabled">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Background">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ToggleButtonBackgroundDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="BorderBrush">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ToggleButtonBorderBrushDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ToggleButtonForegroundDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="Checked">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Background">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ToggleButtonBackgroundChecked}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="BorderBrush">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ToggleButtonBorderBrushChecked}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ToggleButtonForegroundChecked}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="CheckedPointerOver">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Background">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ToggleButtonBackgroundCheckedPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="BorderBrush">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ToggleButtonBorderBrushCheckedPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ToggleButtonForegroundCheckedPointerOver}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="CheckedPressed">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Background">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ToggleButtonBackgroundCheckedPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="BorderBrush">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ToggleButtonBorderBrushCheckedPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ToggleButtonForegroundCheckedPressed}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            <VisualState x:Name="CheckedDisabled">
++                                <Storyboard>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Background">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ToggleButtonBackgroundCheckedDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="BorderBrush">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ToggleButtonBorderBrushCheckedDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentPresenter" Storyboard.TargetProperty="Foreground">
++                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource ToggleButtonForegroundCheckedDisabled}"/>
++                                    </ObjectAnimationUsingKeyFrames>
++                                </Storyboard>
++                            </VisualState>
++                            </VisualStateGroup>
++                        </VisualStateManager.VisualStateGroups>
++                    </ContentPresenter>
++                </ControlTemplate>
++            </Setter.Value>
++        </Setter>
++    </Style>
++
++    <Style TargetType="CheckBox">
++        <Setter Property="Padding" Value="8,5,0,0"/>
++        <Setter Property="HorizontalAlignment" Value="Left"/>
++        <Setter Property="VerticalAlignment" Value="Center"/>
++        <Setter Property="HorizontalContentAlignment" Value="Left"/>
++        <Setter Property="VerticalContentAlignment" Value="Top"/>
++        <Setter Property="FontSize" Value="14"/>
++    </Style>
++
++    <Style TargetType="RadioButton">
++        <Setter Property="Padding" Value="8,5,0,0"/>
++        <Setter Property="HorizontalAlignment" Value="Left"/>
++        <Setter Property="VerticalAlignment" Value="Center"/>
++        <Setter Property="HorizontalContentAlignment" Value="Left"/>
++        <Setter Property="VerticalContentAlignment" Value="Top"/>
++        <Setter Property="FontSize" Value="14"/>
++    </Style>
++</ResourceDictionary>
+diff --git a/dlls/windows.ui.xaml/main.c b/dlls/windows.ui.xaml/main.c
+index 8b335d2..f49e21e 100644
+--- a/dlls/windows.ui.xaml/main.c
++++ b/dlls/windows.ui.xaml/main.c
+@@ -66,6 +66,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( page_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Frame ))
+         IActivationFactory_QueryInterface( frame_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Markup_XamlReader ))
++        IActivationFactory_QueryInterface( xaml_reader_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ContentPresenter ))
+         IActivationFactory_QueryInterface( content_presenter_factory, &IID_IActivationFactory, (void **)factory );
+ 
+diff --git a/dlls/windows.ui.xaml/presenter.c b/dlls/windows.ui.xaml/presenter.c
+index da3a86b..a55ae2c 100644
+--- a/dlls/windows.ui.xaml/presenter.c
++++ b/dlls/windows.ui.xaml/presenter.c
+@@ -148,7 +148,7 @@ static void presenter_render( struct xaml_element *element, struct layout_contex
+ 
+     element_fill( ctx, &element->bounds, impl->background );
+     element_frame( ctx, &element->bounds, &impl->border_thickness, impl->border_brush );
+-    if (impl->foreground && brush_get_color( impl->foreground, &c )) color = RGB( c.R, c.G, c.B );
++    if (impl->foreground && brush_get_color( impl->foreground, &c )) color = element_text_color( ctx, &element->bounds, c );
+     if (impl->child)
+     {
+         ctx->foreground = color;
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index 331d5cd..b1c2c0d 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -75,6 +75,7 @@ extern IActivationFactory *user_control_factory;
+ extern IActivationFactory *page_factory;
+ extern IActivationFactory *frame_factory;
+ extern IActivationFactory *content_presenter_factory;
++extern IActivationFactory *xaml_reader_factory;
+ 
+ /* event handler lists (handlers are kept, tokens are indices + 1) */
+ struct event_list
+@@ -104,6 +105,8 @@ HRESULT xbf_parse( BYTE *data, SIZE_T size, struct xbf **out );
+ HRESULT xbf_load( struct xbf *xbf, IInspectable *root, IInspectable **out );
+ void xbf_free( struct xbf *xbf );
+ HRESULT load_component( IInspectable *component, HSTRING uri );
++HRESULT xaml_text_load( const WCHAR *text, SIZE_T len, IInspectable *root, IInspectable **out );
++IInspectable *generic_resource_lookup( const WCHAR *key );   /* generic.xaml; referenced, or NULL */
+ 
+ /* markup.c: what the XBF object writer does to objects */
+ struct xprop;
+@@ -196,6 +199,7 @@ struct xaml_element
+     IInspectable *resources;                   /* FrameworkElement.Resources */
+     IInspectable *style;                       /* FrameworkElement.Style */
+     BOOL implicit_style_done;
++    BOOL default_style_done;
+     IInspectable *visual_state_groups;         /* VisualStateManager.VisualStateGroups (a template's root) */
+     IInspectable *template;                    /* Control.Template */
+     struct template_instance *template_instance;
+@@ -216,6 +220,7 @@ struct xaml_element *element_from_object( IInspectable *object );   /* NULL with
+ IInspectable *element_resources( IInspectable *object );            /* FrameworkElement.Resources, not referenced */
+ void element_mark_local( struct xaml_element *element, const WCHAR *property );
+ void element_set_template( struct xaml_element *element, IInspectable *template );
++void element_apply_default_style( struct xaml_element *element );
+ /* a resource in the element's or its ancestors' Resources, or the application's; referenced, or NULL */
+ IInspectable *element_lookup_resource( struct xaml_element *element, const WCHAR *key );
+ BOOL element_is_local( struct xaml_element *element, const WCHAR *property );
+@@ -248,6 +253,7 @@ void element_device_rect( const struct layout_rect *rect, struct layout_context
+ void element_fill( struct layout_context *ctx, const struct layout_rect *rect, IBrush *brush );
+ void element_frame( struct layout_context *ctx, const struct layout_rect *rect, const Thickness *thickness, IBrush *brush );
+ void element_fill_color( struct layout_context *ctx, const struct layout_rect *rect, COLORREF color );
++COLORREF element_text_color( struct layout_context *ctx, const struct layout_rect *rect, Color color );
+ void element_frame_color( struct layout_context *ctx, const struct layout_rect *rect, const Thickness *thickness,
+                           COLORREF color );
+ BOOL definition_get( IInspectable *object, GridLength *length, double *min, double *max );
+diff --git a/dlls/windows.ui.xaml/reader.c b/dlls/windows.ui.xaml/reader.c
+new file mode 100644
+index 0000000..1c741ea
+--- /dev/null
++++ b/dlls/windows.ui.xaml/reader.c
+@@ -0,0 +1,134 @@
++/* WinRT Windows.UI.Xaml.Markup.XamlReader implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* XamlReader.Load: XAML text into objects. Event handlers and x:Class aren't allowed in it, as on Windows. */
++
++struct reader_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IXamlReaderStatics IXamlReaderStatics_iface;
++};
++
++static inline struct reader_statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct reader_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct reader_statics *impl = impl_from_IActivationFactory( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IXamlReaderStatics ))
++        *out = &impl->IXamlReaderStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    return 2;
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    return 1;
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( reader_statics, IXamlReaderStatics, struct reader_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI reader_statics_Load( IXamlReaderStatics *iface, HSTRING xaml, IInspectable **value )
++{
++    UINT32 len;
++    const WCHAR *text = WindowsGetStringRawBuffer( xaml, &len );
++    HRESULT hr;
++
++    TRACE( "iface %p, xaml %s, value %p.\n", iface, debugstr_hstring(xaml), value );
++    if (!value) return E_POINTER;
++    if (FAILED(hr = xaml_text_load( text, len, NULL, value ))) WARN( "Load failed, hr %#lx.\n", hr );
++    return hr;
++}
++
++static HRESULT WINAPI reader_statics_LoadWithInitialTemplateValidation( IXamlReaderStatics *iface, HSTRING xaml, IInspectable **value )
++{
++    TRACE( "iface %p, xaml %s, value %p.\n", iface, debugstr_hstring(xaml), value );
++    return reader_statics_Load( iface, xaml, value );
++}
++
++static const struct IXamlReaderStaticsVtbl reader_statics_vtbl =
++{
++    reader_statics_QueryInterface,
++    reader_statics_AddRef,
++    reader_statics_Release,
++    /* IInspectable methods */
++    reader_statics_GetIids,
++    reader_statics_GetRuntimeClassName,
++    reader_statics_GetTrustLevel,
++    /* IXamlReaderStatics methods */
++    reader_statics_Load,
++    reader_statics_LoadWithInitialTemplateValidation,
++};
++
++static struct reader_statics reader_statics = { {&factory_vtbl}, {&reader_statics_vtbl} };
++IActivationFactory *xaml_reader_factory = &reader_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/text_block.c b/dlls/windows.ui.xaml/text_block.c
+index 9cf6111..4404409 100644
+--- a/dlls/windows.ui.xaml/text_block.c
++++ b/dlls/windows.ui.xaml/text_block.c
+@@ -436,7 +436,7 @@ static void text_block_render( struct xaml_element *element, struct layout_conte
+     if (impl->foreground)
+     {
+         if (!brush_get_color( impl->foreground, &c ) || !c.A) return;
+-        color = RGB( c.R, c.G, c.B );
++        color = element_text_color( ctx, &element->bounds, c );
+     }
+     rect.x += p->Left;
+     rect.y += p->Top;
+diff --git a/dlls/windows.ui.xaml/windows.ui.xaml.rc b/dlls/windows.ui.xaml/windows.ui.xaml.rc
+new file mode 100644
+index 0000000..1cabfc3
+--- /dev/null
++++ b/dlls/windows.ui.xaml/windows.ui.xaml.rc
+@@ -0,0 +1,22 @@
++/*
++ * Resources for windows.ui.xaml
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/* @makedep: generic.xaml */
++GENERIC_XAML RCDATA generic.xaml
+diff --git a/dlls/windows.ui.xaml/xbf.c b/dlls/windows.ui.xaml/xbf.c
+index 2f90808..21333a9 100644
+--- a/dlls/windows.ui.xaml/xbf.c
++++ b/dlls/windows.ui.xaml/xbf.c
+@@ -722,6 +722,8 @@ struct writer
+     UINT32 name_count;
+     struct binding *bindings;        /* a template's TemplateBindings */
+     UINT32 binding_count;
++    struct xml_doc *doc;             /* text markup being read */
++    BOOL defer_resources;            /* generic.xaml: style setters look their resources up when applied */
+ };
+ 
+ static void register_name( struct writer *w, const WCHAR *name, IInspectable *object )
+@@ -782,6 +784,7 @@ enum set_mode
+     SET_LOCAL,   /* markup or app code: the value wins over styles */
+     SET_STYLE,   /* a style setter: skipped where a local value is set */
+     SET_STATE,   /* a visual state: neither */
++    SET_DEFAULT, /* the default style (generic.xaml): skipped where a local or style value is set */
+ };
+ 
+ static HRESULT set_property( struct writer *w, IInspectable *target, const struct xprop *prop, struct xvalue *value,
+@@ -799,6 +802,7 @@ struct style_setter
+ {
+     struct xprop prop;
+     struct xvalue value;
++    WCHAR *resource;     /* {StaticResource}/{ThemeResource} key looked up when applied (text markup), or NULL */
+ };
+ 
+ struct style
+@@ -856,7 +860,11 @@ static ULONG WINAPI style_Release( IStyle *iface )
+ 
+     if (!ref)
+     {
+-        for (i = 0; i < impl->count; i++) xvalue_clear( &impl->setters[i].value );
++        for (i = 0; i < impl->count; i++)
++        {
++            xvalue_clear( &impl->setters[i].value );
++            free( impl->setters[i].resource );
++        }
+         free( impl->setters );
+         if (impl->based_on) IInspectable_Release( impl->based_on );
+         free( impl );
+@@ -976,6 +984,8 @@ static void style_add_setter( struct style *impl, const struct xprop *prop, stru
+     {
+         if (wcscmp( impl->setters[i].prop.name, prop->name )) continue;
+         xvalue_clear( &impl->setters[i].value );   /* a later setter for the same property wins */
++        free( impl->setters[i].resource );
++        impl->setters[i].resource = NULL;
+         impl->setters[i].value = *value;
+         memset( value, 0, sizeof(*value) );
+         return;
+@@ -984,28 +994,58 @@ static void style_add_setter( struct style *impl, const struct xprop *prop, stru
+     impl->setters = setters;
+     setters[impl->count].prop = *prop;
+     setters[impl->count].value = *value;
++    setters[impl->count].resource = NULL;
+     memset( value, 0, sizeof(*value) );
+     impl->count++;
+ }
+ 
+ /* apply BasedOn's setters, then the style's own; properties set directly on the element keep their values */
+-void style_apply( IInspectable *style, IInspectable *target )
++/* a resource for a style applied to target: the element's and its ancestors' resources, the application's, then
++ * the built-in ones; so an app's ButtonBackground overrides the one generic.xaml's Button style refers to */
++static IInspectable *target_resource( IInspectable *target, const WCHAR *key )
++{
++    struct xaml_element *element = element_from_object( target );
++    IInspectable *value = NULL, *dict;
++
++    if (element) value = element_lookup_resource( element, key );
++    else if ((dict = application_resources())) value = resource_dictionary_lookup( dict, key );
++    if (!value) value = generic_resource_lookup( key );
++    if (!value) value = theme_resource_lookup( key );
++    return value;
++}
++
++static void style_apply_mode( IInspectable *style, IInspectable *target, enum set_mode mode )
+ {
+     struct style *impl = style_from_object( style );
+     struct xvalue copy;
+     UINT32 i;
+ 
+     if (!impl) return;
+-    TRACE( "style %p (%s, %u setters) on %p.\n", impl, debugstr_w(impl->target), impl->count, target );
+-    if (impl->based_on) style_apply( impl->based_on, target );
++    TRACE( "style %p (%s, %u setters) on %p, mode %d.\n", impl, debugstr_w(impl->target), impl->count, target, mode );
++    if (impl->based_on) style_apply_mode( impl->based_on, target, mode );
+     for (i = 0; i < impl->count; i++)
+     {
+-        xvalue_copy( &copy, &impl->setters[i].value );
+-        set_property( NULL, target, &impl->setters[i].prop, &copy, SET_STYLE );
++        if (impl->setters[i].resource)
++        {
++            memset( &copy, 0, sizeof(copy) );
++            if (!(copy.object = target_resource( target, impl->setters[i].resource )))
++            {
++                WARN( "resource %s for %s not found.\n", debugstr_w(impl->setters[i].resource), debugstr_w(impl->setters[i].prop.name) );
++                continue;
++            }
++            copy.kind = XV_OBJECT;
++        }
++        else xvalue_copy( &copy, &impl->setters[i].value );
++        set_property( NULL, target, &impl->setters[i].prop, &copy, mode );
+         xvalue_clear( &copy );
+     }
+ }
+ 
++void style_apply( IInspectable *style, IInspectable *target )
++{
++    style_apply_mode( style, target, SET_STYLE );
++}
++
+ /* where a setter's {StaticResource}/{ThemeResource} value node puts Setter.Value */
+ struct value_sink
+ {
+@@ -1227,6 +1267,11 @@ static BOOL is_bag_type( const WCHAR *name )
+ 
+ /* ---- ControlTemplate: a deferred node stream, instantiated for each templated control ---- */
+ 
++struct xml_doc;
++struct xml_node;
++static void xml_doc_addref( struct xml_doc *doc );
++static void xml_doc_release( struct xml_doc *doc );
++
+ struct control_template
+ {
+     IControlTemplate IControlTemplate_iface;
+@@ -1235,6 +1280,8 @@ struct control_template
+     struct xbf *xbf;     /* referenced */
+     UINT32 stream;
+     BOOL has_content;
++    struct xml_doc *doc; /* text markup: referenced, and the template's element in it */
++    struct xml_node *node;
+ };
+ 
+ static const struct IControlTemplateVtbl control_template_vtbl;
+@@ -1287,6 +1334,7 @@ static ULONG WINAPI control_template_Release( IControlTemplate *iface )
+     if (!ref)
+     {
+         if (impl->xbf) xbf_free( impl->xbf );
++        if (impl->doc) xml_doc_release( impl->doc );
+         free( impl );
+     }
+     return ref;
+@@ -1648,6 +1696,29 @@ static BOOL prop_is( const struct xprop *prop, const WCHAR *name )
+     return !wcscmp( prop->name, name );
+ }
+ 
++/* local values beat style values, which beat the default style's; TRUE if this mode must leave the value alone */
++static BOOL precedence_skip( struct xaml_element *element, const WCHAR *name, enum set_mode mode )
++{
++    WCHAR styled[100];
++
++    styled[0] = 1;
++    lstrcpynW( styled + 1, name, ARRAY_SIZE(styled) - 1 );
++    switch (mode)
++    {
++    case SET_LOCAL:
++        element_mark_local( element, name );
++        return FALSE;
++    case SET_STYLE:
++        if (element_is_local( element, name )) return TRUE;
++        element_mark_local( element, styled );
++        return FALSE;
++    case SET_DEFAULT:
++        return element_is_local( element, name ) || element_is_local( element, styled );
++    default:
++        return FALSE;
++    }
++}
++
+ #define QI( obj, I, out ) SUCCEEDED(IInspectable_QueryInterface( obj, &IID_##I, (void **)out ))
+ 
+ /* Set prop on target from a markup value. Unsupported properties are logged and skipped. */
+@@ -1711,8 +1782,7 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+     }
+     if (prop_is( prop, L"Template" ) && (element = element_from_object( target )))
+     {
+-        if (mode == SET_STYLE && element_is_local( element, prop->name )) return S_OK;
+-        if (mode == SET_LOCAL) element_mark_local( element, prop->name );
++        if (precedence_skip( element, prop->name, mode )) return S_OK;
+         if (value->kind == XV_OBJECT && template_from_object( value->object ))
+             element_set_template( element, value->object );
+         return S_OK;
+@@ -1730,10 +1800,9 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+     }
+     if ((element = element_from_object( target )) && !prop->directive && !prop_is( prop, L"Name" ) && !prop_is( prop, L"Style" ))
+     {
+-        if (mode == SET_LOCAL) element_mark_local( element, prop->name );
+-        else if (mode == SET_STYLE && element_is_local( element, prop->name ))
++        if (precedence_skip( element, prop->name, mode ))
+         {
+-            TRACE( "%s is set locally, the style doesn't change it.\n", debugstr_w(prop->name) );
++            TRACE( "%s has a value of higher precedence, mode %d leaves it.\n", debugstr_w(prop->name), mode );
+             return S_OK;
+         }
+     }
+@@ -1823,6 +1892,29 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+             return S_OK;
+         }
+     }
++    if (prop_is( prop, L"FontWeight" ))
++    {
++        static const struct { const WCHAR *name; UINT16 weight; } weights[] =
++        {
++            { L"Thin", 100 }, { L"ExtraLight", 200 }, { L"Light", 300 }, { L"SemiLight", 350 }, { L"Normal", 400 },
++            { L"Medium", 500 }, { L"SemiBold", 600 }, { L"Bold", 700 }, { L"ExtraBold", 800 }, { L"Black", 900 },
++            { L"ExtraBlack", 950 },
++        };
++        FontWeight weight = { 0 };
++        UINT32 i;
++
++        if (value->kind == XV_STRING)
++        {
++            for (i = 0; i < ARRAY_SIZE(weights); i++) if (!wcsicmp( value->s, weights[i].name )) weight.Weight = weights[i].weight;
++            if (!weight.Weight) weight.Weight = wcstol( value->s, NULL, 10 );
++        }
++        else if (to_int( value, &e )) weight.Weight = e;
++        if (weight.Weight)
++        {
++            if (QI( target, ITextBlock, &tb )) { ITextBlock_put_FontWeight( tb, weight ); ITextBlock_Release( tb ); return S_OK; }
++            if (QI( target, IControl, &control )) { IControl_put_FontWeight( control, weight ); IControl_Release( control ); return S_OK; }
++        }
++    }
+     if (prop_is( prop, L"FontSize" ) && to_double( value, &d ))
+     {
+         IContentPresenter *presenter;
+@@ -2156,7 +2248,10 @@ static IInspectable *lookup_resource( struct writer *w, const WCHAR *key, BOOL t
+         if ((dict = element_resources( w->stack[i].object ))) value = resource_dictionary_lookup( dict, key );
+         else value = resource_dictionary_lookup( w->stack[i].object, key );
+     }
++    if (!value && w->templated_parent && element_from_object( w->templated_parent ))
++        value = element_lookup_resource( element_from_object( w->templated_parent ), key );
+     if (!value && (dict = application_resources())) value = resource_dictionary_lookup( dict, key );
++    if (!value) value = generic_resource_lookup( key );
+     if (!value) value = theme_resource_lookup( key );
+     if (!value && !quiet) WARN( "%s resource %s not found.\n", theme ? "theme" : "static", debugstr_w(key) );
+     return value;
+@@ -2229,6 +2324,30 @@ enum run_mode
+ 
+ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, enum run_mode mode );
+ 
++/* {TemplateBinding source}: set target.prop from the templated parent now, and keep the binding so that later
++ * changes on the control reach the template */
++static void template_bind( struct writer *w, IInspectable *target, const struct xprop *prop, const WCHAR *source )
++{
++    struct binding *binding;
++    struct xvalue value;
++
++    if (!w->templated_parent || !target) return;
++    if ((binding = realloc( w->bindings, (w->binding_count + 1) * sizeof(*binding) )))
++    {
++        w->bindings = binding;
++        binding += w->binding_count++;
++        IInspectable_AddRef( (binding->target = target) );
++        binding->prop = *prop;
++        lstrcpynW( binding->source, source, ARRAY_SIZE(binding->source) );
++    }
++    if (get_value( w->templated_parent, source, &value ))
++    {
++        set_property( w, target, prop, &value, SET_LOCAL );
++        xvalue_clear( &value );
++    }
++    else FIXME( "TemplateBinding from %s is not supported.\n", debugstr_w(source) );
++}
++
+ static void add_to_collection( IInspectable *collection, struct xvalue *value )
+ {
+     IVector_IInspectable *vector;
+@@ -2588,26 +2707,7 @@ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, enum run
+         case NODE_SET_VALUE_FROM_TEMPLATE_BINDING:
+             read_property( &r, &prop );
+             read_property( &r, &prop2 );
+-            if (w->templated_parent)
+-            {
+-                struct binding *binding;
+-
+-                /* kept, so that later changes on the control reach the template */
+-                if (top_object( w ) && (binding = realloc( w->bindings, (w->binding_count + 1) * sizeof(*binding) )))
+-                {
+-                    w->bindings = binding;
+-                    binding += w->binding_count++;
+-                    IInspectable_AddRef( (binding->target = top_object( w )) );
+-                    binding->prop = prop;
+-                    lstrcpynW( binding->source, prop2.name, ARRAY_SIZE(binding->source) );
+-                }
+-                if (get_value( w->templated_parent, prop2.name, &value ))
+-                {
+-                    set_property( w, top_object( w ), &prop, &value, SET_LOCAL );
+-                    xvalue_clear( &value );
+-                }
+-                else FIXME( "TemplateBinding from %s.%s is not supported.\n", debugstr_w(prop2.owner), debugstr_w(prop2.name) );
+-            }
++            template_bind( w, top_object( w ), &prop, prop2.name );
+             break;
+         case NODE_SET_VALUE_CONVERTED_RESOLVED_PROPERTY:
+             read_property( &r, &prop );
+@@ -2673,6 +2773,929 @@ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, enum run
+ 
+ /* Build the objects of an XBF file's main node stream. With root, the markup's root element is root itself
+  * (Application.LoadComponent); otherwise *out receives the root object. */
++/* ---- XAML text: XamlReader.Load and the built-in generic.xaml ----
++ *
++ * A small XML reader builds a tree of the markup, which is then run through the same object writer as compiled XBF:
++ * elements create objects, attributes and property elements set properties, children go to the content property.
++ * Control templates keep their part of the tree and build it for each control. */
++
++#define NS_PRESENTATION L"http://schemas.microsoft.com/winfx/2006/xaml/presentation"
++#define NS_XAML L"http://schemas.microsoft.com/winfx/2006/xaml"
++
++struct xml_attr
++{
++    WCHAR *ns;      /* NULL for unprefixed attributes */
++    WCHAR *name;    /* local name, "Grid.Row" for attached properties */
++    WCHAR *value;
++};
++
++struct xml_node
++{
++    WCHAR *ns, *name;
++    struct xml_attr *attrs;
++    UINT32 attr_count;
++    struct xml_node **children;
++    UINT32 child_count;
++    WCHAR *text;    /* character content, trimmed; NULL if only white space */
++};
++
++struct xml_doc
++{
++    LONG ref;
++    struct xml_node *root;
++};
++
++struct xml_parser
++{
++    const WCHAR *p, *end;
++    struct { WCHAR *prefix, *uri; } *ns;
++    UINT32 ns_count, ns_size;
++    BOOL failed;
++};
++
++static void xml_node_free( struct xml_node *node )
++{
++    UINT32 i;
++
++    if (!node) return;
++    for (i = 0; i < node->attr_count; i++)
++    {
++        free( node->attrs[i].ns );
++        free( node->attrs[i].name );
++        free( node->attrs[i].value );
++    }
++    for (i = 0; i < node->child_count; i++) xml_node_free( node->children[i] );
++    free( node->attrs );
++    free( node->children );
++    free( node->ns );
++    free( node->name );
++    free( node->text );
++    free( node );
++}
++
++static void xml_doc_addref( struct xml_doc *doc )
++{
++    InterlockedIncrement( &doc->ref );
++}
++
++static void xml_doc_release( struct xml_doc *doc )
++{
++    if (InterlockedDecrement( &doc->ref )) return;
++    xml_node_free( doc->root );
++    free( doc );
++}
++
++static WCHAR *wcsndup_( const WCHAR *str, SIZE_T len )
++{
++    WCHAR *ret = malloc( (len + 1) * sizeof(WCHAR) );
++    if (!ret) return NULL;
++    memcpy( ret, str, len * sizeof(WCHAR) );
++    ret[len] = 0;
++    return ret;
++}
++
++static BOOL xml_space( WCHAR c )
++{
++    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
++}
++
++static void xml_skip_space( struct xml_parser *x )
++{
++    while (x->p < x->end && xml_space( *x->p )) x->p++;
++}
++
++static BOOL xml_starts( struct xml_parser *x, const WCHAR *str )
++{
++    SIZE_T len = wcslen( str );
++    return x->end - x->p >= len && !memcmp( x->p, str, len * sizeof(WCHAR) );
++}
++
++static BOOL xml_skip_past( struct xml_parser *x, const WCHAR *str )
++{
++    SIZE_T len = wcslen( str );
++    for (; x->end - x->p >= len; x->p++)
++        if (!memcmp( x->p, str, len * sizeof(WCHAR) )) { x->p += len; return TRUE; }
++    x->failed = TRUE;
++    return FALSE;
++}
++
++/* character data with the predefined and numeric entities decoded */
++static WCHAR *xml_decode( const WCHAR *str, SIZE_T len )
++{
++    static const struct { const WCHAR *name; WCHAR c; } entities[] =
++        { {L"lt;", '<'}, {L"gt;", '>'}, {L"amp;", '&'}, {L"quot;", '"'}, {L"apos;", '\''} };
++    WCHAR *ret = malloc( (len + 1) * sizeof(WCHAR) ), *d = ret;
++    const WCHAR *end = str + len;
++    UINT32 i, c;
++
++    if (!ret) return NULL;
++    while (str < end)
++    {
++        if (*str != '&') { *d++ = *str++; continue; }
++        str++;
++        if (*str == '#')
++        {
++            WCHAR *stop;
++            c = str[1] == 'x' ? wcstoul( str + 2, &stop, 16 ) : wcstoul( str + 1, &stop, 10 );
++            if (stop < end && *stop == ';') str = stop + 1;
++            if (c >= 0x10000) { c -= 0x10000; *d++ = 0xd800 | (c >> 10); *d++ = 0xdc00 | (c & 0x3ff); }
++            else *d++ = c;
++            continue;
++        }
++        for (i = 0; i < ARRAY_SIZE(entities); i++)
++        {
++            SIZE_T n = wcslen( entities[i].name );
++            if (end - str >= n && !memcmp( str, entities[i].name, n * sizeof(WCHAR) )) { *d++ = entities[i].c; str += n; break; }
++        }
++        if (i == ARRAY_SIZE(entities)) *d++ = '&';
++    }
++    *d = 0;
++    return ret;
++}
++
++static WCHAR *xml_name( struct xml_parser *x )
++{
++    const WCHAR *start = x->p;
++    while (x->p < x->end && !xml_space( *x->p ) && *x->p != '=' && *x->p != '>' && *x->p != '/' && *x->p != '<') x->p++;
++    if (x->p == start) { x->failed = TRUE; return NULL; }
++    return wcsndup_( start, x->p - start );
++}
++
++static const WCHAR *xml_lookup_ns( struct xml_parser *x, const WCHAR *prefix, SIZE_T len )
++{
++    UINT32 i;
++    for (i = x->ns_count; i > 0; i--)
++        if (wcslen( x->ns[i - 1].prefix ) == len && !memcmp( x->ns[i - 1].prefix, prefix, len * sizeof(WCHAR) ))
++            return x->ns[i - 1].uri;
++    return NULL;
++}
++
++/* split "prefix:name" and resolve the prefix; *local points into qname */
++static WCHAR *xml_resolve( struct xml_parser *x, const WCHAR *qname, const WCHAR **local, BOOL attribute )
++{
++    const WCHAR *colon = wcschr( qname, ':' ), *uri;
++
++    if (!colon)
++    {
++        *local = qname;
++        if (attribute) return NULL;
++        uri = xml_lookup_ns( x, L"", 0 );
++    }
++    else
++    {
++        *local = colon + 1;
++        uri = xml_lookup_ns( x, qname, colon - qname );
++        if (!uri) WARN( "undeclared prefix in %s.\n", debugstr_w(qname) );
++    }
++    return uri ? wcsdup( uri ) : NULL;
++}
++
++static BOOL xml_add_child( struct xml_node *node, struct xml_node *child )
++{
++    struct xml_node **children = realloc( node->children, (node->child_count + 1) * sizeof(*children) );
++    if (!children) return FALSE;
++    node->children = children;
++    children[node->child_count++] = child;
++    return TRUE;
++}
++
++static void xml_add_text( struct xml_node *node, const WCHAR *str, SIZE_T len, BOOL raw )
++{
++    WCHAR *text = raw ? wcsndup_( str, len ) : xml_decode( str, len ), *joined;
++    SIZE_T old = node->text ? wcslen( node->text ) : 0;
++
++    if (!text) return;
++    if (!(joined = realloc( node->text, (old + wcslen( text ) + 1) * sizeof(WCHAR) ))) { free( text ); return; }
++    lstrcpyW( joined + old, text );
++    node->text = joined;
++    free( text );
++}
++
++static void xml_trim_text( struct xml_node *node )
++{
++    WCHAR *start, *end;
++
++    if (!node->text) return;
++    for (start = node->text; xml_space( *start ); start++);
++    for (end = start + wcslen( start ); end > start && xml_space( end[-1] ); end--);
++    if (end == start)
++    {
++        free( node->text );
++        node->text = NULL;
++        return;
++    }
++    memmove( node->text, start, (end - start) * sizeof(WCHAR) );
++    node->text[end - start] = 0;
++}
++
++static struct xml_node *xml_element( struct xml_parser *x )
++{
++    struct raw_attr { WCHAR *name, *value; } *raw = NULL;
++    UINT32 raw_count = 0, ns_saved = x->ns_count, i;
++    struct xml_node *node;
++    const WCHAR *local, *start;
++    WCHAR *qname, quote;
++
++    x->p++;  /* '<' */
++    if (!(qname = xml_name( x ))) return NULL;
++    if (!(node = calloc( 1, sizeof(*node) ))) { free( qname ); x->failed = TRUE; return NULL; }
++
++    /* attributes; xmlns declarations first, so that the others can be resolved */
++    for (;;)
++    {
++        struct raw_attr *tmp;
++        WCHAR *name;
++
++        xml_skip_space( x );
++        if (x->p >= x->end) { x->failed = TRUE; break; }
++        if (*x->p == '/' || *x->p == '>') break;
++        if (!(name = xml_name( x ))) break;
++        xml_skip_space( x );
++        if (x->p >= x->end || *x->p != '=') { free( name ); x->failed = TRUE; break; }
++        x->p++;
++        xml_skip_space( x );
++        if (x->p >= x->end || (*x->p != '"' && *x->p != '\'')) { free( name ); x->failed = TRUE; break; }
++        quote = *x->p++;
++        for (start = x->p; x->p < x->end && *x->p != quote; x->p++);
++        if (x->p >= x->end) { free( name ); x->failed = TRUE; break; }
++        if (!(tmp = realloc( raw, (raw_count + 1) * sizeof(*raw) ))) { free( name ); x->failed = TRUE; break; }
++        raw = tmp;
++        raw[raw_count].name = name;
++        raw[raw_count++].value = xml_decode( start, x->p - start );
++        x->p++;
++    }
++    for (i = 0; i < raw_count && !x->failed; i++)
++    {
++        const WCHAR *prefix;
++        if (!wcscmp( raw[i].name, L"xmlns" )) prefix = L"";
++        else if (!wcsncmp( raw[i].name, L"xmlns:", 6 )) prefix = raw[i].name + 6;
++        else continue;
++        if (x->ns_count == x->ns_size)
++        {
++            UINT32 size = max( 16, x->ns_size * 2 );
++            void *tmp = realloc( x->ns, size * sizeof(*x->ns) );
++            if (!tmp) { x->failed = TRUE; break; }
++            x->ns = tmp;
++            x->ns_size = size;
++        }
++        x->ns[x->ns_count].prefix = wcsdup( prefix );
++        x->ns[x->ns_count++].uri = wcsdup( raw[i].value );
++    }
++    node->ns = xml_resolve( x, qname, &local, FALSE );
++    node->name = wcsdup( local );
++    if ((node->attrs = calloc( max( 1, raw_count ), sizeof(*node->attrs) )))
++    {
++        for (i = 0; i < raw_count; i++)
++        {
++            if (!wcscmp( raw[i].name, L"xmlns" ) || !wcsncmp( raw[i].name, L"xmlns:", 6 )) continue;
++            node->attrs[node->attr_count].ns = xml_resolve( x, raw[i].name, &local, TRUE );
++            node->attrs[node->attr_count].name = wcsdup( local );
++            node->attrs[node->attr_count].value = raw[i].value;
++            raw[i].value = NULL;
++            node->attr_count++;
++        }
++    }
++    for (i = 0; i < raw_count; i++)
++    {
++        free( raw[i].name );
++        free( raw[i].value );
++    }
++    free( raw );
++
++    if (!x->failed && *x->p == '/')
++    {
++        x->p++;
++        if (x->p < x->end && *x->p == '>') x->p++; else x->failed = TRUE;
++    }
++    else if (!x->failed)
++    {
++        x->p++;  /* '>' */
++        for (;;)
++        {
++            for (start = x->p; x->p < x->end && *x->p != '<'; x->p++);
++            if (x->p > start) xml_add_text( node, start, x->p - start, FALSE );
++            if (x->p >= x->end) { x->failed = TRUE; break; }
++            if (xml_starts( x, L"<!--" )) { if (!xml_skip_past( x, L"-->" )) break; }
++            else if (xml_starts( x, L"<![CDATA[" ))
++            {
++                x->p += 9;
++                start = x->p;
++                if (!xml_skip_past( x, L"]]>" )) break;
++                xml_add_text( node, start, x->p - 3 - start, TRUE );
++            }
++            else if (xml_starts( x, L"<?" )) { if (!xml_skip_past( x, L"?>" )) break; }
++            else if (xml_starts( x, L"</" ))
++            {
++                WCHAR *end_name;
++                x->p += 2;
++                if ((end_name = xml_name( x )))
++                {
++                    if (wcscmp( end_name, qname )) { WARN( "</%s> closes <%s>.\n", debugstr_w(end_name), debugstr_w(qname) ); x->failed = TRUE; }
++                    free( end_name );
++                }
++                xml_skip_space( x );
++                if (x->p < x->end && *x->p == '>') x->p++; else x->failed = TRUE;
++                break;
++            }
++            else
++            {
++                struct xml_node *child = xml_element( x );
++                if (!child || !xml_add_child( node, child )) { xml_node_free( child ); x->failed = TRUE; }
++                if (x->failed) break;
++            }
++        }
++        xml_trim_text( node );
++    }
++    while (x->ns_count > ns_saved)
++    {
++        x->ns_count--;
++        free( x->ns[x->ns_count].prefix );
++        free( x->ns[x->ns_count].uri );
++    }
++    free( qname );
++    return node;
++}
++
++static HRESULT xml_parse( const WCHAR *text, SIZE_T len, struct xml_doc **out )
++{
++    struct xml_parser x = { text, text + len };
++    struct xml_doc *doc;
++
++    if (x.p < x.end && *x.p == 0xfeff) x.p++;
++    for (;;)
++    {
++        xml_skip_space( &x );
++        if (xml_starts( &x, L"<?" )) { if (!xml_skip_past( &x, L"?>" )) break; }
++        else if (xml_starts( &x, L"<!--" )) { if (!xml_skip_past( &x, L"-->" )) break; }
++        else break;
++    }
++    if (x.failed || x.p >= x.end || *x.p != '<') return E_INVALIDARG;
++    if (!(doc = calloc( 1, sizeof(*doc) ))) return E_OUTOFMEMORY;
++    doc->ref = 1;
++    doc->root = xml_element( &x );
++    free( x.ns );
++    if (x.failed || !doc->root)
++    {
++        WARN( "malformed XAML near offset %Iu.\n", (SIZE_T)(x.p - text) );
++        xml_doc_release( doc );
++        return E_INVALIDARG;
++    }
++    *out = doc;
++    return S_OK;
++}
++
++static const WCHAR *xml_attr_value( struct xml_node *node, const WCHAR *ns, const WCHAR *name )
++{
++    UINT32 i;
++    for (i = 0; i < node->attr_count; i++)
++    {
++        struct xml_attr *a = &node->attrs[i];
++        if (wcscmp( a->name, name )) continue;
++        if (ns ? (a->ns && !wcscmp( a->ns, ns )) : !a->ns) return a->value;
++    }
++    return NULL;
++}
++
++static BOOL is_ns( const WCHAR *ns, const WCHAR *uri )
++{
++    return ns && !wcscmp( ns, uri );
++}
++
++/* "Grid.Row" -> Grid, Row; "Background" -> the element's type, Background */
++static void text_prop( struct xprop *prop, const WCHAR *owner, const WCHAR *name )
++{
++    const WCHAR *dot = wcschr( name, '.' );
++
++    memset( prop, 0, sizeof(*prop) );
++    if (dot)
++    {
++        lstrcpynW( prop->owner, name, min( ARRAY_SIZE(prop->owner), dot - name + 1 ) );
++        name = dot + 1;
++    }
++    else if (owner) lstrcpynW( prop->owner, owner, ARRAY_SIZE(prop->owner) );
++    lstrcpynW( prop->name, name, ARRAY_SIZE(prop->name) );
++}
++
++enum extension
++{
++    EXT_NONE,
++    EXT_STATIC_RESOURCE,
++    EXT_THEME_RESOURCE,
++    EXT_TEMPLATE_BINDING,
++    EXT_NULL,
++    EXT_OTHER,
++};
++
++/* "{StaticResource Key}" and friends; arg gets the key or property */
++static enum extension text_extension( const WCHAR *value, WCHAR *arg, SIZE_T len )
++{
++    static const struct { const WCHAR *name; enum extension ext; const WCHAR *named; } names[] =
++    {
++        { L"StaticResource", EXT_STATIC_RESOURCE, L"ResourceKey=" },
++        { L"ThemeResource", EXT_THEME_RESOURCE, L"ResourceKey=" },
++        { L"TemplateBinding", EXT_TEMPLATE_BINDING, L"Property=" },
++        { L"x:Null", EXT_NULL, NULL },
++    };
++    const WCHAR *p, *end;
++    SIZE_T n;
++    UINT32 i;
++
++    arg[0] = 0;
++    if (value[0] != '{' || value[1] == '}') return EXT_NONE;
++    for (p = value + 1; xml_space( *p ); p++);
++    for (i = 0; i < ARRAY_SIZE(names); i++)
++    {
++        n = wcslen( names[i].name );
++        if (wcsncmp( p, names[i].name, n ) || (!xml_space( p[n] ) && p[n] != '}')) continue;
++        for (p += n; xml_space( *p ); p++);
++        if (names[i].named && !wcsncmp( p, names[i].named, wcslen( names[i].named ) )) p += wcslen( names[i].named );
++        for (end = p; *end && *end != '}' && !xml_space( *end ) && *end != ','; end++);
++        lstrcpynW( arg, p, min( len, end - p + 1 ) );
++        return names[i].ext;
++    }
++    for (end = p; *end && *end != '}' && !xml_space( *end ); end++);
++    lstrcpynW( arg, p, min( len, end - p + 1 ) );
++    return EXT_OTHER;
++}
++
++/* an attribute value as a writer value; FALSE if there's nothing to set */
++static BOOL text_value( struct writer *w, const WCHAR *str, struct xvalue *out )
++{
++    WCHAR arg[128];
++    IInspectable *object;
++
++    memset( out, 0, sizeof(*out) );
++    switch (text_extension( str, arg, ARRAY_SIZE(arg) ))
++    {
++    case EXT_NONE:
++        out->kind = XV_STRING;
++        out->s = wcsdup( str[0] == '{' && str[1] == '}' ? str + 2 : str );
++        return TRUE;
++    case EXT_STATIC_RESOURCE:
++    case EXT_THEME_RESOURCE:
++        if (!(object = lookup_resource( w, arg, str[1] == 'T', FALSE ))) return FALSE;
++        out->kind = XV_OBJECT;
++        out->object = object;
++        unbox_value( out );
++        return TRUE;
++    case EXT_NULL:
++        out->kind = XV_NULL;
++        return TRUE;
++    case EXT_TEMPLATE_BINDING:
++        return FALSE;   /* the caller binds */
++    default:
++        FIXME( "markup extension %s is not supported.\n", debugstr_w(str) );
++        return FALSE;
++    }
++}
++
++static void text_element( struct writer *w, struct xml_node *node, struct xvalue *out );
++
++static BOOL is_property_element( struct xml_node *node )
++{
++    return node->name && wcschr( node->name, '.' ) != NULL;
++}
++
++static const WCHAR *event_names[] =
++{
++    L"Click", L"Checked", L"Unchecked", L"Indeterminate", L"Loaded", L"Unloaded", L"Tapped", L"PointerPressed",
++    L"PointerReleased", L"PointerEntered", L"PointerExited", L"SelectionChanged", L"TextChanged", L"ValueChanged",
++};
++
++/* resources in a dictionary: each with its x:Key, or a Style's implicit key */
++static void text_add_resource( struct writer *w, IInspectable *dict, struct xml_node *node )
++{
++    const WCHAR *key = xml_attr_value( node, NS_XAML, L"Key" );
++    struct xvalue value;
++    WCHAR implicit[100];
++
++    if (!key) key = xml_attr_value( node, NS_XAML, L"Name" );
++    text_element( w, node, &value );
++    if (value.kind == XV_OBJECT && value.object && style_from_object( value.object ) && !key)
++    {
++        implicit_key( style_from_object( value.object )->target, implicit, ARRAY_SIZE(implicit) );
++        key = implicit;
++    }
++    if (value.kind != XV_OBJECT) box_value( &value );
++    if (key && value.object) resource_dictionary_insert( dict, key, value.object );
++    else if (!key) FIXME( "resource %s without x:Key.\n", debugstr_w(node->name) );
++    xvalue_clear( &value );
++}
++
++/* <Setter Property="..." Value="..."/> in a Style */
++static void text_style_setter( struct writer *w, struct style *style, struct xml_node *node )
++{
++    const WCHAR *property = xml_attr_value( node, NULL, L"Property" ), *str = xml_attr_value( node, NULL, L"Value" );
++    struct style_setter *setter;
++    struct xvalue value = {0};
++    struct xprop prop;
++    WCHAR arg[128];
++    enum extension ext;
++    UINT32 i;
++
++    if (wcscmp( node->name, L"Setter" ) || !property)
++    {
++        FIXME( "%s in a Style is not supported.\n", debugstr_w(node->name) );
++        return;
++    }
++    text_prop( &prop, style->target, property );
++    if (w->defer_resources && str && ((ext = text_extension( str, arg, ARRAY_SIZE(arg) )) == EXT_STATIC_RESOURCE || ext == EXT_THEME_RESOURCE))
++    {
++        /* looked up when the style is applied, where the app's resources can override it */
++        value.kind = XV_NULL;
++        style_add_setter( style, &prop, &value );
++        for (i = 0; i < style->count; i++)
++        {
++            setter = &style->setters[i];
++            if (!wcscmp( setter->prop.name, prop.name )) setter->resource = wcsdup( arg );
++        }
++        return;
++    }
++    if (str && !text_value( w, str, &value )) return;
++    for (i = 0; !str && i < node->child_count; i++)
++    {
++        struct xml_node *child = node->children[i];
++        if (wcscmp( child->name, L"Setter.Value" )) continue;
++        if (child->child_count) text_element( w, child->children[0], &value );
++        else if (child->text) { value.kind = XV_STRING; value.s = wcsdup( child->text ); }
++    }
++    if (!value.kind || (value.kind == XV_OBJECT && !value.object))
++    {
++        xvalue_clear( &value );
++        return;
++    }
++    style_add_setter( style, &prop, &value );
++}
++
++/* the collection a content or property element adds to, or NULL for a single value */
++static BOOL is_collection_property( IInspectable *target, const WCHAR *name )
++{
++    static const WCHAR *names[] =
++    {
++        L"Children", L"RowDefinitions", L"ColumnDefinitions", L"VisualStateGroups", L"MergedDictionaries", L"States",
++        L"KeyFrames", L"Setters", L"Items",
++    };
++    UINT32 i;
++
++    for (i = 0; i < ARRAY_SIZE(names); i++) if (!wcscmp( name, names[i] )) return TRUE;
++    return FALSE;
++}
++
++static void text_set_children( struct writer *w, IInspectable *target, const struct xprop *prop,
++                               struct xml_node **children, UINT32 count, const WCHAR *text )
++{
++    IInspectable *collection;
++    struct xvalue value;
++    UINT32 i;
++
++    if (prop_is( prop, L"Resources" ) && !(count == 1 && !wcscmp( children[0]->name, L"ResourceDictionary" )))
++    {
++        if (!(collection = get_property( target, prop ))) return;
++        IInspectable_AddRef( collection );
++        push_object( w, collection );
++        for (i = 0; i < count; i++) text_add_resource( w, collection, children[i] );
++        pop( w, &value );
++        xvalue_clear( &value );
++        IInspectable_Release( collection );
++        return;
++    }
++    if (prop_is( prop, L"ThemeDictionaries" ))
++    {
++        if (!(collection = get_property( target, prop ))) return;
++        for (i = 0; i < count; i++) text_add_resource( w, collection, children[i] );
++        IInspectable_Release( collection );
++        return;
++    }
++    if (is_collection_property( target, prop->name ))
++    {
++        if (!(collection = get_property( target, prop ))) return;
++        for (i = 0; i < count; i++)
++        {
++            text_element( w, children[i], &value );
++            add_to_collection( collection, &value );
++            xvalue_clear( &value );
++        }
++        IInspectable_Release( collection );
++        return;
++    }
++    memset( &value, 0, sizeof(value) );
++    if (count) text_element( w, children[0], &value );
++    else if (text) { value.kind = XV_STRING; value.s = wcsdup( text ); }
++    if (count > 1) FIXME( "%s takes one value, ignoring %u more.\n", debugstr_w(prop->name), count - 1 );
++    if (value.kind) set_property( w, target, prop, &value, SET_LOCAL );
++    xvalue_clear( &value );
++}
++
++/* the content property children without a property element go to */
++static BOOL content_property( IInspectable *object, const WCHAR *type, struct xprop *prop )
++{
++    struct bag *bag = bag_from_object( object );
++    IInspectable *iface;
++    const WCHAR *name = NULL;
++
++    if (bag)
++    {
++        if (!wcscmp( bag->type, L"VisualStateGroup" )) name = L"States";
++        else if (!wcscmp( bag->type, L"VisualState" )) name = L"Storyboard";
++        else if (!wcscmp( bag->type, L"Storyboard" )) name = L"Children";
++        else if (wcsstr( bag->type, L"UsingKeyFrames" )) name = L"KeyFrames";
++        else if (!wcscmp( bag->type, L"Collection" )) name = L"Items";
++    }
++    else if (SUCCEEDED(IInspectable_QueryInterface( object, &IID_IPanel, (void **)&iface ))) name = L"Children";
++    else if (SUCCEEDED(IInspectable_QueryInterface( object, &IID_IBorder, (void **)&iface ))) name = L"Child";
++    else if (SUCCEEDED(IInspectable_QueryInterface( object, &IID_ITextBlock, (void **)&iface ))) name = L"Text";
++    else if (SUCCEEDED(IInspectable_QueryInterface( object, &IID_IContentControl, (void **)&iface )) ||
++             SUCCEEDED(IInspectable_QueryInterface( object, &IID_IUserControl, (void **)&iface )) ||
++             SUCCEEDED(IInspectable_QueryInterface( object, &IID_IContentPresenter, (void **)&iface ))) name = L"Content";
++    if (!bag && name) IInspectable_Release( iface );
++    if (!name) return FALSE;
++    text_prop( prop, type, name );
++    return TRUE;
++}
++
++/* a value-type element: <x:Double>, <x:String>, <Thickness>, <Color>, ... */
++static BOOL text_value_element( struct xml_node *node, struct xvalue *out )
++{
++    const WCHAR *text = node->text ? node->text : L"";
++    struct xvalue str = { XV_STRING };
++
++    memset( out, 0, sizeof(*out) );
++    str.s = (WCHAR *)text;
++    if (is_ns( node->ns, NS_XAML ))
++    {
++        if (!wcscmp( node->name, L"Null" )) out->kind = XV_NULL;
++        else if (!wcscmp( node->name, L"String" )) { out->kind = XV_STRING; out->s = wcsdup( text ); }
++        else if (!wcscmp( node->name, L"Double" )) { out->kind = XV_FLOAT; out->f = wcstod( text, NULL ); }
++        else if (!wcscmp( node->name, L"Int32" )) { out->kind = XV_SIGNED; out->i = wcstol( text, NULL, 10 ); }
++        else if (!wcscmp( node->name, L"Boolean" )) { out->kind = XV_BOOL; out->b = !wcsicmp( text, L"True" ); }
++        else FIXME( "x:%s is not supported.\n", debugstr_w(node->name) );
++        return TRUE;
++    }
++    if (!is_ns( node->ns, NS_PRESENTATION )) return FALSE;
++    if (!wcscmp( node->name, L"Thickness" ))
++    {
++        out->kind = XV_THICKNESS;
++        if (!to_thickness( &str, &out->thickness )) out->kind = XV_NONE;
++        return TRUE;
++    }
++    if (!wcscmp( node->name, L"Color" ))
++    {
++        Color c;
++        out->kind = XV_COLOR;
++        if (to_color( &str, &c )) out->color = c.A << 24 | c.R << 16 | c.G << 8 | c.B;
++        else out->kind = XV_NONE;
++        return TRUE;
++    }
++    if (!wcscmp( node->name, L"CornerRadius" ) || !wcscmp( node->name, L"GridLength" ) || !wcscmp( node->name, L"FontWeight" ))
++    {
++        out->kind = XV_STRING;
++        out->s = wcsdup( text );
++        return TRUE;
++    }
++    return FALSE;
++}
++
++static void text_element( struct writer *w, struct xml_node *node, struct xvalue *out )
++{
++    struct xml_node **content = NULL;
++    IInspectable *object = NULL;
++    struct style *style;
++    struct xvalue value;
++    struct xprop prop;
++    UINT32 i, j, content_count = 0;
++    WCHAR full[256], arg[128];
++
++    memset( out, 0, sizeof(*out) );
++    if (text_value_element( node, out )) return;
++
++    if (w->root && !w->root_used)
++    {
++        w->root_used = TRUE;
++        IInspectable_AddRef( (object = w->root) );
++    }
++    else if (is_ns( node->ns, NS_PRESENTATION ))
++    {
++        if (!wcscmp( node->name, L"ControlTemplate" ))
++        {
++            struct control_template *template;
++            const WCHAR *target = xml_attr_value( node, NULL, L"TargetType" );
++
++            if (!(object = control_template_create())) return;
++            template = template_from_object( object );
++            if (target) lstrcpynW( template->target, wcschr( target, ':' ) ? wcschr( target, ':' ) + 1 : target, 96 );
++            if (w->doc)
++            {
++                xml_doc_addref( (template->doc = w->doc) );
++                template->node = node;
++                template->has_content = TRUE;
++            }
++            out->kind = XV_OBJECT;
++            out->object = object;
++            return;
++        }
++        if (!wcscmp( node->name, L"Style" )) object = style_create();
++        else object = create_builtin( node->name );
++    }
++    else if (node->ns && !wcsncmp( node->ns, L"using:", 6 ))
++    {
++        swprintf( full, ARRAY_SIZE(full), L"%s.%s", node->ns + 6, node->name );
++        object = app_create_instance( full );
++    }
++    else FIXME( "element %s in namespace %s is not supported.\n", debugstr_w(node->name), debugstr_w(node->ns) );
++    if (!object) return;
++
++    IInspectable_AddRef( object );
++    push_object( w, object );
++    style = style_from_object( object );
++
++    /* attributes */
++    for (i = 0; i < node->attr_count; i++)
++    {
++        struct xml_attr *a = &node->attrs[i];
++
++        if (a->ns)
++        {
++            if (!is_ns( a->ns, NS_XAML )) continue;   /* mc:, d: and other design-time attributes */
++            if (!wcscmp( a->name, L"Name" ))
++            {
++                register_name( w, a->value, object );
++                value.kind = XV_STRING;
++                value.s = wcsdup( a->value );
++                text_prop( &prop, L"FrameworkElement", L"Name" );
++                set_property( w, object, &prop, &value, SET_LOCAL );
++                xvalue_clear( &value );
++            }
++            else if (wcscmp( a->name, L"Key" ) && wcscmp( a->name, L"Class" ))
++                FIXME( "x:%s is not supported.\n", debugstr_w(a->name) );
++            continue;
++        }
++        if (style && !wcscmp( a->name, L"TargetType" ))
++        {
++            style_set_target( style, wcschr( a->value, ':' ) ? wcschr( a->value, ':' ) + 1 : a->value );
++            continue;
++        }
++        for (j = 0; j < ARRAY_SIZE(event_names); j++) if (!wcscmp( a->name, event_names[j] )) break;
++        if (j < ARRAY_SIZE(event_names) && a->value[0] != '{')
++        {
++            FIXME( "event handler %s=%s in text markup is ignored.\n", debugstr_w(a->name), debugstr_w(a->value) );
++            continue;
++        }
++        text_prop( &prop, node->name, a->name );
++        if (text_extension( a->value, arg, ARRAY_SIZE(arg) ) == EXT_TEMPLATE_BINDING)
++        {
++            if (w->templated_parent) template_bind( w, object, &prop, arg );
++            continue;
++        }
++        if (!text_value( w, a->value, &value )) continue;
++        set_property( w, object, &prop, &value, SET_LOCAL );
++        xvalue_clear( &value );
++    }
++
++    /* property elements, and content */
++    for (i = 0; i < node->child_count; i++)
++    {
++        struct xml_node *child = node->children[i];
++        struct xml_node **tmp;
++
++        if (is_property_element( child ))
++        {
++            text_prop( &prop, NULL, child->name );
++            if (style && prop_is( &prop, L"Setters" ))
++            {
++                for (j = 0; j < child->child_count; j++) text_style_setter( w, style, child->children[j] );
++                continue;
++            }
++            if (!wcscmp( child->name, L"ControlTemplate.TargetType" )) continue;
++            text_set_children( w, object, &prop, child->children, child->child_count, child->text );
++            continue;
++        }
++        if (style)
++        {
++            text_style_setter( w, style, child );
++            continue;
++        }
++        if (!(tmp = realloc( content, (content_count + 1) * sizeof(*content) ))) continue;
++        content = tmp;
++        content[content_count++] = child;
++    }
++    if (content_count || (node->text && !style))
++    {
++        IResourceDictionary *dict;
++
++        if (QI( object, IResourceDictionary, &dict ))
++        {
++            IResourceDictionary_Release( dict );
++            for (i = 0; i < content_count; i++) text_add_resource( w, object, content[i] );
++        }
++        else if (content_property( object, node->name, &prop ))
++            text_set_children( w, object, &prop, content, content_count, node->text );
++        else FIXME( "%s has no content property we know.\n", debugstr_w(node->name) );
++    }
++    free( content );
++
++    finish_object( w, object );
++    pop( w, &value );
++    xvalue_clear( &value );
++    out->kind = XV_OBJECT;
++    out->object = object;
++}
++
++/* XAML text into objects; with root, the markup's root element is root (LoadComponent) */
++static HRESULT text_load( const WCHAR *text, SIZE_T len, IInspectable *root, BOOL generic, IInspectable **out )
++{
++    struct xml_doc *doc;
++    struct xvalue value;
++    struct writer *w;
++    HRESULT hr;
++    UINT32 i;
++
++    if (out) *out = NULL;
++    if (FAILED(hr = xml_parse( text, len, &doc ))) return hr;
++    if (!(w = calloc( 1, sizeof(*w) )))
++    {
++        xml_doc_release( doc );
++        return E_OUTOFMEMORY;
++    }
++    w->doc = doc;
++    w->root = root;
++    w->names_owner = w;
++    w->defer_resources = generic;
++    text_element( w, doc->root, &value );
++    if (value.kind != XV_OBJECT || !value.object) hr = E_FAIL;
++    else if (out)
++    {
++        *out = value.object;
++        value.object = NULL;
++    }
++    xvalue_clear( &value );
++    while (w->sp) { pop( w, &value ); xvalue_clear( &value ); }
++    for (i = 0; i < w->name_count; i++) IInspectable_Release( w->names[i].object );
++    free( w->names );
++    free( w );
++    xml_doc_release( doc );
++    return hr;
++}
++
++HRESULT xaml_text_load( const WCHAR *text, SIZE_T len, IInspectable *root, IInspectable **out )
++{
++    return text_load( text, len, root, FALSE, out );
++}
++
++/* the built-in theme resources and default styles: generic.xaml, a resource of this DLL */
++static IInspectable *generic_dictionary;
++static BOOL generic_loading;
++
++static IInspectable *generic_resources(void)
++{
++    HMODULE module;
++    HRSRC rsrc;
++    const char *data;
++    WCHAR *text;
++    DWORD size;
++    int len;
++
++    if (generic_dictionary || generic_loading) return generic_dictionary;
++    generic_loading = TRUE;
++    if (GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                            (const WCHAR *)generic_resources, &module ) &&
++        (rsrc = FindResourceW( module, L"GENERIC_XAML", (const WCHAR *)RT_RCDATA )) &&
++        (data = LockResource( LoadResource( module, rsrc ) )) && (size = SizeofResource( module, rsrc )))
++    {
++        len = MultiByteToWideChar( CP_UTF8, 0, data, size, NULL, 0 );
++        if ((text = malloc( len * sizeof(WCHAR) )))
++        {
++            MultiByteToWideChar( CP_UTF8, 0, data, size, text, len );
++            if (FAILED(text_load( text, len, NULL, TRUE, &generic_dictionary ))) ERR( "generic.xaml failed to load.\n" );
++            else TRACE( "loaded generic.xaml.\n" );
++            free( text );
++        }
++    }
++    else ERR( "generic.xaml resource not found.\n" );
++    generic_loading = FALSE;
++    return generic_dictionary;
++}
++
++IInspectable *generic_resource_lookup( const WCHAR *key )
++{
++    IInspectable *dict = generic_resources();
++    return dict ? resource_dictionary_lookup( dict, key ) : NULL;
++}
++
++/* the default style (DefaultStyleKey) for an element, applied below its own and implicit styles */
++void element_apply_default_style( struct xaml_element *element )
++{
++    IInspectable *style;
++    WCHAR key[100];
++
++    if (element->default_style_done) return;
++    element->default_style_done = TRUE;
++    implicit_key( element->class_name, key, ARRAY_SIZE(key) );
++    if (!(style = generic_resource_lookup( key ))) return;
++    TRACE( "default style for %s.\n", debugstr_w(element->class_name) );
++    style_apply_mode( style, element->outer, SET_DEFAULT );
++    IInspectable_Release( style );
++}
++
+ HRESULT xbf_load( struct xbf *xbf, IInspectable *root, IInspectable **out )
+ {
+     struct writer *w;
+@@ -2896,7 +3919,7 @@ struct template_instance *template_instantiate( IInspectable *template, IInspect
+     struct writer *w;
+     struct xvalue value;
+ 
+-    if (!impl || !impl->xbf) return NULL;
++    if (!impl || (!impl->xbf && !impl->doc)) return NULL;
+     if (!(instance = calloc( 1, sizeof(*instance) ))) return NULL;
+     if (!(w = calloc( 1, sizeof(*w) )))
+     {
+@@ -2908,7 +3931,20 @@ struct template_instance *template_instantiate( IInspectable *template, IInspect
+     w->root_used = TRUE;
+     w->templated_parent = templated_parent;
+     w->names_owner = w;
+-    run_stream( w, impl->stream, 0, RUN_OBJECT );
++    if (impl->doc)
++    {
++        /* text markup: the template's one element child */
++        UINT32 i;
++        w->doc = impl->doc;
++        for (i = 0; i < impl->node->child_count; i++)
++        {
++            if (is_property_element( impl->node->children[i] )) continue;
++            text_element( w, impl->node->children[i], &value );
++            push( w, &value );
++            break;
++        }
++    }
++    else run_stream( w, impl->stream, 0, RUN_OBJECT );
+     if (w->sp)
+     {
+         pop( w, &value );
