@@ -18,7 +18,7 @@
             <Button x:Name="TemplatedButton" Content="Templated" Style="{StaticResource TemplatedButton}" Margin="0,10,0,0"/>
         </StackPanel>
         <!-- milestone 4 part 3: toggle controls; each has its own Background (or BorderBrush) to be found by -->
-        <StackPanel Margin="20" HorizontalAlignment="Right" Width="200">
+        <StackPanel x:Name="TogglePanel" Margin="20" HorizontalAlignment="Right" Width="200">
             <CheckBox x:Name="Check" Content="Check me" Background="#FF102030" Checked="OnChecked" Unchecked="OnUnchecked"/>
             <CheckBox x:Name="ThreeState" Content="Three states" Background="#FF203040" IsThreeState="True" IsChecked="True"/>
             <RadioButton x:Name="RadioA" Content="A" Background="#FF304050" IsChecked="True"/>

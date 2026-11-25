@@ -122,6 +122,7 @@ struct main_page
     int clicks;
     IToggleButton *check, *three_state, *radio_a, *radio_b, *toggle;   /* milestone 4 part 3 */
     IButton *plain;
+    IPanel *toggle_panel;       /* milestone 4 part 4 */
     int checked, unchecked;     /* Checked="OnChecked" Unchecked="OnUnchecked" */
 };
 
@@ -229,7 +230,8 @@ static HRESULT WINAPI page_Connect(IComponentConnector *iface, INT32 id, IInspec
     case 4:
         IInspectable_QueryInterface(target, &IID_IButton, (void **)&page->templated);
         break;
-    case 5:
+    case 5: IInspectable_QueryInterface(target, &IID_IPanel, (void **)&page->toggle_panel); break;
+    case 6:
         IInspectable_QueryInterface(target, &IID_IToggleButton, (void **)&page->check);
         on_checked.count = &page->checked;
         on_unchecked.count = &page->unchecked;
@@ -239,11 +241,11 @@ static HRESULT WINAPI page_Connect(IComponentConnector *iface, INT32 id, IInspec
             IToggleButton_add_Unchecked(page->check, &on_unchecked.IRoutedEventHandler_iface, &token);
         }
         break;
-    case 6: IInspectable_QueryInterface(target, &IID_IToggleButton, (void **)&page->three_state); break;
-    case 7: IInspectable_QueryInterface(target, &IID_IToggleButton, (void **)&page->radio_a); break;
-    case 8: IInspectable_QueryInterface(target, &IID_IToggleButton, (void **)&page->radio_b); break;
-    case 9: IInspectable_QueryInterface(target, &IID_IToggleButton, (void **)&page->toggle); break;
-    case 10: IInspectable_QueryInterface(target, &IID_IButton, (void **)&page->plain); break;
+    case 7: IInspectable_QueryInterface(target, &IID_IToggleButton, (void **)&page->three_state); break;
+    case 8: IInspectable_QueryInterface(target, &IID_IToggleButton, (void **)&page->radio_a); break;
+    case 9: IInspectable_QueryInterface(target, &IID_IToggleButton, (void **)&page->radio_b); break;
+    case 10: IInspectable_QueryInterface(target, &IID_IToggleButton, (void **)&page->toggle); break;
+    case 11: IInspectable_QueryInterface(target, &IID_IButton, (void **)&page->plain); break;
     }
     return S_OK;
 }
@@ -744,7 +746,7 @@ static void check_toggles(struct main_page *page)
     BOOL found;
 
     check(page->check && page->three_state && page->radio_a && page->radio_b && page->toggle && page->plain,
-          "Connect(5-10) gave us the CheckBoxes, RadioButtons, ToggleButton and the plain Button");
+          "Connect(6-11) gave us the CheckBoxes, RadioButtons, ToggleButton and the plain Button");
     if (!page->check || !page->three_state || !page->radio_a || !page->radio_b || !page->toggle || !page->plain) return;
     leave();
     snapshot();
@@ -833,6 +835,135 @@ static void check_toggles(struct main_page *page)
     check(count_color(0xf7630c) > 500, "the plain Button's hover colour is the app's ButtonBackgroundPointerOver (%d px)",
           count_color(0xf7630c));
     leave();
+}
+
+/* milestone 4 part 4: XAML text (XamlReader.Load), generic.xaml's text styles and default templates */
+
+static const WCHAR loaded_xaml[] =
+    L"<StackPanel xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\"\n"
+    L"            xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\" Margin=\"0,8,0,0\">\n"
+    L"  <!-- a comment, and an entity: &amp; -->\n"
+    L"  <StackPanel.Resources>\n"
+    L"    <SolidColorBrush x:Key=\"TextBrush\" Color=\"#FF00CC6A\"/>\n"
+    L"    <Style x:Key=\"LoadedButton\" TargetType=\"Button\">\n"
+    L"      <Setter Property=\"Background\" Value=\"{StaticResource TextBrush}\"/>\n"
+    L"      <Setter Property=\"Template\">\n"
+    L"        <Setter.Value>\n"
+    L"          <ControlTemplate TargetType=\"Button\">\n"
+    L"            <Border x:Name=\"Root\" Background=\"{TemplateBinding Background}\" Padding=\"12,6,12,6\">\n"
+    L"              <VisualStateManager.VisualStateGroups>\n"
+    L"                <VisualStateGroup x:Name=\"CommonStates\">\n"
+    L"                  <VisualState x:Name=\"Normal\"/>\n"
+    L"                  <VisualState x:Name=\"PointerOver\">\n"
+    L"                    <VisualState.Setters>\n"
+    L"                      <Setter Target=\"Root.Background\" Value=\"#FF8764B8\"/>\n"
+    L"                    </VisualState.Setters>\n"
+    L"                  </VisualState>\n"
+    L"                </VisualStateGroup>\n"
+    L"              </VisualStateManager.VisualStateGroups>\n"
+    L"              <ContentPresenter Content=\"{TemplateBinding Content}\"/>\n"
+    L"            </Border>\n"
+    L"          </ControlTemplate>\n"
+    L"        </Setter.Value>\n"
+    L"      </Setter>\n"
+    L"    </Style>\n"
+    L"  </StackPanel.Resources>\n"
+    L"  <TextBlock x:Name=\"Heading\" Text=\"Text &amp; markup\" Style=\"{StaticResource TitleTextBlockStyle}\"/>\n"
+    L"  <Button Content=\"Text template\" Style=\"{StaticResource LoadedButton}\"/>\n"
+    L"</StackPanel>\n";
+
+static IInspectable *xaml_load(const WCHAR *text, HRESULT *hr)
+{
+    IXamlReaderStatics *reader = get_factory(L"Windows.UI.Xaml.Markup.XamlReader", &IID_IXamlReaderStatics);
+    IInspectable *object = NULL;
+    HSTRING str;
+
+    *hr = E_FAIL;
+    if (!reader) return NULL;
+    str = hs(text);
+    *hr = IXamlReaderStatics_Load(reader, str, &object);
+    WindowsDeleteString(str);
+    IXamlReaderStatics_Release(reader);
+    return object;
+}
+
+static void check_text_markup(struct main_page *page)
+{
+    IVector_UIElement *children;
+    IInspectable *object, *item;
+    IUIElement *ui;
+    ITextBlock *heading = NULL;
+    IControl *control;
+    IBrush *brush = NULL;
+    FontWeight weight;
+    UINT32 size = 0, argb = 0;
+    POINT pt;
+    DOUBLE d;
+    HRESULT hr;
+    WCHAR buf[64];
+
+    object = xaml_load(L"<StackPanel xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\"><Button></StackPanel>", &hr);
+    check(FAILED(hr) && !object, "XamlReader.Load refuses malformed XML, hr %#lx", hr);
+
+    object = xaml_load(loaded_xaml, &hr);
+    check(hr == S_OK && object, "XamlReader.Load of a StackPanel with resources, a Style and a ControlTemplate, hr %#lx", hr);
+    if (!object) return;
+    IInspectable_QueryInterface(object, &IID_IPanel, (void **)&ui);
+    check(ui != NULL, "the root is a Panel");
+    if (ui)
+    {
+        IPanel_get_Children((IPanel *)ui, &children);
+        IVector_UIElement_get_Size(children, &size);
+        check(size == 2, "it has the 2 children from the markup (%u)", size);
+        if (size == 2)
+        {
+            IVector_UIElement_GetAt(children, 0, (IUIElement **)&item);
+            IInspectable_QueryInterface(item, &IID_ITextBlock, (void **)&heading);
+            IInspectable_Release(item);
+        }
+        IVector_UIElement_Release(children);
+        IPanel_Release((IPanel *)ui);
+    }
+    check(heading != NULL, "the first child is a TextBlock");
+    if (heading)
+    {
+        check(!wcscmp(text_of(heading, buf, ARRAYSIZE(buf)), L"Text & markup"), "its Text has the entity decoded (%ls)", buf);
+        ITextBlock_get_FontSize(heading, &d);
+        ITextBlock_get_FontWeight(heading, &weight);
+        check(d == 24 && weight.Weight == 350, "generic.xaml's TitleTextBlockStyle (BasedOn BaseTextBlockStyle) gives 24 px SemiLight (%.0f, %u)",
+              d, weight.Weight);
+        ITextBlock_Release(heading);
+    }
+
+    /* show it, and its text template */
+    if (page->toggle_panel)
+    {
+        IPanel_get_Children(page->toggle_panel, &children);
+        IInspectable_QueryInterface(object, &IID_IUIElement, (void **)&ui);
+        IVector_UIElement_Append(children, ui);
+        IUIElement_Release(ui);
+        IVector_UIElement_Release(children);
+        snapshot();
+        check(center_of(0x00cc6a, &pt), "the text ControlTemplate draws the style's {StaticResource TextBrush} (%d px)", count_color(0x00cc6a));
+        hover(pt);
+        snapshot();
+        check(count_color(0x8764b8) > 300 && count_color(0x00cc6a) == 0, "and its PointerOver state (%d px)", count_color(0x8764b8));
+        leave();
+    }
+    IInspectable_Release(object);
+
+    /* a plain Button gets generic.xaml's default style and template */
+    IButton_QueryInterface(page->plain, &IID_IControl, (void **)&control);
+    {
+        IControlTemplate *template = NULL;
+        IControl_get_Template(control, (void *)&template);
+        check(template != NULL, "the plain Button has the default ControlTemplate from generic.xaml");
+        if (template) IUnknown_Release((IUnknown *)template);
+    }
+    IControl_get_Background(control, &brush);
+    check(brush_color(brush, &argb) && argb == 0x33000000, "its Background is the default style's {ThemeResource ButtonBackground} (%#x)", argb);
+    if (brush) IBrush_Release(brush);
+    IControl_Release(control);
 }
 
 static void check_microsoft_xbf(const WCHAR *file, const WCHAR *component_class)
@@ -940,6 +1071,7 @@ static void CALLBACK verify(HWND unused, UINT msg, UINT_PTR id, DWORD time)
     check(the_page->clicks == 1, "clicking ClickButton ran OnClick (%d)", the_page->clicks);
     check_template(the_page);
     check_toggles(the_page);
+    check_text_markup(the_page);
     check(!wcscmp(text_of(the_page->title, buf, ARRAYSIZE(buf)), L"Clicked!"), "OnClick changed Title (%ls)", buf);
     snapshot();
 

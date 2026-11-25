@@ -349,7 +349,8 @@ static void CALLBACK verify(HWND unused, UINT msg, UINT_PTR id, DWORD time)
     /* hover */
     mouse(WM_MOUSEMOVE, cx, cy);
     snapshot();
-    check(pixel(bx, cy) == 0x999999 && pixel(bx + 3, cy) == 0xcccccc, "hover draws the 2 px border (%06lx, %06lx)", pixel(bx, cy), pixel(bx + 3, cy));
+    /* the default template (generic.xaml) draws ButtonBorderBrushPointerOver #66000000 over the #33000000 background */
+    check(pixel(bx, cy) == 0x7a7a7a && pixel(bx + 3, cy) == 0xcccccc, "hover draws the 2 px border (%06lx, %06lx)", pixel(bx, cy), pixel(bx + 3, cy));
 
     {
         IUIElement *ui_first;
