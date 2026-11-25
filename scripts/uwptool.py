@@ -97,7 +97,8 @@ def registry(game_dir, app_dir):
     for server in re.findall(r"<InProcessServer>(.*?)</InProcessServer>", manifest, re.S):
         dll = re.search(r"<Path>([^<]+)</Path>", server).group(1)
         for cls in re.findall(r'ActivatableClassId="([^"]+)"', server):
-            out += [reg_key(cls), '"DllPath"="%s\\\\%s"' % (app_dir.replace("\\", "\\\\"), dll), ""]
+            # app_dir and the manifest's Path (GearGame\Binaries\x.dll) are Windows paths: escape them for .reg
+            out += [reg_key(cls), '"DllPath"="%s\\\\%s"' % (app_dir.replace("\\", "\\\\"), dll.replace("\\", "\\\\")), ""]
     for dll, classes in WINE_CLASSES.items():
         for cls in classes:
             out += [reg_key(cls), '"DllPath"="C:\\\\windows\\\\system32\\\\%s"' % dll, ""]
