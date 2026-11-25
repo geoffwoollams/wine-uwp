@@ -43,6 +43,9 @@
 #define WIDL_using_Windows_UI_Xaml_Media
 #define WIDL_using_Windows_UI_Xaml_Markup
 #define WIDL_using_Windows_UI_Xaml_Interop
+#define WIDL_using_Windows_UI_Xaml_Data
+#define WIDL_using_Windows_UI_Xaml_Media_Animation
+#define WIDL_using_Windows_UI_Xaml_Controls_Primitives
 #include "windows.ui.xaml.h"
 
 /* Windows.ApplicationModel.Activation.IPrelaunchActivatedEventArgs, not in Wine's headers */
@@ -1200,6 +1203,569 @@ static void check_loose_xaml(void)
     IInspectable_Release(page.inner);
 }
 
+/* milestone 4 part 6: Opacity, Path curves and geometries, ToggleSwitch/Slider/ProgressBar, animation timing,
+ * DataTemplate/ItemsControl and {Binding} */
+
+static void pump(DWORD ms)
+{
+    DWORD end = GetTickCount() + ms;
+    MSG msg;
+
+    while ((int)(end - GetTickCount()) > 0)
+    {
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
+        {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        Sleep(5);
+    }
+}
+
+static IInspectable *find_in(IInspectable *root, const WCHAR *name)
+{
+    IFrameworkElement *fe;
+    IInspectable *found = NULL;
+    HSTRING str;
+
+    if (FAILED(IInspectable_QueryInterface(root, &IID_IFrameworkElement, (void **)&fe))) return NULL;
+    str = hs(name);
+    IFrameworkElement_FindName(fe, str, &found);
+    WindowsDeleteString(str);
+    IFrameworkElement_Release(fe);
+    return found;
+}
+
+static DOUBLE opacity_of(IInspectable *object)
+{
+    IUIElement *ui;
+    DOUBLE d = -1;
+    if (!object || FAILED(IInspectable_QueryInterface(object, &IID_IUIElement, (void **)&ui))) return -1;
+    IUIElement_get_Opacity(ui, &d);
+    IUIElement_Release(ui);
+    return d;
+}
+
+/* a data object for bindings: Name, Count, Color and Items through ICustomPropertyProvider, and PropertyChanged */
+struct data_object
+{
+    ICustomPropertyProvider ICustomPropertyProvider_iface;
+    INotifyPropertyChanged INotifyPropertyChanged_iface;
+    LONG ref;
+    WCHAR name[32], color[16];
+    double count;
+    IInspectable *items;
+    IPropertyChangedEventHandler *handlers[8];
+};
+
+struct data_property
+{
+    ICustomProperty ICustomProperty_iface;
+    LONG ref;
+    WCHAR name[32];
+};
+
+static IInspectable *box_str(const WCHAR *str)
+{
+    IPropertyValueStatics *pv = get_factory(L"Windows.Foundation.PropertyValue", &IID_IPropertyValueStatics);
+    IInspectable *value = NULL;
+    HSTRING h = hs(str);
+    IPropertyValueStatics_CreateString(pv, h, &value);
+    WindowsDeleteString(h);
+    IPropertyValueStatics_Release(pv);
+    return value;
+}
+
+static IInspectable *box_dbl(double d)
+{
+    IPropertyValueStatics *pv = get_factory(L"Windows.Foundation.PropertyValue", &IID_IPropertyValueStatics);
+    IInspectable *value = NULL;
+    IPropertyValueStatics_CreateDouble(pv, d, &value);
+    IPropertyValueStatics_Release(pv);
+    return value;
+}
+
+static struct data_object *data_from_provider(ICustomPropertyProvider *iface)
+{
+    return CONTAINING_RECORD(iface, struct data_object, ICustomPropertyProvider_iface);
+}
+
+static HRESULT WINAPI data_QueryInterface(ICustomPropertyProvider *iface, REFIID iid, void **out)
+{
+    struct data_object *obj = data_from_provider(iface);
+    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) || IsEqualGUID(iid, &IID_ICustomPropertyProvider))
+        *out = &obj->ICustomPropertyProvider_iface;
+    else if (IsEqualGUID(iid, &IID_INotifyPropertyChanged)) *out = &obj->INotifyPropertyChanged_iface;
+    else { *out = NULL; return E_NOINTERFACE; }
+    InterlockedIncrement(&obj->ref);
+    return S_OK;
+}
+static ULONG WINAPI data_AddRef(ICustomPropertyProvider *iface) { return InterlockedIncrement(&data_from_provider(iface)->ref); }
+static ULONG WINAPI data_Release(ICustomPropertyProvider *iface) { return InterlockedDecrement(&data_from_provider(iface)->ref); }
+static HRESULT WINAPI data_GetIids(ICustomPropertyProvider *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
+static HRESULT WINAPI data_GetRuntimeClassName(ICustomPropertyProvider *iface, HSTRING *name) { *name = hs(L"XamlMarkup.Data"); return S_OK; }
+static HRESULT WINAPI data_GetTrustLevel(ICustomPropertyProvider *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
+
+static struct data_property *prop_from_iface(ICustomProperty *iface)
+{
+    return CONTAINING_RECORD(iface, struct data_property, ICustomProperty_iface);
+}
+static HRESULT WINAPI prop_QueryInterface(ICustomProperty *iface, REFIID iid, void **out)
+{
+    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) || IsEqualGUID(iid, &IID_ICustomProperty))
+    {
+        *out = iface;
+        InterlockedIncrement(&prop_from_iface(iface)->ref);
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI prop_AddRef(ICustomProperty *iface) { return InterlockedIncrement(&prop_from_iface(iface)->ref); }
+static ULONG WINAPI prop_Release(ICustomProperty *iface)
+{
+    ULONG ref = InterlockedDecrement(&prop_from_iface(iface)->ref);
+    if (!ref) free(prop_from_iface(iface));
+    return ref;
+}
+static HRESULT WINAPI prop_GetIids(ICustomProperty *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
+static HRESULT WINAPI prop_GetRuntimeClassName(ICustomProperty *iface, HSTRING *name) { return E_NOTIMPL; }
+static HRESULT WINAPI prop_GetTrustLevel(ICustomProperty *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
+static HRESULT WINAPI prop_get_Type(ICustomProperty *iface, TypeName *value) { memset(value, 0, sizeof(*value)); return S_OK; }
+static HRESULT WINAPI prop_get_Name(ICustomProperty *iface, HSTRING *value) { *value = hs(prop_from_iface(iface)->name); return S_OK; }
+static HRESULT WINAPI prop_GetValue(ICustomProperty *iface, IInspectable *target, IInspectable **value)
+{
+    struct data_object *obj = data_from_provider((ICustomPropertyProvider *)target);
+    const WCHAR *name = prop_from_iface(iface)->name;
+    *value = NULL;
+    if (!wcscmp(name, L"Name")) *value = box_str(obj->name);
+    else if (!wcscmp(name, L"Color")) *value = box_str(obj->color);
+    else if (!wcscmp(name, L"Count")) *value = box_dbl(obj->count);
+    else if (!wcscmp(name, L"Items") && obj->items) { IInspectable_AddRef(obj->items); *value = obj->items; }
+    return S_OK;
+}
+static HRESULT WINAPI prop_SetValue(ICustomProperty *iface, IInspectable *target, IInspectable *value)
+{
+    struct data_object *obj = data_from_provider((ICustomPropertyProvider *)target);
+    IPropertyValue *pv;
+    if (wcscmp(prop_from_iface(iface)->name, L"Count") || !value) return E_NOTIMPL;
+    if (FAILED(IInspectable_QueryInterface(value, &IID_IPropertyValue, (void **)&pv))) return E_INVALIDARG;
+    IPropertyValue_GetDouble(pv, &obj->count);
+    IPropertyValue_Release(pv);
+    return S_OK;
+}
+static HRESULT WINAPI prop_GetIndexedValue(ICustomProperty *iface, IInspectable *target, IInspectable *index, IInspectable **value) { return E_NOTIMPL; }
+static HRESULT WINAPI prop_SetIndexedValue(ICustomProperty *iface, IInspectable *target, IInspectable *value, IInspectable *index) { return E_NOTIMPL; }
+static HRESULT WINAPI prop_get_CanWrite(ICustomProperty *iface, boolean *value) { *value = TRUE; return S_OK; }
+static HRESULT WINAPI prop_get_CanRead(ICustomProperty *iface, boolean *value) { *value = TRUE; return S_OK; }
+static ICustomPropertyVtbl prop_vtbl =
+{
+    prop_QueryInterface, prop_AddRef, prop_Release, prop_GetIids, prop_GetRuntimeClassName, prop_GetTrustLevel,
+    prop_get_Type, prop_get_Name, prop_GetValue, prop_SetValue, prop_GetIndexedValue, prop_SetIndexedValue,
+    prop_get_CanWrite, prop_get_CanRead,
+};
+
+static HRESULT WINAPI data_GetCustomProperty(ICustomPropertyProvider *iface, HSTRING name, ICustomProperty **value)
+{
+    struct data_property *prop = calloc(1, sizeof(*prop));
+    prop->ICustomProperty_iface.lpVtbl = &prop_vtbl;
+    prop->ref = 1;
+    lstrcpynW(prop->name, WindowsGetStringRawBuffer(name, NULL), ARRAYSIZE(prop->name));
+    *value = &prop->ICustomProperty_iface;
+    return S_OK;
+}
+static HRESULT WINAPI data_GetIndexedProperty(ICustomPropertyProvider *iface, HSTRING name, TypeName type, ICustomProperty **value) { return E_NOTIMPL; }
+static HRESULT WINAPI data_GetStringRepresentation(ICustomPropertyProvider *iface, HSTRING *value) { *value = hs(data_from_provider(iface)->name); return S_OK; }
+static HRESULT WINAPI data_get_Type(ICustomPropertyProvider *iface, TypeName *value) { memset(value, 0, sizeof(*value)); return S_OK; }
+static ICustomPropertyProviderVtbl data_vtbl =
+{
+    data_QueryInterface, data_AddRef, data_Release, data_GetIids, data_GetRuntimeClassName, data_GetTrustLevel,
+    data_GetCustomProperty, data_GetIndexedProperty, data_GetStringRepresentation, data_get_Type,
+};
+
+static struct data_object *data_from_notify(INotifyPropertyChanged *iface)
+{
+    return CONTAINING_RECORD(iface, struct data_object, INotifyPropertyChanged_iface);
+}
+static HRESULT WINAPI notify_QueryInterface(INotifyPropertyChanged *iface, REFIID iid, void **out)
+{
+    return data_QueryInterface(&data_from_notify(iface)->ICustomPropertyProvider_iface, iid, out);
+}
+static ULONG WINAPI notify_AddRef(INotifyPropertyChanged *iface) { return data_AddRef(&data_from_notify(iface)->ICustomPropertyProvider_iface); }
+static ULONG WINAPI notify_Release(INotifyPropertyChanged *iface) { return data_Release(&data_from_notify(iface)->ICustomPropertyProvider_iface); }
+static HRESULT WINAPI notify_GetIids(INotifyPropertyChanged *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
+static HRESULT WINAPI notify_GetRuntimeClassName(INotifyPropertyChanged *iface, HSTRING *name) { return E_NOTIMPL; }
+static HRESULT WINAPI notify_GetTrustLevel(INotifyPropertyChanged *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
+static HRESULT WINAPI notify_add_PropertyChanged(INotifyPropertyChanged *iface, IPropertyChangedEventHandler *handler, EventRegistrationToken *token)
+{
+    struct data_object *obj = data_from_notify(iface);
+    int i;
+    for (i = 0; i < 8 && obj->handlers[i]; i++);
+    if (i == 8) return E_OUTOFMEMORY;
+    obj->handlers[i] = handler;
+    token->value = i + 1;
+    return S_OK;
+}
+static HRESULT WINAPI notify_remove_PropertyChanged(INotifyPropertyChanged *iface, EventRegistrationToken token)
+{
+    if (token.value >= 1 && token.value <= 8) data_from_notify(iface)->handlers[token.value - 1] = NULL;
+    return S_OK;
+}
+static INotifyPropertyChangedVtbl notify_vtbl =
+{
+    notify_QueryInterface, notify_AddRef, notify_Release, notify_GetIids, notify_GetRuntimeClassName, notify_GetTrustLevel,
+    notify_add_PropertyChanged, notify_remove_PropertyChanged,
+};
+
+static void data_init(struct data_object *obj, const WCHAR *name, const WCHAR *color, double count)
+{
+    memset(obj, 0, sizeof(*obj));
+    obj->ICustomPropertyProvider_iface.lpVtbl = &data_vtbl;
+    obj->INotifyPropertyChanged_iface.lpVtbl = &notify_vtbl;
+    obj->ref = 1;
+    lstrcpyW(obj->name, name);
+    lstrcpyW(obj->color, color);
+    obj->count = count;
+}
+
+/* "PropertyChanged(name)" from the data object, as an app's setter raises it */
+static void data_changed(struct data_object *obj, const WCHAR *property)
+{
+    IActivationFactory *factory;
+    IPropertyChangedEventArgsFactory *args_factory;
+    IPropertyChangedEventArgs *args = NULL;
+    IInspectable *inner = NULL;
+    HSTRING name;
+    int i;
+
+    if (!(factory = get_factory(L"Windows.UI.Xaml.Data.PropertyChangedEventArgs", &IID_IActivationFactory))) return;
+    if (SUCCEEDED(IActivationFactory_QueryInterface(factory, &IID_IPropertyChangedEventArgsFactory, (void **)&args_factory)))
+    {
+        name = hs(property);
+        IPropertyChangedEventArgsFactory_CreateInstance(args_factory, name, NULL, &inner, &args);
+        WindowsDeleteString(name);
+        IPropertyChangedEventArgsFactory_Release(args_factory);
+    }
+    IActivationFactory_Release(factory);
+    for (i = 0; i < 8; i++)
+        if (obj->handlers[i]) IPropertyChangedEventHandler_Invoke(obj->handlers[i], (IInspectable *)&obj->ICustomPropertyProvider_iface, args);
+    if (args) IPropertyChangedEventArgs_Release(args);
+}
+
+/* a three-item IIterable<Object> for ItemsSource */
+struct item_list
+{
+    IIterable_IInspectable IIterable_iface;
+    IIterator_IInspectable IIterator_iface;
+    IInspectable *items[3];
+    UINT32 pos;
+};
+static struct item_list *list_from_iterable(IIterable_IInspectable *iface) { return CONTAINING_RECORD(iface, struct item_list, IIterable_iface); }
+static struct item_list *list_from_iterator(IIterator_IInspectable *iface) { return CONTAINING_RECORD(iface, struct item_list, IIterator_iface); }
+static HRESULT WINAPI list_QueryInterface(IIterable_IInspectable *iface, REFIID iid, void **out)
+{
+    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) || IsEqualGUID(iid, &IID_IIterable_IInspectable))
+    {
+        *out = iface;
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI list_AddRef(IIterable_IInspectable *iface) { return 2; }
+static ULONG WINAPI list_Release(IIterable_IInspectable *iface) { return 1; }
+static HRESULT WINAPI list_GetIids(IIterable_IInspectable *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
+static HRESULT WINAPI list_GetRuntimeClassName(IIterable_IInspectable *iface, HSTRING *name) { return E_NOTIMPL; }
+static HRESULT WINAPI list_GetTrustLevel(IIterable_IInspectable *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
+static HRESULT WINAPI list_First(IIterable_IInspectable *iface, IIterator_IInspectable **value)
+{
+    struct item_list *list = list_from_iterable(iface);
+    list->pos = 0;
+    *value = &list->IIterator_iface;
+    return S_OK;
+}
+static IIterable_IInspectableVtbl list_vtbl = { list_QueryInterface, list_AddRef, list_Release, list_GetIids, list_GetRuntimeClassName, list_GetTrustLevel, list_First };
+static HRESULT WINAPI iter_QueryInterface(IIterator_IInspectable *iface, REFIID iid, void **out) { *out = iface; return S_OK; }
+static ULONG WINAPI iter_AddRef(IIterator_IInspectable *iface) { return 2; }
+static ULONG WINAPI iter_Release(IIterator_IInspectable *iface) { return 1; }
+static HRESULT WINAPI iter_GetIids(IIterator_IInspectable *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
+static HRESULT WINAPI iter_GetRuntimeClassName(IIterator_IInspectable *iface, HSTRING *name) { return E_NOTIMPL; }
+static HRESULT WINAPI iter_GetTrustLevel(IIterator_IInspectable *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
+static HRESULT WINAPI iter_get_Current(IIterator_IInspectable *iface, IInspectable **value)
+{
+    struct item_list *list = list_from_iterator(iface);
+    if (list->pos >= 3) return E_BOUNDS;
+    *value = list->items[list->pos];
+    IInspectable_AddRef(*value);
+    return S_OK;
+}
+static HRESULT WINAPI iter_get_HasCurrent(IIterator_IInspectable *iface, boolean *value) { *value = list_from_iterator(iface)->pos < 3; return S_OK; }
+static HRESULT WINAPI iter_MoveNext(IIterator_IInspectable *iface, boolean *value)
+{
+    struct item_list *list = list_from_iterator(iface);
+    if (list->pos < 3) list->pos++;
+    *value = list->pos < 3;
+    return S_OK;
+}
+static HRESULT WINAPI iter_GetMany(IIterator_IInspectable *iface, UINT32 size, IInspectable **items, UINT32 *count) { return E_NOTIMPL; }
+static IIterator_IInspectableVtbl iter_vtbl =
+{
+    iter_QueryInterface, iter_AddRef, iter_Release, iter_GetIids, iter_GetRuntimeClassName, iter_GetTrustLevel,
+    iter_get_Current, iter_get_HasCurrent, iter_MoveNext, iter_GetMany,
+};
+
+static int toggled_count, value_changed_count, completed_count;
+
+static HRESULT WINAPI toggled_Invoke(IRoutedEventHandler *iface, IInspectable *sender, IRoutedEventArgs *args) { toggled_count++; return S_OK; }
+static IRoutedEventHandlerVtbl toggled_vtbl = { click_QueryInterface, click_AddRef, click_Release, toggled_Invoke };
+static IRoutedEventHandler on_toggled = { &toggled_vtbl };
+
+static HRESULT WINAPI value_QueryInterface(IRangeBaseValueChangedEventHandler *iface, REFIID iid, void **out) { *out = iface; return S_OK; }
+static ULONG WINAPI value_AddRef(IRangeBaseValueChangedEventHandler *iface) { return 2; }
+static ULONG WINAPI value_Release(IRangeBaseValueChangedEventHandler *iface) { return 1; }
+static HRESULT WINAPI value_Invoke(IRangeBaseValueChangedEventHandler *iface, IInspectable *sender, IRangeBaseValueChangedEventArgs *args) { value_changed_count++; return S_OK; }
+static IRangeBaseValueChangedEventHandlerVtbl value_vtbl = { value_QueryInterface, value_AddRef, value_Release, value_Invoke };
+static IRangeBaseValueChangedEventHandler on_value = { &value_vtbl };
+
+static HRESULT WINAPI completed_QueryInterface(IEventHandler_IInspectable *iface, REFIID iid, void **out) { *out = iface; return S_OK; }
+static ULONG WINAPI completed_AddRef(IEventHandler_IInspectable *iface) { return 2; }
+static ULONG WINAPI completed_Release(IEventHandler_IInspectable *iface) { return 1; }
+static HRESULT WINAPI completed_Invoke(IEventHandler_IInspectable *iface, IInspectable *sender, IInspectable *args) { completed_count++; return S_OK; }
+static IEventHandler_IInspectableVtbl completed_vtbl = { completed_QueryInterface, completed_AddRef, completed_Release, completed_Invoke };
+static IEventHandler_IInspectable on_completed = { &completed_vtbl };
+
+static const WCHAR part6_xaml[] =
+    L"<Grid xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\"\n"
+    L"      xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\"\n"
+    L"      Grid.RowSpan=\"2\" Width=\"400\" HorizontalAlignment=\"Center\" Background=\"White\">\n"
+    L"  <Grid.Resources>\n"
+    L"    <Storyboard x:Key=\"Fade\">\n"
+    L"      <DoubleAnimation Storyboard.TargetName=\"FadeBox\" Storyboard.TargetProperty=\"Opacity\" From=\"1\" To=\"0\" Duration=\"0:0:0.3\"/>\n"
+    L"    </Storyboard>\n"
+    L"    <Style x:Key=\"SlowButton\" TargetType=\"Button\">\n"
+    L"      <Setter Property=\"Template\"><Setter.Value>\n"
+    L"        <ControlTemplate TargetType=\"Button\">\n"
+    L"          <Border x:Name=\"Root\" Background=\"#FF000080\" Width=\"80\" Height=\"30\">\n"
+    L"            <VisualStateManager.VisualStateGroups>\n"
+    L"              <VisualStateGroup x:Name=\"CommonStates\">\n"
+    L"                <VisualState x:Name=\"Normal\"/>\n"
+    L"                <VisualState x:Name=\"PointerOver\">\n"
+    L"                  <Storyboard>\n"
+    L"                    <ColorAnimation Storyboard.TargetName=\"Root\" Storyboard.TargetProperty=\"(Border.Background).(SolidColorBrush.Color)\"\n"
+    L"                                    To=\"#FF00FF80\" Duration=\"0:0:0.4\"/>\n"
+    L"                  </Storyboard>\n"
+    L"                </VisualState>\n"
+    L"              </VisualStateGroup>\n"
+    L"            </VisualStateManager.VisualStateGroups>\n"
+    L"          </Border>\n"
+    L"        </ControlTemplate>\n"
+    L"      </Setter.Value></Setter>\n"
+    L"    </Style>\n"
+    L"  </Grid.Resources>\n"
+    L"  <StackPanel>\n"
+    L"    <Border x:Name=\"Half\" Background=\"#FFFF0000\" Opacity=\"0.5\" Height=\"20\"/>\n"
+    L"    <Border x:Name=\"FadeBox\" Background=\"#FF00A0A0\" Height=\"20\"/>\n"
+    L"    <Path Stroke=\"#FFA000A0\" StrokeThickness=\"3\" Data=\"M 10,30 C 60,-10 110,70 160,30 Q 200,0 240,30 A 20,20 0 0 1 280,30\"/>\n"
+    L"    <Path Fill=\"#FF308030\"><Path.Data><EllipseGeometry Center=\"40,20\" RadiusX=\"40\" RadiusY=\"20\"/></Path.Data></Path>\n"
+    L"    <ToggleSwitch x:Name=\"Switch\" Header=\"Wi-Fi\"/>\n"
+    L"    <Slider x:Name=\"Slide\" Minimum=\"0\" Maximum=\"100\" Value=\"25\" StepFrequency=\"5\" Width=\"200\" HorizontalAlignment=\"Left\"/>\n"
+    L"    <ProgressBar x:Name=\"Progress\" Value=\"50\" Width=\"200\" HorizontalAlignment=\"Left\" Foreground=\"#FFC04000\"/>\n"
+    L"    <Button x:Name=\"Slow\" Style=\"{StaticResource SlowButton}\"/>\n"
+    L"    <TextBlock x:Name=\"Bound\" Text=\"{Binding Name}\"/>\n"
+    L"    <ItemsControl x:Name=\"List\" ItemsSource=\"{Binding Items}\">\n"
+    L"      <ItemsControl.ItemTemplate>\n"
+    L"        <DataTemplate><Border Height=\"12\" Background=\"{Binding Color}\"/></DataTemplate>\n"
+    L"      </ItemsControl.ItemTemplate>\n"
+    L"    </ItemsControl>\n"
+    L"    <Slider x:Name=\"TwoWay\" Maximum=\"100\" Value=\"{Binding Count, Mode=TwoWay}\" Width=\"200\" HorizontalAlignment=\"Left\"/>\n"
+    L"    <TextBlock x:Name=\"Echo\" Text=\"{Binding Value, ElementName=TwoWay}\"/>\n"
+    L"    <Button x:Name=\"Templated\" Content=\"{Binding}\">\n"
+    L"      <Button.ContentTemplate><DataTemplate><Border Width=\"200\" Height=\"10\" Background=\"{Binding Color}\"/></DataTemplate></Button.ContentTemplate>\n"
+    L"    </Button>\n"
+    L"  </StackPanel>\n"
+    L"</Grid>\n";
+
+static void check_part6(struct main_page *page)
+{
+    struct data_object data, a, b, c;
+    struct item_list list = { { &list_vtbl }, { &iter_vtbl } };
+    IInspectable *root, *object, *fade;
+    IFrameworkElement2 *page_grid = page_root(page);
+    IPanel *grid_panel;
+    IVector_UIElement *children;
+    IUIElement *ui;
+    IFrameworkElement *fe;
+    IToggleSwitch *ts;
+    IRangeBase *range;
+    IResourceDictionary *dict;
+    IMap_IInspectable_IInspectable *map;
+    IStoryboard *storyboard;
+    ITimeline *timeline;
+    EventRegistrationToken token;
+    ITextBlock *tb;
+    RECT box;
+    POINT pt;
+    DOUBLE d = 0;
+    boolean on = FALSE;
+    HRESULT hr;
+    WCHAR buf[64];
+    int n, before;
+
+    data_init(&a, L"One", L"#FF102080", 0);
+    data_init(&b, L"Two", L"#FF208010", 0);
+    data_init(&c, L"Three", L"#FF801020", 0);
+    list.items[0] = (IInspectable *)&a.ICustomPropertyProvider_iface;
+    list.items[1] = (IInspectable *)&b.ICustomPropertyProvider_iface;
+    list.items[2] = (IInspectable *)&c.ICustomPropertyProvider_iface;
+    data_init(&data, L"Alpha", L"#FF5050F0", 40);
+    data.items = (IInspectable *)&list.IIterable_iface;
+
+    root = xaml_load(part6_xaml, &hr);
+    check(hr == S_OK && root, "XamlReader.Load of the part 6 page, hr %#lx", hr);
+    if (!root || !page_grid) return;
+    IInspectable_QueryInterface(root, &IID_IFrameworkElement, (void **)&fe);
+    IFrameworkElement_put_DataContext(fe, (IInspectable *)&data.ICustomPropertyProvider_iface);
+    IFrameworkElement2_QueryInterface(page_grid, &IID_IPanel, (void **)&grid_panel);
+    IPanel_get_Children(grid_panel, &children);
+    IInspectable_QueryInterface(root, &IID_IUIElement, (void **)&ui);
+    IVector_UIElement_Append(children, ui);
+    snapshot();
+
+    /* Opacity: #FF0000 at 0.5 over white */
+    n = count_color(0xff8080) + count_color(0xff7f7f);
+    check(n > 2000, "a Border with Opacity 0.5 draws its red half-blended over white (%d px)", n);
+    /* curves and geometries */
+    n = find_color(0xa000a0, &box);
+    check(n > 300 && box.bottom - box.top > 12, "a Path with C, Q and A segments draws a curve (%d px, %ld high)", n, box.bottom - box.top + 1);
+    n = count_color(0x308030);
+    check(n > 2200 && n < 2800, "a Path with an EllipseGeometry fills about pi*40*20 px (%d)", n);
+    /* ProgressBar at 50 of 100, 200 wide, 4 high */
+    n = count_color(0xc04000);
+    check(n >= 380 && n <= 420, "ProgressBar Value 50 fills half its width (%d px)", n);
+
+    /* ToggleSwitch */
+    object = find_in(root, L"Switch");
+    check(object && SUCCEEDED(IInspectable_QueryInterface(object, &IID_IToggleSwitch, (void **)&ts)), "FindName finds the ToggleSwitch");
+    if (object && ts)
+    {
+        IToggleSwitch_add_Toggled(ts, &on_toggled, &token);
+        before = count_color(0x0078d7);
+        IToggleSwitch_put_IsOn(ts, TRUE);
+        snapshot();
+        IToggleSwitch_get_IsOn(ts, &on);
+        check(on && toggled_count == 1, "IsOn = true raises Toggled (%d)", toggled_count);
+        check(count_color(0x0078d7) > before + 400, "the On track is drawn in the accent colour (%d px, was %d)", count_color(0x0078d7), before);
+        IToggleSwitch_Release(ts);
+    }
+    if (object) IInspectable_Release(object);
+
+    /* Slider: a click at three quarters of its track */
+    object = find_in(root, L"Slide");
+    if (object && SUCCEEDED(IInspectable_QueryInterface(object, &IID_IRangeBase, (void **)&range)))
+    {
+        IRangeBase_add_ValueChanged(range, &on_value, &token);
+        IRangeBase_get_Value(range, &d);
+        check(d == 25, "Slider Value from markup (%.1f)", d);
+        IRangeBase_Release(range);
+    }
+    if (object) IInspectable_Release(object);
+
+    /* Storyboard.Begin from code, with timing and Completed */
+    IInspectable_QueryInterface(root, &IID_IFrameworkElement, (void **)&fe);
+    IFrameworkElement_get_Resources(fe, &dict);
+    IResourceDictionary_QueryInterface(dict, &IID_IMap_IInspectable_IInspectable, (void **)&map);
+    {
+        IInspectable *key = box_str(L"Fade");
+        fade = NULL;
+        IMap_IInspectable_IInspectable_Lookup(map, key, &fade);
+        IInspectable_Release(key);
+    }
+    check(fade && SUCCEEDED(IInspectable_QueryInterface(fade, &IID_IStoryboard, (void **)&storyboard)), "Resources[\"Fade\"] is a Storyboard");
+    if (fade && storyboard)
+    {
+        object = find_in(root, L"FadeBox");
+        IStoryboard_QueryInterface(storyboard, &IID_ITimeline, (void **)&timeline);
+        ITimeline_add_Completed(timeline, &on_completed, &token);
+        IStoryboard_Begin(storyboard);
+        d = opacity_of(object);
+        check(d > 0.8, "Begin: the DoubleAnimation starts From 1 (%.2f)", d);
+        pump(120);
+        d = opacity_of(object);
+        check(d > 0.05 && d < 0.95, "after ~120 ms of 300 it is part way (%.2f)", d);
+        pump(400);
+        d = opacity_of(object);
+        check(d == 0 && completed_count == 1, "after 300 ms it holds To 0 and Completed fired (%.2f, %d)", d, completed_count);
+        ITimeline_Release(timeline);
+        IStoryboard_Release(storyboard);
+        if (object) IInspectable_Release(object);
+    }
+    if (fade) IInspectable_Release(fade);
+    IMap_IInspectable_IInspectable_Release(map);
+    IResourceDictionary_Release(dict);
+
+    /* a timed visual state: ColorAnimation over 400 ms on PointerOver */
+    snapshot();
+    if (center_of(0x000080, &pt))
+    {
+        hover(pt);
+        pump(150);
+        snapshot();
+        check(count_color(0x00ff80) == 0 && count_color(0x000080) == 0, "PointerOver's ColorAnimation is between its colours after 150 ms");
+        pump(450);
+        snapshot();
+        check(count_color(0x00ff80) > 1500, "and at To #00FF80 after 400 ms (%d px)", count_color(0x00ff80));
+        leave();
+        snapshot();
+        check(count_color(0x000080) > 1500, "leaving the state puts the Normal colour back (%d px)", count_color(0x000080));
+    }
+    else check(0, "the timed template draws #000080");
+
+    /* {Binding}: DataContext, INotifyPropertyChanged, ItemsControl with an ItemTemplate, TwoWay, ElementName, ContentTemplate */
+    object = find_in(root, L"Bound");
+    if (object && SUCCEEDED(IInspectable_QueryInterface(object, &IID_ITextBlock, (void **)&tb)))
+    {
+        check(!wcscmp(text_of(tb, buf, ARRAYSIZE(buf)), L"Alpha"), "{Binding Name} from the DataContext (%ls)", buf);
+        lstrcpyW(data.name, L"Beta");
+        data_changed(&data, L"Name");
+        snapshot();
+        check(!wcscmp(text_of(tb, buf, ARRAYSIZE(buf)), L"Beta"), "PropertyChanged(\"Name\") updates it (%ls)", buf);
+        ITextBlock_Release(tb);
+    }
+    else check(0, "FindName finds Bound");
+    if (object) IInspectable_Release(object);
+    check(count_color(0x102080) > 1500 && count_color(0x208010) > 1500 && count_color(0x801020) > 1500,
+          "ItemsControl shows its 3 ItemsSource items through the DataTemplate, each Border's {Binding Color} (%d, %d, %d px)",
+          count_color(0x102080), count_color(0x208010), count_color(0x801020));
+    check(count_color(0x5050f0) > 1500, "Button.ContentTemplate shows its Content {Binding} with the item as DataContext (%d px)",
+          count_color(0x5050f0));
+    object = find_in(root, L"TwoWay");
+    if (object && SUCCEEDED(IInspectable_QueryInterface(object, &IID_IRangeBase, (void **)&range)))
+    {
+        IRangeBase_get_Value(range, &d);
+        check(d == 40, "Slider.Value {Binding Count, Mode=TwoWay} reads 40 (%.1f)", d);
+        IRangeBase_put_Value(range, 70);
+        check(data.count == 70, "and setting the Slider writes 70 back to the data object (%.1f)", data.count);
+        IRangeBase_Release(range);
+    }
+    else check(0, "FindName finds TwoWay");
+    if (object) IInspectable_Release(object);
+    snapshot();
+    object = find_in(root, L"Echo");
+    if (object && SUCCEEDED(IInspectable_QueryInterface(object, &IID_ITextBlock, (void **)&tb)))
+    {
+        check(!wcscmp(text_of(tb, buf, ARRAYSIZE(buf)), L"70"), "{Binding Value, ElementName=TwoWay} follows the Slider (%ls)", buf);
+        ITextBlock_Release(tb);
+    }
+    if (object) IInspectable_Release(object);
+
+    IVector_UIElement_Release(children);
+    IPanel_Release(grid_panel);
+    IUIElement_Release(ui);
+    IFrameworkElement_Release(fe);
+    IFrameworkElement2_Release(page_grid);
+    IInspectable_Release(root);
+}
+
 static void check_microsoft_xbf(const WCHAR *file, const WCHAR *component_class)
 {
     IActivationFactory *factory;
@@ -1310,6 +1876,7 @@ static void CALLBACK verify(HWND unused, UINT msg, UINT_PTR id, DWORD time)
     check_corners(the_page);
     check_theme_change(the_page);
     check_loose_xaml();
+    check_part6(the_page);
     check(!wcscmp(text_of(the_page->title, buf, ARRAYSIZE(buf)), L"Clicked!"), "OnClick changed Title (%ls)", buf);
     snapshot();
 

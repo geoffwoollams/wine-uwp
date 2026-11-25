@@ -1,5 +1,6 @@
 #!/bin/bash
-# Runs the XAML test apps (xamlhello: milestone 1, xamllayout: milestone 2, xamlmarkup: milestone 3) in a throwaway Wine prefix (never the shared one): tests/xaml/run.sh [keep-prefix-dir]
+# Runs the XAML test apps (xamlhello: milestone 1, xamllayout: milestone 2, xamlmarkup: milestones 3-4) in a throwaway Wine
+# prefix (never the shared one), removed afterwards unless given: tests/xaml/run.sh [keep-prefix-dir]
 # Opens a 1280x720 window for a few seconds. Exit status 0 means every check passed.
 # XAML_MS_XBF_DIR=dir also loads Microsoft's compiler-made .xbf test files from dir.
 set -uo pipefail
@@ -25,4 +26,6 @@ for t in xamlhello xamllayout xamlmarkup; do
 done
 ls "$WINEPREFIX"/drive_c/*.bmp >/dev/null 2>&1 && info "screenshots in $WINEPREFIX/drive_c/"
 [ $RC = 0 ] && info "all XAML tests passed" || info "some XAML tests FAILED"
+# a prefix we made ourselves goes again (about 800 MB, often on a RAM-backed /tmp); one given as an argument stays
+if [ -z "${1:-}" ] && [ -z "${XAMLHELLO_SCREENSHOT:-}" ]; then cd / && rm -rf "${TMP:?}"; fi
 exit $RC
