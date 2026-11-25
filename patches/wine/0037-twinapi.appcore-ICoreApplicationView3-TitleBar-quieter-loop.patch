@@ -1,0 +1,296 @@
+Subject: twinapi.appcore, kernelbase: ICoreApplicationView3 and a CoreApplicationViewTitleBar, the package manifest above a
+ subfolder executable, quieter per-frame traces (Gears of War 4)
+
+diff --git a/dlls/combase/roapi.c b/dlls/combase/roapi.c
+index e55913a..66ec3d3 100644
+--- a/dlls/combase/roapi.c
++++ b/dlls/combase/roapi.c
+@@ -460,7 +460,9 @@ HRESULT WINAPI RoUnregisterForApartmentShutdown(APARTMENT_SHUTDOWN_REGISTRATION_
+  */
+ HRESULT WINAPI RoGetApartmentIdentifier(UINT64 *identifier)
+ {
+-    FIXME("(%p): stub\n", identifier);
++    static int once;
++
++    if (!once++) FIXME("(%p): stub\n", identifier);
+ 
+     if (!identifier)
+         return E_INVALIDARG;
+diff --git a/dlls/kernelbase/version.c b/dlls/kernelbase/version.c
+index 8951268..ee19b01 100644
+--- a/dlls/kernelbase/version.c
++++ b/dlls/kernelbase/version.c
+@@ -1606,15 +1606,20 @@ static BOOL CALLBACK init_current_package( INIT_ONCE *once, void *param, void **
+ 
+     len = GetModuleFileNameW( NULL, manifest_path, MAX_PATH );
+     if (!len || len >= MAX_PATH) return TRUE;
+-    if (!(p = wcsrchr( manifest_path, '\\' ))) return TRUE;
+-    p[1] = 0;
+-    wcscpy( current_package.path, manifest_path );
+-    p[0] = 0; /* path without trailing separator */
+-    wcscpy( current_package.path, manifest_path );
+-    p[0] = '\\';
+-    wcscat( manifest_path, L"AppxManifest.xml" );
+-
+-    file = CreateFileW( manifest_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++    /* the package root is the nearest directory above the executable with the manifest: the executable can be in
++     * a subfolder (Gears of War 4's GearGame\Binaries\UWP64\GearGame.exe) */
++    file = INVALID_HANDLE_VALUE;
++    for (i = 0; i < 8 && file == INVALID_HANDLE_VALUE && (p = wcsrchr( manifest_path, '\\' )); i++)
++    {
++        p[0] = 0; /* the directory, without its trailing separator */
++        if (wcslen( manifest_path ) + 18 >= MAX_PATH) break;
++        wcscpy( current_package.path, manifest_path );
++        wcscat( manifest_path, L"\\AppxManifest.xml" );
++        file = CreateFileW( manifest_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++        if ((p = wcsrchr( manifest_path, '\\' ))) p[0] = 0;   /* back to the directory */
++        if (file == INVALID_HANDLE_VALUE) continue;
++        TRACE( "package manifest in %s.\n", debugstr_w(current_package.path) );
++    }
+     if (file == INVALID_HANDLE_VALUE) return TRUE;
+     if (!GetFileSizeEx( file, &size ) || size.QuadPart > 1024 * 1024 || !(data = HeapAlloc( GetProcessHeap(), 0, size.QuadPart + 1 )))
+     {
+diff --git a/dlls/twinapi.appcore/core_gen.c b/dlls/twinapi.appcore/core_gen.c
+index 79ecdab..d012692 100644
+--- a/dlls/twinapi.appcore/core_gen.c
++++ b/dlls/twinapi.appcore/core_gen.c
+@@ -7,6 +7,8 @@
+ #include "windows.applicationmodel.activation.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
++/* what a game's loop calls every frame (GetForCurrentThread, Dispatcher, ProcessEvents): +coreloop to see it */
++WINE_DECLARE_DEBUG_CHANNEL(coreloop);
+ 
+ static LONG event_token_counter;
+ extern HRESULT core_input_add_handler(int ev, IUnknown *handler, EventRegistrationToken *token);
+@@ -61,6 +63,9 @@ struct core_view
+ {
+     ICoreApplicationView ICoreApplicationView_iface;
+     ICoreApplicationView2 ICoreApplicationView2_iface;
++    ICoreApplicationView3 ICoreApplicationView3_iface;
++    ICoreApplicationViewTitleBar ICoreApplicationViewTitleBar_iface;
++    boolean extend_into_title_bar;
+     LONG ref;
+     struct core_window *window;
+     ITypedEventHandler_CoreApplicationView_IActivatedEventArgs *activated[8];
+@@ -394,6 +399,8 @@ static HRESULT core_view_qi(struct core_view *impl, REFIID iid, void **out)
+         *out = &impl->ICoreApplicationView_iface;
+     else if (IsEqualGUID(iid, &IID_ICoreApplicationView2))
+         *out = &impl->ICoreApplicationView2_iface;
++    else if (IsEqualGUID(iid, &IID_ICoreApplicationView3))
++        *out = &impl->ICoreApplicationView3_iface;
+     else
+     {
+         FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
+@@ -482,7 +489,7 @@ static struct core_window_factory core_window_factory_instance;
+ 
+ static HRESULT core_window_factory_qi(struct core_window_factory *impl, REFIID iid, void **out)
+ {
+-    TRACE("%p, %s, %p.\n", impl, debugstr_guid(iid), out);
++    TRACE_(coreloop)("%p, %s, %p.\n", impl, debugstr_guid(iid), out);
+     if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
+         IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IActivationFactory))
+         *out = &impl->IActivationFactory_iface;
+@@ -555,7 +562,7 @@ static HRESULT WINAPI core_dispatcher_ProcessEvents(ICoreDispatcher *iface, __x_
+ {
+     struct core_dispatcher *impl __attribute__((unused)) = impl_from_core_dispatcher(iface);
+     MSG msg;
+-    TRACE("iface %p, options %d.\n", iface, options);
++    TRACE_(coreloop)("iface %p, options %d.\n", iface, options);
+     if (options == CoreProcessEventsOption_ProcessUntilQuit)
+     {
+         /* used by FrameworkView.Run (XAML): block until WM_QUIT, running RunAsync work as it is queued */
+@@ -706,7 +713,7 @@ static HRESULT WINAPI core_window_get_CustomProperties(ICoreWindow *iface, __x_A
+ static HRESULT WINAPI core_window_get_Dispatcher(ICoreWindow *iface, __x_ABI_CWindows_CUI_CCore_CICoreDispatcher **value)
+ {
+     struct core_window *impl __attribute__((unused)) = impl_from_core_window(iface);
+-    TRACE("iface %p, value %p.\n", iface, value);
++    TRACE_(coreloop)("iface %p, value %p.\n", iface, value);
+     *value = &impl->dispatcher->ICoreDispatcher_iface;
+     ICoreDispatcher_AddRef(*value);
+     return S_OK;
+@@ -1361,6 +1368,166 @@ static const ICoreApplicationView2Vtbl core_view2_vtbl =
+     core_view2_get_Dispatcher,
+ };
+ 
++/* ---- ICoreApplicationView3 on core_view ---- */
++/* Gears of War 4 reads these in its Activated handler. The view is never a hosted component, and its title bar
++ * is the window's own; it has no system overlay and keeps the size it had. */
++static inline struct core_view *impl_from_core_view3(ICoreApplicationView3 *iface)
++{ return CONTAINING_RECORD(iface, struct core_view, ICoreApplicationView3_iface); }
++
++static HRESULT WINAPI core_view3_QueryInterface(ICoreApplicationView3 *iface, REFIID iid, void **out)
++{ return core_view_qi(impl_from_core_view3(iface), iid, out); }
++static ULONG WINAPI core_view3_AddRef(ICoreApplicationView3 *iface)
++{ return core_view_addref(impl_from_core_view3(iface)); }
++static ULONG WINAPI core_view3_Release(ICoreApplicationView3 *iface)
++{ return core_view_release(impl_from_core_view3(iface)); }
++static HRESULT WINAPI core_view3_GetIids(ICoreApplicationView3 *iface, ULONG *count, IID **iids)
++{ FIXME("iface %p stub!\n", iface); return E_NOTIMPL; }
++static HRESULT WINAPI core_view3_GetRuntimeClassName(ICoreApplicationView3 *iface, HSTRING *name)
++{ FIXME("iface %p stub!\n", iface); return E_NOTIMPL; }
++static HRESULT WINAPI core_view3_GetTrustLevel(ICoreApplicationView3 *iface, TrustLevel *level)
++{ *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI core_view3_get_IsComponent(ICoreApplicationView3 *iface, boolean *value)
++{
++    TRACE("iface %p, value %p.\n", iface, value);
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI core_view3_get_TitleBar(ICoreApplicationView3 *iface, ICoreApplicationViewTitleBar **value)
++{
++    struct core_view *impl = impl_from_core_view3(iface);
++    TRACE("iface %p, value %p.\n", iface, value);
++    *value = &impl->ICoreApplicationViewTitleBar_iface;
++    ICoreApplicationViewTitleBar_AddRef(*value);
++    return S_OK;
++}
++
++static HRESULT WINAPI core_view3_add_HostedViewClosing(ICoreApplicationView3 *iface,
++        __FITypedEventHandler_2_Windows__CApplicationModel__CCore__CCoreApplicationView_Windows__CApplicationModel__CCore__CHostedViewClosingEventArgs *handler,
++        EventRegistrationToken *token)
++{
++    TRACE("iface %p, handler %p (a view that isn't hosted never closes as one).\n", iface, handler);
++    token->value = InterlockedIncrement(&event_token_counter);
++    return S_OK;
++}
++
++static HRESULT WINAPI core_view3_remove_HostedViewClosing(ICoreApplicationView3 *iface, EventRegistrationToken token)
++{ return S_OK; }
++
++static const ICoreApplicationView3Vtbl core_view3_vtbl =
++{
++    core_view3_QueryInterface,
++    core_view3_AddRef,
++    core_view3_Release,
++    core_view3_GetIids,
++    core_view3_GetRuntimeClassName,
++    core_view3_GetTrustLevel,
++    core_view3_get_IsComponent,
++    core_view3_get_TitleBar,
++    core_view3_add_HostedViewClosing,
++    core_view3_remove_HostedViewClosing,
++};
++
++/* ---- CoreApplicationViewTitleBar, part of core_view ---- */
++static inline struct core_view *impl_from_title_bar(ICoreApplicationViewTitleBar *iface)
++{ return CONTAINING_RECORD(iface, struct core_view, ICoreApplicationViewTitleBar_iface); }
++
++static HRESULT WINAPI title_bar_QueryInterface(ICoreApplicationViewTitleBar *iface, REFIID iid, void **out)
++{
++    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_ICoreApplicationViewTitleBar))
++    {
++        *out = iface;
++        ICoreApplicationViewTitleBar_AddRef(iface);
++        return S_OK;
++    }
++    FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI title_bar_AddRef(ICoreApplicationViewTitleBar *iface)
++{ return core_view_addref(impl_from_title_bar(iface)); }
++static ULONG WINAPI title_bar_Release(ICoreApplicationViewTitleBar *iface)
++{ return core_view_release(impl_from_title_bar(iface)); }
++static HRESULT WINAPI title_bar_GetIids(ICoreApplicationViewTitleBar *iface, ULONG *count, IID **iids)
++{ FIXME("iface %p stub!\n", iface); return E_NOTIMPL; }
++static HRESULT WINAPI title_bar_GetRuntimeClassName(ICoreApplicationViewTitleBar *iface, HSTRING *name)
++{
++    static const WCHAR class_name[] = L"Windows.ApplicationModel.Core.CoreApplicationViewTitleBar";
++    return WindowsCreateString(class_name, wcslen(class_name), name);
++}
++static HRESULT WINAPI title_bar_GetTrustLevel(ICoreApplicationViewTitleBar *iface, TrustLevel *level)
++{ *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI title_bar_put_ExtendViewIntoTitleBar(ICoreApplicationViewTitleBar *iface, boolean value)
++{
++    TRACE("iface %p, value %d (the window keeps its frame).\n", iface, value);
++    impl_from_title_bar(iface)->extend_into_title_bar = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI title_bar_get_ExtendViewIntoTitleBar(ICoreApplicationViewTitleBar *iface, boolean *value)
++{
++    *value = impl_from_title_bar(iface)->extend_into_title_bar;
++    return S_OK;
++}
++
++static HRESULT WINAPI title_bar_get_SystemOverlayLeftInset(ICoreApplicationViewTitleBar *iface, DOUBLE *value)
++{ *value = 0; return S_OK; }
++static HRESULT WINAPI title_bar_get_SystemOverlayRightInset(ICoreApplicationViewTitleBar *iface, DOUBLE *value)
++{ *value = 0; return S_OK; }
++static HRESULT WINAPI title_bar_get_Height(ICoreApplicationViewTitleBar *iface, DOUBLE *value)
++{ *value = 0; return S_OK; }
++
++static HRESULT WINAPI title_bar_add_LayoutMetricsChanged(ICoreApplicationViewTitleBar *iface,
++        __FITypedEventHandler_2_Windows__CApplicationModel__CCore__CCoreApplicationViewTitleBar_IInspectable *handler,
++        EventRegistrationToken *token)
++{
++    TRACE("iface %p, handler %p (event never raised).\n", iface, handler);
++    token->value = InterlockedIncrement(&event_token_counter);
++    return S_OK;
++}
++
++static HRESULT WINAPI title_bar_remove_LayoutMetricsChanged(ICoreApplicationViewTitleBar *iface, EventRegistrationToken token)
++{ return S_OK; }
++
++static HRESULT WINAPI title_bar_get_IsVisible(ICoreApplicationViewTitleBar *iface, boolean *value)
++{ *value = FALSE; return S_OK; }
++
++static HRESULT WINAPI title_bar_add_IsVisibleChanged(ICoreApplicationViewTitleBar *iface,
++        __FITypedEventHandler_2_Windows__CApplicationModel__CCore__CCoreApplicationViewTitleBar_IInspectable *handler,
++        EventRegistrationToken *token)
++{
++    TRACE("iface %p, handler %p (event never raised).\n", iface, handler);
++    token->value = InterlockedIncrement(&event_token_counter);
++    return S_OK;
++}
++
++static HRESULT WINAPI title_bar_remove_IsVisibleChanged(ICoreApplicationViewTitleBar *iface, EventRegistrationToken token)
++{ return S_OK; }
++
++static const ICoreApplicationViewTitleBarVtbl title_bar_vtbl =
++{
++    title_bar_QueryInterface,
++    title_bar_AddRef,
++    title_bar_Release,
++    title_bar_GetIids,
++    title_bar_GetRuntimeClassName,
++    title_bar_GetTrustLevel,
++    title_bar_put_ExtendViewIntoTitleBar,
++    title_bar_get_ExtendViewIntoTitleBar,
++    title_bar_get_SystemOverlayLeftInset,
++    title_bar_get_SystemOverlayRightInset,
++    title_bar_get_Height,
++    title_bar_add_LayoutMetricsChanged,
++    title_bar_remove_LayoutMetricsChanged,
++    title_bar_get_IsVisible,
++    title_bar_add_IsVisibleChanged,
++    title_bar_remove_IsVisibleChanged,
++};
++
+ /* ---- ICoreCursor on core_cursor ---- */
+ static inline struct core_cursor *impl_from_core_cursor(ICoreCursor *iface)
+ { return CONTAINING_RECORD(iface, struct core_cursor, ICoreCursor_iface); }
+@@ -1466,7 +1633,7 @@ static HRESULT WINAPI core_window_static_GetForCurrentThread(ICoreWindowStatic *
+ {
+     struct core_window_factory *impl __attribute__((unused)) = impl_from_core_window_static(iface);
+     struct core_view *view = get_core_view();
+-    TRACE("iface %p, windows %p.\n", iface, windows);
++    TRACE_(coreloop)("iface %p, windows %p.\n", iface, windows);
+     if (!view) return E_OUTOFMEMORY;
+     *windows = &view->window->ICoreWindow_iface;
+     ICoreWindow_AddRef(*windows);
+@@ -1990,6 +2157,8 @@ static struct core_view *get_core_view(void)
+     window->dispatcher = dispatcher;
+     view->ICoreApplicationView_iface.lpVtbl = &core_view_vtbl;
+     view->ICoreApplicationView2_iface.lpVtbl = &core_view2_vtbl;
++    view->ICoreApplicationView3_iface.lpVtbl = &core_view3_vtbl;
++    view->ICoreApplicationViewTitleBar_iface.lpVtbl = &title_bar_vtbl;
+     view->ref = 1;
+     view->window = window;
+     core_app_instance.view = view;
