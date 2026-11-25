@@ -1,14 +1,15 @@
 Subject: dxgi: implement CreateSwapChainForCoreWindow via the CoreWindow's HWND
 
 diff --git a/dlls/dxgi/factory.c b/dlls/dxgi/factory.c
-index ebdb42a..bab89f5 100644
+index ebdb42a..9ec72c2 100644
 --- a/dlls/dxgi/factory.c
 +++ b/dlls/dxgi/factory.c
 @@ -316,14 +316,48 @@ static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForHwnd(IWineDXGIFa
      return DXGI_ERROR_UNSUPPORTED;
  }
  
-+/* ICoreWindowInterop {45D64A29-A63E-4CB6-B498-5781D298CB4F}; only get_WindowHandle (slot 6) is used. */
++/* ICoreWindowInterop {45D64A29-A63E-4CB6-B498-5781D298CB4F} derives from IUnknown;
++ * only get_WindowHandle (slot 3) is used. */
 +static const GUID IID_ICoreWindowInterop_dxgi =
 +        {0x45d64a29, 0xa63e, 0x4cb6, {0xb4, 0x98, 0x57, 0x81, 0xd2, 0x98, 0xcb, 0x4f}};
 +
@@ -17,7 +18,6 @@ index ebdb42a..bab89f5 100644
 +    HRESULT (STDMETHODCALLTYPE *QueryInterface)(void *, REFIID, void **);
 +    ULONG (STDMETHODCALLTYPE *AddRef)(void *);
 +    ULONG (STDMETHODCALLTYPE *Release)(void *);
-+    void *GetIids, *GetRuntimeClassName, *GetTrustLevel;
 +    HRESULT (STDMETHODCALLTYPE *get_WindowHandle)(void *, HWND *);
 +};
 +

@@ -1,10 +1,10 @@
 Subject: dxgi: implement CreateSwapChainForCoreWindow via ICoreWindowInterop's HWND
 
 diff --git a/src/dxgi/dxgi_factory.cpp b/src/dxgi/dxgi_factory.cpp
-index d89409ee..4093ba1f 100644
+index d89409ee..6c289147 100644
 --- a/src/dxgi/dxgi_factory.cpp
 +++ b/src/dxgi/dxgi_factory.cpp
-@@ -273,9 +273,47 @@ namespace dxvk {
+@@ -273,9 +273,45 @@ namespace dxvk {
            IDXGIOutput*          pRestrictToOutput,
            IDXGISwapChain1**     ppSwapChain) {
      InitReturnPtr(ppSwapChain);
@@ -15,9 +15,10 @@ index d89409ee..4093ba1f 100644
 +    if (pWindow == nullptr)
 +      return DXGI_ERROR_INVALID_CALL;
 +
-+    // ICoreWindowInterop {45D64A29-A63E-4CB6-B498-5781D298CB4F}. Wine's
-+    // CoreWindow implementation exposes the backing HWND through it, so we
-+    // can forward to the regular HWND swap chain path.
++    // ICoreWindowInterop {45D64A29-A63E-4CB6-B498-5781D298CB4F}, which
++    // derives from IUnknown (corewindow.h). Wine's CoreWindow implementation
++    // exposes the backing HWND through it, so we can forward to the regular
++    // HWND swap chain path.
 +    static const GUID IID_ICoreWindowInterop =
 +      { 0x45d64a29, 0xa63e, 0x4cb6, { 0xb4, 0x98, 0x57, 0x81, 0xd2, 0x98, 0xcb, 0x4f } };
 +
@@ -25,9 +26,6 @@ index d89409ee..4093ba1f 100644
 +      HRESULT (STDMETHODCALLTYPE *QueryInterface)(void*, REFIID, void**);
 +      ULONG   (STDMETHODCALLTYPE *AddRef)(void*);
 +      ULONG   (STDMETHODCALLTYPE *Release)(void*);
-+      void*   GetIids;
-+      void*   GetRuntimeClassName;
-+      void*   GetTrustLevel;
 +      HRESULT (STDMETHODCALLTYPE *get_WindowHandle)(void*, HWND*);
 +    };
 +

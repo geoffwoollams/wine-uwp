@@ -1,10 +1,10 @@
 Subject: twinapi.appcore: CoreDispatcher.ProcessEvents(ProcessUntilQuit) blocks until WM_QUIT
 
 diff --git a/dlls/twinapi.appcore/core_gen.c b/dlls/twinapi.appcore/core_gen.c
-index 6b5c7c6..2f92f5e 100644
+index 0f59a15..34be97e 100644
 --- a/dlls/twinapi.appcore/core_gen.c
 +++ b/dlls/twinapi.appcore/core_gen.c
-@@ -528,7 +528,20 @@ static HRESULT WINAPI core_dispatcher_ProcessEvents(ICoreDispatcher *iface, __x_
+@@ -526,7 +526,20 @@ static HRESULT WINAPI core_dispatcher_ProcessEvents(ICoreDispatcher *iface, __x_
      struct core_dispatcher *impl __attribute__((unused)) = impl_from_core_dispatcher(iface);
      MSG msg;
      TRACE("iface %p, options %d.\n", iface, options);

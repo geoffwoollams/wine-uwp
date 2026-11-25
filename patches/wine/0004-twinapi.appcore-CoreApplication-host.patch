@@ -923,10 +923,10 @@ index 3ad10af..83aba1c 100644
 +}
 diff --git a/dlls/twinapi.appcore/core_gen.c b/dlls/twinapi.appcore/core_gen.c
 new file mode 100644
-index 0000000..6b5c7c6
+index 0000000..0f59a15
 --- /dev/null
 +++ b/dlls/twinapi.appcore/core_gen.c
-@@ -0,0 +1,1948 @@
+@@ -0,0 +1,1942 @@
 +/* CoreApplication / CoreWindow scaffold. */
 +#include <stdlib.h>
 +#include "private.h"
@@ -945,7 +945,8 @@ index 0000000..6b5c7c6
 +extern BOOL core_input_message(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, ICoreWindow *sender);
 +static HWND create_core_hwnd(void);
 +
-+/* ICoreWindowInterop {45D64A29-A63E-4CB6-B498-5781D298CB4F}: not in Wine's IDL, declared by hand. */
++/* ICoreWindowInterop {45D64A29-A63E-4CB6-B498-5781D298CB4F} (corewindow.h): not in Wine's IDL, declared by hand.
++ * It derives from IUnknown, not IInspectable, so get_WindowHandle is slot 3. */
 +static const GUID IID_ICoreWindowInterop_local =
 +    { 0x45d64a29, 0xa63e, 0x4cb6, { 0xb4, 0x98, 0x57, 0x81, 0xd2, 0x98, 0xcb, 0x4f } };
 +typedef struct ICoreWindowInterop ICoreWindowInterop;
@@ -954,9 +955,6 @@ index 0000000..6b5c7c6
 +    HRESULT (WINAPI *QueryInterface)(ICoreWindowInterop *, REFIID, void **);
 +    ULONG (WINAPI *AddRef)(ICoreWindowInterop *);
 +    ULONG (WINAPI *Release)(ICoreWindowInterop *);
-+    HRESULT (WINAPI *GetIids)(ICoreWindowInterop *, ULONG *, IID **);
-+    HRESULT (WINAPI *GetRuntimeClassName)(ICoreWindowInterop *, HSTRING *);
-+    HRESULT (WINAPI *GetTrustLevel)(ICoreWindowInterop *, TrustLevel *);
 +    HRESULT (WINAPI *get_WindowHandle)(ICoreWindowInterop *, HWND *);
 +    HRESULT (WINAPI *put_MessageHandled)(ICoreWindowInterop *, BYTE);
 +};
@@ -2606,9 +2604,6 @@ index 0000000..6b5c7c6
 +{ return core_window_qi(impl_from_interop(iface), iid, out); }
 +static ULONG WINAPI interop_AddRef(ICoreWindowInterop *iface) { return core_window_addref(impl_from_interop(iface)); }
 +static ULONG WINAPI interop_Release(ICoreWindowInterop *iface) { return core_window_release(impl_from_interop(iface)); }
-+static HRESULT WINAPI interop_GetIids(ICoreWindowInterop *iface, ULONG *c, IID **i) { return E_NOTIMPL; }
-+static HRESULT WINAPI interop_GetRuntimeClassName(ICoreWindowInterop *iface, HSTRING *n) { return E_NOTIMPL; }
-+static HRESULT WINAPI interop_GetTrustLevel(ICoreWindowInterop *iface, TrustLevel *l) { *l = BaseTrust; return S_OK; }
 +static HRESULT WINAPI interop_get_WindowHandle(ICoreWindowInterop *iface, HWND *hwnd)
 +{
 +    TRACE("iface %p, hwnd %p -> %p.\n", iface, hwnd, impl_from_interop(iface)->hwnd);
@@ -2619,7 +2614,6 @@ index 0000000..6b5c7c6
 +static const struct ICoreWindowInteropVtbl interop_vtbl =
 +{
 +    interop_QueryInterface, interop_AddRef, interop_Release,
-+    interop_GetIids, interop_GetRuntimeClassName, interop_GetTrustLevel,
 +    interop_get_WindowHandle, interop_put_MessageHandled,
 +};
 +
