@@ -16,7 +16,7 @@ UWP apps don't create a normal Win32 window. They ask Windows for a `CoreApplica
 |---|---|
 | Halo Wars 2 (`Microsoft.HoganThreshold`, D3D12) | Playable offline: videos, menus, skirmish, native-resolution fullscreen, mouse and keyboard, settings and local saves. See [the example](#example-halo-wars-2). |
 
-Other native C++ UWP apps may work; many will need WinRT classes this project doesn't have yet. XAML apps (anything using `Windows.UI.Xaml`) do not work and are out of scope: Wine has no XAML implementation and a usable one is a UI-toolkit-sized project; see [docs/xaml-scoping.md](docs/xaml-scoping.md). Reports and patches are welcome.
+Other native C++ UWP apps may work; many will need WinRT classes this project doesn't have yet. XAML apps (anything using `Windows.UI.Xaml`) do not work yet: Wine has no XAML implementation. [docs/xaml-plan.md](docs/xaml-plan.md) lays out a staged plan for one. Reports and patches are welcome.
 
 ## Quick start: prebuilt release
 
