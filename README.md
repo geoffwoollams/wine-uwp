@@ -4,10 +4,12 @@ Run unpacked **UWP (Microsoft Store) apps and games** on Linux with a patched Wi
 
 UWP apps don't create a normal Win32 window. They ask Windows for a `CoreApplication`, get a `CoreWindow`, and read their identity, storage, licence and sign-in from WinRT classes that Wine 11.0 mostly lacks. This project adds the missing pieces, without touching the app's files:
 
-- a `CoreApplication`/`CoreWindow` host (window, mouse and keyboard input, fullscreen, lifecycle)
+- a `CoreApplication`/`CoreWindow` host (window, fullscreen, lifecycle, keyboard, and mouse input including pointer events, raw mouse motion for mouse look and a hideable cursor)
 - package identity read from the app's `AppxManifest.xml`
 - `ApplicationData` (local files and settings), `GameSaveProvider` (Xbox connected storage kept on disk), `DisplayRequest`
-- an offline Xbox sign-in for your Linux user, and an offline Store licence for the app itself (`StoreContext` and the older `CurrentApp`)
+- an offline Xbox sign-in for your Linux user, and an offline Store licence for the app itself (`StoreContext` and the older `CurrentApp`); Xbox Live web requests fail cleanly as "no network", and a local Xbox Live device address lets games create their sessions
+- `MessageDialog` (shown as a small window of its own) and other everyday WinRT classes games ask for
+- a partial `Windows.UI.Xaml`, so simple XAML apps start and draw; see [XAML apps](#xaml-apps)
 - a DXVK `dxgi.dll` with `CreateSwapChainForCoreWindow`, so D3D12 apps can draw into the CoreWindow
 
 **Tested apps:**
@@ -15,8 +17,9 @@ UWP apps don't create a normal Win32 window. They ask Windows for a `CoreApplica
 | App | Status |
 |---|---|
 | Halo Wars 2 (`Microsoft.HoganThreshold`, D3D12) | Playable offline: videos, menus, skirmish, native-resolution fullscreen, mouse and keyboard, settings and local saves. See [the example](#example-halo-wars-2). |
+| Gears of War 4 (`Microsoft.SpartaUWP`, Unreal Engine 4, D3D12) | Campaign playable offline in fullscreen: menus, videos, mouse look and aiming, keyboard; the built-in benchmark runs. No multiplayer or co-op. See [the example](#example-gears-of-war-4). |
 
-Other native C++ UWP apps may work; many will need WinRT classes this project doesn't have yet. Real XAML apps (anything built with `Windows.UI.Xaml` pages and markup) do not work yet; see [XAML apps](#xaml-apps). Reports and patches are welcome.
+Other native C++ UWP apps may work; many will need WinRT classes this project doesn't have yet. XAML apps (built with `Windows.UI.Xaml` pages and markup) have partial support: simple ones start and work, real Store apps will often still stop or look wrong; see [XAML apps](#xaml-apps). Reports and patches are welcome.
 
 ## Quick start: prebuilt release
 
@@ -70,7 +73,7 @@ Everything lives under `~/.local/share/wine-uwp/` (the prefix and logs) and the 
 
 ## XAML apps
 
-Wine has no `Windows.UI.Xaml`, the UI framework most non-game UWP apps are built on. This project is adding it in stages; [docs/xaml-plan.md](docs/xaml-plan.md) has the plan, the evidence behind it and estimates.
+Wine has no `Windows.UI.Xaml`, the UI framework most non-game UWP apps are built on. This project adds a **partial** implementation, in stages; what works so far is listed below, and [docs/xaml-plan.md](docs/xaml-plan.md) has the plan, the evidence behind it and estimates.
 
 **Milestone 1 (done): code-only XAML apps.** `Application.Start`, an app's own `App` class deriving from `Application` (with `OnLaunched` called on launch), `Application.Current`, `RequestedTheme` (light or dark background), `Window.Current` (`Content`, `Activate`, `Bounds`, `Dispatcher`, `Close`), and a `TextBlock` (`Text`, `FontSize`, `FontWeight`, `FontStyle`, `Foreground`, `TextWrapping`, `TextAlignment`, `Padding`) with `Margin`, `Width`/`Height` and alignment, drawn in the CoreWindow. Brushes are `SolidColorBrush` only. Rendering is GDI, so text is anti-aliased but there are no transforms or opacity yet.
 
@@ -148,6 +151,23 @@ Things specific to this game:
 - **Crash on quit.** The game's network code faults during shutdown because its network subsystem never came up. It happens after you choose to quit, so nothing is lost; the backtrace lands in the log folder.
 - It keeps a "Progression" container in Xbox connected storage (blobs such as `data`, `LeaderboardEntries` and `keyremaps`); see [Saves and settings](#saves-and-settings).
 
+## Example: Gears of War 4
+
+Package `Microsoft.SpartaUWP`, x64, DirectX 12, an Unreal Engine 4 game of over 60 GB. Its executable is in a subfolder (`GearGame\Binaries\UWP64\GearGame.exe`), which `setup-prefix.sh` handles; the game finds its content from the package root.
+
+```bash
+scripts/setup-prefix.sh "/path/to/Gears of War 4"
+scripts/run-app.sh Microsoft.SpartaUWP
+```
+
+Things specific to this game:
+
+- **Run it fullscreen** (the default, without `WINE_CORE_WINDOWED=1`): in a window the mouse may not reach the game; see [Limitations](#limitations).
+- At start it shows a **"Thank you for installing Gears of War 4"** dialog saying the graphics driver has known compatibility problems. It reads the driver version the way Windows reports it, which Wine doesn't match. Choose Continue.
+- It then says the **Xbox user and the Store user don't match**, because both are offline stand-ins here. It carries on.
+- The campaign and the benchmark work. Everything online (multiplayer, Horde, co-op, cards, profile stats) fails as offline. The game keeps retrying Xbox Live in the background, which shows in the log but does no harm.
+- The first launch compiles a lot of shaders, so expect long loads and some stutter the first time through a level.
+
 ## Troubleshooting
 
 Each run writes `~/.local/share/wine-uwp/logs/run-<package>-<time>.log` (the last 8 are kept; `latest.log` points at the newest). The last line says how the app exited. If it crashed, a backtrace is saved next to it as `run-<package>-<time>.crash.txt`. Include both when reporting a problem.
@@ -157,8 +177,8 @@ Each run writes `~/.local/share/wine-uwp/logs/run-<package>-<time>.log` (the las
 For maintainers. After building (see above) and committing, with GE-Proton 11-14 installed:
 
 ```bash
-scripts/package-release.sh v1.0
-gh release create v1.0 dist/wine-uwp-x86_64.tar.xz dist/wine-uwp-x86_64.tar.xz.sha256 --notes-file dist/NOTES.md
+scripts/package-release.sh v2.0
+gh release create v2.0 dist/wine-uwp-x86_64.tar.xz dist/wine-uwp-x86_64.tar.xz.sha256 --notes-file dist/NOTES.md
 ```
 
 The archive contains the Wine install tree, `dxgi.dll`, the four component DLLs (`d3d12.dll`, `d3d12core.dll`, `wintypes.dll`, `windows.storage.dll`), the licence texts, `SOURCE.txt` (where to get every part's source) and a copy of `patches/`, `docker/` and `scripts/` (the recipe that built it). The script refuses to run with uncommitted changes in those folders, and refuses a Wine build containing add-on unlocking code.
@@ -188,7 +208,10 @@ patches/wine/   patches against the wine-11.0 tag (apply in order with git apply
                 TemplateBinding), 0028-0029 part 4 (XAML text, XamlReader, generic.xaml),
                 0030-0031 part 5 (shapes, corners, theme changes, loose XAML), 0032-0033 part 6
                 (ToggleSwitch, Slider, ProgressBar, ItemsControl, DataTemplate, {Binding}, animation timing),
-                0034-0035 Direct2D rendering (transforms, clips, gradients)
+                0034-0035 Direct2D rendering (transforms, clips, gradients), 0036-0039 Gears of War 4
+                (CoreApplication error and view interfaces, package root lookup, LoadPackagedLibrary,
+                MouseDevice, MessageDialog, Xbox Live device address, msxml6 HTTP class registration,
+                COM ContextCallback, pointer devices and cursor)
 patches/dxvk/   patch against DXVK f90f1bf1 (v3.1.1-235)
 docker/         build containers
 apps/           optional per-app settings
