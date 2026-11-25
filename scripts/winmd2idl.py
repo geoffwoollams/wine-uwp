@@ -505,7 +505,8 @@ class Emitter:
         out = ['/* needs: %s */\n' % ', '.join('import "%s";' % i for i in sorted(self.imports))]
         # method names that collide with Win32 A/W macros
         clash = {'GetClassName', 'GetObject', 'GetMessage', 'SendMessage', 'PostMessage', 'DrawText', 'LoadImage',
-                 'CreateFont', 'GetCurrentDirectory', 'FindText', 'ReplaceText', 'CreateEvent', 'GetUserName', 'StartService'}
+                 'CreateFont', 'GetCurrentDirectory', 'FindText', 'ReplaceText', 'CreateEvent', 'GetUserName', 'StartService',
+                 'GetCurrentTime'}
         used = set()
         for n in self.full:
             k = self.w.kind(self.w.types[n])
