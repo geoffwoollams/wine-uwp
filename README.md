@@ -88,7 +88,9 @@ Wine has no `Windows.UI.Xaml`, the UI framework most non-game UWP apps are built
 
 **Milestone 4, part 5 (done): shapes, corners and themes.** `Rectangle`, `Ellipse` and `Path`, `CornerRadius`, and default CheckBox and RadioButton templates built from shapes. Theme changes while the app runs take effect: `RequestedTheme` on an element (the usual in-app dark mode switch) and the system's light or dark setting, when the app hasn't fixed its theme. `LoadComponent` reads loose `.xaml` files when there is no compiled `.xbf`.
 
-**Not yet:** default templates for ToggleSwitch, Slider, ProgressBar and other controls, animation timing, data templates, data binding (`{Binding}`), `TextBox`, scrolling, keyboard focus, localized `x:Uid` strings and navigation history. Real Store apps will mostly still look wrong or stop where they need these; see [docs/xaml-plan.md](docs/xaml-plan.md).
+**Milestone 4, part 6 (done): data and motion.** `{Binding}` (DataContext, ElementName, TwoWay, converters, `INotifyPropertyChanged`), `DataTemplate` (ContentTemplate, `ItemsControl` with `ItemsSource` and `ItemTemplate`), `ToggleSwitch`, `Slider` and `ProgressBar`, storyboards that run over time (visual states, and `Storyboard.Begin` from code), `Opacity`, and Path curves and geometries.
+
+**Not yet:** Direct2D rendering (anti-aliased shapes, transforms), ListView/GridView and other item controls, `x:Bind` beyond what its generated code calls, `TextBox`, scrolling, keyboard focus, localized `x:Uid` strings and navigation history. Real Store apps will still often stop or look wrong where they need these; see [docs/xaml-plan.md](docs/xaml-plan.md).
 
 To try it, build the test clients and run them in a throwaway prefix (each opens a window for a few seconds and checks what was drawn):
 
@@ -182,7 +184,8 @@ patches/wine/   patches against the wine-11.0 tag (apply in order with git apply
                 0023 milestone 4 part 1 (styles, theme and merged dictionaries), 0024-0025 part 2 (control
                 templates, visual states), 0026-0027 part 3 (ToggleButton, CheckBox, RadioButton, live
                 TemplateBinding), 0028-0029 part 4 (XAML text, XamlReader, generic.xaml),
-                0030-0031 part 5 (shapes, corners, theme changes, loose XAML)
+                0030-0031 part 5 (shapes, corners, theme changes, loose XAML), 0032-0033 part 6
+                (ToggleSwitch, Slider, ProgressBar, ItemsControl, DataTemplate, {Binding}, animation timing)
 patches/dxvk/   patch against DXVK f90f1bf1 (v3.1.1-235)
 docker/         build containers
 apps/           optional per-app settings

@@ -444,3 +444,74 @@ Milestone 4 is the largest rung (3 to 6 months in the ladder), so it lands in pa
 - `DataTemplate`.
 - `{Binding}`.
 - Direct2D rendering.
+
+## 15. Milestone 4, part 6: controls, DataTemplate, {Binding}, animation timing, Opacity, geometries (patches 0032-0033)
+
+Patch 0032 is the IDL, generated with `winmd2idl.py` for:
+- `Controls.ToggleSwitch`, `Slider`, `ProgressBar`, `Primitives.RangeBase`, `ItemsControl`, `ItemsPanelTemplate` and `ItemCollection`;
+- `Media.Animation.Storyboard` and `Timeline`;
+- `Data.INotifyPropertyChanged`, `ICustomPropertyProvider`, `ICustomProperty`, `PropertyChangedEventArgs` and `IValueConverter`;
+- `Interop.IBindableIterable`, `IBindableIterator` and `IBindableVector`;
+- `Media.EllipseGeometry`, `LineGeometry` and `RectangleGeometry`;
+- `DataTemplate` and `FrameworkTemplate`.
+
+`GetCurrentTime` (a winbase macro) is now in the generator's list of names to `#undef`.
+
+**What was built:**
+
+- **`ToggleSwitch`, `Slider`, `ProgressBar`** (`range.c`) share Button's `Control` code. The control struct moved to `control.h`.
+  - They draw the Windows 10 look themselves, taking WinUI's resource keys from the app (`ToggleSwitchFillOn`, `SliderTrackValueFill`, `ProgressBarForeground`, ...).
+  - **Slider:** horizontal or vertical. Pressing and dragging set `Value`, snapped to `StepFrequency`, and `ValueChanged` is raised.
+  - **ProgressBar:** a value bar, an indeterminate moving segment, `ShowError` and `ShowPaused`.
+  - **ToggleSwitch:** `IsOn`, `Header`, `OnContent`/`OffContent` and `Toggled`.
+  - App templates for these aren't used.
+- **`DataTemplate` and `ItemsPanelTemplate`** are templates like ControlTemplate, from XBF or text, with `LoadContent`.
+  - `ContentControl.ContentTemplate` and `ContentPresenter.ContentTemplate` show non-element content through the template, with the content as its DataContext. generic.xaml's presenters bind `ContentTemplate`.
+- **`ItemsControl`** (`items.c`):
+  - **Sources:** `Items`, which markup content also fills, or `ItemsSource` as an `IIterable<Object>` or `IBindableIterable`. An observable `IObservableVector<Object>` regenerates on change.
+  - **Display:** `ItemTemplate` with each item as its DataContext, otherwise UIElements as they are and anything else as text.
+  - **Panel:** `ItemsPanel`, a StackPanel by default.
+  - **Not supported:** containers, ItemsPresenter, grouping and `DisplayMemberPath`.
+- **`{Binding}`** (`binding.c`), from XBF (the Binding object the compiler writes) or text (`{Binding Path, Mode=..., ElementName=..., Converter={StaticResource ...}}`):
+  - **Sources:** `Source`, `ElementName`, or the inherited `FrameworkElement.DataContext`.
+  - **Paths:** dotted paths read through `ICustomPropertyProvider`, the app's `IXamlMetadataProvider` (`IXamlMember`), or our own elements' properties.
+  - **Updates:** `INotifyPropertyChanged` on the last object, and our controls' own changes (`Value`, `IsOn`, `IsChecked`), update the target. `TwoWay` writes target changes back through `ICustomProperty`/`IXamlMember.SetValue`.
+  - **Also:** `OneTime`, `Converter`/`ConverterParameter`, `FallbackValue`, `TargetNullValue`, and conversion to text for text properties. `PropertyChangedEventArgs` can be created by apps.
+  - **Not supported:** `RelativeSource`, `UpdateSourceTrigger`, indexers and `SetBinding` from code.
+- **Animation timing** (`animation.c`): storyboard animations become tracks sampled by a 60 Hz thread timer.
+  - **Animation kinds:** `DoubleAnimation`/`ColorAnimation` (From/To/By, `Duration` defaulting to 1 s), key-frame animations (discrete frames hold; linear, easing and spline frames are interpolated linearly) and `ObjectAnimationUsingKeyFrames`.
+  - **Timing:** `BeginTime`, `AutoReverse`, and `RepeatBehavior` as `Forever` or a count.
+  - **Visual states:** animations play over time and are stopped when the group leaves the state.
+  - **From code:** a Storyboard from markup is an `IStoryboard`/`ITimeline`. `Begin` resolves `TargetName` from the markup's root, and `Stop`, `SkipToFill`, `GetCurrentState` and `Completed` work.
+  - **Not supported:** easing functions, SpeedRatio, Seek, Pause and visual transitions.
+- **`Opacity`** is drawn: an element below 1 is rendered over a copy of what is under it and blended back, which also works nested.
+- **Path data:** `C`, `S`, `Q`, `T` and `A` are flattened into lines. `Path.Data` also takes `RectangleGeometry`, `EllipseGeometry` and `LineGeometry`, from markup or code. `PathGeometry` and transforms aren't supported.
+- **`tests/xaml/run.sh`** removes the throwaway prefix it creates. Each run had left about 800 MB in `/tmp`, which filled a RAM-backed `/tmp`.
+
+**Tests:**
+
+- **`xamlmarkup`: 128/128 checks pass.** A page loaded with XamlReader and shown over the main page checks:
+  - Opacity 0.5 blending;
+  - a curved Path;
+  - an EllipseGeometry's filled area;
+  - the ProgressBar's half fill;
+  - ToggleSwitch `IsOn`/`Toggled` and its accent track;
+  - Slider's `Value`;
+  - `Storyboard.Begin` from 1 through about 0.6 to 0 with `Completed`;
+  - a visual state's `ColorAnimation` part way at 150 ms and done at 400 ms, then restored;
+  - `{Binding Name}` and its `PropertyChanged` update;
+  - an ItemsControl drawing three items through a DataTemplate's `{Binding Color}`;
+  - `Button.ContentTemplate` with `{Binding}`;
+  - a TwoWay Slider reading 40 from the data object and writing 70 back;
+  - an ElementName binding following it.
+- Milestones 1 and 2 still pass 34/34. Microsoft's sample files load, and their Bindings are now Binding objects rather than unsupported types.
+- Slider dragging and a ToggleSwitch click aren't driven by the test; `IsOn`/`Value` are set from code.
+
+**Still to do (next round):**
+
+- Direct2D rendering: anti-aliasing, transforms, `RenderTransform`, and clipping.
+- ListView/GridView.
+- `TextBox`.
+- Scrolling.
+- Keyboard focus.
+- Visual transitions and easing.
