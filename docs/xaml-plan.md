@@ -277,3 +277,38 @@ Milestone 4 is the largest rung (3 to 6 months in the ladder), so it lands in pa
   - Setters given as whole objects (flag 0x40).
   - Styles keyed by anything but a string or type.
   - Re-evaluating `{ThemeResource}` when the theme changes at run time.
+
+## 11. Milestone 4, part 2: control templates and visual states (patches 0024-0025)
+
+**What was built:**
+
+- **`ControlTemplate`:** its content is the deferred `FrameworkTemplate.Template` node stream. The template keeps its XBF file alive (the file is now reference-counted) and is instantiated for each control.
+  - `Control.Template` can be set directly or from a style setter, including the `<Setter.Value><ControlTemplate>` object form.
+  - A templated Button builds its template on first layout, as WinUI's `ApplyTemplate` does. It then measures, arranges, draws and hit-tests the template's root instead of its built-in look.
+- **`TemplateBinding`:** evaluated once, when the template is applied. It covers Background, Foreground, BorderBrush, BorderThickness, Padding, Content, the content alignments, FontSize, Opacity, Visibility, size and margin. Later changes on the control don't flow into the template yet.
+- **`ContentPresenter`:** shows a UIElement, or any other content as text, with background, border, padding, foreground and content alignment.
+- **`VisualStateManager`:**
+  - Groups, states and storyboards are built from the visual-state custom data's node stream as internal objects.
+  - `GoToState` applies `VisualState.Setters` (`Target="Name.Property"`) and storyboard animations: `DoubleAnimation`/`ColorAnimation` `To`, key-frame animations' last frame, and `(Border.Background).(SolidColorBrush.Color)`-style paths, which get a new brush.
+  - Animations jump to their final value. There are no timelines, easing or transitions yet.
+  - Leaving a state restores the values it changed. The template's `x:Name`s form their own name scope.
+  - A templated Button goes through `Normal`, `PointerOver`, `Pressed` and `Disabled`.
+- **Value resources** (`<x:Double>`, `<Thickness>`, booleans, strings) are kept as boxed values; theme dictionaries are full of them. `Brush.Opacity` can be set from markup.
+- `scripts/xbf.py compile` handles `ControlTemplate`, `TemplateBinding`, `ContentPresenter`, `VisualStateManager.VisualStateGroups` with states, setters, storyboards and key frames, and style setters with object values.
+
+**Tests:**
+
+- **`xamlmarkup`: 54/54 checks pass.** `Styles.xaml` defines a `TemplatedButton` style whose template has a Grid with a `TemplateBinding` background, a Border named `Frame` around a `ContentPresenter`, and `CommonStates`:
+  - `PointerOver` uses a Setter.
+  - `Pressed` uses `ObjectAnimationUsingKeyFrames` on the Grid's background and a `ColorAnimation` on the Border's brush colour.
+  - The test checks the drawn template, the presenter's text and padding, each state's colours as the mouse hovers, presses and releases, and that leaving Pressed and PointerOver restores the earlier values.
+- Milestones 1 and 2 still pass 34/34. Microsoft's 7 sample files still load, and value resources in their theme dictionaries are now kept instead of dropped.
+
+**Still to do in milestone 4:**
+
+- Live `TemplateBinding` (changes after the template is applied), and templates for Page, UserControl, Frame and `ContentControl` in general (only Button is templated so far).
+- Animation timing and visual transitions.
+- `DataTemplate`/`ItemsPanelTemplate`.
+- A default `generic.xaml` adapted from WinUI 3 (MIT), so built-in controls get their real templates; and CheckBox, RadioButton, ToggleSwitch, Slider, ProgressBar.
+- `{Binding}`.
+- Direct2D rendering: rounded corners, opacity and gradients, which real templates use heavily.

@@ -80,7 +80,9 @@ Wine has no `Windows.UI.Xaml`, the UI framework most non-game UWP apps are built
 
 **Milestone 4, part 1 (done): styles.** Explicit and implicit `Style`s with `BasedOn` (local values still win), theme dictionaries for `{ThemeResource}`, merged dictionaries and `ResourceDictionary Source="ms-appx:///Styles.xaml"`.
 
-**Not yet:** control templates and visual states, data binding (`{Binding}`), `TextBox`, scrolling, keyboard focus, localized `x:Uid` strings and navigation history. Real Store apps will mostly still look wrong or stop where they need these; see [docs/xaml-plan.md](docs/xaml-plan.md).
+**Milestone 4, part 2 (done): control templates.** `ControlTemplate` (directly or from a style), `TemplateBinding`, `ContentPresenter`, and `VisualStateManager` states with setters and storyboards (which jump to their final values), so a templated Button changes look on hover and press.
+
+**Not yet:** the built-in controls' default templates, animation timing, data templates, data binding (`{Binding}`), `TextBox`, scrolling, keyboard focus, localized `x:Uid` strings and navigation history. Real Store apps will mostly still look wrong or stop where they need these; see [docs/xaml-plan.md](docs/xaml-plan.md).
 
 To try it, build the test clients and run them in a throwaway prefix (each opens a window for a few seconds and checks what was drawn):
 
@@ -171,7 +173,8 @@ patches/wine/   patches against the wine-11.0 tag (apply in order with git apply
                 0012 no hard-coded Store ID, 0013-0016 Windows.UI.Xaml milestone 1 (widl fix, generated IDL,
                 ProcessUntilQuit, the XAML code), 0017-0018 milestone 2 (IDL, layout, panels, Button),
                 0019-0022 milestone 3 (widl registration fix, IDL, launch args, markup loading),
-                0023 milestone 4 part 1 (styles, theme and merged dictionaries)
+                0023 milestone 4 part 1 (styles, theme and merged dictionaries), 0024-0025 part 2 (control
+                templates, visual states)
 patches/dxvk/   patch against DXVK f90f1bf1 (v3.1.1-235)
 docker/         build containers
 apps/           optional per-app settings
