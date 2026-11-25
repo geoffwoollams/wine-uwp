@@ -1,20 +1,24 @@
 #!/bin/bash
 # Creates the shared Wine prefix (once) and links one unpacked UWP package into it. The package folder is never modified.
 # Usage: scripts/setup-prefix.sh /path/to/package-folder [--vclibs /path/to/Microsoft.VCLibs.140.00_..._x64.appx|folder] [--skip-verify]
-# Run it again for each app; they share the prefix.
+#        [--shortcut | --no-shortcut]
+# Run it again for each app; they share the prefix. It offers to add a launcher (a .desktop file with the app's icon) to
+# the applications menu and the desktop; --shortcut adds it without asking, --no-shortcut skips it.
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
 
-PKG_DIR="" VCLIBS="" VERIFY=1
+PKG_DIR="" VCLIBS="" VERIFY=1 SHORTCUT=ask
 while [ $# -gt 0 ]; do
     case "$1" in
         --vclibs) VCLIBS="$2"; shift 2 ;;
         --skip-verify) VERIFY=0; shift ;;
+        --shortcut) SHORTCUT=yes; shift ;;
+        --no-shortcut) SHORTCUT=no; shift ;;
         -*) die "unknown option $1" ;;
         *) PKG_DIR="$(cd "$1" && pwd)"; shift ;;
     esac
 done
-[ -n "$PKG_DIR" ] || die "usage: $0 /path/to/package-folder [--vclibs path] [--skip-verify]"
+[ -n "$PKG_DIR" ] || die "usage: $0 /path/to/package-folder [--vclibs path] [--skip-verify] [--shortcut | --no-shortcut]"
 [ -x "$WINE_ROOT/bin/wine" ] || die "patched Wine not found in $WINE_ROOT: run scripts/fetch-release.sh or scripts/build-wine.sh first"
 [ -f "$DXVK_DXGI" ] || die "patched dxgi.dll not found at $DXVK_DXGI: run scripts/fetch-release.sh or scripts/build-dxvk.sh first"
 IFS=$'\t' read -r PKG_NAME PKG_EXE < <(python3 -I "$REPO/scripts/uwptool.py" info "$PKG_DIR")
@@ -67,4 +71,52 @@ info "Registering WinRT classes"
 python3 -I "$REPO/scripts/uwptool.py" registry "$PKG_DIR" "C:\\$APPS_DIR_NAME\\$PKG_NAME" > "$PREFIX/drive_c/uwp-$PKG_NAME.reg"
 wine regedit /S "C:\\uwp-$PKG_NAME.reg"
 wineserver -w
-info "Done. Start it with scripts/run-app.sh $PKG_NAME"
+
+# A launcher: ~/.local/share/applications/wine-uwp-<package>.desktop (the menu) and a copy on the desktop, with the app's
+# own icon. StartupWMClass is the name Wine gives the window (the lowercased executable, the X11 class and the Wayland
+# app id), so the desktop puts the running window under the launcher's icon.
+if [ "$SHORTCUT" = ask ]; then
+    if [ -t 0 ] && [ -t 1 ]; then
+        read -r -p "Add a launcher for this app to the applications menu and the desktop? [Y/n] " answer || answer=n
+        case "${answer,,}" in n|no) SHORTCUT=no ;; *) SHORTCUT=yes ;; esac
+    else
+        SHORTCUT=no
+    fi
+fi
+if [ "$SHORTCUT" = yes ]; then
+    IFS=$'\t' read -r APP_TITLE APP_ICON < <(python3 -I "$REPO/scripts/uwptool.py" appinfo "$PKG_DIR")
+    APPLICATIONS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    DESKTOP_DIR="$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")"
+    ID="wine-uwp-$PKG_NAME"
+    mkdir -p "$APPLICATIONS" "$DATA/icons"
+    ICON_LINE=""
+    if [ -n "$APP_ICON" ]; then cp "$APP_ICON" "$DATA/icons/$PKG_NAME.png" && ICON_LINE="Icon=$DATA/icons/$PKG_NAME.png"; fi
+    exe_name="${PKG_EXE//\\//}"; exe_name="${exe_name##*/}"
+    # Exec: quoted per the desktop entry spec; settings that move the prefix or data are passed on
+    quote() { local v="${1//\\/\\\\}"; v="${v//\"/\\\"}"; v="${v//\$/\\\$}"; v="${v//\`/\\\`}"; printf '"%s"' "$v"; }
+    EXEC="$(quote "$REPO/scripts/run-app.sh") $(quote "$PKG_NAME")"
+    for var in UWP_PREFIX UWP_DATA_DIR UWP_LOGS UWP_BUILD_DIR; do
+        [ -n "${!var:-}" ] && EXEC="env $var=$(quote "${!var}") ${EXEC#env }"
+    done
+    cat > "$APPLICATIONS/$ID.desktop" <<EOT
+[Desktop Entry]
+Type=Application
+Name=$APP_TITLE
+Comment=$APP_TITLE (UWP app, run with wine-uwp)
+Exec=$EXEC
+${ICON_LINE}
+Terminal=false
+Categories=Game;
+StartupWMClass=${exe_name,,}
+EOT
+    chmod +x "$APPLICATIONS/$ID.desktop"
+    command -v update-desktop-database >/dev/null && update-desktop-database "$APPLICATIONS" >/dev/null 2>&1
+    if [ -d "$DESKTOP_DIR" ]; then
+        cp "$APPLICATIONS/$ID.desktop" "$DESKTOP_DIR/$ID.desktop"
+        chmod +x "$DESKTOP_DIR/$ID.desktop"
+        # GNOME only starts desktop launchers marked as trusted
+        command -v gio >/dev/null && gio set "$DESKTOP_DIR/$ID.desktop" metadata::trusted true 2>/dev/null
+    fi
+    info "Added a launcher for $APP_TITLE: $APPLICATIONS/$ID.desktop$([ -d "$DESKTOP_DIR" ] && echo " and $DESKTOP_DIR/$ID.desktop")"
+fi
+info "Done. Start it with scripts/run-app.sh $PKG_NAME$([ "$SHORTCUT" = yes ] && echo ", or from the launcher")"

@@ -1,0 +1,184 @@
+Subject: twinapi.appcore: the CoreWindow takes the app's icon from the manifest's Square44x44Logo
+
+diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
+index 5ab2083..34349b6 100644
+--- a/dlls/twinapi.appcore/Makefile.in
++++ b/dlls/twinapi.appcore/Makefile.in
+@@ -5,6 +5,7 @@ IMPORTS   = combase advapi32 user32 gdi32
+ SOURCES = \
+ 	advertising_manager.c \
+ 	analytics_info.c \
++	app_icon.c \
+ 	application_view.c \
+ 	classes.idl \
+ 	auth_probe.c \
+diff --git a/dlls/twinapi.appcore/app_icon.c b/dlls/twinapi.appcore/app_icon.c
+new file mode 100644
+index 0000000..aeff817
+--- /dev/null
++++ b/dlls/twinapi.appcore/app_icon.c
+@@ -0,0 +1,143 @@
++/* The app's own icon for the CoreWindow (taskbar, title bar, Alt-Tab)
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#include "appmodel.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
++
++/* Windows takes an app's taskbar and title bar icon from the manifest's VisualElements Square44x44Logo. The name
++ * there ("Assets\Square44x44Logo.png") usually isn't a file itself: the package holds variants qualified by size
++ * or scale, such as Square44x44Logo.targetsize-48_altform-unplated.png or Square44x44Logo.scale-200.png. The
++ * "unplated" ones are drawn without a coloured tile behind them, which is what the taskbar uses; high-contrast
++ * variants are skipped. The small icon is the smallest image at least as big as the system's small icon size,
++ * the big one the largest up to 256 pixels. Wine's window drivers pass the icons on to the desktop (X11
++ * _NET_WM_ICON, Wayland xdg-toplevel-icon). */
++
++struct icon_candidate
++{
++    WCHAR path[MAX_PATH];
++    UINT size;   /* pixel width, from the PNG header */
++    int rank;    /* 2 unplated, 1 plain, 0 light-unplated */
++};
++
++static UINT png_width( const WCHAR *path )
++{
++    static const BYTE signature[8] = { 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
++    BYTE header[24];
++    DWORD read;
++    HANDLE file;
++    UINT width = 0;
++
++    file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++    if (file == INVALID_HANDLE_VALUE) return 0;
++    /* the IHDR chunk comes first: width and height are big-endian at offsets 16 and 20 */
++    if (ReadFile( file, header, sizeof(header), &read, NULL ) && read == sizeof(header) &&
++        !memcmp( header, signature, sizeof(signature) ) && !memcmp( header + 12, "IHDR", 4 ))
++        width = header[16] << 24 | header[17] << 16 | header[18] << 8 | header[19];
++    CloseHandle( file );
++    return width;
++}
++
++static HICON load_png_icon( const WCHAR *path, UINT size )
++{
++    LARGE_INTEGER file_size;
++    HICON icon = NULL;
++    HANDLE file;
++    DWORD read;
++    BYTE *data;
++
++    file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++    if (file == INVALID_HANDLE_VALUE) return NULL;
++    if (GetFileSizeEx( file, &file_size ) && file_size.QuadPart < 16 * 1024 * 1024 &&
++        (data = malloc( file_size.LowPart )))
++    {
++        if (ReadFile( file, data, file_size.LowPart, &read, NULL ) && read == file_size.LowPart)
++            icon = CreateIconFromResourceEx( data, read, TRUE, 0x00030000, size, size, LR_DEFAULTCOLOR );
++        free( data );
++    }
++    CloseHandle( file );
++    return icon;
++}
++
++static int better( const struct icon_candidate *a, const struct icon_candidate *b, UINT want, BOOL largest )
++{
++    if (!b->size) return TRUE;
++    if (a->rank != b->rank) return a->rank > b->rank;
++    if (largest) return a->size > b->size;
++    /* at least the wanted size, as close to it as possible; failing that, the biggest smaller one */
++    if ((a->size >= want) != (b->size >= want)) return a->size >= want;
++    return a->size >= want ? a->size < b->size : a->size > b->size;
++}
++
++void core_window_set_icons( HWND hwnd )
++{
++    WCHAR logo[MAX_PATH], pattern[MAX_PATH], root[MAX_PATH], dir[MAX_PATH], base[MAX_PATH], *p;
++    struct icon_candidate best_small = { 0 }, best_big = { 0 }, cand;
++    UINT32 len = ARRAY_SIZE(root);
++    UINT want_small = GetSystemMetrics( SM_CXSMICON );
++    WIN32_FIND_DATAW data;
++    HICON icon_small, icon_big;
++    HANDLE find;
++
++    if (!manifest_app_visual( "Square44x44Logo", logo, ARRAY_SIZE(logo) ) &&
++        !manifest_app_visual( "Square150x150Logo", logo, ARRAY_SIZE(logo) ))
++        return;
++    if (GetCurrentPackagePath( &len, root )) return;
++    for (p = logo; *p; p++) if (*p == '/') *p = '\\';
++
++    /* dir: the folder holding the logo; base: its name without ".png" */
++    swprintf( dir, ARRAY_SIZE(dir), L"%s\\%s", root, logo );
++    if (!(p = wcsrchr( dir, '\\' ))) return;
++    lstrcpynW( base, p + 1, ARRAY_SIZE(base) );
++    p[1] = 0;
++    if ((p = wcsrchr( base, '.' )) && !wcsicmp( p, L".png" )) *p = 0;
++
++    swprintf( pattern, ARRAY_SIZE(pattern), L"%s%s*.png", dir, base );
++    if ((find = FindFirstFileW( pattern, &data )) == INVALID_HANDLE_VALUE) return;
++    do
++    {
++        const WCHAR *qualifiers = data.cFileName + wcslen( base );
++
++        /* exactly the logo, or the logo with qualifiers ("Logo.scale-200.png"), not "Logo2.png" */
++        if (*qualifiers != '.' ) continue;
++        if (wcsstr( qualifiers, L"contrast-" )) continue;
++        swprintf( cand.path, ARRAY_SIZE(cand.path), L"%s%s", dir, data.cFileName );
++        if (!(cand.size = png_width( cand.path )) || cand.size > 256) continue;
++        if (wcsstr( qualifiers, L"altform-lightunplated" )) cand.rank = 0;
++        else if (wcsstr( qualifiers, L"altform-unplated" )) cand.rank = 2;
++        else cand.rank = 1;
++        if (better( &cand, &best_small, want_small, FALSE )) best_small = cand;
++        if (better( &cand, &best_big, 0, TRUE )) best_big = cand;
++    } while (FindNextFileW( find, &data ));
++    FindClose( find );
++
++    if (!best_big.size) return;
++    TRACE( "small icon %s (%u), big icon %s (%u).\n", debugstr_w(best_small.path), best_small.size, debugstr_w(best_big.path), best_big.size );
++    icon_small = load_png_icon( best_small.path, best_small.size );
++    icon_big = load_png_icon( best_big.path, best_big.size );
++    if (!icon_small && !icon_big)
++    {
++        WARN( "could not load the icons %s and %s.\n", debugstr_w(best_small.path), debugstr_w(best_big.path) );
++        return;
++    }
++    /* the window keeps them for its lifetime, which is the process's */
++    if (icon_big) SendMessageW( hwnd, WM_SETICON, ICON_BIG, (LPARAM)icon_big );
++    if (icon_small) SendMessageW( hwnd, WM_SETICON, ICON_SMALL, (LPARAM)icon_small );
++}
+diff --git a/dlls/twinapi.appcore/core_gen.c b/dlls/twinapi.appcore/core_gen.c
+index 8dd2cb7..4c34b0d 100644
+--- a/dlls/twinapi.appcore/core_gen.c
++++ b/dlls/twinapi.appcore/core_gen.c
+@@ -2159,6 +2159,7 @@ static HWND create_core_hwnd(void)
+                            rect.right - rect.left, rect.bottom - rect.top, NULL, NULL, wc.hInstance, NULL);
+     created_hwnd = hwnd;
+     TRACE("created hwnd %p %s (%ldx%ld).\n", hwnd, debugstr_w(title), rect.right - rect.left, rect.bottom - rect.top);
++    if (hwnd) core_window_set_icons(hwnd);
+     return hwnd;
+ }
+ 
+diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
+index 2bf980e..6cbf0d7 100644
+--- a/dlls/twinapi.appcore/private.h
++++ b/dlls/twinapi.appcore/private.h
+@@ -125,3 +125,4 @@ extern float core_view_scale(void);
+ extern BOOL manifest_property(const char *element, WCHAR *out, UINT32 out_len);
+ extern BOOL manifest_app_visual(const char *attribute, WCHAR *out, UINT32 out_len);
+ extern void app_display_name(WCHAR *out, UINT32 out_len);
++extern void core_window_set_icons( HWND hwnd );   /* app_icon.c */

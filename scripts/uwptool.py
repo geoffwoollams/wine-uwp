@@ -6,6 +6,7 @@
   uwptool.py registry PACKAGE_DIR APP_DIR print a REGEDIT4 file with the WinRT class registrations to import
   uwptool.py info PACKAGE_DIR              print the package name and the executable of its first application (name<TAB>exe)
   uwptool.py native-copy SRC DEST         copy a Wine PE DLL so Wine loads it as a native DLL (clears the builtin marker)
+  uwptool.py appinfo PACKAGE_DIR           print the app's display name and its best icon file (name<TAB>icon path, or name<TAB>)
 """
 import base64
 import hashlib
@@ -121,6 +122,83 @@ def info(package_dir):
     print("%s\t%s" % (name.group(1), exe.group(1)))
 
 
+def png_width(path):
+    try:
+        with open(path, "rb") as f:
+            header = f.read(24)
+    except OSError:
+        return 0
+    if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR":
+        return 0
+    return int.from_bytes(header[16:20], "big")
+
+
+def find_case_insensitive(root, relative):
+    """root/relative with each part matched regardless of case, as Windows does ("Assets" finds "assets")."""
+    path = root
+    for part in [p for p in relative.split("/") if p]:
+        try:
+            match = next((n for n in os.listdir(path) if n.lower() == part.lower()), None)
+        except OSError:
+            return None
+        if match is None:
+            return None
+        path = os.path.join(path, match)
+    return path
+
+
+def best_icon(package_dir, logo):
+    """The largest image (up to 256 pixels) among the logo's size and scale variants, preferring the "unplated" ones
+    (no coloured tile behind them) and skipping high-contrast ones; the same choice the CoreWindow makes for its icon."""
+    logo = logo.replace("\\", "/")
+    folder = find_case_insensitive(package_dir, os.path.dirname(logo))
+    base = os.path.basename(logo)
+    if base.lower().endswith(".png"):
+        base = base[:-4]
+    best = None
+    if folder is None:
+        return None
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return None
+    for name in names:
+        if not name.lower().endswith(".png") or not name.lower().startswith(base.lower()):
+            continue
+        qualifiers = name[len(base):-4].lower()
+        if qualifiers and not qualifiers.startswith("."):
+            continue
+        if "contrast-" in qualifiers:
+            continue
+        path = os.path.join(folder, name)
+        size = png_width(path)
+        if not size or size > 256:
+            continue
+        rank = 0 if "altform-lightunplated" in qualifiers else 2 if "altform-unplated" in qualifiers else 1
+        if best is None or (rank, size) > best[:2]:
+            best = (rank, size, path)
+    return best[2] if best else None
+
+
+def appinfo(package_dir):
+    manifest = open(os.path.join(package_dir, "AppxManifest.xml"), encoding="utf-8").read()
+    visual = re.search(r"<(?:\w+:)?VisualElements\b[^>]*>", manifest)
+    visual = visual.group(0) if visual else ""
+    name = None
+    for m in (re.search(r'\bDisplayName="([^"]+)"', visual), re.search(r"<DisplayName>([^<]+)</DisplayName>", manifest)):
+        if m and not m.group(1).startswith("ms-resource:"):
+            name = m.group(1)
+            break
+    if not name:
+        name = re.search(r"<Identity\b[^>]*\bName=\"([^\"]+)\"", manifest).group(1)
+    icon = None
+    for attr in ("Square44x44Logo", "Square150x150Logo"):
+        m = re.search(r'\b%s="([^"]+)"' % attr, visual)
+        if m and (icon := best_icon(package_dir, m.group(1))):
+            break
+    print("%s\t%s" % (name.replace("\t", " "), os.path.abspath(icon) if icon else ""))
+
+
 def native_copy(src, dest):
     data = bytearray(open(src, "rb").read())
     marker = b"Wine builtin DLL"
@@ -137,6 +215,8 @@ if __name__ == "__main__":
         info(sys.argv[2])
     elif len(sys.argv) == 4 and sys.argv[1] == "vclibs":
         vclibs(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) == 3 and sys.argv[1] == "appinfo":
+        appinfo(sys.argv[2])
     elif len(sys.argv) == 4 and sys.argv[1] == "native-copy":
         native_copy(sys.argv[2], sys.argv[3])
     elif len(sys.argv) == 4 and sys.argv[1] == "registry":

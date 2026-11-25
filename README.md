@@ -4,7 +4,7 @@ Run unpacked **UWP (Microsoft Store) apps and games** on Linux with a patched Wi
 
 UWP apps don't create a normal Win32 window. They ask Windows for a `CoreApplication`, get a `CoreWindow`, and read their identity, storage, licence and sign-in from WinRT classes that Wine 11.0 mostly lacks. This project adds the missing pieces, without touching the app's files:
 
-- a `CoreApplication`/`CoreWindow` host (window, fullscreen, lifecycle, keyboard, and mouse input including pointer events, raw mouse motion for mouse look and a hideable cursor)
+- a `CoreApplication`/`CoreWindow` host (window with the app's own icon, fullscreen, lifecycle, keyboard, and mouse input including pointer events, raw mouse motion for mouse look and a hideable cursor)
 - package identity read from the app's `AppxManifest.xml`
 - `ApplicationData` (local files and settings), `GameSaveProvider` (Xbox connected storage kept on disk), `DisplayRequest`
 - an offline Xbox sign-in for your Linux user, and an offline Store licence for the app itself (`StoreContext` and the older `CurrentApp`); Xbox Live web requests fail cleanly as "no network", and a local Xbox Live device address lets games create their sessions
@@ -62,14 +62,18 @@ scripts/setup-prefix.sh "/path/to/package-folder" --vclibs /path/to/Microsoft.VC
 
 This checks every file against the hashes in `AppxBlockMap.xml` (a few minutes for a big app; `--skip-verify` skips it), creates the shared Wine prefix on first use, and links the package into it as `C:\UWP\<package name>`. The package folder is never modified. Run it again for each further app; they share the prefix.
 
-Play:
+At the end it asks whether to **add a launcher** for the app: a `.desktop` file in your applications menu (`~/.local/share/applications/wine-uwp-<package name>.desktop`) and a copy on your desktop, with the app's own icon taken from its package. Pass `--shortcut` to add it without asking, or `--no-shortcut` to skip the question, for example in scripts. To remove a launcher, delete those two files.
+
+Play, either from the launcher or from a terminal:
 
 ```bash
 scripts/run-app.sh                       # if only one app is set up
 scripts/run-app.sh Microsoft.HoganThreshold
 ```
 
-Everything lives under `~/.local/share/wine-uwp/` (the prefix and logs) and the repo's `build/` folder. Delete those to uninstall.
+The game window shows the app's icon in the taskbar, in Alt-Tab and in its title bar, and the desktop groups it under the launcher's icon. This works under X11 and under Wayland through XWayland, which is how Wine runs on a Wayland desktop by default. With Wine's own Wayland driver it needs a compositor that supports the `xdg-toplevel-icon` protocol (KDE Plasma 6.1 or later, for example). Elsewhere the launcher's icon still shows.
+
+Everything lives under `~/.local/share/wine-uwp/` (the prefix, logs and launcher icons) and the repo's `build/` folder, plus any launchers you added. Delete those to uninstall.
 
 ## XAML apps
 
@@ -177,8 +181,8 @@ Each run writes `~/.local/share/wine-uwp/logs/run-<package>-<time>.log` (the las
 For maintainers. After building (see above) and committing, with GE-Proton 11-14 installed:
 
 ```bash
-scripts/package-release.sh v2.0
-gh release create v2.0 dist/wine-uwp-x86_64.tar.xz dist/wine-uwp-x86_64.tar.xz.sha256 --notes-file dist/NOTES.md
+scripts/package-release.sh v2.1
+gh release create v2.1 dist/wine-uwp-x86_64.tar.xz dist/wine-uwp-x86_64.tar.xz.sha256 --notes-file dist/NOTES.md
 ```
 
 The archive contains the Wine install tree, `dxgi.dll`, the four component DLLs (`d3d12.dll`, `d3d12core.dll`, `wintypes.dll`, `windows.storage.dll`), the licence texts, `SOURCE.txt` (where to get every part's source) and a copy of `patches/`, `docker/` and `scripts/` (the recipe that built it). The script refuses to run with uncommitted changes in those folders, and refuses a Wine build containing add-on unlocking code.
@@ -211,7 +215,7 @@ patches/wine/   patches against the wine-11.0 tag (apply in order with git apply
                 0034-0035 Direct2D rendering (transforms, clips, gradients), 0036-0039 Gears of War 4
                 (CoreApplication error and view interfaces, package root lookup, LoadPackagedLibrary,
                 MouseDevice, MessageDialog, Xbox Live device address, msxml6 HTTP class registration,
-                COM ContextCallback, pointer devices and cursor)
+                COM ContextCallback, pointer devices and cursor), 0040 the app's icon on its window
 patches/dxvk/   patch against DXVK f90f1bf1 (v3.1.1-235)
 docker/         build containers
 apps/           optional per-app settings
