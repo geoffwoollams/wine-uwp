@@ -1,8 +1,8 @@
 # wine-uwp
 
-Run unpacked **UWP (Microsoft Store) apps and games** on Linux with a patched Wine 11.0.
+Run unpacked **UWP (Microsoft Store) apps and games** on Linux with a patched Wine 11.22 (development release).
 
-UWP apps don't create a normal Win32 window. They ask Windows for a `CoreApplication`, get a `CoreWindow`, and read their identity, storage, licence and sign-in from WinRT classes that Wine 11.0 mostly lacks. This project adds the missing pieces, without touching the app's files:
+UWP apps don't create a normal Win32 window. They ask Windows for a `CoreApplication`, get a `CoreWindow`, and read their identity, storage, licence and sign-in from WinRT classes that Wine 11.22 mostly lacks. This project adds the missing pieces, without touching the app's files:
 
 - a `CoreApplication`/`CoreWindow` host (window with the app's own icon, fullscreen, lifecycle, keyboard, and mouse input including pointer events, raw mouse motion for mouse look and a hideable cursor)
 - package identity read from the app's `AppxManifest.xml`
@@ -133,7 +133,7 @@ Local files and settings are written where Windows would put them, inside the pr
 - **Offline only.** You are signed in as your Linux user name; there is no Xbox Live, multiplayer or LAN.
 - **No add-ons.** Wine has no Store client, so only the app's own licence is reported; add-ons and DLC that require a licence are unavailable.
 - **Xbox cloud saves stay on this PC.** Nothing is synchronised with Xbox Live, so saves from Windows or Xbox do not appear, and the reverse.
-- **The screen can still blank.** `DisplayRequest` asks Wine to keep the display on, but Wine 11.0 does not pass that on to the desktop, so a screensaver or display power-off may still happen.
+- **The screen can still blank.** `DisplayRequest` asks Wine to keep the display on, but Wine 11.22 does not pass that on to the desktop, so a screensaver or display power-off may still happen.
 - **Fullscreen or windowed is chosen at launch.** The window is created borderless at your screen's resolution (or as a 1280x720 window with `WINE_CORE_WINDOWED=1`) and is not resized while you play, because resizing a mapped window under its Vulkan swapchain can leave it without mouse input under XWayland. An app's own windowed-mode option may lose the mouse the same way; set `WINE_CORE_WINDOWED=1` instead.
 - **Resource strings.** `ms-resource:` names in the manifest are not resolved (no `resources.pri` support), so an app with such a display name gets its package name as the window title.
 - **Only D3D12 apps are covered** by the graphics setup; D3D11 or other renderers on a CoreWindow are untested.
@@ -202,11 +202,13 @@ This is not legal advice. The LGPL requires that anyone who gets the binaries ca
 ## Repository layout
 
 ```
-patches/wine/   patches against the wine-11.0 tag (apply in order with git apply): 0001-0007 the UWP host and
-                services, 0008 CurrentApp, 0009 DisplayRequest, 0010 GameSaveProvider, 0011 class registration,
-                0012 no hard-coded Store ID, 0013-0016 Windows.UI.Xaml milestone 1 (widl fix, generated IDL,
-                ProcessUntilQuit, the XAML code), 0017-0018 milestone 2 (IDL, layout, panels, Button),
-                0019-0022 milestone 3 (widl registration fix, IDL, launch args, markup loading),
+patches/wine/   patches against the wine-11.22 tag (apply in order with git apply): 0001-0007 the UWP host and
+                services (0004 replaces Wine's stub CoreApplication factory; 0007's JsonObject works with Wine's
+                JsonValue and JsonArray), 0008 CurrentApp, 0009 DisplayRequest, 0010 GameSaveProvider,
+                0011 class registration (CoreWindow and DisplayInformation come from twinapi.appcore, not Wine's
+                stubs), 0012 no hard-coded Store ID, 0013-0016 Windows.UI.Xaml milestone 1 (widl fix,
+                generated IDL, ProcessUntilQuit, the XAML code), 0017-0018 milestone 2 (IDL, layout, panels,
+                Button), 0019-0022 milestone 3 (widl registration fix, IDL, launch args, markup loading),
                 0023 milestone 4 part 1 (styles, theme and merged dictionaries), 0024-0025 part 2 (control
                 templates, visual states), 0026-0027 part 3 (ToggleButton, CheckBox, RadioButton, live
                 TemplateBinding), 0028-0029 part 4 (XAML text, XamlReader, generic.xaml),
@@ -215,7 +217,8 @@ patches/wine/   patches against the wine-11.0 tag (apply in order with git apply
                 0034-0035 Direct2D rendering (transforms, clips, gradients), 0036-0039 Gears of War 4
                 (CoreApplication error and view interfaces, package root lookup, LoadPackagedLibrary,
                 MouseDevice, MessageDialog, Xbox Live device address, msxml6 HTTP class registration,
-                COM ContextCallback, pointer devices and cursor), 0040 the app's icon on its window
+                pointer devices and cursor; COM ContextCallback is Wine's own since 11.x), 0040 the app's icon
+                on its window
 patches/dxvk/   patch against DXVK f90f1bf1 (v3.1.1-235)
 docker/         build containers
 apps/           optional per-app settings
