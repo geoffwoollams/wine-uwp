@@ -46,6 +46,7 @@
 #define WIDL_using_Windows_UI_Xaml_Data
 #define WIDL_using_Windows_UI_Xaml_Input
 #define WIDL_using_Windows_UI_Xaml_Media_Animation
+#define WIDL_using_Windows_UI_Xaml_Media_Imaging
 #define WIDL_using_Windows_UI_Xaml_Controls_Primitives
 #include "windows.ui.xaml.h"
 
@@ -2304,6 +2305,149 @@ done:
     IInspectable_Release(root);
 }
 
+/* milestone 5 part 3: Image, BitmapImage and ImageBrush (an overlay at 600,510; halves.png is 40x20, red | blue) */
+
+static int image_failed_count;
+static HRESULT WINAPI failed_QueryInterface(IExceptionRoutedEventHandler *iface, REFIID iid, void **out)
+{
+    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IExceptionRoutedEventHandler))
+    { *out = iface; return S_OK; }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI failed_AddRef(IExceptionRoutedEventHandler *iface) { return 2; }
+static ULONG WINAPI failed_Release(IExceptionRoutedEventHandler *iface) { return 1; }
+static HRESULT WINAPI failed_Invoke(IExceptionRoutedEventHandler *iface, IInspectable *sender, IExceptionRoutedEventArgs *args)
+{
+    image_failed_count++;
+    return S_OK;
+}
+static IExceptionRoutedEventHandlerVtbl failed_vtbl = { failed_QueryInterface, failed_AddRef, failed_Release, failed_Invoke };
+static IExceptionRoutedEventHandler on_image_failed = { &failed_vtbl };
+
+static const WCHAR image_xaml[] =
+    L"<StackPanel xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\"\n"
+    L"      xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\" Grid.RowSpan=\"2\" Margin=\"600,510,0,0\"\n"
+    L"      HorizontalAlignment=\"Left\" VerticalAlignment=\"Top\" Width=\"300\" Height=\"190\" Background=\"White\"\n"
+    L"      Orientation=\"Horizontal\">\n"
+    L"  <Image x:Name=\"Natural\" Source=\"ms-appx:///halves.png\" Stretch=\"None\" VerticalAlignment=\"Top\"/>\n"
+    L"  <Image x:Name=\"Filled\" Source=\"halves.png\" Stretch=\"Fill\" Width=\"80\" Height=\"40\" Margin=\"10,0,0,0\"\n"
+    L"         VerticalAlignment=\"Top\"/>\n"
+    L"  <Border Width=\"60\" Height=\"30\" Margin=\"10,0,0,0\" VerticalAlignment=\"Top\">\n"
+    L"    <Border.Background><ImageBrush ImageSource=\"ms-appx:///halves.png\" Stretch=\"Fill\"/></Border.Background>\n"
+    L"  </Border>\n"
+    L"  <Image x:Name=\"Missing\" Source=\"ms-appx:///missing.png\" Width=\"10\" Height=\"10\" VerticalAlignment=\"Top\"/>\n"
+    L"</StackPanel>\n";
+
+static void check_images(struct main_page *page)
+{
+    IFrameworkElement2 *page_grid = page_root(page);
+    IInspectable *root, *natural_obj, *missing_obj, *object;
+    IImage *natural = NULL, *missing = NULL;
+    IImageSource *source = NULL;
+    IBitmapSource *bitmap_source = NULL;
+    IBitmapImage *bitmap = NULL;
+    IActivationFactory *factory;
+    IUriRuntimeClassFactory *uri_factory;
+    IUriRuntimeClass *uri = NULL;
+    IVector_UIElement *children;
+    IUIElement *ui;
+    IPanel *panel;
+    EventRegistrationToken token;
+    static int opened;
+    static struct counter_handler on_opened = { { &counter_vtbl }, &opened };
+    INT32 w = 0, h = 0;
+    HSTRING str;
+    HRESULT hr;
+    DWORD c;
+    int x = 600, y = 510;
+
+    root = xaml_load(image_xaml, &hr);
+    check(hr == S_OK && root, "XamlReader.Load of Images and an ImageBrush, hr %#lx", hr);
+    if (!root || !page_grid) return;
+    IFrameworkElement2_QueryInterface(page_grid, &IID_IPanel, (void **)&panel);
+    IPanel_get_Children(panel, &children);
+    IInspectable_QueryInterface(root, &IID_IUIElement, (void **)&ui);
+    IVector_UIElement_Append(children, ui);
+    IUIElement_Release(ui);
+    natural_obj = find_in(root, L"Natural");
+    missing_obj = find_in(root, L"Missing");
+    if (natural_obj) IInspectable_QueryInterface(natural_obj, &IID_IImage, (void **)&natural);
+    if (missing_obj) IInspectable_QueryInterface(missing_obj, &IID_IImage, (void **)&missing);
+    check(natural && missing, "the Images are IImage");
+    if (!natural || !missing) goto done;
+    IImage_add_ImageOpened(natural, &on_opened.IRoutedEventHandler_iface, &token);
+    IImage_add_ImageFailed(missing, &on_image_failed, &token);
+    pump(100);
+    check(opened == 1, "ImageOpened is raised once the picture is decoded (%d)", opened);
+    check(image_failed_count == 1, "ImageFailed for a file that isn't there (%d)", image_failed_count);
+
+    IImage_get_Source(natural, &source);
+    if (source) IImageSource_QueryInterface(source, &IID_IBitmapSource, (void **)&bitmap_source);
+    if (bitmap_source)
+    {
+        IBitmapSource_get_PixelWidth(bitmap_source, &w);
+        IBitmapSource_get_PixelHeight(bitmap_source, &h);
+        IBitmapSource_Release(bitmap_source);
+    }
+    if (source) IImageSource_Release(source);
+    check(w == 40 && h == 20, "Source is a BitmapImage of the 40x20 picture (%dx%d)", w, h);
+
+    snapshot();
+    check(actual(natural, FALSE) == 40 && actual(natural, TRUE) == 20, "Stretch=None takes the picture's own size (%gx%g)",
+          actual(natural, FALSE), actual(natural, TRUE));
+    c = px(x + 5, y + 10);
+    check(close_rgb(c, 255, 0, 0, 8), "and draws its red left half (%06lx)", c);
+    c = px(x + 35, y + 10);
+    check(close_rgb(c, 0, 0, 255, 8), "and blue right half (%06lx)", c);
+    c = px(x + 55, y + 30);
+    check(close_rgb(c, 255, 0, 0, 8), "Stretch=Fill scales it to 80x40: red at the left (%06lx)", c);
+    c = px(x + 125, y + 30);
+    check(close_rgb(c, 0, 0, 255, 8), "and blue at the right (%06lx)", c);
+    /* the Border is at 140..200: Natural (40), a 10 px margin, Filled (80), another 10 px */
+    c = px(x + 145, y + 15);
+    check(close_rgb(c, 255, 0, 0, 8), "an ImageBrush paints a Border's background: red (%06lx)", c);
+    c = px(x + 195, y + 15);
+    check(close_rgb(c, 0, 0, 255, 8), "and blue (%06lx)", c);
+
+    /* from code: DecodePixelWidth scales the decoded picture, keeping its shape */
+    factory = get_factory(L"Windows.UI.Xaml.Media.Imaging.BitmapImage", &IID_IActivationFactory);
+    uri_factory = get_factory(L"Windows.Foundation.Uri", &IID_IUriRuntimeClassFactory);
+    object = NULL;
+    if (factory) IActivationFactory_ActivateInstance(factory, &object);
+    if (object) IInspectable_QueryInterface(object, &IID_IBitmapImage, (void **)&bitmap);
+    if (bitmap && uri_factory)
+    {
+        str = hs(L"ms-appx:///halves.png");
+        IUriRuntimeClassFactory_CreateUri(uri_factory, str, &uri);
+        WindowsDeleteString(str);
+        IBitmapImage_put_DecodePixelWidth(bitmap, 20);
+        IBitmapImage_put_UriSource(bitmap, uri);
+        IBitmapImage_QueryInterface(bitmap, &IID_IBitmapSource, (void **)&bitmap_source);
+        w = h = 0;
+        IBitmapSource_get_PixelWidth(bitmap_source, &w);
+        IBitmapSource_get_PixelHeight(bitmap_source, &h);
+        IBitmapSource_Release(bitmap_source);
+        if (uri) IUriRuntimeClass_Release(uri);
+    }
+    check(w == 20 && h == 10, "DecodePixelWidth=20 decodes it at 20x10 (%dx%d)", w, h);
+    if (bitmap) IBitmapImage_Release(bitmap);
+    if (object) IInspectable_Release(object);
+    if (factory) IActivationFactory_Release(factory);
+    if (uri_factory) IUriRuntimeClassFactory_Release(uri_factory);
+    pump(50);
+
+done:
+    if (natural) IImage_Release(natural);
+    if (missing) IImage_Release(missing);
+    if (natural_obj) IInspectable_Release(natural_obj);
+    if (missing_obj) IInspectable_Release(missing_obj);
+    IVector_UIElement_Release(children);
+    IPanel_Release(panel);
+    IFrameworkElement2_Release(page_grid);
+    IInspectable_Release(root);
+}
+
 static void check_microsoft_xbf(const WCHAR *file, const WCHAR *component_class)
 {
     IActivationFactory *factory;
@@ -2418,6 +2562,7 @@ static void CALLBACK verify(HWND unused, UINT msg, UINT_PTR id, DWORD time)
     check_d2d(the_page);
     check_scroll_focus(the_page);
     check_textbox(the_page);
+    check_images(the_page);
     check(!wcscmp(text_of(the_page->title, buf, ARRAYSIZE(buf)), L"Clicked!"), "OnClick changed Title (%ls)", buf);
     snapshot();
 

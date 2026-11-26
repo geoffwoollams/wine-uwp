@@ -1,0 +1,1599 @@
+Subject: windows.ui.xaml: Image, BitmapImage and ImageBrush (milestone 5 part 3)
+
+diff --git a/dlls/windows.ui.xaml/Makefile.in b/dlls/windows.ui.xaml/Makefile.in
+index 6b75d4f..25a4233 100644
+--- a/dlls/windows.ui.xaml/Makefile.in
++++ b/dlls/windows.ui.xaml/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE  = windows.ui.xaml.dll
+-IMPORTS = combase user32 gdi32 advapi32 d2d1 dwrite uuid
++IMPORTS = combase user32 gdi32 advapi32 d2d1 dwrite ole32 uuid
+ 
+ SOURCES = \
+ 	animation.c \
+@@ -15,6 +15,7 @@ SOURCES = \
+ 	definitions.c \
+ 	element.c \
+ 	focus.c \
++	image.c \
+ 	items.c \
+ 	main.c \
+ 	media.c \
+diff --git a/dlls/windows.ui.xaml/classes.idl b/dlls/windows.ui.xaml/classes.idl
+index fd3b0e2..0eecabc 100644
+--- a/dlls/windows.ui.xaml/classes.idl
++++ b/dlls/windows.ui.xaml/classes.idl
+@@ -42,6 +42,7 @@ namespace Windows.UI.Xaml.Controls {
+     runtimeclass ContentPresenter;
+     runtimeclass Frame;
+     runtimeclass Grid;
++    runtimeclass Image;
+     runtimeclass ItemsControl;
+     runtimeclass Page;
+     runtimeclass PasswordBox;
+@@ -79,7 +80,12 @@ namespace Windows.UI.Xaml.Shapes {
+     runtimeclass Rectangle;
+ }
+ 
++namespace Windows.UI.Xaml.Media.Imaging {
++    runtimeclass BitmapImage;
++}
++
+ namespace Windows.UI.Xaml.Media {
++    runtimeclass ImageBrush;
+     runtimeclass CompositeTransform;
+     runtimeclass EllipseGeometry;
+     runtimeclass GradientStop;
+diff --git a/dlls/windows.ui.xaml/image.c b/dlls/windows.ui.xaml/image.c
+new file mode 100644
+index 0000000..d0b1f96
+--- /dev/null
++++ b/dlls/windows.ui.xaml/image.c
+@@ -0,0 +1,1292 @@
++/* Windows.UI.Xaml Image, Media.Imaging.BitmapImage and Media.ImageBrush
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <math.h>
++
++#include <stdarg.h>
++#define COBJMACROS
++#include "windef.h"
++#include "winbase.h"
++#include "objbase.h"
++#include "wincodec.h"
++#include "appmodel.h"
++
++#include "private.h"
++#include "wine/list.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* not in Wine's uuid library */
++static const GUID CLSID_WICImagingFactory_local =
++    { 0xcacaf262, 0x9370, 0x4615, { 0xa1, 0x3b, 0x9f, 0x55, 0x39, 0xda, 0x4c, 0x0a } };
++static const GUID IID_IWICImagingFactory_local =
++    { 0xec5ec8a9, 0xc395, 0x4314, { 0x9c, 0x77, 0x54, 0xd7, 0xa9, 0x35, 0xff, 0x70 } };
++static const GUID GUID_WICPixelFormat32bppPBGRA_local =
++    { 0x6fddc324, 0x4e03, 0x4bfe, { 0xb1, 0x85, 0x3d, 0x77, 0x76, 0x8d, 0xc9, 0x10 } };
++
++/* A BitmapImage decodes its UriSource (ms-appx:/// in the app's package, ms-appx with the package name, or a plain
++ * file path) with WIC into 32-bit premultiplied BGRA pixels, scaled to DecodePixelWidth /
++ * DecodePixelHeight when set. Decoding happens at once; ImageOpened or ImageFailed follow from a timer on the UI
++ * thread, after the caller has had the chance to add its handlers, as Windows raises them asynchronously. Web URIs
++ * fail (there is no network) and so do ms-appdata ones for now. An Image draws its source by Stretch (Uniform by
++ * default) centred in its slot, and its natural size is the bitmap's pixel size. An ImageBrush paints its
++ * ImageSource over what it fills, placed by Stretch, AlignmentX and AlignmentY. Animated images show their first
++ * frame. */
++
++struct bitmap_image
++{
++    IBitmapImage IBitmapImage_iface;
++    IBitmapImage2 IBitmapImage2_iface;
++    IBitmapImage3 IBitmapImage3_iface;
++    IBitmapSource IBitmapSource_iface;
++    IImageSource IImageSource_iface;
++    LONG ref;
++    IUriRuntimeClass *uri;
++    BitmapCreateOptions options;
++    INT32 decode_width, decode_height;
++    DecodePixelType decode_type;
++    boolean autoplay;
++    struct event_list opened, failed, progress;
++    struct image_pixels pixels;
++    enum { IMAGE_EMPTY, IMAGE_LOADED, IMAGE_FAILED } state;
++    HSTRING error;
++    UINT32 generation;               /* bumped on each load, for the Images that show it */
++    UINT_PTR timer;
++};
++
++static inline struct bitmap_image *impl_from_IBitmapImage( IBitmapImage *iface )
++{
++    return CONTAINING_RECORD( iface, struct bitmap_image, IBitmapImage_iface );
++}
++
++static struct bitmap_image *bitmap_from_source( IInspectable *source );
++
++/* ---- decoding ---- */
++
++static IWICImagingFactory *wic_factory(void)
++{
++    static IWICImagingFactory *factory;
++    if (!factory && FAILED(CoCreateInstance( &CLSID_WICImagingFactory_local, NULL, CLSCTX_INPROC_SERVER,
++                                             &IID_IWICImagingFactory_local, (void **)&factory )))
++        ERR( "WIC isn't available.\n" );
++    return factory;
++}
++
++static HRESULT decode( struct bitmap_image *bitmap, IWICBitmapDecoder *decoder )
++{
++    IWICImagingFactory *factory = wic_factory();
++    IWICBitmapFrameDecode *frame = NULL;
++    IWICFormatConverter *converter = NULL;
++    IWICBitmapScaler *scaler = NULL;
++    IWICBitmapSource *source;
++    UINT width, height, out_w, out_h;
++    HRESULT hr;
++    BYTE *bits;
++
++    if (FAILED(hr = IWICBitmapDecoder_GetFrame( decoder, 0, &frame ))) return hr;
++    if (FAILED(hr = IWICImagingFactory_CreateFormatConverter( factory, &converter ))) goto done;
++    if (FAILED(hr = IWICFormatConverter_Initialize( converter, (IWICBitmapSource *)frame, &GUID_WICPixelFormat32bppPBGRA_local,
++                                                    WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom )))
++        goto done;
++    source = (IWICBitmapSource *)converter;
++    IWICBitmapSource_GetSize( source, &width, &height );
++    out_w = width;
++    out_h = height;
++    /* DecodePixelWidth / Height: one of them keeps the aspect ratio */
++    if (bitmap->decode_width > 0 && bitmap->decode_height > 0) { out_w = bitmap->decode_width; out_h = bitmap->decode_height; }
++    else if (bitmap->decode_width > 0) { out_w = bitmap->decode_width; out_h = max( 1, MulDiv( height, out_w, width ) ); }
++    else if (bitmap->decode_height > 0) { out_h = bitmap->decode_height; out_w = max( 1, MulDiv( width, out_h, height ) ); }
++    if (out_w != width || out_h != height)
++    {
++        if (FAILED(hr = IWICImagingFactory_CreateBitmapScaler( factory, &scaler ))) goto done;
++        if (FAILED(hr = IWICBitmapScaler_Initialize( scaler, source, out_w, out_h, WICBitmapInterpolationModeFant ))) goto done;
++        source = (IWICBitmapSource *)scaler;
++    }
++    if (!(bits = malloc( out_w * 4 * out_h ))) { hr = E_OUTOFMEMORY; goto done; }
++    if (FAILED(hr = IWICBitmapSource_CopyPixels( source, NULL, out_w * 4, out_w * 4 * out_h, bits )))
++    {
++        free( bits );
++        goto done;
++    }
++    free( bitmap->pixels.bits );
++    bitmap->pixels.bits = bits;
++    bitmap->pixels.width = out_w;
++    bitmap->pixels.height = out_h;
++    bitmap->pixels.stride = out_w * 4;
++    TRACE( "decoded %ux%u (from %ux%u).\n", out_w, out_h, width, height );
++
++done:
++    if (scaler) IWICBitmapScaler_Release( scaler );
++    if (converter) IWICFormatConverter_Release( converter );
++    if (frame) IWICBitmapFrameDecode_Release( frame );
++    return hr;
++}
++
++/* ms-appx:///path (or ms-appx://package/path) to a file in the app's package; FALSE if it isn't one */
++BOOL resolve_app_uri( const WCHAR *uri, WCHAR *file, UINT32 size )
++{
++    UINT32 len = size;
++    const WCHAR *path = uri;
++    WCHAR *p;
++
++    if (!wcsnicmp( uri, L"ms-appx://", 10 ))
++    {
++        path = uri + 10;
++        if (*path != '/' && !(path = wcschr( path, '/' ))) return FALSE;
++        while (*path == '/') path++;
++    }
++    else if (wcschr( uri, ':' ) && !(iswalpha( uri[0] ) && uri[1] == ':'))
++        return FALSE;   /* another scheme */
++    else if (iswalpha( uri[0] ) && uri[1] == ':')
++    {
++        lstrcpynW( file, uri, size );   /* a plain path */
++        return TRUE;
++    }
++    /* the package root, or without a package the folder of the executable */
++    if (GetCurrentPackagePath( &len, file ))
++    {
++        GetModuleFileNameW( NULL, file, size );
++        if ((p = wcsrchr( file, '\\' ))) *p = 0;
++    }
++    if (wcslen( file ) + wcslen( path ) + 2 > size) return FALSE;
++    lstrcatW( file, L"\\" );
++    p = file + wcslen( file );
++    lstrcatW( file, path );
++    for (; *p; p++) if (*p == '/') *p = '\\';
++    return TRUE;
++}
++
++static void schedule_notify( struct bitmap_image *bitmap );
++
++static void load_failed( struct bitmap_image *bitmap, const WCHAR *message )
++{
++    bitmap->state = IMAGE_FAILED;
++    WindowsDeleteString( bitmap->error );
++    WindowsCreateString( message, wcslen( message ), &bitmap->error );
++    bitmap->generation++;
++    schedule_notify( bitmap );
++}
++
++static void load_uri( struct bitmap_image *bitmap )
++{
++    IWICImagingFactory *factory = wic_factory();
++    IWICBitmapDecoder *decoder;
++    HSTRING raw = NULL;
++    WCHAR file[MAX_PATH];
++    HRESULT hr;
++
++    free( bitmap->pixels.bits );
++    memset( &bitmap->pixels, 0, sizeof(bitmap->pixels) );
++    bitmap->state = IMAGE_EMPTY;
++    if (!bitmap->uri) { bitmap->generation++; window_invalidate(); return; }
++    IUriRuntimeClass_get_RawUri( bitmap->uri, &raw );
++    if (!resolve_app_uri( WindowsGetStringRawBuffer( raw, NULL ), file, ARRAY_SIZE(file) ))
++    {
++        FIXME( "image URI %s isn't supported.\n", debugstr_hstring(raw) );
++        WindowsDeleteString( raw );
++        load_failed( bitmap, L"E_NETWORK_ERROR" );
++        return;
++    }
++    TRACE( "%s from %s.\n", debugstr_hstring(raw), debugstr_w(file) );
++    WindowsDeleteString( raw );
++    if (!factory || FAILED(hr = IWICImagingFactory_CreateDecoderFromFilename( factory, file, NULL, GENERIC_READ,
++                                                                              WICDecodeMetadataCacheOnDemand, &decoder )))
++    {
++        WARN( "can't open %s.\n", debugstr_w(file) );
++        load_failed( bitmap, L"AG_E_NETWORK_ERROR" );
++        return;
++    }
++    hr = decode( bitmap, decoder );
++    IWICBitmapDecoder_Release( decoder );
++    if (FAILED(hr)) { load_failed( bitmap, L"E_UNKNOWN_ERROR" ); return; }
++    bitmap->state = IMAGE_LOADED;
++    bitmap->generation++;
++    element_property_changed( (IInspectable *)&bitmap->IBitmapImage_iface, L"PixelWidth" );
++    schedule_notify( bitmap );
++    window_invalidate();
++}
++
++/* ---- ImageOpened / ImageFailed, from a UI-thread timer ---- */
++
++struct exception_args
++{
++    IExceptionRoutedEventArgs IExceptionRoutedEventArgs_iface;
++    IRoutedEventArgs IRoutedEventArgs_iface;
++    LONG ref;
++    HSTRING message;
++    IInspectable *source;
++};
++
++static inline struct exception_args *impl_from_IExceptionRoutedEventArgs( IExceptionRoutedEventArgs *iface )
++{
++    return CONTAINING_RECORD( iface, struct exception_args, IExceptionRoutedEventArgs_iface );
++}
++
++static HRESULT WINAPI ex_args_QueryInterface( IExceptionRoutedEventArgs *iface, REFIID iid, void **out )
++{
++    struct exception_args *impl = impl_from_IExceptionRoutedEventArgs( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IExceptionRoutedEventArgs ))
++        *out = &impl->IExceptionRoutedEventArgs_iface;
++    else if (IsEqualGUID( iid, &IID_IRoutedEventArgs )) *out = &impl->IRoutedEventArgs_iface;
++    else { *out = NULL; return E_NOINTERFACE; }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI ex_args_AddRef( IExceptionRoutedEventArgs *iface )
++{
++    return InterlockedIncrement( &impl_from_IExceptionRoutedEventArgs( iface )->ref );
++}
++
++static ULONG WINAPI ex_args_Release( IExceptionRoutedEventArgs *iface )
++{
++    struct exception_args *impl = impl_from_IExceptionRoutedEventArgs( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        WindowsDeleteString( impl->message );
++        if (impl->source) IInspectable_Release( impl->source );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI ex_args_GetIids( IExceptionRoutedEventArgs *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI ex_args_GetRuntimeClassName( IExceptionRoutedEventArgs *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI ex_args_GetTrustLevel( IExceptionRoutedEventArgs *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI ex_args_get_ErrorMessage( IExceptionRoutedEventArgs *iface, HSTRING *value )
++{
++    return WindowsDuplicateString( impl_from_IExceptionRoutedEventArgs( iface )->message, value );
++}
++
++static const struct IExceptionRoutedEventArgsVtbl ex_args_vtbl =
++{
++    ex_args_QueryInterface, ex_args_AddRef, ex_args_Release, ex_args_GetIids, ex_args_GetRuntimeClassName,
++    ex_args_GetTrustLevel, ex_args_get_ErrorMessage,
++};
++
++DEFINE_IINSPECTABLE( ex_routed, IRoutedEventArgs, struct exception_args, IExceptionRoutedEventArgs_iface )
++
++static HRESULT WINAPI ex_routed_get_OriginalSource( IRoutedEventArgs *iface, IInspectable **value )
++{
++    struct exception_args *impl = impl_from_IRoutedEventArgs( iface );
++    if ((*value = impl->source)) IInspectable_AddRef( *value );
++    return S_OK;
++}
++
++static const struct IRoutedEventArgsVtbl ex_routed_vtbl =
++{
++    ex_routed_QueryInterface, ex_routed_AddRef, ex_routed_Release, ex_routed_GetIids, ex_routed_GetRuntimeClassName,
++    ex_routed_GetTrustLevel, ex_routed_get_OriginalSource,
++};
++
++/* raise ImageOpened (a RoutedEventHandler) or ImageFailed (an ExceptionRoutedEventHandler) on a list */
++static void raise_image_event( struct event_list *list, IInspectable *sender, BOOL failed, HSTRING message )
++{
++    IUnknown **handlers;
++    UINT32 i, count = list->count;
++    IRoutedEventArgs *args = NULL;
++    struct exception_args *ex = NULL;
++
++    if (!count || !(handlers = calloc( count, sizeof(*handlers) ))) return;
++    if (failed)
++    {
++        if (!(ex = calloc( 1, sizeof(*ex) ))) { free( handlers ); return; }
++        ex->IExceptionRoutedEventArgs_iface.lpVtbl = &ex_args_vtbl;
++        ex->IRoutedEventArgs_iface.lpVtbl = &ex_routed_vtbl;
++        ex->ref = 1;
++        WindowsDuplicateString( message, &ex->message );
++        if ((ex->source = sender)) IInspectable_AddRef( sender );
++    }
++    else if (FAILED(routed_event_args_create( sender, &args ))) { free( handlers ); return; }
++    for (i = 0; i < count; i++) if ((handlers[i] = list->handlers[i])) IUnknown_AddRef( handlers[i] );
++    for (i = 0; i < count; i++)
++    {
++        if (!handlers[i]) continue;
++        if (failed) IExceptionRoutedEventHandler_Invoke( (IExceptionRoutedEventHandler *)handlers[i], sender,
++                                                         &ex->IExceptionRoutedEventArgs_iface );
++        else IRoutedEventHandler_Invoke( (IRoutedEventHandler *)handlers[i], sender, args );
++        IUnknown_Release( handlers[i] );
++    }
++    free( handlers );
++    if (ex) IExceptionRoutedEventArgs_Release( &ex->IExceptionRoutedEventArgs_iface );
++    if (args) IRoutedEventArgs_Release( args );
++}
++
++/* the Images and ImageBrushes showing a bitmap hear of its load through these */
++struct image_listener
++{
++    struct list entry;
++    struct bitmap_image *bitmap;
++    struct event_list *opened, *failed;
++    IInspectable *sender;   /* not referenced */
++};
++
++static struct list listeners = LIST_INIT( listeners );
++static struct bitmap_image **pending;
++static UINT32 pending_count;
++static UINT_PTR notify_timer;
++
++static void listen( struct bitmap_image *bitmap, IInspectable *sender, struct event_list *opened, struct event_list *failed )
++{
++    struct image_listener *l;
++
++    if (!bitmap || !(l = calloc( 1, sizeof(*l) ))) return;
++    l->bitmap = bitmap;
++    l->opened = opened;
++    l->failed = failed;
++    l->sender = sender;
++    list_add_tail( &listeners, &l->entry );
++}
++
++static void unlisten( IInspectable *sender )
++{
++    struct image_listener *l, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( l, next, &listeners, struct image_listener, entry )
++    {
++        if (l->sender != sender) continue;
++        list_remove( &l->entry );
++        free( l );
++    }
++}
++
++static void CALLBACK notify_proc( HWND hwnd, UINT msg, UINT_PTR id, DWORD time )
++{
++    struct bitmap_image **list = pending;
++    UINT32 i, count = pending_count;
++    struct image_listener *l, *next;
++
++    KillTimer( NULL, notify_timer );
++    notify_timer = 0;
++    pending = NULL;
++    pending_count = 0;
++    for (i = 0; i < count; i++)
++    {
++        struct bitmap_image *bitmap = list[i];
++        BOOL failed = bitmap->state == IMAGE_FAILED;
++
++        TRACE( "%p: %s.\n", bitmap, failed ? "ImageFailed" : "ImageOpened" );
++        if (bitmap->state != IMAGE_EMPTY)
++        {
++            raise_image_event( failed ? &bitmap->failed : &bitmap->opened, (IInspectable *)&bitmap->IBitmapImage_iface,
++                               failed, bitmap->error );
++            LIST_FOR_EACH_ENTRY_SAFE( l, next, &listeners, struct image_listener, entry )
++                if (l->bitmap == bitmap)
++                    raise_image_event( failed ? l->failed : l->opened, l->sender, failed, bitmap->error );
++        }
++        IBitmapImage_Release( &bitmap->IBitmapImage_iface );
++    }
++    free( list );
++    window_invalidate();
++}
++
++static void schedule_notify( struct bitmap_image *bitmap )
++{
++    struct bitmap_image **list;
++    UINT32 i;
++
++    for (i = 0; i < pending_count; i++) if (pending[i] == bitmap) return;
++    if (!(list = realloc( pending, (pending_count + 1) * sizeof(*list) ))) return;
++    pending = list;
++    IBitmapImage_AddRef( &bitmap->IBitmapImage_iface );
++    pending[pending_count++] = bitmap;
++    if (!notify_timer) notify_timer = SetTimer( NULL, 0, 0, notify_proc );
++}
++
++/* ---- IBitmapImage ---- */
++
++static HRESULT WINAPI bitmap_QueryInterface( IBitmapImage *iface, REFIID iid, void **out )
++{
++    struct bitmap_image *impl = impl_from_IBitmapImage( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IBitmapImage ))
++        *out = &impl->IBitmapImage_iface;
++    else if (IsEqualGUID( iid, &IID_IBitmapImage2 )) *out = &impl->IBitmapImage2_iface;
++    else if (IsEqualGUID( iid, &IID_IBitmapImage3 )) *out = &impl->IBitmapImage3_iface;
++    else if (IsEqualGUID( iid, &IID_IBitmapSource )) *out = &impl->IBitmapSource_iface;
++    else if (IsEqualGUID( iid, &IID_IImageSource )) *out = &impl->IImageSource_iface;
++    else
++    {
++        report_missing_interface( L"BitmapImage", iid );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI bitmap_AddRef( IBitmapImage *iface )
++{
++    return InterlockedIncrement( &impl_from_IBitmapImage( iface )->ref );
++}
++
++static ULONG WINAPI bitmap_Release( IBitmapImage *iface )
++{
++    struct bitmap_image *impl = impl_from_IBitmapImage( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        if (impl->uri) IUriRuntimeClass_Release( impl->uri );
++        event_list_clear( &impl->opened );
++        event_list_clear( &impl->failed );
++        event_list_clear( &impl->progress );
++        WindowsDeleteString( impl->error );
++        free( impl->pixels.bits );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI bitmap_GetIids( IBitmapImage *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI bitmap_GetRuntimeClassName( IBitmapImage *iface, HSTRING *name )
++{
++    return WindowsCreateString( RuntimeClass_Windows_UI_Xaml_Media_Imaging_BitmapImage,
++                                wcslen( RuntimeClass_Windows_UI_Xaml_Media_Imaging_BitmapImage ), name );
++}
++
++static HRESULT WINAPI bitmap_GetTrustLevel( IBitmapImage *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI bitmap_get_CreateOptions( IBitmapImage *iface, BitmapCreateOptions *value )
++{
++    *value = impl_from_IBitmapImage( iface )->options;
++    return S_OK;
++}
++
++static HRESULT WINAPI bitmap_put_CreateOptions( IBitmapImage *iface, BitmapCreateOptions value )
++{
++    impl_from_IBitmapImage( iface )->options = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI bitmap_get_UriSource( IBitmapImage *iface, IUriRuntimeClass **value )
++{
++    struct bitmap_image *impl = impl_from_IBitmapImage( iface );
++    if ((*value = impl->uri)) IUriRuntimeClass_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI bitmap_put_UriSource( IBitmapImage *iface, IUriRuntimeClass *value )
++{
++    struct bitmap_image *impl = impl_from_IBitmapImage( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (value) IUriRuntimeClass_AddRef( value );
++    if (impl->uri) IUriRuntimeClass_Release( impl->uri );
++    impl->uri = value;
++    load_uri( impl );
++    return S_OK;
++}
++
++static HRESULT WINAPI bitmap_get_DecodePixelWidth( IBitmapImage *iface, INT32 *value )
++{
++    *value = impl_from_IBitmapImage( iface )->decode_width;
++    return S_OK;
++}
++
++static HRESULT WINAPI bitmap_put_DecodePixelWidth( IBitmapImage *iface, INT32 value )
++{
++    struct bitmap_image *impl = impl_from_IBitmapImage( iface );
++    impl->decode_width = value;
++    if (impl->uri) load_uri( impl );
++    return S_OK;
++}
++
++static HRESULT WINAPI bitmap_get_DecodePixelHeight( IBitmapImage *iface, INT32 *value )
++{
++    *value = impl_from_IBitmapImage( iface )->decode_height;
++    return S_OK;
++}
++
++static HRESULT WINAPI bitmap_put_DecodePixelHeight( IBitmapImage *iface, INT32 value )
++{
++    struct bitmap_image *impl = impl_from_IBitmapImage( iface );
++    impl->decode_height = value;
++    if (impl->uri) load_uri( impl );
++    return S_OK;
++}
++
++static HRESULT WINAPI bitmap_add_DownloadProgress( IBitmapImage *iface, IDownloadProgressEventHandler *handler,
++                                                   EventRegistrationToken *token )
++{
++    return event_list_add( &impl_from_IBitmapImage( iface )->progress, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI bitmap_remove_DownloadProgress( IBitmapImage *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IBitmapImage( iface )->progress, token );
++}
++
++static HRESULT WINAPI bitmap_add_ImageOpened( IBitmapImage *iface, IRoutedEventHandler *handler, EventRegistrationToken *token )
++{
++    return event_list_add( &impl_from_IBitmapImage( iface )->opened, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI bitmap_remove_ImageOpened( IBitmapImage *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IBitmapImage( iface )->opened, token );
++}
++
++static HRESULT WINAPI bitmap_add_ImageFailed( IBitmapImage *iface, IExceptionRoutedEventHandler *handler,
++                                              EventRegistrationToken *token )
++{
++    return event_list_add( &impl_from_IBitmapImage( iface )->failed, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI bitmap_remove_ImageFailed( IBitmapImage *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IBitmapImage( iface )->failed, token );
++}
++
++static const struct IBitmapImageVtbl bitmap_vtbl =
++{
++    bitmap_QueryInterface, bitmap_AddRef, bitmap_Release, bitmap_GetIids, bitmap_GetRuntimeClassName, bitmap_GetTrustLevel,
++    bitmap_get_CreateOptions, bitmap_put_CreateOptions, bitmap_get_UriSource, bitmap_put_UriSource,
++    bitmap_get_DecodePixelWidth, bitmap_put_DecodePixelWidth, bitmap_get_DecodePixelHeight, bitmap_put_DecodePixelHeight,
++    bitmap_add_DownloadProgress, bitmap_remove_DownloadProgress, bitmap_add_ImageOpened, bitmap_remove_ImageOpened,
++    bitmap_add_ImageFailed, bitmap_remove_ImageFailed,
++};
++
++DEFINE_IINSPECTABLE( bitmap2, IBitmapImage2, struct bitmap_image, IBitmapImage_iface )
++
++static HRESULT WINAPI bitmap2_get_DecodePixelType( IBitmapImage2 *iface, DecodePixelType *value )
++{
++    *value = impl_from_IBitmapImage2( iface )->decode_type;
++    return S_OK;
++}
++
++static HRESULT WINAPI bitmap2_put_DecodePixelType( IBitmapImage2 *iface, DecodePixelType value )
++{
++    impl_from_IBitmapImage2( iface )->decode_type = value;   /* the decode size is always in physical pixels here */
++    return S_OK;
++}
++
++static const struct IBitmapImage2Vtbl bitmap2_vtbl =
++{
++    bitmap2_QueryInterface, bitmap2_AddRef, bitmap2_Release, bitmap2_GetIids, bitmap2_GetRuntimeClassName,
++    bitmap2_GetTrustLevel, bitmap2_get_DecodePixelType, bitmap2_put_DecodePixelType,
++};
++
++DEFINE_IINSPECTABLE( bitmap3, IBitmapImage3, struct bitmap_image, IBitmapImage_iface )
++
++static HRESULT WINAPI bitmap3_get_IsAnimatedBitmap( IBitmapImage3 *iface, boolean *value ) { *value = FALSE; return S_OK; }
++static HRESULT WINAPI bitmap3_get_IsPlaying( IBitmapImage3 *iface, boolean *value ) { *value = FALSE; return S_OK; }
++static HRESULT WINAPI bitmap3_get_AutoPlay( IBitmapImage3 *iface, boolean *value )
++{
++    *value = impl_from_IBitmapImage3( iface )->autoplay;
++    return S_OK;
++}
++static HRESULT WINAPI bitmap3_put_AutoPlay( IBitmapImage3 *iface, boolean value )
++{
++    impl_from_IBitmapImage3( iface )->autoplay = value;
++    return S_OK;
++}
++static HRESULT WINAPI bitmap3_Play( IBitmapImage3 *iface ) { FIXME( "animated images aren't played.\n" ); return S_OK; }
++static HRESULT WINAPI bitmap3_Stop( IBitmapImage3 *iface ) { return S_OK; }
++
++static const struct IBitmapImage3Vtbl bitmap3_vtbl =
++{
++    bitmap3_QueryInterface, bitmap3_AddRef, bitmap3_Release, bitmap3_GetIids, bitmap3_GetRuntimeClassName,
++    bitmap3_GetTrustLevel, bitmap3_get_IsAnimatedBitmap, bitmap3_get_IsPlaying, bitmap3_get_AutoPlay,
++    bitmap3_put_AutoPlay, bitmap3_Play, bitmap3_Stop,
++};
++
++DEFINE_IINSPECTABLE( bitmap_source, IBitmapSource, struct bitmap_image, IBitmapImage_iface )
++
++static HRESULT WINAPI bitmap_source_get_PixelWidth( IBitmapSource *iface, INT32 *value )
++{
++    *value = impl_from_IBitmapSource( iface )->pixels.width;
++    return S_OK;
++}
++
++static HRESULT WINAPI bitmap_source_get_PixelHeight( IBitmapSource *iface, INT32 *value )
++{
++    *value = impl_from_IBitmapSource( iface )->pixels.height;
++    return S_OK;
++}
++
++static HRESULT WINAPI bitmap_source_SetSource( IBitmapSource *iface, __x_ABI_CWindows_CStorage_CStreams_CIRandomAccessStream *stream )
++{
++    /* reading the stream needs CreateStreamOverRandomAccessStream, which Wine's shcore doesn't implement yet */
++    FIXME( "iface %p, stream %p: decoding from a stream isn't supported yet.\n", iface, stream );
++    load_failed( impl_from_IBitmapSource( iface ), L"E_NOTIMPL" );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI bitmap_source_SetSourceAsync( IBitmapSource *iface, __x_ABI_CWindows_CStorage_CStreams_CIRandomAccessStream *stream, IAsyncAction **value )
++{
++    FIXME( "iface %p: SetSourceAsync isn't implemented.\n", iface );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct IBitmapSourceVtbl bitmap_source_vtbl =
++{
++    bitmap_source_QueryInterface, bitmap_source_AddRef, bitmap_source_Release, bitmap_source_GetIids,
++    bitmap_source_GetRuntimeClassName, bitmap_source_GetTrustLevel,
++    bitmap_source_get_PixelWidth, bitmap_source_get_PixelHeight, bitmap_source_SetSource, bitmap_source_SetSourceAsync,
++};
++
++DEFINE_IINSPECTABLE( image_source, IImageSource, struct bitmap_image, IBitmapImage_iface )
++
++static const struct IImageSourceVtbl image_source_vtbl =
++{
++    image_source_QueryInterface, image_source_AddRef, image_source_Release, image_source_GetIids,
++    image_source_GetRuntimeClassName, image_source_GetTrustLevel,
++};
++
++static HRESULT bitmap_create( IUriRuntimeClass *uri, IBitmapImage **out )
++{
++    struct bitmap_image *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IBitmapImage_iface.lpVtbl = &bitmap_vtbl;
++    impl->IBitmapImage2_iface.lpVtbl = &bitmap2_vtbl;
++    impl->IBitmapImage3_iface.lpVtbl = &bitmap3_vtbl;
++    impl->IBitmapSource_iface.lpVtbl = &bitmap_source_vtbl;
++    impl->IImageSource_iface.lpVtbl = &image_source_vtbl;
++    impl->ref = 1;
++    impl->autoplay = TRUE;
++    if (uri) bitmap_put_UriSource( &impl->IBitmapImage_iface, uri );
++    *out = &impl->IBitmapImage_iface;
++    return S_OK;
++}
++
++static struct bitmap_image *bitmap_from_source( IInspectable *source )
++{
++    IBitmapImage *bitmap;
++    struct bitmap_image *impl;
++
++    if (!source || FAILED(IInspectable_QueryInterface( source, &IID_IBitmapImage, (void **)&bitmap ))) return NULL;
++    impl = bitmap->lpVtbl == &bitmap_vtbl ? impl_from_IBitmapImage( bitmap ) : NULL;
++    IBitmapImage_Release( bitmap );
++    return impl;
++}
++
++/* the decoded pixels of an ImageSource, if it is one of our bitmaps and has loaded */
++BOOL image_source_pixels( IInspectable *source, struct image_pixels *out )
++{
++    struct bitmap_image *bitmap = bitmap_from_source( source );
++
++    if (!bitmap || bitmap->state != IMAGE_LOADED || !bitmap->pixels.bits) return FALSE;
++    *out = bitmap->pixels;
++    return TRUE;
++}
++
++/* markup: Source="ms-appx:///Assets/Logo.png", or a relative path, which is relative to the package */
++IInspectable *bitmap_from_string( const WCHAR *str )
++{
++    IUriRuntimeClassFactory *factory;
++    IUriRuntimeClass *uri = NULL;
++    IBitmapImage *bitmap = NULL;
++    WCHAR buf[MAX_PATH + 16];
++    HSTRING hstr;
++
++    if (wcschr( str, ':' )) lstrcpynW( buf, str, ARRAY_SIZE(buf) );
++    else swprintf( buf, ARRAY_SIZE(buf), L"ms-appx:///%s", str[0] == '/' ? str + 1 : str );
++    WindowsCreateString( L"Windows.Foundation.Uri", 22, &hstr );
++    factory = NULL;
++    RoGetActivationFactory( hstr, &IID_IUriRuntimeClassFactory, (void **)&factory );
++    WindowsDeleteString( hstr );
++    if (!factory) return NULL;
++    WindowsCreateString( buf, wcslen( buf ), &hstr );
++    IUriRuntimeClassFactory_CreateUri( factory, hstr, &uri );
++    WindowsDeleteString( hstr );
++    IUriRuntimeClassFactory_Release( factory );
++    if (!uri) return NULL;
++    bitmap_create( uri, &bitmap );
++    IUriRuntimeClass_Release( uri );
++    return (IInspectable *)bitmap;
++}
++
++/* ---- BitmapImage's factory ---- */
++
++struct bitmap_factory
++{
++    IActivationFactory IActivationFactory_iface;
++    IBitmapImageFactory IBitmapImageFactory_iface;
++};
++
++static HRESULT WINAPI bfactory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out );
++static ULONG WINAPI bfactory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI bfactory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI bfactory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI bfactory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI bfactory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI bfactory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    return bitmap_create( NULL, (IBitmapImage **)instance );
++}
++
++static const IActivationFactoryVtbl bfactory_vtbl =
++{
++    bfactory_QueryInterface, bfactory_AddRef, bfactory_Release, bfactory_GetIids, bfactory_GetRuntimeClassName,
++    bfactory_GetTrustLevel, bfactory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( bfactory_uri, IBitmapImageFactory, struct bitmap_factory, IActivationFactory_iface )
++
++static HRESULT WINAPI bfactory_uri_CreateInstanceWithUriSource( IBitmapImageFactory *iface, IUriRuntimeClass *uri,
++                                                                IBitmapImage **value )
++{
++    return bitmap_create( uri, value );
++}
++
++static const struct IBitmapImageFactoryVtbl bfactory_uri_vtbl =
++{
++    bfactory_uri_QueryInterface, bfactory_uri_AddRef, bfactory_uri_Release, bfactory_uri_GetIids,
++    bfactory_uri_GetRuntimeClassName, bfactory_uri_GetTrustLevel, bfactory_uri_CreateInstanceWithUriSource,
++};
++
++static struct bitmap_factory bitmap_factory = { { &bfactory_vtbl }, { &bfactory_uri_vtbl } };
++
++static HRESULT WINAPI bfactory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &bitmap_factory.IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IBitmapImageFactory )) *out = &bitmap_factory.IBitmapImageFactory_iface;
++    else { report_missing_interface( L"BitmapImage factory", iid ); *out = NULL; return E_NOINTERFACE; }
++    return S_OK;
++}
++
++IActivationFactory *bitmap_image_factory = &bitmap_factory.IActivationFactory_iface;
++
++/* ---- placing an image: Stretch and alignment ---- */
++
++void image_place( Stretch stretch, int align_x, int align_y, float iw, float ih, const struct layout_rect *box,
++                  struct layout_rect *dest )
++{
++    float sx = iw ? box->width / iw : 0, sy = ih ? box->height / ih : 0, s;
++
++    switch (stretch)
++    {
++    case Stretch_None: dest->width = iw; dest->height = ih; break;
++    case Stretch_Fill: dest->width = box->width; dest->height = box->height; break;
++    case Stretch_UniformToFill: s = max( sx, sy ); dest->width = iw * s; dest->height = ih * s; break;
++    default: s = min( sx, sy ); dest->width = iw * s; dest->height = ih * s; break;
++    }
++    /* 0 left / top, 1 centre, 2 right / bottom */
++    dest->x = box->x + (align_x == 0 ? 0 : align_x == 2 ? box->width - dest->width : (box->width - dest->width) / 2);
++    dest->y = box->y + (align_y == 0 ? 0 : align_y == 2 ? box->height - dest->height : (box->height - dest->height) / 2);
++}
++
++/* ---- Image ---- */
++
++struct image
++{
++    struct xaml_element element;
++    IImage IImage_iface;
++    IImage2 IImage2_iface;
++    IImage3 IImage3_iface;
++    IImageSource *source;
++    Stretch stretch;
++    Thickness nine_grid;
++    struct event_list opened, failed;
++};
++
++static inline struct image *impl_from_image_element( struct xaml_element *element )
++{
++    return CONTAINING_RECORD( element, struct image, element );
++}
++
++static HRESULT image_query_interface( struct xaml_element *element, REFIID iid, void **out )
++{
++    struct image *impl = impl_from_image_element( element );
++
++    if (IsEqualGUID( iid, &IID_IImage )) *out = &impl->IImage_iface;
++    else if (IsEqualGUID( iid, &IID_IImage2 )) *out = &impl->IImage2_iface;
++    else if (IsEqualGUID( iid, &IID_IImage3 )) *out = &impl->IImage3_iface;
++    else return E_NOINTERFACE;
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static BOOL image_size( struct image *impl, float *w, float *h )
++{
++    struct image_pixels pixels;
++
++    if (!image_source_pixels( (IInspectable *)impl->source, &pixels )) return FALSE;
++    *w = pixels.width;
++    *h = pixels.height;
++    return TRUE;
++}
++
++static void image_measure( struct xaml_element *element, struct layout_context *ctx, float avail_width, float avail_height,
++                           float *width, float *height )
++{
++    struct image *impl = impl_from_image_element( element );
++    struct layout_rect box = { 0, 0, avail_width, avail_height }, dest;
++    float iw, ih;
++
++    *width = *height = 0;
++    if (!image_size( impl, &iw, &ih )) return;
++    if (isinf( avail_width ) && isinf( avail_height )) { *width = iw; *height = ih; return; }
++    /* a Uniform image in a slot open along one axis takes its natural size along it, scaled to the other */
++    if (isinf( box.width )) box.width = impl->stretch == Stretch_None ? iw : box.height * iw / ih;
++    if (isinf( box.height )) box.height = impl->stretch == Stretch_None ? ih : box.width * ih / iw;
++    if (impl->stretch == Stretch_Fill || impl->stretch == Stretch_UniformToFill)
++    {
++        /* they fill what they are given, but don't ask for more than their natural size along an open axis */
++        *width = isinf( avail_width ) ? iw : box.width;
++        *height = isinf( avail_height ) ? ih : box.height;
++        return;
++    }
++    image_place( impl->stretch, 1, 1, iw, ih, &box, &dest );
++    *width = dest.width;
++    *height = dest.height;
++}
++
++static void image_arrange( struct xaml_element *element, struct layout_context *ctx )
++{
++}
++
++static void image_render( struct xaml_element *element, struct layout_context *ctx )
++{
++    struct image *impl = impl_from_image_element( element );
++    struct image_pixels pixels;
++    struct layout_rect dest;
++    BOOL clip;
++
++    if (!image_source_pixels( (IInspectable *)impl->source, &pixels )) return;
++    image_place( impl->stretch, 1, 1, pixels.width, pixels.height, &element->bounds, &dest );
++    /* UniformToFill and None can be bigger than the element: clipped to it */
++    clip = dest.width > element->bounds.width + 0.5f || dest.height > element->bounds.height + 0.5f;
++    if (clip && ctx->rt) d2d_push_clip( ctx, &element->bounds );
++    draw_image( ctx, &pixels, &dest, 1.0f );
++    if (clip && ctx->rt) d2d_pop_clip( ctx );
++}
++
++static BOOL image_hit_self( struct xaml_element *element, float x, float y )
++{
++    return TRUE;
++}
++
++static void image_destroy( struct xaml_element *element )
++{
++    struct image *impl = impl_from_image_element( element );
++
++    unlisten( impl->element.outer );
++    if (impl->source) IImageSource_Release( impl->source );
++    event_list_clear( &impl->opened );
++    event_list_clear( &impl->failed );
++    free( impl );
++}
++
++static const struct element_ops image_ops =
++{
++    .query_interface = image_query_interface,
++    .measure = image_measure,
++    .arrange = image_arrange,
++    .render = image_render,
++    .hit_self = image_hit_self,
++    .destroy = image_destroy,
++};
++
++DEFINE_IINSPECTABLE_( img, IImage, struct image, impl_from_IImage, IImage_iface, impl->element.outer )
++
++static HRESULT WINAPI img_get_Source( IImage *iface, IImageSource **value )
++{
++    struct image *impl = impl_from_IImage( iface );
++    if ((*value = impl->source)) IImageSource_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI img_put_Source( IImage *iface, IImageSource *value )
++{
++    struct image *impl = impl_from_IImage( iface );
++    struct bitmap_image *bitmap;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (value) IImageSource_AddRef( value );
++    if (impl->source) IImageSource_Release( impl->source );
++    impl->source = value;
++    unlisten( impl->element.outer );
++    if ((bitmap = bitmap_from_source( (IInspectable *)value )))
++    {
++        listen( bitmap, impl->element.outer, &impl->opened, &impl->failed );
++        /* already loaded: the Image's events follow too */
++        if (bitmap->state != IMAGE_EMPTY) schedule_notify( bitmap );
++    }
++    else if (value) FIXME( "image source %p isn't one of our bitmaps.\n", value );
++    element_mark_local( &impl->element, L"Source" );
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI img_get_Stretch( IImage *iface, Stretch *value )
++{
++    *value = impl_from_IImage( iface )->stretch;
++    return S_OK;
++}
++
++static HRESULT WINAPI img_put_Stretch( IImage *iface, Stretch value )
++{
++    impl_from_IImage( iface )->stretch = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI img_get_NineGrid( IImage *iface, Thickness *value )
++{
++    *value = impl_from_IImage( iface )->nine_grid;
++    return S_OK;
++}
++
++static HRESULT WINAPI img_put_NineGrid( IImage *iface, Thickness value )
++{
++    impl_from_IImage( iface )->nine_grid = value;
++    FIXME( "NineGrid isn't used for drawing.\n" );
++    return S_OK;
++}
++
++static HRESULT WINAPI img_get_PlayToSource( IImage *iface, __x_ABI_CWindows_CMedia_CPlayTo_CIPlayToSource **value )
++{
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI img_add_ImageFailed( IImage *iface, IExceptionRoutedEventHandler *handler, EventRegistrationToken *token )
++{
++    return event_list_add( &impl_from_IImage( iface )->failed, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI img_remove_ImageFailed( IImage *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IImage( iface )->failed, token );
++}
++
++static HRESULT WINAPI img_add_ImageOpened( IImage *iface, IRoutedEventHandler *handler, EventRegistrationToken *token )
++{
++    return event_list_add( &impl_from_IImage( iface )->opened, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI img_remove_ImageOpened( IImage *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IImage( iface )->opened, token );
++}
++
++static const struct IImageVtbl img_vtbl =
++{
++    img_QueryInterface, img_AddRef, img_Release, img_GetIids, img_GetRuntimeClassName, img_GetTrustLevel,
++    img_get_Source, img_put_Source, img_get_Stretch, img_put_Stretch, img_get_NineGrid, img_put_NineGrid,
++    img_get_PlayToSource, img_add_ImageFailed, img_remove_ImageFailed, img_add_ImageOpened, img_remove_ImageOpened,
++};
++
++DEFINE_IINSPECTABLE_( img2, IImage2, struct image, impl_from_IImage2, IImage2_iface, impl->element.outer )
++
++static HRESULT WINAPI img2_GetAsCastingSource( IImage2 *iface, __x_ABI_CWindows_CMedia_CCasting_CICastingSource **value )
++{
++    FIXME( "casting isn't supported.\n" );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct IImage2Vtbl img2_vtbl =
++{
++    img2_QueryInterface, img2_AddRef, img2_Release, img2_GetIids, img2_GetRuntimeClassName, img2_GetTrustLevel,
++    img2_GetAsCastingSource,
++};
++
++DEFINE_IINSPECTABLE_( img3, IImage3, struct image, impl_from_IImage3, IImage3_iface, impl->element.outer )
++
++static HRESULT WINAPI img3_GetAlphaMask( IImage3 *iface, __x_ABI_CWindows_CUI_CComposition_CICompositionBrush **value )
++{
++    FIXME( "composition brushes aren't supported.\n" );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct IImage3Vtbl img3_vtbl =
++{
++    img3_QueryInterface, img3_AddRef, img3_Release, img3_GetIids, img3_GetRuntimeClassName, img3_GetTrustLevel,
++    img3_GetAlphaMask,
++};
++
++static HRESULT image_create( IInspectable **out )
++{
++    struct image *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    element_init( &impl->element, &image_ops, RuntimeClass_Windows_UI_Xaml_Controls_Image, NULL );
++    impl->IImage_iface.lpVtbl = &img_vtbl;
++    impl->IImage2_iface.lpVtbl = &img2_vtbl;
++    impl->IImage3_iface.lpVtbl = &img3_vtbl;
++    impl->stretch = Stretch_Uniform;
++    return element_compose( &impl->element, NULL, NULL, &impl->IImage_iface, (void **)out );
++}
++
++/* ---- ImageBrush ---- */
++
++struct image_brush
++{
++    IImageBrush IImageBrush_iface;
++    ITileBrush ITileBrush_iface;
++    IBrush IBrush_iface;
++    LONG ref;
++    IImageSource *source;
++    AlignmentX align_x;
++    AlignmentY align_y;
++    Stretch stretch;
++    double opacity;
++    ITransform *transform, *relative_transform;
++    struct event_list opened, failed;
++};
++
++static inline struct image_brush *impl_from_IImageBrush( IImageBrush *iface )
++{
++    return CONTAINING_RECORD( iface, struct image_brush, IImageBrush_iface );
++}
++
++static HRESULT WINAPI ib_QueryInterface( IImageBrush *iface, REFIID iid, void **out )
++{
++    struct image_brush *impl = impl_from_IImageBrush( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IImageBrush ))
++        *out = &impl->IImageBrush_iface;
++    else if (IsEqualGUID( iid, &IID_ITileBrush )) *out = &impl->ITileBrush_iface;
++    else if (IsEqualGUID( iid, &IID_IBrush )) *out = &impl->IBrush_iface;
++    else { report_missing_interface( L"ImageBrush", iid ); *out = NULL; return E_NOINTERFACE; }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI ib_AddRef( IImageBrush *iface )
++{
++    return InterlockedIncrement( &impl_from_IImageBrush( iface )->ref );
++}
++
++static ULONG WINAPI ib_Release( IImageBrush *iface )
++{
++    struct image_brush *impl = impl_from_IImageBrush( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        unlisten( (IInspectable *)&impl->IImageBrush_iface );
++        if (impl->source) IImageSource_Release( impl->source );
++        if (impl->transform) ITransform_Release( impl->transform );
++        if (impl->relative_transform) ITransform_Release( impl->relative_transform );
++        event_list_clear( &impl->opened );
++        event_list_clear( &impl->failed );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI ib_GetIids( IImageBrush *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI ib_GetRuntimeClassName( IImageBrush *iface, HSTRING *name )
++{
++    return WindowsCreateString( RuntimeClass_Windows_UI_Xaml_Media_ImageBrush,
++                                wcslen( RuntimeClass_Windows_UI_Xaml_Media_ImageBrush ), name );
++}
++static HRESULT WINAPI ib_GetTrustLevel( IImageBrush *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI ib_get_ImageSource( IImageBrush *iface, IImageSource **value )
++{
++    struct image_brush *impl = impl_from_IImageBrush( iface );
++    if ((*value = impl->source)) IImageSource_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI ib_put_ImageSource( IImageBrush *iface, IImageSource *value )
++{
++    struct image_brush *impl = impl_from_IImageBrush( iface );
++    struct bitmap_image *bitmap;
++
++    if (value) IImageSource_AddRef( value );
++    if (impl->source) IImageSource_Release( impl->source );
++    impl->source = value;
++    unlisten( (IInspectable *)&impl->IImageBrush_iface );
++    if ((bitmap = bitmap_from_source( (IInspectable *)value )))
++    {
++        listen( bitmap, (IInspectable *)&impl->IImageBrush_iface, &impl->opened, &impl->failed );
++        if (bitmap->state != IMAGE_EMPTY) schedule_notify( bitmap );
++    }
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI ib_add_ImageFailed( IImageBrush *iface, IExceptionRoutedEventHandler *handler, EventRegistrationToken *token )
++{
++    return event_list_add( &impl_from_IImageBrush( iface )->failed, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI ib_remove_ImageFailed( IImageBrush *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IImageBrush( iface )->failed, token );
++}
++
++static HRESULT WINAPI ib_add_ImageOpened( IImageBrush *iface, IRoutedEventHandler *handler, EventRegistrationToken *token )
++{
++    return event_list_add( &impl_from_IImageBrush( iface )->opened, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI ib_remove_ImageOpened( IImageBrush *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IImageBrush( iface )->opened, token );
++}
++
++static const struct IImageBrushVtbl ib_vtbl =
++{
++    ib_QueryInterface, ib_AddRef, ib_Release, ib_GetIids, ib_GetRuntimeClassName, ib_GetTrustLevel,
++    ib_get_ImageSource, ib_put_ImageSource, ib_add_ImageFailed, ib_remove_ImageFailed,
++    ib_add_ImageOpened, ib_remove_ImageOpened,
++};
++
++DEFINE_IINSPECTABLE( tile, ITileBrush, struct image_brush, IImageBrush_iface )
++
++static HRESULT WINAPI tile_get_AlignmentX( ITileBrush *iface, AlignmentX *value ) { *value = impl_from_ITileBrush( iface )->align_x; return S_OK; }
++static HRESULT WINAPI tile_put_AlignmentX( ITileBrush *iface, AlignmentX value ) { impl_from_ITileBrush( iface )->align_x = value; window_invalidate(); return S_OK; }
++static HRESULT WINAPI tile_get_AlignmentY( ITileBrush *iface, AlignmentY *value ) { *value = impl_from_ITileBrush( iface )->align_y; return S_OK; }
++static HRESULT WINAPI tile_put_AlignmentY( ITileBrush *iface, AlignmentY value ) { impl_from_ITileBrush( iface )->align_y = value; window_invalidate(); return S_OK; }
++static HRESULT WINAPI tile_get_Stretch( ITileBrush *iface, Stretch *value ) { *value = impl_from_ITileBrush( iface )->stretch; return S_OK; }
++static HRESULT WINAPI tile_put_Stretch( ITileBrush *iface, Stretch value ) { impl_from_ITileBrush( iface )->stretch = value; window_invalidate(); return S_OK; }
++
++static const struct ITileBrushVtbl tile_vtbl =
++{
++    tile_QueryInterface, tile_AddRef, tile_Release, tile_GetIids, tile_GetRuntimeClassName, tile_GetTrustLevel,
++    tile_get_AlignmentX, tile_put_AlignmentX, tile_get_AlignmentY, tile_put_AlignmentY, tile_get_Stretch, tile_put_Stretch,
++};
++
++DEFINE_IINSPECTABLE( ibrush, IBrush, struct image_brush, IImageBrush_iface )
++
++static HRESULT WINAPI ibrush_get_Opacity( IBrush *iface, DOUBLE *value ) { *value = impl_from_IBrush( iface )->opacity; return S_OK; }
++static HRESULT WINAPI ibrush_put_Opacity( IBrush *iface, DOUBLE value ) { impl_from_IBrush( iface )->opacity = value; window_invalidate(); return S_OK; }
++
++static HRESULT get_transform( ITransform *transform, ITransform **value )
++{
++    if ((*value = transform)) ITransform_AddRef( transform );
++    return S_OK;
++}
++
++static HRESULT put_transform( ITransform **slot, ITransform *value )
++{
++    if (value) ITransform_AddRef( value );
++    if (*slot) ITransform_Release( *slot );
++    *slot = value;
++    if (value) FIXME( "brush transforms aren't supported.\n" );
++    return S_OK;
++}
++
++static HRESULT WINAPI ibrush_get_Transform( IBrush *iface, ITransform **value ) { return get_transform( impl_from_IBrush( iface )->transform, value ); }
++static HRESULT WINAPI ibrush_put_Transform( IBrush *iface, ITransform *value ) { return put_transform( &impl_from_IBrush( iface )->transform, value ); }
++static HRESULT WINAPI ibrush_get_RelativeTransform( IBrush *iface, ITransform **value ) { return get_transform( impl_from_IBrush( iface )->relative_transform, value ); }
++static HRESULT WINAPI ibrush_put_RelativeTransform( IBrush *iface, ITransform *value ) { return put_transform( &impl_from_IBrush( iface )->relative_transform, value ); }
++
++static const struct IBrushVtbl ibrush_vtbl =
++{
++    ibrush_QueryInterface, ibrush_AddRef, ibrush_Release, ibrush_GetIids, ibrush_GetRuntimeClassName, ibrush_GetTrustLevel,
++    ibrush_get_Opacity, ibrush_put_Opacity, ibrush_get_Transform, ibrush_put_Transform,
++    ibrush_get_RelativeTransform, ibrush_put_RelativeTransform,
++};
++
++static HRESULT image_brush_create( IInspectable **out )
++{
++    struct image_brush *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IImageBrush_iface.lpVtbl = &ib_vtbl;
++    impl->ITileBrush_iface.lpVtbl = &tile_vtbl;
++    impl->IBrush_iface.lpVtbl = &ibrush_vtbl;
++    impl->ref = 1;
++    impl->align_x = AlignmentX_Center;
++    impl->align_y = AlignmentY_Center;
++    impl->stretch = Stretch_Fill;
++    impl->opacity = 1.0;
++    *out = (IInspectable *)&impl->IImageBrush_iface;
++    return S_OK;
++}
++
++/* an ImageBrush's picture and placement, for render.c; FALSE if the brush isn't one or has nothing to show */
++BOOL brush_get_image( IBrush *brush, struct image_pixels *pixels, Stretch *stretch, int *align_x, int *align_y,
++                      float *opacity )
++{
++    IImageBrush *ib;
++    struct image_brush *impl;
++    BOOL ret;
++
++    if (!brush || FAILED(IBrush_QueryInterface( brush, &IID_IImageBrush, (void **)&ib ))) return FALSE;
++    impl = ib->lpVtbl == &ib_vtbl ? impl_from_IImageBrush( ib ) : NULL;
++    ret = impl && image_source_pixels( (IInspectable *)impl->source, pixels );
++    if (ret)
++    {
++        *stretch = impl->stretch;
++        *align_x = impl->align_x == AlignmentX_Left ? 0 : impl->align_x == AlignmentX_Right ? 2 : 1;
++        *align_y = impl->align_y == AlignmentY_Top ? 0 : impl->align_y == AlignmentY_Bottom ? 2 : 1;
++        *opacity = impl->opacity;
++    }
++    IImageBrush_Release( ib );
++    return ret;
++}
++
++/* ---- factories for Image and ImageBrush ---- */
++
++struct simple_factory
++{
++    IActivationFactory IActivationFactory_iface;
++    HRESULT (*create)( IInspectable **out );
++};
++
++static inline struct simple_factory *impl_from_simple( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct simple_factory, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI simple_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    /* the statics (dependency property identifiers) aren't implemented */
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI simple_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI simple_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI simple_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI simple_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI simple_GetTrustLevel( IActivationFactory *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI simple_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    return impl_from_simple( iface )->create( instance );
++}
++
++static const IActivationFactoryVtbl simple_vtbl =
++{
++    simple_QueryInterface, simple_AddRef, simple_Release, simple_GetIids, simple_GetRuntimeClassName,
++    simple_GetTrustLevel, simple_ActivateInstance,
++};
++
++static struct simple_factory image_statics = { { &simple_vtbl }, image_create };
++static struct simple_factory image_brush_statics = { { &simple_vtbl }, image_brush_create };
++
++IActivationFactory *image_factory = &image_statics.IActivationFactory_iface;
++IActivationFactory *image_brush_factory = &image_brush_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/main.c b/dlls/windows.ui.xaml/main.c
+index 6a1e149..9197be0 100644
+--- a/dlls/windows.ui.xaml/main.c
++++ b/dlls/windows.ui.xaml/main.c
+@@ -60,6 +60,12 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( slider_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ProgressBar ))
+         IActivationFactory_QueryInterface( progress_bar_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Image ))
++        IActivationFactory_QueryInterface( image_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_ImageBrush ))
++        IActivationFactory_QueryInterface( image_brush_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_Imaging_BitmapImage ))
++        IActivationFactory_QueryInterface( bitmap_image_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_TextBox ))
+         IActivationFactory_QueryInterface( text_box_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_PasswordBox ))
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index 10596b1..3b01471 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -52,6 +52,7 @@
+ #define WIDL_using_Windows_UI_Xaml_Controls_Primitives
+ #define WIDL_using_Windows_UI_Xaml_Media
+ #define WIDL_using_Windows_UI_Xaml_Media_Animation
++#define WIDL_using_Windows_UI_Xaml_Media_Imaging
+ #define WIDL_using_Windows_UI_Xaml_Data
+ #define WIDL_using_Windows_UI_Xaml_Input
+ #define WIDL_using_Windows_System
+@@ -436,6 +437,25 @@ void definition_set_actual( IInspectable *object, double actual );
+ HRESULT routed_event_args_create( IInspectable *source, IRoutedEventArgs **out );
+ extern const struct vector_iids uielement_collection_iids;
+ 
++/* image.c: decoded images (32-bit premultiplied BGRA) */
++struct image_pixels
++{
++    UINT32 width, height, stride;
++    BYTE *bits;
++};
++extern IActivationFactory *image_factory;
++extern IActivationFactory *image_brush_factory;
++extern IActivationFactory *bitmap_image_factory;
++BOOL resolve_app_uri( const WCHAR *uri, WCHAR *file, UINT32 size );
++BOOL image_source_pixels( IInspectable *source, struct image_pixels *out );
++IInspectable *bitmap_from_string( const WCHAR *str );   /* a BitmapImage for a markup URI string */
++void image_place( Stretch stretch, int align_x, int align_y, float iw, float ih, const struct layout_rect *box,
++                  struct layout_rect *dest );
++BOOL brush_get_image( IBrush *brush, struct image_pixels *pixels, Stretch *stretch, int *align_x, int *align_y,
++                      float *opacity );
++void draw_image( struct layout_context *ctx, const struct image_pixels *pixels, const struct layout_rect *dest,
++                 float opacity );   /* render.c */
++
+ /* text drawing shared by TextBlock and Button */
+ struct text_format
+ {
+diff --git a/dlls/windows.ui.xaml/render.c b/dlls/windows.ui.xaml/render.c
+index 39e1b57..bad1c2c 100644
+--- a/dlls/windows.ui.xaml/render.c
++++ b/dlls/windows.ui.xaml/render.c
+@@ -115,6 +115,8 @@ static ID2D1Brush *solid( struct layout_context *ctx, Color c )
+ }
+ 
+ /* our Brush as a Direct2D one for drawing over bounds (a gradient's relative points are mapped to them) */
++static ID2D1Bitmap *d2d_bitmap( struct layout_context *ctx, const struct image_pixels *pixels );
++
+ static ID2D1Brush *d2d_brush( struct layout_context *ctx, IBrush *brush, const struct layout_rect *bounds )
+ {
+     struct gradient_info info;
+@@ -127,6 +129,31 @@ static ID2D1Brush *d2d_brush( struct layout_context *ctx, IBrush *brush, const s
+     Color c;
+ 
+     if (!brush) return NULL;
++    {
++        /* ImageBrush: the bitmap, scaled and placed by Stretch and alignment over the bounds */
++        struct image_pixels pixels;
++        struct layout_rect dest;
++        Stretch stretch;
++        int ax, ay;
++        float opacity;
++        if (brush_get_image( brush, &pixels, &stretch, &ax, &ay, &opacity ))
++        {
++            D2D1_BITMAP_BRUSH_PROPERTIES bitmap_props = { D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP,
++                                                          D2D1_BITMAP_INTERPOLATION_MODE_LINEAR };
++            ID2D1BitmapBrush *bitmap_brush = NULL;
++            ID2D1Bitmap *bitmap;
++            image_place( stretch, ax, ay, pixels.width, pixels.height, bounds, &dest );
++            if (!(bitmap = d2d_bitmap( ctx, &pixels ))) return NULL;
++            brush_props.opacity = opacity;
++            brush_props.transform._11 = dest.width / pixels.width;
++            brush_props.transform._22 = dest.height / pixels.height;
++            brush_props.transform._31 = dest.x;
++            brush_props.transform._32 = dest.y;
++            ID2D1RenderTarget_CreateBitmapBrush( RT(ctx), bitmap, &bitmap_props, &brush_props, &bitmap_brush );
++            ID2D1Bitmap_Release( bitmap );
++            return (ID2D1Brush *)bitmap_brush;
++        }
++    }
+     if (brush_get_gradient( brush, &info ))
+     {
+         for (i = 0; i < info.count && i < ARRAY_SIZE(stops); i++)
+@@ -149,6 +176,54 @@ static ID2D1Brush *d2d_brush( struct layout_context *ctx, IBrush *brush, const s
+     return solid( ctx, c );
+ }
+ 
++static ID2D1Bitmap *d2d_bitmap( struct layout_context *ctx, const struct image_pixels *pixels )
++{
++    D2D1_BITMAP_PROPERTIES props = { { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED }, 96.0f, 96.0f };
++    D2D1_SIZE_U size = { pixels->width, pixels->height };
++    ID2D1Bitmap *bitmap = NULL;
++
++    ID2D1RenderTarget_CreateBitmap( RT(ctx), size, pixels->bits, pixels->stride, &props, &bitmap );
++    return bitmap;
++}
++
++/* an Image's pixels into dest (view pixels); with GDI, alpha-blended from a DIB */
++void draw_image( struct layout_context *ctx, const struct image_pixels *pixels, const struct layout_rect *dest,
++                 float opacity )
++{
++    BLENDFUNCTION blend = { AC_SRC_OVER, 0, (BYTE)(255 * opacity), AC_SRC_ALPHA };
++    BITMAPINFO info = {{ sizeof(info.bmiHeader) }};
++    ID2D1Bitmap *bitmap;
++    HBITMAP dib, old;
++    void *bits;
++    RECT r;
++    HDC mem;
++
++    if (ctx->rt)
++    {
++        D2D1_RECT_F rect = rect_f( dest );
++        if (!(bitmap = d2d_bitmap( ctx, pixels ))) return;
++        ID2D1RenderTarget_DrawBitmap( RT(ctx), bitmap, &rect, opacity, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, NULL );
++        ID2D1Bitmap_Release( bitmap );
++        return;
++    }
++    info.bmiHeader.biWidth = pixels->width;
++    info.bmiHeader.biHeight = -(LONG)pixels->height;
++    info.bmiHeader.biPlanes = 1;
++    info.bmiHeader.biBitCount = 32;
++    if (!(mem = CreateCompatibleDC( ctx->hdc ))) return;
++    if ((dib = CreateDIBSection( mem, &info, DIB_RGB_COLORS, &bits, NULL, 0 )))
++    {
++        memcpy( bits, pixels->bits, pixels->stride * pixels->height );
++        old = SelectObject( mem, dib );
++        element_device_rect( dest, ctx, &r );
++        GdiAlphaBlend( ctx->hdc, r.left, r.top, r.right - r.left, r.bottom - r.top, mem, 0, 0, pixels->width,
++                       pixels->height, blend );
++        SelectObject( mem, old );
++        DeleteObject( dib );
++    }
++    DeleteDC( mem );
++}
++
+ void d2d_fill_color( struct layout_context *ctx, const struct layout_rect *rect, Color c )
+ {
+     ID2D1Brush *brush = solid( ctx, c );
+diff --git a/dlls/windows.ui.xaml/xbf.c b/dlls/windows.ui.xaml/xbf.c
+index 7e6a3a1..346be0d 100644
+--- a/dlls/windows.ui.xaml/xbf.c
++++ b/dlls/windows.ui.xaml/xbf.c
+@@ -2098,6 +2098,85 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+         }
+     }
+ 
++    /* Image, BitmapImage and ImageBrush */
++    {
++        static const WCHAR *const stretch_names[] = { L"None", L"Fill", L"Uniform", L"UniformToFill" };
++        static const WCHAR *const align_x_names[] = { L"Left", L"Center", L"Right" };
++        static const WCHAR *const align_y_names[] = { L"Top", L"Center", L"Bottom" };
++        IImage *image;
++        IImageBrush *image_brush;
++        ITileBrush *tile;
++        IBitmapImage *bitmap;
++        IImageSource *source = NULL;
++        BOOL done = FALSE;
++        double d;
++
++        if ((prop_is( prop, L"Source" ) || prop_is( prop, L"ImageSource" )) &&
++            (value->kind == XV_STRING || value->kind == XV_OBJECT))
++        {
++            IInspectable *object = value->kind == XV_STRING ? bitmap_from_string( value->s ) : value->object;
++            if (object) IInspectable_QueryInterface( object, &IID_IImageSource, (void **)&source );
++            if (value->kind == XV_STRING && object) IInspectable_Release( object );
++            if (source && prop_is( prop, L"Source" ) && QI( target, IImage, &image ))
++            {
++                IImage_put_Source( image, source );
++                IImage_Release( image );
++                done = TRUE;
++            }
++            else if (source && QI( target, IImageBrush, &image_brush ))
++            {
++                IImageBrush_put_ImageSource( image_brush, source );
++                IImageBrush_Release( image_brush );
++                done = TRUE;
++            }
++            if (source) IImageSource_Release( source );
++            if (done) return S_OK;
++        }
++        if (prop_is( prop, L"Stretch" ) && to_enum( value, stretch_names, 4, &e ))
++        {
++            if (QI( target, IImage, &image )) { IImage_put_Stretch( image, e ); IImage_Release( image ); return S_OK; }
++            if (QI( target, ITileBrush, &tile )) { ITileBrush_put_Stretch( tile, e ); ITileBrush_Release( tile ); return S_OK; }
++        }
++        if (prop_is( prop, L"AlignmentX" ) && to_enum( value, align_x_names, 3, &e ) && QI( target, ITileBrush, &tile ))
++        {
++            ITileBrush_put_AlignmentX( tile, e );
++            ITileBrush_Release( tile );
++            return S_OK;
++        }
++        if (prop_is( prop, L"AlignmentY" ) && to_enum( value, align_y_names, 3, &e ) && QI( target, ITileBrush, &tile ))
++        {
++            ITileBrush_put_AlignmentY( tile, e );
++            ITileBrush_Release( tile );
++            return S_OK;
++        }
++        if (QI( target, IBitmapImage, &bitmap ))
++        {
++            if (prop_is( prop, L"UriSource" ) && value->kind == XV_STRING)
++            {
++                /* through a temporary BitmapImage made from the string, which owns the parsed Uri */
++                IInspectable *temp = bitmap_from_string( value->s );
++                IBitmapImage *temp_bitmap;
++                IUriRuntimeClass *uri = NULL;
++                if (temp && SUCCEEDED(IInspectable_QueryInterface( temp, &IID_IBitmapImage, (void **)&temp_bitmap )))
++                {
++                    IBitmapImage_get_UriSource( temp_bitmap, &uri );
++                    IBitmapImage_Release( temp_bitmap );
++                }
++                if (temp) IInspectable_Release( temp );
++                if (uri)
++                {
++                    IBitmapImage_put_UriSource( bitmap, uri );
++                    IUriRuntimeClass_Release( uri );
++                    done = TRUE;
++                }
++            }
++            else if (prop_is( prop, L"DecodePixelWidth" ) && to_double( value, &d )) { IBitmapImage_put_DecodePixelWidth( bitmap, d ); done = TRUE; }
++            else if (prop_is( prop, L"DecodePixelHeight" ) && to_double( value, &d )) { IBitmapImage_put_DecodePixelHeight( bitmap, d ); done = TRUE; }
++            IBitmapImage_Release( bitmap );
++            if (done) return S_OK;
++        }
++    }
++
+     /* TextBox and PasswordBox */
+     {
+         INT32 number = value->kind == XV_ENUM ? value->e.value : value->kind == XV_BOOL ? value->b :
+@@ -2817,6 +2896,9 @@ IInspectable *create_builtin( const WCHAR *name )
+         { L"ScrollViewer", &scroll_viewer_factory },
+         { L"TextBox", &text_box_factory },
+         { L"PasswordBox", &password_box_factory },
++        { L"Image", &image_factory },
++        { L"ImageBrush", &image_brush_factory },
++        { L"BitmapImage", &bitmap_image_factory },
+         { L"ItemsControl", &items_control_factory },
+         { L"UserControl", &user_control_factory },
+     };

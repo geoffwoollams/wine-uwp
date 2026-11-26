@@ -16,6 +16,7 @@ cd "$WINEPREFIX/drive_c" || exit 1
 RC=0
 cp "$BUILD"/tests/xaml/*.xbf .
 cp "$BUILD"/tests/xaml/*.xaml .
+cp "$BUILD"/tests/xaml/*.png .
 # optional: Microsoft's compiler-made test files (microsoft-ui-xaml, dxaml/test/resources/res/...), to check the reader
 if [ -n "${XAML_MS_XBF_DIR:-}" ]; then mkdir -p ms; cp "$XAML_MS_XBF_DIR"/*.xbf ms/; fi
 for t in xamlhello xamllayout xamlmarkup; do

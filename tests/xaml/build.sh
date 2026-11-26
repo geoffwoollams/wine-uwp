@@ -11,6 +11,16 @@ for x in "$REPO"/tests/xaml/markup/*.xaml; do
     python3 -I "$REPO/scripts/xbf.py" compile "$x" "$BUILD/tests/xaml/$(basename "${x%.xaml}").xbf" >/dev/null
 done
 cp "$REPO"/tests/xaml/loose/*.xaml "$BUILD/tests/xaml/"   # loose markup, loaded as text
+# a 40x20 test picture for Image and ImageBrush: the left half red, the right half blue (made here, not committed)
+python3 -I - "$BUILD/tests/xaml/halves.png" <<'PY'
+import struct, sys, zlib
+w, h = 40, 20
+rows = b"".join(b"\0" + b"".join(b"\xff\0\0\xff" if x < w // 2 else b"\0\0\xff\xff" for x in range(w)) for _ in range(h))
+def chunk(kind, data):
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
+png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
+open(sys.argv[1], "wb").write(png)
+PY
 docker run --rm -u "$(id -u):$(id -g)" -v "$BUILD:/build" -w /build/obj/wine wine-uwp-build bash -c '
     set -e
     for t in xamlhello xamllayout xamlmarkup; do

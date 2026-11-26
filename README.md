@@ -122,6 +122,8 @@ Wine has no `Windows.UI.Xaml`, the UI framework most non-game UWP apps are built
 
 **Milestone 5, part 2 (done): text entry.** `TextBox` and `PasswordBox` with typing, selection, the caret, the clipboard, multi-line text with `AcceptsReturn`, `MaxLength`, `IsReadOnly`, `Header`, `PlaceholderText`, `TextChanged` and `PasswordChanged`. No IME or undo yet.
 
+**Milestone 5, part 3 (done): pictures.** `Image` with `Stretch`, `BitmapImage` from `ms-appx:` files (PNG, JPEG, BMP, GIF and the other formats WIC reads) with `DecodePixelWidth`/`Height`, `ImageOpened`/`ImageFailed`, and `ImageBrush` backgrounds and fills.
+
 **Not yet:** ListView/GridView and other item controls, `x:Bind` beyond what its generated code calls, localized `x:Uid` strings and navigation history. Real Store apps will still often stop or look wrong where they need these; see [docs/xaml-plan.md](docs/xaml-plan.md).
 
 To try it, build the test clients and run them in a throwaway prefix (each opens a window for a few seconds and checks what was drawn):
@@ -247,7 +249,7 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 pointer devices and cursor; COM ContextCallback is Wine's own since 11.x), 0040 the app's icon
                 on its window, 0041-0042 Forza Motorsport 7 and automatic dialog answers, 0043-0044 XAML
                 milestone 5 part 1 (ScrollViewer, keyboard focus, key events), 0045-0046 part 2 (TextBox,
-                PasswordBox)
+                PasswordBox), 0047-0048 part 3 (Image, BitmapImage, ImageBrush)
 patches/dxvk/   patch against DXVK f90f1bf1 (v3.1.1-235)
 docker/         build containers
 apps/           optional per-app settings

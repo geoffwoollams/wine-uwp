@@ -650,3 +650,41 @@ Patch 0045 is the IDL, generated with `winmd2idl.py` for `Controls.TextBox`, `Pa
   - typing a password with `PasswordChanged`;
   - Enter adding a line to an `AcceptsReturn` box, which then grows.
 - Milestones 1 and 2 still pass 34/34.
+
+## 19. Milestone 5, part 3: Image, BitmapImage and ImageBrush (patches 0047-0048)
+
+Patch 0047 is the IDL. `winmd2idl.py` generated `Controls.Image`, `Media.ImageBrush`, `TileBrush`, `ImageSource`, and
+`Media.Imaging.BitmapSource` with the rest of BitmapImage's interfaces (`IBitmapImage2`, `3` and `IBitmapImageFactory`).
+`IBitmapImage` itself was already in the file, from milestone 1's generation.
+- That earlier `runtimeclass BitmapImage` had no `activatable` attributes, so widl didn't register the class. They are added, with a forward declaration of the factory interface.
+- `windows.storage.streams.idl` is now imported.
+
+Patch 0048 is the code (`image.c`).
+
+**What was built:**
+
+- **`BitmapImage`** decodes with WIC into 32-bit premultiplied BGRA pixels.
+  - **Where from:** `ms-appx:///` and `ms-appx://package/` resolve in the app's package (or, without one, the executable's folder), and plain paths work too. Markup paths without a scheme are relative to the package.
+  - **API:** `PixelWidth`/`PixelHeight`, `DecodePixelWidth`/`DecodePixelHeight` (one of them keeps the aspect ratio), `UriSource`, and the `IBitmapImageFactory` constructor with a URI.
+  - **Events:** decoding happens at once, but `ImageOpened`/`ImageFailed` (with `ExceptionRoutedEventArgs`) follow from a UI-thread timer. Callers add handlers after setting the source, as with Windows' asynchronous loading.
+  - **Not supported:** `SetSource` with a stream (Wine's `CreateStreamOverRandomAccessStream` is a stub), web URIs (no network), `ms-appdata`, and animated images (the first frame is shown).
+- **`Image`** draws its source by `Stretch`, Uniform by default, centred in its slot and clipped when it is bigger.
+  - Its natural size is the bitmap's pixel size. An open axis takes the picture's proportions.
+  - `ImageOpened`/`ImageFailed` are raised for the Image as well as the bitmap.
+  - `NineGrid` is kept but not used.
+- **`ImageBrush`** (`IImageBrush`, `ITileBrush`, `IBrush`) works anywhere a brush is filled: Background, Fill, and so on.
+  - Under Direct2D it becomes a bitmap brush placed by `Stretch` (Fill by default), `AlignmentX` and `AlignmentY`, with the brush's `Opacity`.
+  - Brush transforms are kept but not applied.
+- **`render.c`:** `draw_image` (Direct2D `DrawBitmap`, or `GdiAlphaBlend` from a DIB without Direct2D), and bitmap brushes in `d2d_brush`.
+- **Markup:** `Image.Source` and `ImageBrush.ImageSource` as URI strings or objects, `BitmapImage.UriSource`/`DecodePixelWidth`/`DecodePixelHeight`, `Stretch`, `AlignmentX`, `AlignmentY`.
+
+**Tests:**
+
+- `tests/xaml/build.sh` makes a 40×20 PNG, red on the left and blue on the right, with Python's standard library rather than committing a binary. `run.sh` copies it next to the test.
+- **`xamlmarkup`: 198/198 checks pass**, 13 of them new:
+  - `ImageOpened` once the picture is decoded, and `ImageFailed` for a missing file;
+  - the source's 40×20 pixel size, and `Stretch=None` taking that size with red and blue halves;
+  - `Stretch=Fill` scaling it to 80×40;
+  - an ImageBrush painting a Border;
+  - `DecodePixelWidth=20` decoding it at 20×10 from code.
+- Milestones 1 and 2 still pass 34/34.
