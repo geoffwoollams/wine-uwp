@@ -1,0 +1,488 @@
+Subject: windows.ui.xaml: compiled XAML from resources.pri, app pages by metadata TypeName, Page.NavigationCacheMode
+
+diff --git a/dlls/windows.ui.xaml/Makefile.in b/dlls/windows.ui.xaml/Makefile.in
+index ae93736..eb6d4e4 100644
+--- a/dlls/windows.ui.xaml/Makefile.in
++++ b/dlls/windows.ui.xaml/Makefile.in
+@@ -25,6 +25,7 @@ SOURCES = \
+ 	media.c \
+ 	panel.c \
+ 	presenter.c \
++	pri.c \
+ 	range.c \
+ 	render.c \
+ 	scroll.c \
+diff --git a/dlls/windows.ui.xaml/content.c b/dlls/windows.ui.xaml/content.c
+index c8dcb06..9c74de1 100644
+--- a/dlls/windows.ui.xaml/content.c
++++ b/dlls/windows.ui.xaml/content.c
+@@ -52,6 +52,7 @@ struct content_host
+     TypeName page_type;           /* Frame: the current page's type */
+     IFrame *frame;                /* Page: the frame showing it (not referenced) */
+     IAppBar *bars[2];             /* Page: TopAppBar and BottomAppBar */
++    NavigationCacheMode cache_mode;   /* Page */
+     struct event_list navigated, navigating, navigation_failed, navigation_stopped;
+ };
+ 
+@@ -235,6 +236,12 @@ static HRESULT frame_navigate( struct content_host *impl, TypeName type, IInspec
+ 
+     *success = FALSE;
+     if (type.Kind == TypeKind_Custom) hr = app_create_instance_from_type( type, &page );
++    else if (type.Kind == TypeKind_Metadata && wcsncmp( WindowsGetStringRawBuffer( type.Name, NULL ), L"Windows.", 8 ))
++    {
++        /* C++/CX's typeid(MainPage): a WinRT class of the app's own, from its metadata provider or activation */
++        hr = app_create_instance_from_type( type, &page );
++        if (FAILED(hr) || !page) hr = RoActivateInstance( type.Name, &page );
++    }
+     else hr = (page = create_builtin( WindowsGetStringRawBuffer( type.Name, NULL ) )) ? S_OK : E_FAIL;
+     if (FAILED(hr) || !page)
+     {
+@@ -301,16 +308,18 @@ static HRESULT WINAPI page_get_Frame( IPage *iface, IFrame **value )
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI page_get_NavigationCacheMode(IPage *iface, __x_ABI_CWindows_CUI_CXaml_CNavigation_CNavigationCacheMode *value)
++/* kept, but pages aren't cached: there is no navigation history */
++static HRESULT WINAPI page_get_NavigationCacheMode( IPage *iface, NavigationCacheMode *value )
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    *value = impl_from_IPage( iface )->cache_mode;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI page_put_NavigationCacheMode(IPage *iface, __x_ABI_CWindows_CUI_CXaml_CNavigation_CNavigationCacheMode value)
++static HRESULT WINAPI page_put_NavigationCacheMode( IPage *iface, NavigationCacheMode value )
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %d.\n", iface, value );
++    impl_from_IPage( iface )->cache_mode = value;
++    return S_OK;
+ }
+ 
+ static void set_app_bar( struct content_host *impl, int which, IAppBar *value )
+diff --git a/dlls/windows.ui.xaml/pri.c b/dlls/windows.ui.xaml/pri.c
+new file mode 100644
+index 0000000..2c12d0e
+--- /dev/null
++++ b/dlls/windows.ui.xaml/pri.c
+@@ -0,0 +1,380 @@
++/* Package resource index (resources.pri) reading
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* Apps may keep their compiled XAML (.xbf) inside resources.pri rather than as files: ms-appx:///MainPage.xaml is
++ * then the resource "Files/MainPage.xbf". A PRI file is a table of sections. The hierarchical schema names the
++ * resources (scopes and items, each with a parent), the resource map gives each item its candidates (one per
++ * qualifier set: language, scale, ...), and a candidate's value is either in the map's own string data or a data
++ * item of a data item section. We take an item's first candidate, which is all a .xbf has; qualifiers (and so
++ * localized strings and scaled images) are not looked at. */
++
++#define SECTION_HEADER 32
++#define SECTION_FOOTER 8
++
++struct pri_section
++{
++    const BYTE *data;   /* the content, after the section header */
++    UINT32 size;
++};
++
++struct pri_file
++{
++    BYTE *data;
++    SIZE_T size;
++    struct pri_section *sections;
++    UINT16 count;
++    char (*ids)[16];
++};
++
++static struct pri_file *pri;
++static BOOL pri_tried;
++
++static UINT16 get16( const BYTE *p ) { return p[0] | (p[1] << 8); }
++static UINT32 get32( const BYTE *p ) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((UINT32)p[3] << 24); }
++
++static BYTE *read_file( const WCHAR *path, SIZE_T *size )
++{
++    LARGE_INTEGER li;
++    HANDLE handle;
++    BYTE *data = NULL;
++    DWORD read;
++
++    handle = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++    if (handle == INVALID_HANDLE_VALUE) return NULL;
++    if (GetFileSizeEx( handle, &li ) && li.QuadPart < 256 * 1024 * 1024 && (data = malloc( li.QuadPart )) &&
++        (!ReadFile( handle, data, li.QuadPart, &read, NULL ) || read != li.QuadPart))
++    {
++        free( data );
++        data = NULL;
++    }
++    CloseHandle( handle );
++    *size = data ? li.QuadPart : 0;
++    return data;
++}
++
++static struct pri_file *pri_open( const WCHAR *path )
++{
++    struct pri_file *file;
++    UINT32 toc, start, i, offset, length;
++    const BYTE *entry, *section;
++
++    if (!(file = calloc( 1, sizeof(*file) ))) return NULL;
++    if (!(file->data = read_file( path, &file->size ))) goto fail;
++    if (file->size < 32 || memcmp( file->data, "mrm_pri", 7 )) goto fail;
++    toc = get32( file->data + 16 );
++    start = get32( file->data + 20 );
++    file->count = get16( file->data + 24 );
++    if ((UINT64)toc + file->count * 32 > file->size) goto fail;
++    if (!(file->sections = calloc( file->count, sizeof(*file->sections) )) ||
++        !(file->ids = calloc( file->count, sizeof(*file->ids) ))) goto fail;
++    for (i = 0; i < file->count; i++)
++    {
++        entry = file->data + toc + i * 32;
++        memcpy( file->ids[i], entry, 16 );
++        offset = start + get32( entry + 24 );
++        length = get32( entry + 28 );
++        if (length < SECTION_HEADER + SECTION_FOOTER || (UINT64)offset + length > file->size) continue;
++        section = file->data + offset;
++        file->sections[i].data = section + SECTION_HEADER;
++        file->sections[i].size = length - SECTION_HEADER - SECTION_FOOTER;
++    }
++    TRACE( "%s: %u sections.\n", debugstr_w(path), file->count );
++    return file;
++
++fail:
++    free( file->data );
++    free( file->sections );
++    free( file->ids );
++    free( file );
++    return NULL;
++}
++
++static int find_section( struct pri_file *file, const char *prefix )
++{
++    UINT16 i;
++    for (i = 0; i < file->count; i++)
++        if (!memcmp( file->ids[i], prefix, strlen( prefix ) ) && file->sections[i].data) return i;
++    return -1;
++}
++
++/* an entry of the hierarchical schema: a scope or an item */
++struct schema_entry
++{
++    UINT16 parent, full_path_length, index;
++    BYTE flags;
++    UINT32 name_offset;
++};
++
++/* the name of entry i into buf; FALSE if it doesn't fit */
++static BOOL entry_name( const struct pri_section *s, const struct schema_entry *e, UINT32 unicode, UINT32 ascii,
++                        WCHAR *buf, UINT32 len )
++{
++    UINT32 i;
++
++    if (!e->full_path_length)
++    {
++        buf[0] = 0;
++        return TRUE;
++    }
++    if (e->flags & 0x20)
++    {
++        for (i = 0; i + 1 < len && ascii + e->name_offset + i < s->size && s->data[ascii + e->name_offset + i]; i++)
++            buf[i] = s->data[ascii + e->name_offset + i];
++    }
++    else
++    {
++        for (i = 0; i + 1 < len && unicode + (e->name_offset + i) * 2 + 1 < s->size &&
++             get16( s->data + unicode + (e->name_offset + i) * 2 ); i++)
++            buf[i] = get16( s->data + unicode + (e->name_offset + i) * 2 );
++    }
++    buf[i] = 0;
++    return i + 1 < len;
++}
++
++/* the resource map item index of a full name ("Files/MainPage.xbf"), or -1 */
++static int schema_find( const struct pri_section *s, BOOL extended, const WCHAR *wanted )
++{
++    UINT32 pos = 0, scopes, items, count, unicode_length, ascii_length = 0, entries, unicode, ascii, i, depth;
++    UINT16 unique_length, name_length;
++    struct schema_entry *table;
++    BOOL extended_names = FALSE;
++    WCHAR path[MAX_PATH], part[MAX_PATH];
++    UINT32 chain[64];
++    int found = -1;
++
++    if (s->size < 8 || get16( s->data ) != 1) return -1;
++    unique_length = get16( s->data + 2 );
++    name_length = get16( s->data + 4 );
++    pos = 8;
++    if (extended)
++    {
++        if (pos + 16 > s->size) return -1;
++        extended_names = !memcmp( s->data + pos, "[def_hnamesx]", 13 );
++        pos += 16;
++    }
++    /* version: major, minor, 0, checksum, scopes, items; then the two names and a 0 */
++    if (pos + 20 > s->size) return -1;
++    scopes = get32( s->data + pos + 12 );
++    items = get32( s->data + pos + 16 );
++    pos += 20 + (unique_length + name_length) * 2 + 2;
++    /* the names block */
++    if (pos + 20 + (extended_names ? 4 : 0) > s->size) return -1;
++    unicode_length = get32( s->data + pos + 16 );
++    if (extended_names) ascii_length = get32( s->data + pos + 24 );
++    pos += 24 + (extended_names ? 4 : 0);
++    count = scopes + items;
++    entries = pos;
++    unicode = entries + count * 12 + scopes * 8 + items * 2;
++    ascii = unicode + unicode_length * 2;
++    if ((UINT64)ascii + ascii_length > s->size || !count) return -1;
++    if (!(table = calloc( count, sizeof(*table) ))) return -1;
++    for (i = 0; i < count; i++)
++    {
++        const BYTE *p = s->data + entries + i * 12;
++        table[i].parent = get16( p );
++        table[i].full_path_length = get16( p + 2 );
++        table[i].flags = p[7];
++        table[i].name_offset = get16( p + 8 ) | ((p[7] & 0xf) << 16);
++        table[i].index = get16( p + 10 );
++    }
++    for (i = 0; i < count && found < 0; i++)
++    {
++        UINT32 j, k = i;
++
++        if (table[i].flags & 0x10) continue;   /* a scope */
++        /* up to the root, which is left out of names */
++        for (depth = 0; k && depth < ARRAY_SIZE(chain); depth++)
++        {
++            chain[depth] = k;
++            if (table[k].parent >= count || table[k].parent == k) break;
++            k = table[k].parent;
++        }
++        path[0] = 0;
++        for (j = depth; j > 0; j--)
++        {
++            if (!entry_name( s, &table[chain[j - 1]], unicode, ascii, part, ARRAY_SIZE(part) )) break;
++            if (wcslen( path ) + wcslen( part ) + 2 >= ARRAY_SIZE(path)) break;
++            if (path[0]) lstrcatW( path, L"/" );
++            lstrcatW( path, part );
++        }
++        if (!wcsicmp( path, wanted )) found = table[i].index;
++    }
++    free( table );
++    return found;
++}
++
++/* the data of an item of a data item section */
++static BOOL data_item( const struct pri_section *s, UINT32 index, const BYTE **data, UINT32 *size )
++{
++    UINT16 strings, blobs;
++    UINT32 start, offset;
++
++    if (s->size < 12) return FALSE;
++    strings = get16( s->data + 4 );
++    blobs = get16( s->data + 6 );
++    start = 12 + strings * 4 + blobs * 8;
++    if (index < strings)
++    {
++        offset = get16( s->data + 12 + index * 4 );
++        *size = get16( s->data + 12 + index * 4 + 2 );
++    }
++    else if (index < (UINT32)strings + blobs)
++    {
++        offset = get32( s->data + 12 + strings * 4 + (index - strings) * 8 );
++        *size = get32( s->data + 12 + strings * 4 + (index - strings) * 8 + 4 );
++    }
++    else return FALSE;
++    if ((UINT64)start + offset + *size > s->size) return FALSE;
++    *data = s->data + start + offset;
++    return TRUE;
++}
++
++/* the first candidate of an item of the resource map */
++static BOOL map_find( struct pri_file *file, const struct pri_section *s, UINT32 item, const BYTE **data, UINT32 *size )
++{
++    UINT16 env_length, schema_ref_length, types, map_count, group_count;
++    UINT32 info_count, candidates, data_length, large_length, pos, i, j;
++    UINT32 first_item, group, group_size, first_info, info, candidate, string_data;
++    const BYTE *large = NULL, *c;
++
++    if (s->size < 32) return FALSE;
++    env_length = get16( s->data );
++    schema_ref_length = get16( s->data + 6 );
++    types = get16( s->data + 10 );
++    map_count = get16( s->data + 12 );
++    group_count = get16( s->data + 14 );
++    info_count = get32( s->data + 16 );
++    candidates = get32( s->data + 20 );
++    data_length = get32( s->data + 24 );
++    large_length = get32( s->data + 28 );
++    pos = 32 + env_length + schema_ref_length + types * 8;
++    /* item ranges -> groups of item infos -> candidates */
++    {
++        UINT32 maps = pos, groups = maps + map_count * 4, infos = groups + group_count * 4;
++        UINT32 large_maps = 0, large_groups = 0, large_infos = 0;
++        UINT32 total_maps, total_groups;
++
++        pos = infos + info_count * 4;
++        if (large_length)
++        {
++            large = s->data + pos;
++            if (pos + 12 > s->size) return FALSE;
++            large_maps = get32( large );
++            large_groups = get32( large + 4 );
++            large_infos = get32( large + 8 );
++        }
++        pos += large_length;
++        string_data = pos + candidates * 8;
++        if ((UINT64)string_data + data_length > s->size) return FALSE;
++        total_maps = map_count + large_maps;
++        total_groups = group_count + large_groups;
++        for (i = 0; i < total_maps; i++)
++        {
++            if (i < map_count)
++            {
++                first_item = get16( s->data + maps + i * 4 );
++                group = get16( s->data + maps + i * 4 + 2 );
++            }
++            else
++            {
++                first_item = get32( large + 12 + (i - map_count) * 8 );
++                group = get32( large + 12 + (i - map_count) * 8 + 4 );
++            }
++            if (group < group_count)
++            {
++                group_size = get16( s->data + groups + group * 4 );
++                first_info = get16( s->data + groups + group * 4 + 2 );
++            }
++            else if (group < total_groups)
++            {
++                const BYTE *g = large + 12 + large_maps * 8 + (group - group_count) * 8;
++                group_size = get32( g );
++                first_info = get32( g + 4 );
++            }
++            else
++            {
++                group_size = 1;
++                first_info = group - total_groups;
++            }
++            if (item < first_item || item >= first_item + group_size) continue;
++            j = first_info + (item - first_item);
++            if (j < info_count) info = get16( s->data + infos + j * 4 + 2 );
++            else if (j - info_count < large_infos) info = get32( large + 12 + large_maps * 8 + large_groups * 8 + (j - info_count) * 8 + 4 );
++            else return FALSE;
++            if (info >= candidates) return FALSE;
++            candidate = info;
++            c = s->data + pos + candidate * 8;
++            if (c[0] == 1)
++            {
++                UINT16 source = get16( c + 2 ), location = get16( c + 4 ), section = get16( c + 6 );
++                if (source) FIXME( "item %u is in another file (%u).\n", item, source );
++                if (source || section >= file->count || !file->sections[section].data) return FALSE;
++                return data_item( &file->sections[section], location, data, size );
++            }
++            if (c[0] == 0)
++            {
++                UINT32 offset = get32( c + 4 );
++                *size = get16( c + 2 );
++                if ((UINT64)offset + *size > data_length) return FALSE;
++                *data = s->data + string_data + offset;
++                return TRUE;
++            }
++            return FALSE;
++        }
++    }
++    return FALSE;
++}
++
++/* a copy of the named resource of the app's resources.pri ("Files/MainPage.xbf"), or NULL */
++BYTE *pri_load_file( const WCHAR *name, SIZE_T *size )
++{
++    WCHAR path[MAX_PATH], *p;
++    const BYTE *data;
++    UINT32 length;
++    int schema, map, item;
++    BYTE *copy;
++
++    if (!pri_tried)
++    {
++        pri_tried = TRUE;
++        GetModuleFileNameW( NULL, path, ARRAY_SIZE(path) - 16 );
++        if ((p = wcsrchr( path, '\\' ))) p[1] = 0;
++        lstrcatW( path, L"resources.pri" );
++        pri = pri_open( path );
++    }
++    if (!pri) return NULL;
++    if ((schema = find_section( pri, "[mrm_hschemaex]" )) < 0 && (schema = find_section( pri, "[mrm_hschema]" )) < 0)
++        return NULL;
++    if ((map = find_section( pri, "[mrm_res_map2_]" )) < 0 && (map = find_section( pri, "[mrm_res_map__]" )) < 0)
++        return NULL;
++    if ((item = schema_find( &pri->sections[schema], !memcmp( pri->ids[schema], "[mrm_hschemaex]", 15 ), name )) < 0)
++    {
++        TRACE( "%s is not in resources.pri.\n", debugstr_w(name) );
++        return NULL;
++    }
++    if (!map_find( pri, &pri->sections[map], item, &data, &length ) || !(copy = malloc( length ))) return NULL;
++    memcpy( copy, data, length );
++    *size = length;
++    TRACE( "%s: item %d, %u bytes.\n", debugstr_w(name), item, length );
++    return copy;
++}
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index 9ecc46a..5096604 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -436,6 +436,7 @@ BOOL dwrite_caret( const struct text_format *format, HSTRING text, float width,
+ BOOL dwrite_hit( const struct text_format *format, HSTRING text, float width, float x, float y, UINT32 *index );
+ BOOL d2d_draw_text( struct layout_context *ctx, const struct text_format *format, HSTRING text,
+                     const struct layout_rect *rect, Color color );
++BYTE *pri_load_file( const WCHAR *name, SIZE_T *size );   /* pri.c: a copy of a resource of resources.pri */
+ BOOL dwrite_has_family( const WCHAR *family );
+ BOOL d2d_draw_glyphs( struct layout_context *ctx, const WCHAR *family, double size, UINT16 weight, const WCHAR *text,
+                       UINT32 len, const struct layout_rect *rect, Color color );
+diff --git a/dlls/windows.ui.xaml/xbf.c b/dlls/windows.ui.xaml/xbf.c
+index 80115e5..3a069ca 100644
+--- a/dlls/windows.ui.xaml/xbf.c
++++ b/dlls/windows.ui.xaml/xbf.c
+@@ -5365,6 +5365,21 @@ HRESULT load_component( IInspectable *component, HSTRING uri )
+         lstrcpyW( (WCHAR *)ext, L".xbf" );
+         if (GetFileAttributesW( file ) == INVALID_FILE_ATTRIBUTES)
+         {
++            /* compiled into resources.pri as Files/<path>.xbf */
++            WCHAR name[MAX_PATH];
++            SIZE_T pri_size;
++
++            swprintf( name, ARRAY_SIZE(name), L"Files/%s", path );
++            if ((p = wcsrchr( name, '.' ))) lstrcpyW( p, L".xbf" );
++            if ((data = pri_load_file( name, &pri_size )))
++            {
++                TRACE( "loading %s from resources.pri (%Iu bytes) into %p.\n", debugstr_w(name), pri_size, component );
++                if (FAILED(hr = xbf_parse( data, pri_size, &xbf ))) return hr;
++                hr = xbf_load( xbf, component, NULL );
++                xbf_free( xbf );
++                if (FAILED(hr)) ERR( "loading %s failed, hr %#lx.\n", debugstr_w(name), hr );
++                return hr;
++            }
+             /* no compiled markup: the loose .xaml file */
+             lstrcpyW( (WCHAR *)ext, L".xaml" );
+             return load_text_component( component, file );

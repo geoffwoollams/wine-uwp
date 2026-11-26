@@ -21,13 +21,16 @@ fi
 info "Building the build container"
 docker build -q -t wine-uwp-dxvk-build -f "$REPO/docker/Dockerfile.dxvk" "$REPO/docker" >/dev/null
 
-info "Building dxgi.dll"
+info "Building dxgi.dll, d3d11.dll and d3d10core.dll"
 cp "$REPO/docker/cross-mingw64.txt" "$BUILD/obj-cross-mingw64.txt"
 docker run --rm -u "$(id -u):$(id -g)" -v "$BUILD:/build" wine-uwp-dxvk-build bash -c "
     set -e
     [ -f /build/obj/dxvk/build.ninja ] || meson setup --cross-file /build/obj-cross-mingw64.txt --buildtype release \
-        -Denable_d3d8=false -Denable_d3d9=false -Denable_d3d10=false -Denable_d3d11=false \
+        -Denable_d3d8=false -Denable_d3d9=false -Denable_d3d10=true -Denable_d3d11=true \
         /build/obj/dxvk /build/src/dxvk > /build/obj-dxvk-setup.log
-    ninja -C /build/obj/dxvk src/dxgi/dxgi.dll > /build/obj-dxvk-ninja.log 2>&1 || { tail -30 /build/obj-dxvk-ninja.log; exit 1; }
-    cp /build/obj/dxvk/src/dxgi/dxgi.dll /build/dxvk/dxgi.dll"
-info "Built $DXVK_DXGI"
+    meson configure -Denable_d3d10=true -Denable_d3d11=true /build/obj/dxvk > /dev/null   # a build dir made before d3d11 was built
+    ninja -C /build/obj/dxvk src/dxgi/dxgi.dll src/d3d11/d3d11.dll src/d3d10/d3d10core.dll > /build/obj-dxvk-ninja.log 2>&1 || { tail -30 /build/obj-dxvk-ninja.log; exit 1; }
+    cp /build/obj/dxvk/src/dxgi/dxgi.dll /build/dxvk/dxgi.dll
+    cp /build/obj/dxvk/src/d3d11/d3d11.dll /build/dxvk/d3d11.dll
+    cp /build/obj/dxvk/src/d3d10/d3d10core.dll /build/dxvk/d3d10core.dll"
+info "Built $DXVK_DXGI, $DXVK_D3D11 and $DXVK_D3D10CORE"

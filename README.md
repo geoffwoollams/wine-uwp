@@ -220,7 +220,7 @@ gh release create 11.22-uwp3.0 dist/wine-uwp-x86_64.tar.xz dist/wine-uwp-x86_64.
 
 **Version numbers** look like `11.22-uwp3.0`: the Wine release the patches are based on, then wine-uwp's own version. Raise `UWP_VERSION` in `scripts/common.sh` for each GitHub release (`3.0`, `3.1`, ...) and change `WINE_TAG` when moving to a newer Wine; `RELEASE_VERSION` is made from both. `build-wine.sh` tags its source checkout so that `wine --version` reports `wine-11.22-uwp3.0`, and `package-release.sh` refuses a build whose version doesn't match. The download keeps the same file name, `wine-uwp-x86_64.tar.xz`, in every release, which is what lets `fetch-release.sh` find the latest one.
 
-The archive contains the Wine install tree, `dxgi.dll`, the four component DLLs (`d3d12.dll`, `d3d12core.dll`, `wintypes.dll`, `windows.storage.dll`), the licence texts, `SOURCE.txt` (where to get every part's source) and a copy of `patches/`, `docker/` and `scripts/` (the recipe that built it). The script refuses to run with uncommitted changes in those folders, and refuses a Wine build containing add-on unlocking code.
+The archive contains the Wine install tree, DXVK's `dxgi.dll`, `d3d11.dll` and `d3d10core.dll` (D3D11 games and XAML's Direct2D drawing need them with that dxgi), the four component DLLs (`d3d12.dll`, `d3d12core.dll`, `wintypes.dll`, `windows.storage.dll`), the licence texts, `SOURCE.txt` (where to get every part's source) and a copy of `patches/`, `docker/` and `scripts/` (the recipe that built it). The script refuses to run with uncommitted changes in those folders, and refuses a Wine build containing add-on unlocking code.
 
 ## Licences
 
@@ -260,7 +260,8 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 milestone 5 part 1 (ScrollViewer, keyboard focus, key events), 0045-0046 part 2 (TextBox,
                 PasswordBox), 0047-0048 part 3 (Image, BitmapImage, ImageBrush), 0049-0050 part 4 (ListView,
                 GridView, their items and panels), 0051-0052 part 5a (ContentDialog; 0051 has all of part 5's IDL),
-                0053 part 5b (CommandBar, app bar buttons, icons)
+                0053 part 5b (CommandBar, app bar buttons, icons), 0054 compiled XAML read from resources.pri
+                and app pages from C++/CX TypeNames, 0055 PointerVisualizationSettings (Microsoft Minesweeper)
 patches/dxvk/   patch against DXVK f90f1bf1 (v3.1.1-235)
 docker/         build containers
 apps/           optional per-app settings

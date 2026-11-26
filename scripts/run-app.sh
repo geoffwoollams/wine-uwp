@@ -23,7 +23,7 @@ APP="$PREFIX/drive_c/$APPS_DIR_NAME/$NAME"
 IFS=$'\t' read -r _ EXE < <(python3 -I "$REPO/scripts/uwptool.py" info "$APP")
 
 wine_env
-export WINEDLLOVERRIDES="${UWP_DLLOVERRIDES:-mscoree,mshtml=d;dxgi=n;d3d12=n;d3d12core=n;wintypes=n;windows.storage=n}"
+export WINEDLLOVERRIDES="${UWP_DLLOVERRIDES:-mscoree,mshtml=d;dxgi=n;d3d11=n;d3d10core=n;d3d12=n;d3d12core=n;wintypes=n;windows.storage=n}"
 export WINEDEBUG="${WINEDEBUG:-err+all,fixme+all,+twinapi}"
 export DXVK_LOG_LEVEL="${DXVK_LOG_LEVEL:-warn}" DXVK_LOG_PATH="$LOGS"
 [ -f "$REPO/apps/$NAME.conf" ] && source "$REPO/apps/$NAME.conf"

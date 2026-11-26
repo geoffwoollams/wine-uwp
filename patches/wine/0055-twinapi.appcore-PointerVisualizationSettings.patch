@@ -1,0 +1,309 @@
+Subject: twinapi.appcore: Windows.UI.Input.PointerVisualizationSettings
+
+diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
+index ff88e9f..c6a2331 100644
+--- a/dlls/twinapi.appcore/Makefile.in
++++ b/dlls/twinapi.appcore/Makefile.in
+@@ -31,6 +31,7 @@ SOURCES = \
+ 	memory_manager.c \
+ 	message_dialog.c \
+ 	mouse.c \
++	pointer_visualization.c \
+ 	hardware_identification.c \
+ 	main.c \
+ 	manifest.c
+diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
+index d408f99..b7e30f3 100644
+--- a/dlls/twinapi.appcore/main.c
++++ b/dlls/twinapi.appcore/main.c
+@@ -116,6 +116,9 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+     else if (!wcscmp( buffer, L"Windows.Devices.Input.PointerDevice" ))
+         IActivationFactory_QueryInterface( pointer_device_factory, &IID_IActivationFactory, (void **)factory );
+ 
++    else if (!wcscmp( buffer, L"Windows.UI.Input.PointerVisualizationSettings" ))
++        IActivationFactory_QueryInterface( pointer_visualization_factory, &IID_IActivationFactory, (void **)factory );
++
+     else if (!wcscmp( buffer, L"Windows.Devices.Input.MouseDevice" ))
+         IActivationFactory_QueryInterface( mouse_device_factory, &IID_IActivationFactory, (void **)factory );
+ 
+diff --git a/dlls/twinapi.appcore/pointer_visualization.c b/dlls/twinapi.appcore/pointer_visualization.c
+new file mode 100644
+index 0000000..1345ce5
+--- /dev/null
++++ b/dlls/twinapi.appcore/pointer_visualization.c
+@@ -0,0 +1,194 @@
++/* WinRT Windows.UI.Input.PointerVisualizationSettings implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#define WIDL_using_Windows_UI_Input
++#include "windows.ui.input.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
++
++/* PointerVisualizationSettings.GetForCurrentView(): whether touch and pen contacts show feedback. Games turn it off;
++ * Wine draws no such feedback, so the settings are only kept. */
++
++struct settings
++{
++    IPointerVisualizationSettings IPointerVisualizationSettings_iface;
++    boolean contact, barrel;
++};
++
++static inline struct settings *impl_from_IPointerVisualizationSettings( IPointerVisualizationSettings *iface )
++{
++    return CONTAINING_RECORD( iface, struct settings, IPointerVisualizationSettings_iface );
++}
++
++static HRESULT WINAPI settings_QueryInterface( IPointerVisualizationSettings *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IPointerVisualizationSettings ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI settings_AddRef( IPointerVisualizationSettings *iface ) { return 2; }
++static ULONG WINAPI settings_Release( IPointerVisualizationSettings *iface ) { return 1; }
++static HRESULT WINAPI settings_GetIids( IPointerVisualizationSettings *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI settings_GetRuntimeClassName( IPointerVisualizationSettings *iface, HSTRING *name )
++{
++    return WindowsCreateString( L"Windows.UI.Input.PointerVisualizationSettings", 46, name );
++}
++
++static HRESULT WINAPI settings_GetTrustLevel( IPointerVisualizationSettings *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI settings_put_IsContactFeedbackEnabled( IPointerVisualizationSettings *iface, boolean value )
++{
++    TRACE( "iface %p, value %d.\n", iface, value );
++    impl_from_IPointerVisualizationSettings( iface )->contact = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI settings_get_IsContactFeedbackEnabled( IPointerVisualizationSettings *iface, boolean *value )
++{
++    *value = impl_from_IPointerVisualizationSettings( iface )->contact;
++    return S_OK;
++}
++
++static HRESULT WINAPI settings_put_IsBarrelButtonFeedbackEnabled( IPointerVisualizationSettings *iface, boolean value )
++{
++    TRACE( "iface %p, value %d.\n", iface, value );
++    impl_from_IPointerVisualizationSettings( iface )->barrel = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI settings_get_IsBarrelButtonFeedbackEnabled( IPointerVisualizationSettings *iface, boolean *value )
++{
++    *value = impl_from_IPointerVisualizationSettings( iface )->barrel;
++    return S_OK;
++}
++
++static const struct IPointerVisualizationSettingsVtbl settings_vtbl =
++{
++    settings_QueryInterface,
++    settings_AddRef,
++    settings_Release,
++    /* IInspectable methods */
++    settings_GetIids,
++    settings_GetRuntimeClassName,
++    settings_GetTrustLevel,
++    /* IPointerVisualizationSettings methods */
++    settings_put_IsContactFeedbackEnabled,
++    settings_get_IsContactFeedbackEnabled,
++    settings_put_IsBarrelButtonFeedbackEnabled,
++    settings_get_IsBarrelButtonFeedbackEnabled,
++};
++
++/* one view, so one settings object */
++static struct settings settings = { {&settings_vtbl}, TRUE, TRUE };
++
++struct statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IPointerVisualizationSettingsStatics IPointerVisualizationSettingsStatics_iface;
++};
++
++static inline struct statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct statics *impl = impl_from_IActivationFactory( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IPointerVisualizationSettingsStatics ))
++        *out = &impl->IPointerVisualizationSettingsStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( pv_statics, IPointerVisualizationSettingsStatics, struct statics, IActivationFactory_iface )
++
++static HRESULT WINAPI pv_statics_GetForCurrentView( IPointerVisualizationSettingsStatics *iface, IPointerVisualizationSettings **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = &settings.IPointerVisualizationSettings_iface;
++    return S_OK;
++}
++
++static const struct IPointerVisualizationSettingsStaticsVtbl pv_statics_vtbl =
++{
++    pv_statics_QueryInterface,
++    pv_statics_AddRef,
++    pv_statics_Release,
++    /* IInspectable methods */
++    pv_statics_GetIids,
++    pv_statics_GetRuntimeClassName,
++    pv_statics_GetTrustLevel,
++    /* IPointerVisualizationSettingsStatics methods */
++    pv_statics_GetForCurrentView,
++};
++
++static struct statics statics = { {&factory_vtbl}, {&pv_statics_vtbl} };
++IActivationFactory *pointer_visualization_factory = &statics.IActivationFactory_iface;
+diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
+index e1ff0ba..a2e49d6 100644
+--- a/dlls/twinapi.appcore/private.h
++++ b/dlls/twinapi.appcore/private.h
+@@ -65,6 +65,7 @@ extern IActivationFactory *display_information_factory;
+ extern void display_information_init(void);
+ extern IActivationFactory *extended_execution_factory;
+ extern IActivationFactory *core_cursor_factory;
++extern IActivationFactory *pointer_visualization_factory;
+ extern void core_cursor_init(void);
+ extern IActivationFactory *message_dialog_factory;
+ extern void message_dialog_init(void);
+diff --git a/dlls/twinapi.appcore/twinapi.appcore.rgs b/dlls/twinapi.appcore/twinapi.appcore.rgs
+index 54f20b4..7d16e9f 100644
+--- a/dlls/twinapi.appcore/twinapi.appcore.rgs
++++ b/dlls/twinapi.appcore/twinapi.appcore.rgs
+@@ -120,6 +120,10 @@ HKLM
+                     {
+                         val 'DllPath' = s '%MODULE%'
+                     }
++                    ForceRemove Windows.UI.Input.PointerVisualizationSettings
++                    {
++                        val 'DllPath' = s '%MODULE%'
++                    }
+                     ForceRemove Windows.Networking.XboxLive.XboxLiveDeviceAddress
+                     {
+                         val 'DllPath' = s '%MODULE%'
+diff --git a/include/windows.ui.input.idl b/include/windows.ui.input.idl
+index f396a3c..79afe5a 100644
+--- a/include/windows.ui.input.idl
++++ b/include/windows.ui.input.idl
+@@ -168,3 +168,49 @@ namespace Windows.UI.Input {
+         [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.UI.Input.IPointerPointProperties2;
+     }
+ }
++
++/* generated by scripts/winmd2idl.py: Windows.UI.Input.PointerVisualizationSettings */
++namespace Windows.UI.Input {
++    interface IPointerVisualizationSettings;
++    interface IPointerVisualizationSettingsStatics;
++    runtimeclass PointerVisualizationSettings;
++}
++
++namespace Windows.UI.Input {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Input.PointerVisualizationSettings),
++        uuid(4d1e6461-84f7-499d-bd91-2a36e2b7aaa2)
++    ]
++    interface IPointerVisualizationSettings : IInspectable
++    {
++        [propput] HRESULT IsContactFeedbackEnabled([in] boolean value);
++        [propget] HRESULT IsContactFeedbackEnabled([out, retval] boolean *value);
++        [propput] HRESULT IsBarrelButtonFeedbackEnabled([in] boolean value);
++        [propget] HRESULT IsBarrelButtonFeedbackEnabled([out, retval] boolean *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Input.PointerVisualizationSettings),
++        uuid(68870edb-165b-4214-b4f3-584eca8c8a69)
++    ]
++    interface IPointerVisualizationSettingsStatics : IInspectable
++    {
++        HRESULT GetForCurrentView([out, retval] Windows.UI.Input.PointerVisualizationSettings * *value);
++    }
++
++}
++
++namespace Windows.UI.Input {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.UI.Input.IPointerVisualizationSettingsStatics, Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass PointerVisualizationSettings
++    {
++        [default] interface Windows.UI.Input.IPointerVisualizationSettings;
++    }
++
++}

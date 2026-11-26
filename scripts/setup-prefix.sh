@@ -104,6 +104,10 @@ for dll in wintypes windows.storage; do   # Wine PE builds: copied so they load 
     python3 -I "$REPO/scripts/uwptool.py" native-copy "$WINEDLL_DIR/$dll.dll" "$SYS32/$dll.dll"
 done
 cp "$DXVK_DXGI" "$SYS32/dxgi.dll"
+# D3D11 (Unity) and Direct2D (XAML) need DXVK's d3d11 and d3d10core with its dxgi; older releases don't have them
+for dll in "$DXVK_D3D11" "$DXVK_D3D10CORE"; do
+    if [ -f "$dll" ]; then cp "$dll" "$SYS32/"; else echo "warning: no $dll: D3D11 and XAML apps will fail (run scripts/build-dxvk.sh)" >&2; fi
+done
 # a prefix made by an older build lacks classes our patches register (msxml6: FreeThreadedXMLHTTP60, for Xbox Live)
 wine regsvr32 /s msxml6.dll >/dev/null 2>&1 || echo "warning: could not register msxml6.dll" >&2
 

@@ -10,7 +10,7 @@ VERSION="${1:-$RELEASE_VERSION}"
 built="$("$WINE_ROOT/bin/wine" --version 2>/dev/null || true)"
 [ "$built" = "wine-$RELEASE_VERSION" ] || die "the Wine build says it is $built, not wine-$RELEASE_VERSION: rebuild with scripts/build-wine.sh after changing UWP_VERSION"
 [ -x "$WINE_ROOT/bin/wine" ] || die "no Wine build in $WINE_ROOT: run scripts/build-wine.sh"
-[ -f "$DXVK_DXGI" ] || die "no dxgi.dll at $DXVK_DXGI: run scripts/build-dxvk.sh"
+[ -f "$DXVK_DXGI" ] && [ -f "$DXVK_D3D11" ] && [ -f "$DXVK_D3D10CORE" ] || die "no dxgi.dll / d3d11.dll in $BUILD/dxvk: run scripts/build-dxvk.sh"
 [ -z "$(git -C "$REPO" status --porcelain patches docker scripts 2>/dev/null)" ] || die "uncommitted changes in patches/, docker/ or scripts/: the release's source must match a commit"
 [ -f "$BUILD/src/wine/COPYING.LIB" ] && [ -f "$BUILD/src/dxvk/LICENSE" ] || die "Wine and DXVK sources not found in $BUILD/src (their licence texts are packaged): build with build-wine.sh and build-dxvk.sh"
 # Guard against shipping a private build: the public build never reads add-on licences from a file
@@ -26,6 +26,8 @@ cp -a "$BUILD/wine-root/usr" "$STAGE/wine-root/"
 rm -rf "$STAGE/wine-root/usr/local/include" "$STAGE/wine-root/usr/local/share/man" "$STAGE/wine-root/usr/local/lib/"*.a
 find "$STAGE/wine-root" -type f \( -name '*.so' -o -name '*.so.*' \) -exec strip --strip-unneeded {} + 2>/dev/null || true
 cp "$DXVK_DXGI" "$STAGE/dxvk/dxgi.dll"
+cp "$DXVK_D3D11" "$STAGE/dxvk/d3d11.dll"
+cp "$DXVK_D3D10CORE" "$STAGE/dxvk/d3d10core.dll"
 for dll in $COMPONENT_DLLS; do
     if [ -f "$VKD3D_DIR/$dll" ]; then cp "$VKD3D_DIR/$dll" "$STAGE/components/$dll"; else cp "$WINEDLL_DIR/$dll" "$STAGE/components/$dll"; fi
 done
@@ -42,7 +44,7 @@ Everything in this archive is free software. The source for each part:
 
 * Wine ($WINE_TAG, LGPL 2.1 or later): the unmodified tag from $WINE_GIT plus patches/wine/ in source/ (apply in order with
   git apply). source/scripts/build-wine.sh and source/docker/ are the exact build recipe.
-* dxvk/dxgi.dll (DXVK, zlib licence): commit $DXVK_COMMIT of $DXVK_GIT plus patches/dxvk/ in source/.
+* dxvk/dxgi.dll, d3d11.dll and d3d10core.dll (DXVK, zlib licence): commit $DXVK_COMMIT of $DXVK_GIT plus patches/dxvk/ in source/.
   Build recipe: source/scripts/build-dxvk.sh.
 * components/d3d12.dll, d3d12core.dll (vkd3d-proton, LGPL 2.1 or later) and wintypes.dll, windows.storage.dll (Wine, LGPL 2.1 or
   later) are unmodified copies from $GE_PROTON_VERSION by GloriousEggroll, https://github.com/GloriousEggroll/proton-ge-custom
