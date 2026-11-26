@@ -1,0 +1,346 @@
+Subject: windows.gaming.ui.gamebar: GameChatOverlay (messages are logged, not shown)
+
+diff --git a/dlls/windows.gaming.ui.gamebar/Makefile.in b/dlls/windows.gaming.ui.gamebar/Makefile.in
+index 96bec12..0e3b9eb 100644
+--- a/dlls/windows.gaming.ui.gamebar/Makefile.in
++++ b/dlls/windows.gaming.ui.gamebar/Makefile.in
+@@ -2,5 +2,6 @@ MODULE = windows.gaming.ui.gamebar.dll
+ IMPORTS = combase uuid
+ 
+ SOURCES = \
++	chat_overlay.c \
+ 	classes.idl \
+ 	main.c
+diff --git a/dlls/windows.gaming.ui.gamebar/chat_overlay.c b/dlls/windows.gaming.ui.gamebar/chat_overlay.c
+new file mode 100644
+index 0000000..d943d71
+--- /dev/null
++++ b/dlls/windows.gaming.ui.gamebar/chat_overlay.c
+@@ -0,0 +1,213 @@
++/* WinRT Windows.Gaming.UI.GameChatOverlay
++ *
++ * There is no Game Bar to draw chat in, so messages are only logged; the desired position is
++ * kept.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(gamebar);
++
++struct chat_overlay
++{
++    IActivationFactory IActivationFactory_iface;
++    IGameChatOverlayStatics IGameChatOverlayStatics_iface;
++    IGameChatOverlay IGameChatOverlay_iface;
++    LONG ref;
++    GameChatOverlayPosition position;
++};
++
++static inline struct chat_overlay *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct chat_overlay, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct chat_overlay *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IGameChatOverlayStatics ))
++        *out = &impl->IGameChatOverlayStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    return InterlockedIncrement( &impl_from_IActivationFactory( iface )->ref );
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    return InterlockedDecrement( &impl_from_IActivationFactory( iface )->ref );
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance ) { return E_NOTIMPL; }
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( statics, IGameChatOverlayStatics, struct chat_overlay, IActivationFactory_iface )
++
++static HRESULT WINAPI statics_GetDefault( IGameChatOverlayStatics *iface, IGameChatOverlay **value )
++{
++    struct chat_overlay *impl = impl_from_IGameChatOverlayStatics( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    *value = &impl->IGameChatOverlay_iface;
++    IGameChatOverlay_AddRef( *value );
++    return S_OK;
++}
++
++static const struct IGameChatOverlayStaticsVtbl statics_vtbl =
++{
++    statics_QueryInterface,
++    statics_AddRef,
++    statics_Release,
++    /* IInspectable methods */
++    statics_GetIids,
++    statics_GetRuntimeClassName,
++    statics_GetTrustLevel,
++    /* IGameChatOverlayStatics methods */
++    statics_GetDefault,
++};
++
++/* the overlay itself: one per process, kept in the same object */
++
++static inline struct chat_overlay *impl_from_IGameChatOverlay( IGameChatOverlay *iface )
++{
++    return CONTAINING_RECORD( iface, struct chat_overlay, IGameChatOverlay_iface );
++}
++
++static HRESULT WINAPI overlay_QueryInterface( IGameChatOverlay *iface, REFIID iid, void **out )
++{
++    struct chat_overlay *impl = impl_from_IGameChatOverlay( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IGameChatOverlay ))
++    {
++        *out = &impl->IGameChatOverlay_iface;
++        IInspectable_AddRef( (IInspectable *)*out );
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI overlay_AddRef( IGameChatOverlay *iface )
++{
++    return InterlockedIncrement( &impl_from_IGameChatOverlay( iface )->ref );
++}
++
++static ULONG WINAPI overlay_Release( IGameChatOverlay *iface )
++{
++    return InterlockedDecrement( &impl_from_IGameChatOverlay( iface )->ref );
++}
++
++static HRESULT WINAPI overlay_GetIids( IGameChatOverlay *iface, ULONG *iid_count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI overlay_GetRuntimeClassName( IGameChatOverlay *iface, HSTRING *class_name )
++{
++    return WindowsCreateString( L"Windows.Gaming.UI.GameChatOverlay", 33, class_name );
++}
++static HRESULT WINAPI overlay_GetTrustLevel( IGameChatOverlay *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI overlay_get_DesiredPosition( IGameChatOverlay *iface, GameChatOverlayPosition *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = impl_from_IGameChatOverlay( iface )->position;
++    return S_OK;
++}
++
++static HRESULT WINAPI overlay_put_DesiredPosition( IGameChatOverlay *iface, GameChatOverlayPosition value )
++{
++    TRACE( "iface %p, value %d.\n", iface, value );
++    impl_from_IGameChatOverlay( iface )->position = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI overlay_AddMessage( IGameChatOverlay *iface, HSTRING sender, HSTRING message, GameChatMessageOrigin origin )
++{
++    FIXME( "iface %p, sender %s, message %s, origin %d: not shown.\n", iface, debugstr_hstring(sender),
++           debugstr_hstring(message), origin );
++    return S_OK;
++}
++
++static const struct IGameChatOverlayVtbl overlay_vtbl =
++{
++    overlay_QueryInterface,
++    overlay_AddRef,
++    overlay_Release,
++    /* IInspectable methods */
++    overlay_GetIids,
++    overlay_GetRuntimeClassName,
++    overlay_GetTrustLevel,
++    /* IGameChatOverlay methods */
++    overlay_get_DesiredPosition,
++    overlay_put_DesiredPosition,
++    overlay_AddMessage,
++};
++
++static struct chat_overlay chat_overlay =
++{
++    {&factory_vtbl},
++    {&statics_vtbl},
++    {&overlay_vtbl},
++    1,
++    GameChatOverlayPosition_BottomCenter,
++};
++
++IActivationFactory *chat_overlay_factory = &chat_overlay.IActivationFactory_iface;
+diff --git a/dlls/windows.gaming.ui.gamebar/classes.idl b/dlls/windows.gaming.ui.gamebar/classes.idl
+index 7279eda..b4d89cf 100644
+--- a/dlls/windows.gaming.ui.gamebar/classes.idl
++++ b/dlls/windows.gaming.ui.gamebar/classes.idl
+@@ -29,4 +29,5 @@ import "windows.gaming.ui.idl";
+ 
+ namespace Windows.Gaming.UI {
+     runtimeclass GameBar;
++    runtimeclass GameChatOverlay;
+ }
+diff --git a/dlls/windows.gaming.ui.gamebar/main.c b/dlls/windows.gaming.ui.gamebar/main.c
+index ff44c6c..dfed055 100644
+--- a/dlls/windows.gaming.ui.gamebar/main.c
++++ b/dlls/windows.gaming.ui.gamebar/main.c
+@@ -213,6 +213,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING class_str, IActivationFactory **
+ 
+     if (!wcscmp( buffer, RuntimeClass_Windows_Gaming_UI_GameBar ))
+         IActivationFactory_QueryInterface( gamebar_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_Gaming_UI_GameChatOverlay ))
++        IActivationFactory_QueryInterface( chat_overlay_factory, &IID_IActivationFactory, (void **)factory );
+ 
+     if (*factory) return S_OK;
+     return CLASS_E_CLASSNOTAVAILABLE;
+diff --git a/dlls/windows.gaming.ui.gamebar/private.h b/dlls/windows.gaming.ui.gamebar/private.h
+index 85f87b5..e82e4f5 100644
+--- a/dlls/windows.gaming.ui.gamebar/private.h
++++ b/dlls/windows.gaming.ui.gamebar/private.h
+@@ -30,6 +30,8 @@
+ #include "activation.h"
+ #include "windows.gaming.ui.h"
+ 
++extern IActivationFactory *chat_overlay_factory;
++
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \
+     {                                                                                              \
+diff --git a/include/windows.gaming.ui.idl b/include/windows.gaming.ui.idl
+index 050bd78..f07344f 100644
+--- a/include/windows.gaming.ui.idl
++++ b/include/windows.gaming.ui.idl
+@@ -26,7 +26,58 @@ import "windowscontracts.idl";
+ import "windows.foundation.idl";
+ 
+ namespace Windows.Gaming.UI {
++    typedef enum GameChatMessageOrigin GameChatMessageOrigin;
++    typedef enum GameChatOverlayPosition GameChatOverlayPosition;
++    interface IGameChatOverlay;
++    interface IGameChatOverlayStatics;
+     runtimeclass GameBar;
++    runtimeclass GameChatOverlay;
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 4.0)
++    ]
++    enum GameChatMessageOrigin
++    {
++        Voice = 0,
++        Text  = 1
++    };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 4.0)
++    ]
++    enum GameChatOverlayPosition
++    {
++        BottomCenter = 0,
++        BottomLeft   = 1,
++        BottomRight  = 2,
++        MiddleRight  = 3,
++        MiddleLeft   = 4,
++        TopCenter    = 5,
++        TopLeft      = 6,
++        TopRight     = 7
++    };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 4.0),
++        exclusiveto(Windows.Gaming.UI.GameChatOverlay),
++        uuid(fbc64865-f6fc-4a48-ae07-03ac6ed43704)
++    ]
++    interface IGameChatOverlay : IInspectable
++    {
++        [propget] HRESULT DesiredPosition([out, retval] Windows.Gaming.UI.GameChatOverlayPosition *value);
++        [propput] HRESULT DesiredPosition([in] Windows.Gaming.UI.GameChatOverlayPosition value);
++        HRESULT AddMessage([in] HSTRING sender, [in] HSTRING message, [in] Windows.Gaming.UI.GameChatMessageOrigin origin);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 4.0),
++        exclusiveto(Windows.Gaming.UI.GameChatOverlay),
++        uuid(89acf614-7867-49f7-9687-25d9dbf444d1)
++    ]
++    interface IGameChatOverlayStatics : IInspectable
++    {
++        HRESULT GetDefault([out, retval] Windows.Gaming.UI.GameChatOverlay **value);
++    }
+ 
+     [
+         contract(Windows.Foundation.UniversalApiContract, 2.0),
+@@ -52,4 +103,14 @@ namespace Windows.Gaming.UI {
+     runtimeclass GameBar
+     {
+     }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 4.0),
++        marshaling_behavior(agile),
++        static(Windows.Gaming.UI.IGameChatOverlayStatics, Windows.Foundation.UniversalApiContract, 4.0)
++    ]
++    runtimeclass GameChatOverlay
++    {
++        [default] interface Windows.Gaming.UI.IGameChatOverlay;
++    }
+ }

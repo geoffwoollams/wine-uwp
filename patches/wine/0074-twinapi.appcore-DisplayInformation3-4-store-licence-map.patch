@@ -1,0 +1,81 @@
+Subject: twinapi.appcore: DisplayInformation 3 and 4 (screen size in raw pixels); the add-on licence map's interfaces
+
+diff --git a/dlls/twinapi.appcore/display_information.c b/dlls/twinapi.appcore/display_information.c
+index 9328466..5fef83a 100644
+--- a/dlls/twinapi.appcore/display_information.c
++++ b/dlls/twinapi.appcore/display_information.c
+@@ -82,9 +82,47 @@ static const void *const probe_vtbl[] = { probe_QueryInterface, probe_AddRef, pr
+     probe_GetRuntimeClassName, probe_GetTrustLevel, probe_slot6, probe_slot7, probe_slot8, probe_slot9, probe_slot10, probe_slot11 };
+ static struct probe probe_obj = { probe_vtbl };
+ 
++/* IDisplayInformation3 (slot 6: DiagonalSizeInInches, an IReference<double>, NULL when unknown) and
++ * IDisplayInformation4 (slots 6, 7: ScreenWidthInRawPixels, ScreenHeightInRawPixels) */
++static const GUID IID_IDisplayInformation3_local = { 0xdb15011d, 0x0f09, 0x4466, { 0x8f, 0xf3, 0x11, 0xde, 0x9a, 0x3c, 0x92, 0x9a } };
++static const GUID IID_IDisplayInformation4_local = { 0xc972ce2f, 0x1242, 0x46be, { 0xb5, 0x36, 0xe1, 0xaa, 0xfe, 0x9e, 0x7a, 0xcf } };
++static HRESULT WINAPI di3_get_DiagonalSizeInInches(void *iface, void **value)
++{
++    TRACE("iface %p: size unknown.\n", iface);
++    *value = NULL;
++    return S_OK;
++}
++static void primary_mode(UINT32 *width, UINT32 *height)
++{
++    /* the primary display's size in pixels (apps run at a scale of 1, so view pixels are raw pixels) */
++    *width = GetSystemMetrics(SM_CXSCREEN);
++    *height = GetSystemMetrics(SM_CYSCREEN);
++}
++static HRESULT WINAPI di4_get_ScreenWidthInRawPixels(void *iface, UINT32 *value)
++{
++    UINT32 height;
++    primary_mode(value, &height);
++    TRACE("iface %p -> %u.\n", iface, *value);
++    return S_OK;
++}
++static HRESULT WINAPI di4_get_ScreenHeightInRawPixels(void *iface, UINT32 *value)
++{
++    UINT32 width;
++    primary_mode(&width, value);
++    TRACE("iface %p -> %u.\n", iface, *value);
++    return S_OK;
++}
++static const void *const di3_vtbl[] = { probe_QueryInterface, probe_AddRef, probe_Release, probe_GetIids,
++    probe_GetRuntimeClassName, probe_GetTrustLevel, di3_get_DiagonalSizeInInches };
++static const void *const di4_vtbl[] = { probe_QueryInterface, probe_AddRef, probe_Release, probe_GetIids,
++    probe_GetRuntimeClassName, probe_GetTrustLevel, di4_get_ScreenWidthInRawPixels, di4_get_ScreenHeightInRawPixels };
++static struct probe di3_obj = { di3_vtbl }, di4_obj = { di4_vtbl };
++
+ static HRESULT WINAPI di_QueryInterface(IDisplayInformation *iface, REFIID iid, void **out)
+ {
+     if (IsEqualGUID(iid, &IID_probe)) { *out = &probe_obj; return S_OK; }
++    if (IsEqualGUID(iid, &IID_IDisplayInformation3_local)) { *out = &di3_obj; return S_OK; }
++    if (IsEqualGUID(iid, &IID_IDisplayInformation4_local)) { *out = &di4_obj; return S_OK; }
+     TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
+     if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
+         IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IDisplayInformation))
+diff --git a/dlls/twinapi.appcore/store.c b/dlls/twinapi.appcore/store.c
+index a4071e3..57546b4 100644
+--- a/dlls/twinapi.appcore/store.c
++++ b/dlls/twinapi.appcore/store.c
+@@ -142,15 +142,18 @@ static HRESULT WINAPI pm_First(struct pmap *m, void **iter)
+ }
+ static const GUID iid_product_map_view = { 0xdbaac6e5, 0x61a4, 0x5c88, { 0xb5, 0xd8, 0x3a, 0x3e, 0x16, 0x1c, 0x3e, 0x4a } };
+ static const GUID iid_product_map_iterable = { 0x78a33722, 0xabfb, 0x57c0, { 0x85, 0x3f, 0x56, 0x16, 0xa3, 0xab, 0x8d, 0x57 } };
++static const GUID iid_license_map_view = { 0x7d0d74f5, 0x4020, 0x54aa, { 0x9f, 0x3d, 0x0f, 0x17, 0x12, 0x7a, 0xcd, 0xdf } };
++static const GUID iid_license_map_iterable = { 0xca8ba445, 0x6f4d, 0x5da9, { 0x95, 0xee, 0x42, 0xcf, 0x11, 0x8d, 0xef, 0x63 } };
+ 
+ static HRESULT WINAPI pm_QI(struct pmap *m, REFIID iid, void **out)
+ {
+     struct pmap_pair *pair = CONTAINING_RECORD(m->twin ? m->twin : m, struct pmap_pair, view);
+     if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) || IsEqualGUID(iid, &IID_IAgileObject)) { *out = m; return S_OK; }
+-    /* IMapView<String, StoreProduct> and IIterable<IKeyValuePair<String, StoreProduct>>, by their pinterface IIDs;
+-     * anything else (IL2CPP probes several interfaces) must fail rather than get one of these vtables */
+-    if (IsEqualGUID(iid, &iid_product_map_view)) { *out = &pair->view; return S_OK; }
+-    if (IsEqualGUID(iid, &iid_product_map_iterable)) { *out = &pair->iterable; return S_OK; }
++    /* IMapView<String, StoreProduct> and IIterable<IKeyValuePair<String, StoreProduct>>, by their pinterface IIDs,
++     * and the same for StoreLicense (AddOnLicenses, always empty); anything else (IL2CPP probes several
++     * interfaces) must fail rather than get one of these vtables */
++    if (IsEqualGUID(iid, &iid_product_map_view) || IsEqualGUID(iid, &iid_license_map_view)) { *out = &pair->view; return S_OK; }
++    if (IsEqualGUID(iid, &iid_product_map_iterable) || IsEqualGUID(iid, &iid_license_map_iterable)) { *out = &pair->iterable; return S_OK; }
+     TRACE("map view QI %s not supported\n", debugstr_guid(iid));
+     *out = NULL;
+     return E_NOINTERFACE;

@@ -1,0 +1,230 @@
+Subject: windows.media.playback.mediaplayer: IMediaPlayer3 and a MediaPlaybackSession
+
+diff --git a/dlls/windows.media.playback.mediaplayer/main.c b/dlls/windows.media.playback.mediaplayer/main.c
+index 4d0d966..d97e989 100644
+--- a/dlls/windows.media.playback.mediaplayer/main.c
++++ b/dlls/windows.media.playback.mediaplayer/main.c
+@@ -28,7 +28,14 @@ struct media_player
+ {
+     IMediaPlayer IMediaPlayer_iface;
+     IMediaPlayer2 IMediaPlayer2_iface;
++    struct { const void *const *lpVtbl; } player3;   /* IMediaPlayer3, declared below */
++    struct { const void *const *lpVtbl; } session;   /* MediaPlaybackSession, declared below */
++    struct { float x, y, width, height; } source_rect;
++    INT32 packing_mode;
+     LONG ref;
++    DOUBLE balance;
++    boolean real_time;
++    INT32 stereo_mode;
+ 
+     ISystemMediaTransportControls *controls;
+     HWND window;
+@@ -41,6 +48,13 @@ struct media_player
+     DOUBLE rate, volume;
+ };
+ 
++/* IMediaPlayer3 is not in the IDL (its types pull in much of Windows.Media), so it is declared
++ * here: 6/7 IsMutedChanged, 8/9 SourceChanged, 10/11 AudioBalance, 12/13 RealTimePlayback,
++ * 14/15 StereoscopicVideoRenderMode, 16 BreakManager, 17 CommandManager, 18/19 AudioDevice,
++ * 20/21 TimelineController, 22/23 TimelineControllerPositionOffset, 24 PlaybackSession,
++ * 25 StepForwardOneFrame, 26 StepBackwardOneFrame, 27 GetAsCastingSource. */
++static const GUID IID_IMediaPlayer3_local = { 0xee0660da, 0x031b, 0x4feb, { 0xbd, 0x9b, 0x92, 0xe0, 0xa0, 0xa8, 0xd2, 0x99 } };
++
+ static inline struct media_player *impl_from_IMediaPlayer( IMediaPlayer *iface )
+ {
+     return CONTAINING_RECORD( iface, struct media_player, IMediaPlayer_iface );
+@@ -69,6 +83,13 @@ static HRESULT WINAPI media_player_QueryInterface( IMediaPlayer *iface, REFIID i
+         return S_OK;
+     }
+ 
++    if (IsEqualGUID( iid, &IID_IMediaPlayer3_local ))
++    {
++        *out = &impl->player3;
++        IInspectable_AddRef( *out );
++        return S_OK;
++    }
++
+     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+     *out = NULL;
+     return E_NOINTERFACE;
+@@ -594,6 +615,170 @@ static const struct IMediaPlayer2Vtbl media_player2_vtbl =
+     media_player2_put_AudioDeviceType,
+ };
+ 
++/* ---- IMediaPlayer3 ---- */
++static inline struct media_player *impl_from_player3( void *iface )
++{
++    return CONTAINING_RECORD( iface, struct media_player, player3 );
++}
++static HRESULT WINAPI player3_QueryInterface( void *iface, REFIID iid, void **out )
++{
++    return IMediaPlayer_QueryInterface( &impl_from_player3( iface )->IMediaPlayer_iface, iid, out );
++}
++static ULONG WINAPI player3_AddRef( void *iface ) { return IMediaPlayer_AddRef( &impl_from_player3( iface )->IMediaPlayer_iface ); }
++static ULONG WINAPI player3_Release( void *iface ) { return IMediaPlayer_Release( &impl_from_player3( iface )->IMediaPlayer_iface ); }
++static HRESULT WINAPI player3_GetIids( void *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI player3_GetRuntimeClassName( void *iface, HSTRING *name )
++{
++    return WindowsCreateString( L"Windows.Media.Playback.MediaPlayer", 34, name );
++}
++static HRESULT WINAPI player3_GetTrustLevel( void *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI player3_add_event( void *iface, IUnknown *handler, EventRegistrationToken *token )
++{
++    /* IsMutedChanged and SourceChanged: muting and sources never change behind the app's back */
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
++    if (!handler || !token) return E_POINTER;
++    token->value = 0x6d70;
++    return S_OK;
++}
++static HRESULT WINAPI player3_remove_event( void *iface, EventRegistrationToken token ) { return S_OK; }
++static HRESULT WINAPI player3_get_AudioBalance( void *iface, DOUBLE *value ) { *value = impl_from_player3( iface )->balance; return S_OK; }
++static HRESULT WINAPI player3_put_AudioBalance( void *iface, DOUBLE value ) { impl_from_player3( iface )->balance = value; return S_OK; }
++static HRESULT WINAPI player3_get_RealTimePlayback( void *iface, boolean *value ) { *value = impl_from_player3( iface )->real_time; return S_OK; }
++static HRESULT WINAPI player3_put_RealTimePlayback( void *iface, boolean value ) { impl_from_player3( iface )->real_time = value; return S_OK; }
++static HRESULT WINAPI player3_get_StereoMode( void *iface, INT32 *value ) { *value = impl_from_player3( iface )->stereo_mode; return S_OK; }
++static HRESULT WINAPI player3_put_StereoMode( void *iface, INT32 value ) { impl_from_player3( iface )->stereo_mode = value; return S_OK; }
++static HRESULT WINAPI player3_get_object( void *iface, void **value )
++{
++    FIXME( "iface %p, value %p: not implemented.\n", iface, value );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI player3_put_object( void *iface, void *value )
++{
++    FIXME( "iface %p, value %p: ignored.\n", iface, value );
++    return S_OK;
++}
++static HRESULT WINAPI player3_get_TimelineControllerPositionOffset( void *iface, TimeSpan *value ) { value->Duration = 0; return S_OK; }
++static HRESULT WINAPI player3_put_TimelineControllerPositionOffset( void *iface, TimeSpan value ) { return S_OK; }
++static HRESULT WINAPI player3_get_PlaybackSession( void *iface, void **value )
++{
++    struct media_player *impl = impl_from_player3( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = &impl->session;
++    IMediaPlayer_AddRef( &impl->IMediaPlayer_iface );
++    return S_OK;
++}
++static HRESULT WINAPI player3_step( void *iface ) { return S_OK; }
++
++/* ---- MediaPlaybackSession (IMediaPlaybackSession, declared here like IMediaPlayer3): the player's
++ * own state seen through the session; nothing plays, so its events are never raised ---- */
++static const GUID IID_IMediaPlaybackSession_local = { 0xc32b683d, 0x0407, 0x41ba, { 0x89, 0x46, 0x8b, 0x34, 0x5a, 0x5a, 0x54, 0x35 } };
++
++static inline struct media_player *impl_from_session( void *iface )
++{
++    return CONTAINING_RECORD( iface, struct media_player, session );
++}
++static HRESULT WINAPI session_QueryInterface( void *iface, REFIID iid, void **out )
++{
++    struct media_player *impl = impl_from_session( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IMediaPlaybackSession_local ))
++    {
++        *out = iface;
++        IMediaPlayer_AddRef( &impl->IMediaPlayer_iface );
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI session_AddRef( void *iface ) { return IMediaPlayer_AddRef( &impl_from_session( iface )->IMediaPlayer_iface ); }
++static ULONG WINAPI session_Release( void *iface ) { return IMediaPlayer_Release( &impl_from_session( iface )->IMediaPlayer_iface ); }
++static HRESULT WINAPI session_GetRuntimeClassName( void *iface, HSTRING *name )
++{
++    return WindowsCreateString( L"Windows.Media.Playback.MediaPlaybackSession", 43, name );
++}
++static HRESULT WINAPI session_get_MediaPlayer( void *iface, IMediaPlayer **value )
++{
++    *value = &impl_from_session( iface )->IMediaPlayer_iface;
++    IMediaPlayer_AddRef( *value );
++    return S_OK;
++}
++static HRESULT WINAPI session_get_TimeSpan( void *iface, TimeSpan *value ) { value->Duration = 0; return S_OK; }
++static HRESULT WINAPI session_put_Position( void *iface, TimeSpan value ) { return S_OK; }
++static HRESULT WINAPI session_get_PlaybackState( void *iface, INT32 *value )
++{
++    /* MediaPlaybackState has MediaPlayerState's values without Closed's meaning and without Stopped */
++    MediaPlayerState state = impl_from_session( iface )->state;
++    *value = state == MediaPlayerState_Stopped ? 4 /* Paused */ : state == MediaPlayerState_Closed ? 0 /* None */ : state;
++    return S_OK;
++}
++static HRESULT WINAPI session_get_true( void *iface, boolean *value ) { *value = TRUE; return S_OK; }
++static HRESULT WINAPI session_get_false( void *iface, boolean *value ) { *value = FALSE; return S_OK; }
++static HRESULT WINAPI session_get_PlaybackRate( void *iface, DOUBLE *value ) { *value = impl_from_session( iface )->rate; return S_OK; }
++static HRESULT WINAPI session_put_PlaybackRate( void *iface, DOUBLE value ) { impl_from_session( iface )->rate = value; return S_OK; }
++static HRESULT WINAPI session_get_one( void *iface, DOUBLE *value ) { *value = 1.0; return S_OK; }
++static HRESULT WINAPI session_get_zero( void *iface, UINT32 *value ) { *value = 0; return S_OK; }
++static HRESULT WINAPI session_get_NormalizedSourceRect( void *iface, void *value )
++{
++    memcpy( value, &impl_from_session( iface )->source_rect, sizeof(impl_from_session( iface )->source_rect) );
++    return S_OK;
++}
++static HRESULT WINAPI session_put_NormalizedSourceRect( void *iface, const void *value )
++{
++    /* a Rect is passed by reference in the x64 calling convention */
++    memcpy( &impl_from_session( iface )->source_rect, value, sizeof(impl_from_session( iface )->source_rect) );
++    return S_OK;
++}
++static HRESULT WINAPI session_get_PackingMode( void *iface, INT32 *value ) { *value = impl_from_session( iface )->packing_mode; return S_OK; }
++static HRESULT WINAPI session_put_PackingMode( void *iface, INT32 value ) { impl_from_session( iface )->packing_mode = value; return S_OK; }
++
++static const void *const session_vtbl[] =
++{
++    session_QueryInterface, session_AddRef, session_Release,
++    player3_GetIids, session_GetRuntimeClassName, player3_GetTrustLevel,
++    /* PlaybackStateChanged, PlaybackRateChanged, SeekCompleted, BufferingStarted, BufferingEnded,
++     * BufferingProgressChanged, DownloadProgressChanged, NaturalDurationChanged, PositionChanged,
++     * NaturalVideoSizeChanged */
++    player3_add_event, player3_remove_event, player3_add_event, player3_remove_event,
++    player3_add_event, player3_remove_event, player3_add_event, player3_remove_event,
++    player3_add_event, player3_remove_event, player3_add_event, player3_remove_event,
++    player3_add_event, player3_remove_event, player3_add_event, player3_remove_event,
++    player3_add_event, player3_remove_event, player3_add_event, player3_remove_event,
++    session_get_MediaPlayer,
++    session_get_TimeSpan,                               /* NaturalDuration */
++    session_get_TimeSpan, session_put_Position,
++    session_get_PlaybackState,
++    session_get_true, session_get_true,                 /* CanSeek, CanPause */
++    session_get_false,                                  /* IsProtected */
++    session_get_PlaybackRate, session_put_PlaybackRate,
++    session_get_one, session_get_one,                   /* BufferingProgress, DownloadProgress */
++    session_get_zero, session_get_zero,                 /* NaturalVideoHeight, NaturalVideoWidth */
++    session_get_NormalizedSourceRect, session_put_NormalizedSourceRect,
++    session_get_PackingMode, session_put_PackingMode,
++};
++
++static const void *const player3_vtbl[] =
++{
++    player3_QueryInterface, player3_AddRef, player3_Release,
++    player3_GetIids, player3_GetRuntimeClassName, player3_GetTrustLevel,
++    player3_add_event, player3_remove_event,            /* IsMutedChanged */
++    player3_add_event, player3_remove_event,            /* SourceChanged */
++    player3_get_AudioBalance, player3_put_AudioBalance,
++    player3_get_RealTimePlayback, player3_put_RealTimePlayback,
++    player3_get_StereoMode, player3_put_StereoMode,
++    player3_get_object,                                 /* BreakManager */
++    player3_get_object,                                 /* CommandManager */
++    player3_get_object, player3_put_object,             /* AudioDevice */
++    player3_get_object, player3_put_object,             /* TimelineController */
++    player3_get_TimelineControllerPositionOffset, player3_put_TimelineControllerPositionOffset,
++    player3_get_PlaybackSession,
++    player3_step, player3_step,                         /* StepForwardOneFrame, StepBackwardOneFrame */
++    player3_get_object,                                 /* GetAsCastingSource */
++};
++
+ struct media_player_statics
+ {
+     IActivationFactory IActivationFactory_iface;
+@@ -709,6 +894,9 @@ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInsp
+ 
+     impl->IMediaPlayer_iface.lpVtbl = &media_player_vtbl;
+     impl->IMediaPlayer2_iface.lpVtbl = &media_player2_vtbl;
++    impl->player3.lpVtbl = player3_vtbl;
++    impl->session.lpVtbl = session_vtbl;
++    impl->source_rect.width = impl->source_rect.height = 1.0f;
+     impl->ref = 1;
+     InitializeCriticalSectionEx( &impl->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
+     impl->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": media_player.cs");

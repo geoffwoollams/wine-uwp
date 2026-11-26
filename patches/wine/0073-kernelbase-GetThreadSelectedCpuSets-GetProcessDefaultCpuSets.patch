@@ -1,0 +1,103 @@
+Subject: kernelbase: GetThreadSelectedCpuSets and GetProcessDefaultCpuSets (no CPU sets selected)
+
+diff --git a/dlls/kernel32/kernel32.spec b/dlls/kernel32/kernel32.spec
+index 199daae..3194e58 100644
+--- a/dlls/kernel32/kernel32.spec
++++ b/dlls/kernel32/kernel32.spec
+@@ -799,6 +799,7 @@
+ @ stdcall GetPrivateProfileStructW(wstr wstr ptr long wstr)
+ @ stdcall GetProcAddress(long str)
+ @ stdcall GetProcessAffinityMask(long ptr ptr)
++@ stdcall -import GetProcessDefaultCpuSets(ptr ptr long ptr)
+ @ stdcall GetProcessDEPPolicy(long ptr ptr)
+ @ stdcall GetProcessFlags(long)
+ @ stdcall -import GetProcessGroupAffinity(long ptr ptr)
+@@ -885,6 +886,7 @@
+ @ stdcall -import GetThreadPriority(long)
+ @ stdcall -import GetThreadPriorityBoost(long ptr)
+ @ stdcall GetThreadSelectorEntry(long long ptr)
++@ stdcall -import GetThreadSelectedCpuSets(ptr ptr long ptr)
+ @ stdcall -import GetThreadTimes(long ptr ptr ptr ptr)
+ @ stdcall -import GetThreadUILanguage()
+ @ stdcall GetTickCount()
+diff --git a/dlls/kernelbase/kernelbase.spec b/dlls/kernelbase/kernelbase.spec
+index 6768169..aa21d74 100644
+--- a/dlls/kernelbase/kernelbase.spec
++++ b/dlls/kernelbase/kernelbase.spec
+@@ -659,7 +659,7 @@
+ @ stdcall GetPrivateObjectSecurity(ptr long ptr long ptr)
+ @ stdcall GetProcAddress(long str)
+ # @ stub GetProcAddressForCaller
+-# @ stub GetProcessDefaultCpuSets
++@ stdcall GetProcessDefaultCpuSets(ptr ptr long ptr)
+ @ stdcall GetProcessGroupAffinity(long ptr ptr)
+ @ stdcall GetProcessHandleCount(long ptr)
+ @ stdcall -norelay GetProcessHeap() kernelbase_GetProcessHeap
+@@ -763,7 +763,7 @@
+ @ stdcall GetThreadPreferredUILanguages(long ptr ptr ptr)
+ @ stdcall GetThreadPriority(long)
+ @ stdcall GetThreadPriorityBoost(long ptr)
+-# @ stub GetThreadSelectedCpuSets
++@ stdcall GetThreadSelectedCpuSets(ptr ptr long ptr)
+ @ stdcall GetThreadTimes(long ptr ptr ptr ptr)
+ @ stdcall GetThreadUILanguage()
+ @ stdcall GetTickCount()
+diff --git a/dlls/kernelbase/memory.c b/dlls/kernelbase/memory.c
+index 1cce666..0947a97 100644
+--- a/dlls/kernelbase/memory.c
++++ b/dlls/kernelbase/memory.c
+@@ -1592,6 +1592,40 @@ BOOL WINAPI SetProcessDefaultCpuSets(HANDLE process, const ULONG *cpu_set_ids, U
+ }
+ 
+ 
++/* The Set functions above keep nothing, so no CPU sets are ever selected: threads and
++ * processes may run on any CPU, and the selection is empty. */
++static BOOL no_cpu_sets( ULONG *cpu_set_ids, ULONG count, ULONG *required )
++{
++    if (!required || (count && !cpu_set_ids))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    *required = 0;
++    return TRUE;
++}
++
++
++/***********************************************************************
++ *           GetThreadSelectedCpuSets   (kernelbase.@)
++ */
++BOOL WINAPI GetThreadSelectedCpuSets(HANDLE thread, ULONG *cpu_set_ids, ULONG count, ULONG *required)
++{
++    TRACE( "thread %p, cpu_set_ids %p, count %lu, required %p.\n", thread, cpu_set_ids, count, required );
++    return no_cpu_sets( cpu_set_ids, count, required );
++}
++
++
++/***********************************************************************
++ *           GetProcessDefaultCpuSets   (kernelbase.@)
++ */
++BOOL WINAPI GetProcessDefaultCpuSets(HANDLE process, ULONG *cpu_set_ids, ULONG count, ULONG *required)
++{
++    TRACE( "process %p, cpu_set_ids %p, count %lu, required %p.\n", process, cpu_set_ids, count, required );
++    return no_cpu_sets( cpu_set_ids, count, required );
++}
++
++
+ /**********************************************************************
+  *             GetNumaHighestNodeNumber   (kernelbase.@)
+  */
+diff --git a/include/winbase.h b/include/winbase.h
+index 749e5aa..2331f49 100644
+--- a/include/winbase.h
++++ b/include/winbase.h
+@@ -2085,7 +2085,9 @@ WINBASEAPI DWORD       WINAPI GetShortPathNameW(LPCWSTR,LPWSTR,DWORD);
+ WINBASEAPI VOID        WINAPI GetStartupInfoA(LPSTARTUPINFOA);
+ #define                       GetStartupInfo WINELIB_NAME_AW(GetStartupInfo)
+ WINBASEAPI HANDLE      WINAPI GetStdHandle(DWORD);
++WINBASEAPI BOOL        WINAPI GetProcessDefaultCpuSets(HANDLE,ULONG*,ULONG,ULONG*);
+ WINBASEAPI BOOL        WINAPI GetSystemCpuSetInformation(SYSTEM_CPU_SET_INFORMATION*,ULONG,ULONG*,HANDLE,ULONG);
++WINBASEAPI BOOL        WINAPI GetThreadSelectedCpuSets(HANDLE,ULONG*,ULONG,ULONG*);
+ WINBASEAPI BOOL        WINAPI GetSystemPowerStatus(LPSYSTEM_POWER_STATUS);
+ WINBASEAPI BOOL        WINAPI GetSystemRegistryQuota(PDWORD,PDWORD);
+ WINBASEAPI UINT        WINAPI GetSystemWindowsDirectoryA(LPSTR,UINT);

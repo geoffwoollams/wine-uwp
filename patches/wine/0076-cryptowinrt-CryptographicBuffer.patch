@@ -1,0 +1,314 @@
+Subject: cryptowinrt: implement CryptographicBuffer's hex, base64, string, byte array, compare and random methods
+
+diff --git a/dlls/cryptowinrt/main.c b/dlls/cryptowinrt/main.c
+index fad3666..a6899f7 100644
+--- a/dlls/cryptowinrt/main.c
++++ b/dlls/cryptowinrt/main.c
+@@ -23,6 +23,7 @@
+ 
+ #include "wine/debug.h"
+ #include "objbase.h"
++#include "roapi.h"
+ 
+ #include "bcrypt.h"
+ #include "wincrypt.h"
+@@ -135,22 +136,98 @@ static const struct IActivationFactoryVtbl cryptobuffer_factory_vtbl =
+     cryptobuffer_factory_ActivateInstance,
+ };
+ 
++/* the bytes of a buffer the app passed in; an empty buffer gives no bytes */
++static HRESULT buffer_bytes( IBuffer *buffer, BYTE **data, UINT32 *length )
++{
++    IBufferByteAccess *access;
++    HRESULT hr;
++
++    *data = NULL;
++    *length = 0;
++    if (!buffer) return E_INVALIDARG;
++    if (FAILED(hr = IBuffer_get_Length( buffer, length ))) return hr;
++    if (!*length) return S_OK;
++    if (FAILED(hr = IBuffer_QueryInterface( buffer, &IID_IBufferByteAccess, (void **)&access ))) return hr;
++    hr = IBufferByteAccess_Buffer( access, data );
++    IBufferByteAccess_Release( access );
++    return hr;
++}
++
++/* a new Windows.Storage.Streams.Buffer holding a copy of the given bytes */
++static HRESULT create_buffer( const void *data, UINT32 length, IBuffer **out )
++{
++    static const WCHAR class_name[] = L"Windows.Storage.Streams.Buffer";
++    IBufferFactory *factory;
++    IBuffer *buffer;
++    HSTRING str;
++    BYTE *bytes;
++    HRESULT hr;
++
++    *out = NULL;
++    if (FAILED(hr = WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, &str ))) return hr;
++    hr = RoGetActivationFactory( str, &IID_IBufferFactory, (void **)&factory );
++    WindowsDeleteString( str );
++    if (FAILED(hr)) return hr;
++    hr = IBufferFactory_Create( factory, length, &buffer );
++    IBufferFactory_Release( factory );
++    if (FAILED(hr)) return hr;
++
++    if (length)
++    {
++        UINT32 got;
++        if (SUCCEEDED(hr = IBuffer_put_Length( buffer, length )) && SUCCEEDED(hr = buffer_bytes( buffer, &bytes, &got )))
++            memcpy( bytes, data, length );
++        if (FAILED(hr))
++        {
++            IBuffer_Release( buffer );
++            return hr;
++        }
++    }
++    *out = buffer;
++    return S_OK;
++}
++
++static int hex_digit( WCHAR c )
++{
++    if (c >= '0' && c <= '9') return c - '0';
++    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
++    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
++    return -1;
++}
++
++
+ DEFINE_IINSPECTABLE(cryptobuffer_statics, ICryptographicBufferStatics, struct cryptobuffer_factory, IActivationFactory_iface);
+ 
+ static HRESULT STDMETHODCALLTYPE cryptobuffer_statics_Compare(
+         ICryptographicBufferStatics *iface, IBuffer *object1, IBuffer *object2, boolean *is_equal)
+ {
+-    FIXME("iface %p, object1 %p, object2 %p, is_equal %p stub!\n", iface, object1, object2, is_equal);
++    UINT32 length1 = 0, length2 = 0;
++    BYTE *data1 = NULL, *data2 = NULL;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, object1 %p, object2 %p, is_equal %p.\n", iface, object1, object2, is_equal);
++
++    if (!is_equal) return E_POINTER;
++    if (object1 && FAILED(hr = buffer_bytes(object1, &data1, &length1))) return hr;
++    if (object2 && FAILED(hr = buffer_bytes(object2, &data2, &length2))) return hr;
++    *is_equal = length1 == length2 && (!length1 || !memcmp(data1, data2, length1));
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE cryptobuffer_statics_GenerateRandom(
+         ICryptographicBufferStatics *iface, UINT32 length, IBuffer **buffer)
+ {
+-    FIXME("iface %p, length %u, buffer %p stub!\n", iface, length, buffer);
++    BYTE *data;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, length %u, buffer %p.\n", iface, length, buffer);
++
++    if (!buffer) return E_POINTER;
++    if (!(data = malloc(length ? length : 1))) return E_OUTOFMEMORY;
++    BCryptGenRandom(NULL, data, length, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
++    hr = create_buffer(data, length, buffer);
++    free(data);
++    return hr;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE cryptobuffer_statics_GenerateRandomNumber(
+@@ -165,41 +242,106 @@ static HRESULT STDMETHODCALLTYPE cryptobuffer_statics_GenerateRandomNumber(
+ static HRESULT STDMETHODCALLTYPE cryptobuffer_statics_CreateFromByteArray(
+         ICryptographicBufferStatics *iface, UINT32 value_size, BYTE *value, IBuffer **buffer)
+ {
+-    FIXME("iface %p, value_size %u, value %p, buffer %p stub!\n", iface, value_size, value, buffer);
++    TRACE("iface %p, value_size %u, value %p, buffer %p.\n", iface, value_size, value, buffer);
+ 
+-    return E_NOTIMPL;
++    if (!buffer) return E_POINTER;
++    if (value_size && !value) return E_INVALIDARG;
++    return create_buffer(value, value_size, buffer);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE cryptobuffer_statics_CopyToByteArray(
+         ICryptographicBufferStatics *iface, IBuffer *buffer, UINT32 *value_size, BYTE **value)
+ {
+-    FIXME("iface %p, buffer %p, value_size %p, value %p stub!\n", iface, buffer, value_size, value);
++    UINT32 length;
++    BYTE *data;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, buffer %p, value_size %p, value %p.\n", iface, buffer, value_size, value);
++
++    if (!value_size || !value) return E_POINTER;
++    *value_size = 0;
++    *value = NULL;
++    if (!buffer) return S_OK;
++    if (FAILED(hr = buffer_bytes(buffer, &data, &length))) return hr;
++    if (!length) return S_OK;
++    if (!(*value = CoTaskMemAlloc(length))) return E_OUTOFMEMORY;
++    memcpy(*value, data, length);
++    *value_size = length;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE cryptobuffer_statics_DecodeFromHexString(
+         ICryptographicBufferStatics *iface, HSTRING value, IBuffer **buffer)
+ {
+-    FIXME("iface %p, value %p, buffer %p stub!\n", iface, value, buffer);
++    UINT32 length, i;
++    const WCHAR *str = WindowsGetStringRawBuffer(value, &length);
++    BYTE *data;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, value %s, buffer %p.\n", iface, debugstr_hstring(value), buffer);
++
++    if (!buffer) return E_POINTER;
++    if (length % 2) return E_INVALIDARG;
++    if (!(data = malloc(length / 2 + 1))) return E_OUTOFMEMORY;
++    for (i = 0; i < length / 2; i++)
++    {
++        int high = hex_digit(str[2 * i]), low = hex_digit(str[2 * i + 1]);
++        if (high < 0 || low < 0)
++        {
++            free(data);
++            return E_INVALIDARG;
++        }
++        data[i] = high << 4 | low;
++    }
++    hr = create_buffer(data, length / 2, buffer);
++    free(data);
++    return hr;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE cryptobuffer_statics_EncodeToHexString(
+         ICryptographicBufferStatics *iface, IBuffer *buffer, HSTRING *value)
+ {
+-    FIXME("iface %p, buffer %p, value %p stub!\n", iface, buffer, value);
++    static const WCHAR digits[] = L"0123456789abcdef";
++    HSTRING_BUFFER str_buffer;
++    UINT32 length, i;
++    WCHAR *str;
++    BYTE *data;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, buffer %p, value %p.\n", iface, buffer, value);
++
++    if (!value) return E_POINTER;
++    if (!buffer) return WindowsCreateString(NULL, 0, value);
++    if (FAILED(hr = buffer_bytes(buffer, &data, &length))) return hr;
++    if (!length) return WindowsCreateString(NULL, 0, value);
++    if (FAILED(hr = WindowsPreallocateStringBuffer(length * 2, &str, &str_buffer))) return hr;
++    for (i = 0; i < length; i++)
++    {
++        str[2 * i] = digits[data[i] >> 4];
++        str[2 * i + 1] = digits[data[i] & 0xf];
++    }
++    return WindowsPromoteStringBuffer(str_buffer, value);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE cryptobuffer_statics_DecodeFromBase64String(
+         ICryptographicBufferStatics *iface, HSTRING value, IBuffer **buffer)
+ {
+-    FIXME("iface %p, value %p, buffer %p stub!\n", iface, value, buffer);
++    UINT32 length;
++    const WCHAR *str = WindowsGetStringRawBuffer(value, &length);
++    DWORD size = 0;
++    BYTE *data;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, value %s, buffer %p.\n", iface, debugstr_hstring(value), buffer);
++
++    if (!buffer) return E_POINTER;
++    if (!length) return create_buffer(NULL, 0, buffer);
++    if (!CryptStringToBinaryW(str, length, CRYPT_STRING_BASE64, NULL, &size, NULL, NULL)) return E_INVALIDARG;
++    if (!(data = malloc(size ? size : 1))) return E_OUTOFMEMORY;
++    if (!CryptStringToBinaryW(str, length, CRYPT_STRING_BASE64, data, &size, NULL, NULL)) hr = E_INVALIDARG;
++    else hr = create_buffer(data, size, buffer);
++    free(data);
++    return hr;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE cryptobuffer_statics_EncodeToBase64String(
+@@ -253,17 +395,75 @@ static HRESULT STDMETHODCALLTYPE cryptobuffer_statics_ConvertStringToBinary(
+         ICryptographicBufferStatics *iface, HSTRING value, BinaryStringEncoding encoding,
+         IBuffer **buffer)
+ {
+-    FIXME("iface %p, value %p, encoding %d, buffer %p stub!\n", iface, value, encoding, buffer);
++    UINT32 length, i;
++    const WCHAR *str = WindowsGetStringRawBuffer(value, &length);
++    BYTE *data;
++    int size;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, value %s, encoding %d, buffer %p.\n", iface, debugstr_hstring(value), encoding, buffer);
++
++    if (!buffer) return E_POINTER;
++    switch (encoding)
++    {
++    case BinaryStringEncoding_Utf8:
++        size = WideCharToMultiByte(CP_UTF8, 0, str, length, NULL, 0, NULL, NULL);
++        if (!(data = malloc(size + 1))) return E_OUTOFMEMORY;
++        WideCharToMultiByte(CP_UTF8, 0, str, length, (char *)data, size, NULL, NULL);
++        break;
++    case BinaryStringEncoding_Utf16LE:
++    case BinaryStringEncoding_Utf16BE:
++        size = length * sizeof(WCHAR);
++        if (!(data = malloc(size + 1))) return E_OUTOFMEMORY;
++        for (i = 0; i < length; i++)
++        {
++            BYTE low = str[i] & 0xff, high = str[i] >> 8;
++            data[2 * i] = encoding == BinaryStringEncoding_Utf16LE ? low : high;
++            data[2 * i + 1] = encoding == BinaryStringEncoding_Utf16LE ? high : low;
++        }
++        break;
++    default:
++        return E_INVALIDARG;
++    }
++    hr = create_buffer(data, size, buffer);
++    free(data);
++    return hr;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE cryptobuffer_statics_ConvertBinaryToString(
+         ICryptographicBufferStatics *iface, BinaryStringEncoding encoding, IBuffer *buffer, HSTRING *value)
+ {
+-    FIXME("iface %p, encoding %d, buffer %p, value %p stub!\n", iface, encoding, buffer, value);
++    HSTRING_BUFFER str_buffer;
++    UINT32 length, count, i;
++    WCHAR *str;
++    BYTE *data;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, encoding %d, buffer %p, value %p.\n", iface, encoding, buffer, value);
++
++    if (!value) return E_POINTER;
++    if (FAILED(hr = buffer_bytes(buffer, &data, &length))) return hr;
++    if (!length) return WindowsCreateString(NULL, 0, value);
++    switch (encoding)
++    {
++    case BinaryStringEncoding_Utf8:
++        if (!(count = MultiByteToWideChar(CP_UTF8, 0, (const char *)data, length, NULL, 0))) return E_INVALIDARG;
++        if (FAILED(hr = WindowsPreallocateStringBuffer(count, &str, &str_buffer))) return hr;
++        MultiByteToWideChar(CP_UTF8, 0, (const char *)data, length, str, count);
++        break;
++    case BinaryStringEncoding_Utf16LE:
++    case BinaryStringEncoding_Utf16BE:
++        if (length % 2) return E_INVALIDARG;
++        count = length / 2;
++        if (FAILED(hr = WindowsPreallocateStringBuffer(count, &str, &str_buffer))) return hr;
++        for (i = 0; i < count; i++)
++            str[i] = encoding == BinaryStringEncoding_Utf16LE ? data[2 * i] | data[2 * i + 1] << 8
++                                                             : data[2 * i] << 8 | data[2 * i + 1];
++        break;
++    default:
++        return E_INVALIDARG;
++    }
++    return WindowsPromoteStringBuffer(str_buffer, value);
+ }
+ 
+ static const struct ICryptographicBufferStaticsVtbl cryptobuffer_statics_vtbl =

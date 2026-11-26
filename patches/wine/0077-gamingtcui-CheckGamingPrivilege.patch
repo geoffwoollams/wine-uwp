@@ -1,0 +1,109 @@
+Subject: gamingtcui: CheckGamingPrivilege functions grant every privilege
+
+diff --git a/dlls/gamingtcui/Makefile.in b/dlls/gamingtcui/Makefile.in
+index 28239be..5011a2a 100644
+--- a/dlls/gamingtcui/Makefile.in
++++ b/dlls/gamingtcui/Makefile.in
+@@ -1,4 +1,5 @@
+-MODULE = gamingtcui.dll
++MODULE  = gamingtcui.dll
++IMPORTS = combase
+ 
+ SOURCES = \
+ 	gamingtcui_main.c
+diff --git a/dlls/gamingtcui/gamingtcui.spec b/dlls/gamingtcui/gamingtcui.spec
+index a0c2d52..91cc116 100644
+--- a/dlls/gamingtcui/gamingtcui.spec
++++ b/dlls/gamingtcui/gamingtcui.spec
+@@ -1,7 +1,7 @@
+-@ stub CheckGamingPrivilegeSilently
+-@ stub CheckGamingPrivilegeSilentlyForUser
+-@ stub CheckGamingPrivilegeWithUI
+-@ stub CheckGamingPrivilegeWithUIForUser
++@ stdcall CheckGamingPrivilegeSilently(long ptr ptr ptr)
++@ stdcall CheckGamingPrivilegeSilentlyForUser(ptr long ptr ptr ptr)
++@ stdcall CheckGamingPrivilegeWithUI(long ptr ptr ptr ptr ptr)
++@ stdcall CheckGamingPrivilegeWithUIForUser(ptr long ptr ptr ptr ptr ptr)
+ @ stdcall ProcessPendingGameUI(long)
+ @ stub ShowChangeFriendRelationshipUI
+ @ stub ShowChangeFriendRelationshipUIForUser
+diff --git a/dlls/gamingtcui/gamingtcui_main.c b/dlls/gamingtcui/gamingtcui_main.c
+index 7c51c28..ffee843 100644
+--- a/dlls/gamingtcui/gamingtcui_main.c
++++ b/dlls/gamingtcui/gamingtcui_main.c
+@@ -21,12 +21,49 @@
+ 
+ #include "windef.h"
+ #include "winbase.h"
++#include "winstring.h"
+ #include "gamingtcui.h"
+ 
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(gamingtcui);
+ 
++/* The offline Xbox user has every privilege (multiplayer, content and so on): what needs a
++ * connection then fails as offline, the way it does for a signed-in player without one. */
++HRESULT WINAPI CheckGamingPrivilegeSilently(UINT32 privilege_id, HSTRING scope, HSTRING policy, BOOL *has_privilege)
++{
++    FIXME("privilege_id %u, scope %s, policy %s, has_privilege %p: granted.\n", privilege_id,
++            debugstr_hstring(scope), debugstr_hstring(policy), has_privilege);
++
++    if (!has_privilege) return E_POINTER;
++    *has_privilege = TRUE;
++    return S_OK;
++}
++
++HRESULT WINAPI CheckGamingPrivilegeSilentlyForUser(IInspectable *user, UINT32 privilege_id, HSTRING scope, HSTRING policy,
++        BOOL *has_privilege)
++{
++    return CheckGamingPrivilegeSilently(privilege_id, scope, policy, has_privilege);
++}
++
++HRESULT WINAPI CheckGamingPrivilegeWithUI(UINT32 privilege_id, HSTRING scope, HSTRING policy, HSTRING friendly_message,
++        GameUICompletionRoutine completion_routine, void *context)
++{
++    FIXME("privilege_id %u, scope %s, policy %s, friendly_message %s, completion_routine %p, context %p: granted.\n",
++            privilege_id, debugstr_hstring(scope), debugstr_hstring(policy), debugstr_hstring(friendly_message),
++            completion_routine, context);
++
++    if (completion_routine)
++        completion_routine(S_OK, context);
++    return S_OK;
++}
++
++HRESULT WINAPI CheckGamingPrivilegeWithUIForUser(IInspectable *user, UINT32 privilege_id, HSTRING scope, HSTRING policy,
++        HSTRING friendly_message, GameUICompletionRoutine completion_routine, void *context)
++{
++    return CheckGamingPrivilegeWithUI(privilege_id, scope, policy, friendly_message, completion_routine, context);
++}
++
+ HRESULT WINAPI ProcessPendingGameUI(BOOL wait_for_completion)
+ {
+     FIXME("wait_for_completion %#x stub.\n", wait_for_completion);
+diff --git a/include/gamingtcui.h b/include/gamingtcui.h
+index 87aa5f5..31d520a 100644
+--- a/include/gamingtcui.h
++++ b/include/gamingtcui.h
+@@ -22,6 +22,7 @@
+ 
+ #include <windows.h>
+ #include <hstring.h>
++#include <inspectable.h>
+ 
+ #ifdef __cplusplus
+ extern "C"
+@@ -32,6 +33,13 @@ typedef void (WINAPI *GameUICompletionRoutine)(HRESULT return_code, void *contex
+ typedef void (WINAPI *PlayerPickerUICompletionRoutine)(HRESULT return_code, void *context,
+         const HSTRING *selected_xuids, size_t count);
+ 
++HRESULT WINAPI CheckGamingPrivilegeSilently(UINT32 privilege_id, HSTRING scope, HSTRING policy, BOOL *has_privilege);
++HRESULT WINAPI CheckGamingPrivilegeSilentlyForUser(IInspectable *user, UINT32 privilege_id, HSTRING scope, HSTRING policy,
++        BOOL *has_privilege);
++HRESULT WINAPI CheckGamingPrivilegeWithUI(UINT32 privilege_id, HSTRING scope, HSTRING policy, HSTRING friendly_message,
++        GameUICompletionRoutine completion_routine, void *context);
++HRESULT WINAPI CheckGamingPrivilegeWithUIForUser(IInspectable *user, UINT32 privilege_id, HSTRING scope, HSTRING policy,
++        HSTRING friendly_message, GameUICompletionRoutine completion_routine, void *context);
+ HRESULT WINAPI ProcessPendingGameUI(BOOL wait_for_completion);
+ HRESULT WINAPI ShowPlayerPickerUI(HSTRING prompt_display_text, const HSTRING *xuids, size_t xuid_count,
+         const HSTRING *preselected_xuids, size_t preselected_xuid_count, size_t min_selection_count,
