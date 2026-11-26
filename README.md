@@ -96,7 +96,7 @@ An app whose package folder has moved or is gone is skipped with a warning. Set 
 
 ## XAML apps
 
-Wine has no `Windows.UI.Xaml`, the UI framework most non-game UWP apps are built on. This project adds a **partial** implementation, in stages; what works so far is listed below, and [docs/xaml-plan.md](docs/xaml-plan.md) has the plan, the evidence behind it and estimates.
+Wine has no `Windows.UI.Xaml`, the UI framework most non-game UWP apps are built on. This project adds a **partial** implementation, in stages; what works so far is listed below.
 
 **Milestone 1 (done): code-only XAML apps.** `Application.Start`, an app's own `App` class deriving from `Application` (with `OnLaunched` called on launch), `Application.Current`, `RequestedTheme` (light or dark background), `Window.Current` (`Content`, `Activate`, `Bounds`, `Dispatcher`, `Close`), and a `TextBlock` (`Text`, `FontSize`, `FontWeight`, `FontStyle`, `Foreground`, `TextWrapping`, `TextAlignment`, `Padding`) with `Margin`, `Width`/`Height` and alignment, drawn in the CoreWindow. Brushes are `SolidColorBrush` only. Rendering is GDI, so text is anti-aliased but there are no transforms or opacity yet.
 
@@ -130,7 +130,7 @@ Wine has no `Windows.UI.Xaml`, the UI framework most non-game UWP apps are built
 
 **Milestone 5, part 5b (done): command bars.** `CommandBar` with primary commands, a "..." overflow menu of secondary commands and light dismiss, `AppBarButton`, `AppBarToggleButton`, `AppBarSeparator`, `SymbolIcon` and `FontIcon` (Segoe MDL2 Assets glyphs, or Unicode stand-ins without that font), and `Page.TopAppBar`/`BottomAppBar`. That completes milestone 5.
 
-**Not yet:** flyouts, menus and the rest of milestone 6, `x:Bind` beyond what its generated code calls, localized `x:Uid` strings and navigation history. Real Store apps will still often stop or look wrong where they need these; see [docs/xaml-plan.md](docs/xaml-plan.md).
+**Not yet:** flyouts, menus and the rest of milestone 6, `x:Bind` beyond what its generated code calls, localized `x:Uid` strings and navigation history. Real Store apps will still often stop or look wrong where they need these.
 
 To try it, build the test clients and run them in a throwaway prefix (each opens a window for a few seconds and checks what was drawn):
 
@@ -226,9 +226,12 @@ The archive contains the Wine install tree, `dxgi.dll`, the four component DLLs 
 
 Everything in a release is free software, and a release contains no Microsoft software and no app files. The VC++ UWP runtime comes from your own `Microsoft.VCLibs` package at setup time and is never redistributed here.
 
+This repository is licensed under the **GNU LGPL 2.1 or later**, the same as Wine ([LICENCE](LICENCE)), except the DXVK patch, which is zlib like DXVK. You can use, change and share the patches, scripts and tests under those terms.
+
 | Part | Licence |
 |---|---|
 | Wine and the patches in `patches/wine/` | LGPL 2.1 or later |
+| The scripts, tests, docker files and app settings in this repository | LGPL 2.1 or later |
 | DXVK `dxgi.dll` and the patch in `patches/dxvk/` | zlib |
 | vkd3d-proton `d3d12.dll`, `d3d12core.dll` and Wine's `wintypes.dll`, `windows.storage.dll` (from GE-Proton) | LGPL 2.1 or later |
 
@@ -266,5 +269,4 @@ scripts/        fetch-release.sh, build-wine.sh, build-dxvk.sh, setup-prefix.sh,
                 xbf.py (dump compiled XAML, or compile test XAML)
 tests/xaml/     the XAML test clients (build.sh, run.sh): xamlhello (milestone 1), xamllayout (milestone 2),
                 xamlmarkup + markup/ (milestones 3 and 4)
-docs/           xaml-plan.md
 ```
