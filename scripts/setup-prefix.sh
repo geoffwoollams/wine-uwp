@@ -1,6 +1,6 @@
 #!/bin/bash
 # Creates the shared Wine prefix (once) and links one unpacked UWP package into it. The package folder is never modified.
-# Usage: scripts/setup-prefix.sh /path/to/package-folder [--vclibs /path/to/Microsoft.VCLibs.140.00_..._x64.appx|folder] [--skip-verify]
+# Usage: scripts/setup-prefix.sh /path/to/package-folder [--vclibs /path/to/Microsoft.VCLibs.140.00_..._x64.appx|folder] [--verify]
 #        [--shortcut | --no-shortcut]
 #        scripts/setup-prefix.sh --update-all
 # Run it again for each app; they share the prefix. It offers to add a launcher (a .desktop file with the app's icon) to
@@ -10,11 +10,12 @@
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
 
-PKG_DIR="" VCLIBS="" VERIFY=1 SHORTCUT=ask UPDATE_ALL=0
+PKG_DIR="" VCLIBS="" VERIFY=0 SHORTCUT=ask UPDATE_ALL=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --vclibs) VCLIBS="$2"; shift 2 ;;
-        --skip-verify) VERIFY=0; shift ;;
+        --verify) VERIFY=1; shift ;;      # check every file against AppxBlockMap.xml first
+        --skip-verify) VERIFY=0; shift ;; # the default now; still accepted
         --shortcut) SHORTCUT=yes; shift ;;
         --no-shortcut) SHORTCUT=no; shift ;;
         --update-all) UPDATE_ALL=1; shift ;;
@@ -42,13 +43,13 @@ if [ "$UPDATE_ALL" = 1 ]; then
             continue
         fi
         info "Updating $name from $src"
-        args=("$src" --skip-verify --no-shortcut)
+        args=("$src" --no-shortcut)
         [ -n "$vcl" ] && [ -e "$vcl" ] && args+=(--vclibs "$vcl")
         "$0" "${args[@]}" || { echo "warning: updating $name failed" >&2; failed=1; }
     done
     exit $failed
 fi
-[ -n "$PKG_DIR" ] || die "usage: $0 /path/to/package-folder [--vclibs path] [--skip-verify] [--shortcut | --no-shortcut], or $0 --update-all"
+[ -n "$PKG_DIR" ] || die "usage: $0 /path/to/package-folder [--vclibs path] [--verify] [--shortcut | --no-shortcut], or $0 --update-all"
 [ -x "$WINE_ROOT/bin/wine" ] || die "patched Wine not found in $WINE_ROOT: run scripts/fetch-release.sh or scripts/build-wine.sh first"
 [ -f "$DXVK_DXGI" ] || die "patched dxgi.dll not found at $DXVK_DXGI: run scripts/fetch-release.sh or scripts/build-dxvk.sh first"
 IFS=$'\t' read -r PKG_NAME PKG_EXE < <(python3 -I "$REPO/scripts/uwptool.py" info "$PKG_DIR")
@@ -72,7 +73,7 @@ if [ -z "$VCLIBS" ]; then
 fi
 
 if [ "$VERIFY" = 1 ]; then
-    info "Verifying files against AppxBlockMap.xml (a few minutes for a large app; --skip-verify to skip)"
+    info "Verifying files against AppxBlockMap.xml (a few minutes for a large app)"
     python3 -I "$REPO/scripts/uwptool.py" verify "$PKG_DIR" || die "package files do not match the package's hash list"
 fi
 

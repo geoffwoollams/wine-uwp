@@ -60,7 +60,7 @@ scripts/setup-prefix.sh "/path/to/package-folder"
 scripts/setup-prefix.sh "/path/to/package-folder" --vclibs /path/to/Microsoft.VCLibs.140.00_..._x64.appx
 ```
 
-This checks every file against the hashes in `AppxBlockMap.xml` (a few minutes for a big app; `--skip-verify` skips it), creates the shared Wine prefix on first use, and links the package into it as `C:\UWP\<package name>`. The package folder is never modified. Run it again for each further app; they share the prefix.
+This creates the shared Wine prefix on first use, and links the package into it as `C:\UWP\<package name>`. The package folder is never modified. Run it again for each further app; they share the prefix. Add `--verify` to first check every file against the hashes in `AppxBlockMap.xml`, which catches a damaged or incomplete copy (a few minutes for a big app).
 
 At the end it asks whether to **add a launcher** for the app: a `.desktop` file in your applications menu (`~/.local/share/applications/wine-uwp-<package name>.desktop`) and a copy on your desktop, with the app's own icon taken from its package. Pass `--shortcut` to add it without asking, or `--no-shortcut` to skip the question, for example in scripts. To remove a launcher, delete those two files.
 
@@ -84,7 +84,7 @@ git pull
 scripts/fetch-release.sh
 ```
 
-After unpacking the new build, `fetch-release.sh` sets up every app already in the prefix again, with `setup-prefix.sh --update-all`. That copies in the new `dxgi.dll` and D3D12 DLLs, registers the WinRT classes the new build adds, and relinks each package from the folder it was set up from. It skips the file check and the launcher question; your saves, settings and launchers are kept. If you build from source instead, run it yourself after `build-wine.sh`:
+After unpacking the new build, `fetch-release.sh` sets up every app already in the prefix again, with `setup-prefix.sh --update-all`. That copies in the new `dxgi.dll` and D3D12 DLLs, registers the WinRT classes the new build adds, and relinks each package from the folder it was set up from. It doesn't ask the launcher question; your saves, settings and launchers are kept. If you build from source instead, run it yourself after `build-wine.sh`:
 
 ```bash
 scripts/setup-prefix.sh --update-all
@@ -157,7 +157,7 @@ Local files and settings are written where Windows would put them, inside the pr
 
 ## Example: Halo Wars 2
 
-Package `Microsoft.HoganThreshold` 1.11.2931.2, x64, DirectX 12, a native C++/CX game. The game files are used exactly as shipped; `setup-prefix.sh` verifies all of them against `AppxBlockMap.xml` and refuses to continue if any differ.
+Package `Microsoft.HoganThreshold` 1.11.2931.2, x64, DirectX 12, a native C++/CX game. The game files are used exactly as shipped; `setup-prefix.sh --verify` checks all of them against `AppxBlockMap.xml` and refuses to continue if any differ.
 
 ```bash
 scripts/setup-prefix.sh "/path/to/Halo Wars 2"
