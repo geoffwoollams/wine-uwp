@@ -40,6 +40,9 @@ RC=$?
 wineserver -w   # let the prefix shut down first, so the exit line is the log's last
 echo "=== process exited with status $RC at $(date +%T) ===" >> "$LOG"
 [ -f "$PREFIX/drive_c/crash.txt" ] && cp "$PREFIX/drive_c/crash.txt" "${LOG%.log}.crash.txt"
-ls -1t "$LOGS"/run-*.log 2>/dev/null | tail -n +9 | xargs -r rm -f
-ls -1t "$LOGS"/run-*.crash.txt 2>/dev/null | tail -n +9 | xargs -r rm -f
+# keep the newest 8 logs and backtraces. Not "ls -1t pattern": with nullglob (set above), a pattern matching nothing
+# leaves a bare ls of the current directory, the app's folder, and that removed its package links.
+prune() { find "$LOGS" -maxdepth 1 -type f -name "$1" -printf '%T@ %p\n' | sort -rn | tail -n +9 | cut -d' ' -f2- | xargs -r -d '\n' rm -f --; }
+prune 'run-*.log'
+prune 'run-*.crash.txt'
 exit $RC
