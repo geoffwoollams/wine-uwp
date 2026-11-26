@@ -284,7 +284,7 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 for Crackdown 3: CPU set queries, DisplayInformation 3 and 4, the add-on licence map,
                 GameChatOverlay, CryptographicBuffer, gaming privilege checks, IMediaPlayer3 and
                 MediaPlaybackSession, 0079 AcceleratorKeyActivated (Unreal Engine's game keys) and CoreWindow key
-                state from any thread
+                state from any thread, 0080 the *FromApp file functions (Microsoft Sudoku)
 patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings

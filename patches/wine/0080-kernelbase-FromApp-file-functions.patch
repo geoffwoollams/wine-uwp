@@ -1,0 +1,194 @@
+Subject: kernelbase: the *FromApp file functions (CreateFileFromAppW and the rest of api-ms-win-core-file-fromapp)
+
+diff --git a/dlls/kernelbase/file.c b/dlls/kernelbase/file.c
+index 7b0f0a6..8a69135 100644
+--- a/dlls/kernelbase/file.c
++++ b/dlls/kernelbase/file.c
+@@ -4736,3 +4736,101 @@ HRESULT WINAPI QueryIoRingCapabilities(IORING_CAPABILITIES *caps)
+ 
+     return E_NOTIMPL;
+ }
++
++
++/***********************************************************************
++ * The *FromApp file functions: the usual file functions with the checks Windows makes for
++ * app-container processes, which don't apply here (apps run with the user's own access).
++ */
++
++/***********************************************************************
++ *           CopyFileFromAppW   (kernelbase.@)
++ */
++BOOL WINAPI CopyFileFromAppW( const WCHAR *source, const WCHAR *dest, BOOL fail_if_exists )
++{
++    return CopyFileExW( source, dest, NULL, NULL, NULL, fail_if_exists ? COPY_FILE_FAIL_IF_EXISTS : 0 );
++}
++
++/***********************************************************************
++ *           CreateDirectoryFromAppW   (kernelbase.@)
++ */
++BOOL WINAPI CreateDirectoryFromAppW( const WCHAR *path, SECURITY_ATTRIBUTES *sa )
++{
++    return CreateDirectoryW( path, sa );
++}
++
++/***********************************************************************
++ *           CreateFileFromAppW   (kernelbase.@)
++ */
++HANDLE WINAPI CreateFileFromAppW( const WCHAR *name, DWORD access, DWORD sharing, SECURITY_ATTRIBUTES *sa,
++                                  DWORD creation, DWORD attributes, HANDLE template )
++{
++    return CreateFileW( name, access, sharing, sa, creation, attributes, template );
++}
++
++/***********************************************************************
++ *           CreateFile2FromAppW   (kernelbase.@)
++ */
++HANDLE WINAPI CreateFile2FromAppW( const WCHAR *name, DWORD access, DWORD sharing, DWORD creation,
++                                   CREATEFILE2_EXTENDED_PARAMETERS *params )
++{
++    return CreateFile2( name, access, sharing, creation, params );
++}
++
++/***********************************************************************
++ *           DeleteFileFromAppW   (kernelbase.@)
++ */
++BOOL WINAPI DeleteFileFromAppW( const WCHAR *path )
++{
++    return DeleteFileW( path );
++}
++
++/***********************************************************************
++ *           FindFirstFileExFromAppW   (kernelbase.@)
++ */
++HANDLE WINAPI FindFirstFileExFromAppW( const WCHAR *filename, FINDEX_INFO_LEVELS level, void *data,
++                                       FINDEX_SEARCH_OPS search_op, void *filter, DWORD flags )
++{
++    return FindFirstFileExW( filename, level, data, search_op, filter, flags );
++}
++
++/***********************************************************************
++ *           GetFileAttributesExFromAppW   (kernelbase.@)
++ */
++BOOL WINAPI GetFileAttributesExFromAppW( const WCHAR *name, GET_FILEEX_INFO_LEVELS level, void *ptr )
++{
++    return GetFileAttributesExW( name, level, ptr );
++}
++
++/***********************************************************************
++ *           MoveFileFromAppW   (kernelbase.@)
++ */
++BOOL WINAPI MoveFileFromAppW( const WCHAR *source, const WCHAR *dest )
++{
++    return MoveFileExW( source, dest, MOVEFILE_COPY_ALLOWED );
++}
++
++/***********************************************************************
++ *           RemoveDirectoryFromAppW   (kernelbase.@)
++ */
++BOOL WINAPI RemoveDirectoryFromAppW( const WCHAR *path )
++{
++    return RemoveDirectoryW( path );
++}
++
++/***********************************************************************
++ *           ReplaceFileFromAppW   (kernelbase.@)
++ */
++BOOL WINAPI ReplaceFileFromAppW( const WCHAR *replaced, const WCHAR *replacement, const WCHAR *backup,
++                                 DWORD flags, void *exclude, void *reserved )
++{
++    return ReplaceFileW( replaced, replacement, backup, flags, exclude, reserved );
++}
++
++/***********************************************************************
++ *           SetFileAttributesFromAppW   (kernelbase.@)
++ */
++BOOL WINAPI SetFileAttributesFromAppW( const WCHAR *name, DWORD attributes )
++{
++    return SetFileAttributesW( name, attributes );
++}
+diff --git a/dlls/kernelbase/kernelbase.spec b/dlls/kernelbase/kernelbase.spec
+index aa21d74..5843573 100644
+--- a/dlls/kernelbase/kernelbase.spec
++++ b/dlls/kernelbase/kernelbase.spec
+@@ -172,6 +172,7 @@
+ @ stdcall CopyContext(ptr long ptr)
+ @ stdcall CopyFile2(wstr wstr ptr)
+ @ stdcall CopyFileExW(wstr wstr ptr ptr ptr long)
++@ stdcall CopyFileFromAppW(wstr wstr long)
+ @ stdcall CopyFileW(wstr wstr long)
+ @ stdcall -arch=x86_64 CopyMemoryNonTemporal(ptr ptr long) ntdll.RtlCopyMemoryNonTemporal
+ @ stdcall CopySid(long ptr ptr)
+@@ -182,6 +183,7 @@
+ @ stdcall CreateConsoleScreenBuffer(long long ptr long ptr)
+ @ stdcall CreateDirectoryA(str ptr)
+ @ stdcall CreateDirectoryExW(wstr wstr ptr)
++@ stdcall CreateDirectoryFromAppW(wstr ptr)
+ @ stdcall CreateDirectoryW(wstr ptr)
+ # @ stub CreateEnclave
+ @ stdcall CreateEventA(ptr long long str)
+@@ -191,7 +193,9 @@
+ @ stdcall CreateFiber(long ptr ptr)
+ @ stdcall CreateFiberEx(long long long ptr ptr)
+ @ stdcall CreateFile2(wstr long long long ptr)
++@ stdcall CreateFile2FromAppW(wstr long long long ptr)
+ @ stdcall CreateFileA(str long long ptr long long long)
++@ stdcall CreateFileFromAppW(wstr long long ptr long long long)
+ @ stdcall CreateFileMapping2(long ptr long long long int64 wstr ptr long)
+ @ stdcall CreateFileMappingFromApp(long ptr long int64 wstr)
+ @ stdcall CreateFileMappingNumaW(long ptr long long long wstr long)
+@@ -244,6 +248,7 @@
+ @ stdcall CtrlRoutine(ptr)
+ # @ stub CveEventWrite
+ @ stdcall DeactivateActCtx(long long)
++@ stdcall DeleteFileFromAppW(wstr)
+ @ stdcall DeriveCapabilitySidsFromName(ptr ptr ptr ptr ptr)
+ @ stdcall DebugActiveProcess(long)
+ @ stdcall DebugActiveProcessStop(long)
+@@ -366,6 +371,7 @@
+ @ stdcall FindFirstChangeNotificationW(wstr long long)
+ @ stdcall FindFirstFileA(str ptr)
+ @ stdcall FindFirstFileExA(str long ptr long ptr long)
++@ stdcall FindFirstFileExFromAppW(wstr long ptr long ptr long)
+ @ stdcall FindFirstFileExW(wstr long ptr long ptr long)
+ @ stdcall FindFirstFileNameW(wstr long ptr ptr)
+ @ stdcall FindFirstFileW(wstr ptr)
+@@ -540,6 +546,7 @@
+ @ stub GetFallbackDisplayName
+ @ stdcall GetFileAttributesA(str)
+ @ stdcall GetFileAttributesExA(str long ptr)
++@ stdcall GetFileAttributesExFromAppW(wstr long ptr)
+ @ stdcall GetFileAttributesExW(wstr long ptr)
+ @ stdcall GetFileAttributesW(wstr)
+ @ stdcall GetFileInformationByHandle(long ptr)
+@@ -1000,6 +1007,7 @@
+ @ stdcall MapViewOfFileExNuma(long long long long long ptr long)
+ @ stdcall MapViewOfFileFromApp(long long int64 long)
+ @ stdcall MoveFileExW(wstr wstr long)
++@ stdcall MoveFileFromAppW(wstr wstr)
+ # @ stub MoveFileWithProgressTransactedW
+ @ stdcall MoveFileWithProgressW(wstr wstr ptr ptr long)
+ @ stdcall MulDiv(long long long)
+@@ -1281,6 +1289,7 @@
+ # @ stub QuirkIsEnabledForProcess
+ @ stdcall RaiseException(long long long ptr)
+ @ stdcall RaiseFailFastException(ptr ptr long)
++@ stdcall RemoveDirectoryFromAppW(wstr)
+ @ stdcall ReOpenFile(ptr long long long)
+ @ stdcall ReadConsoleA(long ptr long ptr ptr)
+ @ stdcall ReadConsoleInputA(long ptr long ptr)
+@@ -1388,6 +1397,7 @@
+ @ stdcall RemoveVectoredContinueHandler(ptr) ntdll.RtlRemoveVectoredContinueHandler
+ @ stdcall RemoveVectoredExceptionHandler(ptr) ntdll.RtlRemoveVectoredExceptionHandler
+ # @ stub ReplaceFileExInternal
++@ stdcall ReplaceFileFromAppW(wstr wstr wstr long ptr ptr)
+ @ stdcall ReplaceFileW(wstr wstr wstr long ptr ptr)
+ @ stdcall ResetEvent(long)
+ # @ stub ResetState
+@@ -1400,6 +1410,7 @@
+ @ stdcall ResumeThread(long)
+ @ stdcall RevertToSelf()
+ # @ stub RsopLoggingEnabledInternal
++@ stdcall SetFileAttributesFromAppW(wstr long)
+ # @ stub SHCoCreateInstance
+ @ stdcall SHExpandEnvironmentStringsA(str ptr long) ExpandEnvironmentStringsA
+ @ stdcall SHExpandEnvironmentStringsW(wstr ptr long) ExpandEnvironmentStringsW
