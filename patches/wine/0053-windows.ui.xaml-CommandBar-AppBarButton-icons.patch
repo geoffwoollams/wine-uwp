@@ -1,0 +1,2660 @@
+Subject: windows.ui.xaml: CommandBar, AppBarButton, AppBarToggleButton, AppBarSeparator, SymbolIcon, FontIcon and Page app bars (milestone 5 part 5b)
+
+diff --git a/dlls/windows.ui.xaml/Makefile.in b/dlls/windows.ui.xaml/Makefile.in
+index e519a36..ae93736 100644
+--- a/dlls/windows.ui.xaml/Makefile.in
++++ b/dlls/windows.ui.xaml/Makefile.in
+@@ -10,6 +10,7 @@ SOURCES = \
+ 	button.c \
+ 	classes.idl \
+ 	collection.c \
++	commandbar.c \
+ 	color_helper.c \
+ 	content.c \
+ 	definitions.c \
+@@ -17,6 +18,7 @@ SOURCES = \
+ 	element.c \
+ 	focus.c \
+ 	image.c \
++	icon.c \
+ 	items.c \
+ 	listview.c \
+ 	main.c \
+diff --git a/dlls/windows.ui.xaml/button.c b/dlls/windows.ui.xaml/button.c
+index 2d6657d..59c4b33 100644
+--- a/dlls/windows.ui.xaml/button.c
++++ b/dlls/windows.ui.xaml/button.c
+@@ -127,6 +127,18 @@ static HRESULT button_query_interface( struct xaml_element *element, REFIID iid,
+         IInspectable_AddRef( (IInspectable *)*out );
+         return S_OK;
+     }
++    if (is_bar_kind( impl ))
++    {
++        if (IsEqualGUID( iid, &IID_IControl )) *out = &impl->IControl_iface;
++        else if (impl->kind != BUTTON_APPBAR_SEPARATOR && IsEqualGUID( iid, &IID_IContentControl )) *out = &impl->IContentControl_iface;
++        else if ((impl->kind == BUTTON_APPBAR || impl->kind == BUTTON_APPBAR_TOGGLE) && IsEqualGUID( iid, &IID_IButtonBase ))
++            *out = &impl->IButtonBase_iface;
++        else if (impl->kind == BUTTON_APPBAR && IsEqualGUID( iid, &IID_IButton )) *out = &impl->IButton_iface;
++        else if (impl->kind == BUTTON_APPBAR_TOGGLE && IsEqualGUID( iid, &IID_IToggleButton )) *out = &impl->IToggleButton_iface;
++        else return bar_query_interface( impl, iid, out );
++        IInspectable_AddRef( (IInspectable *)*out );
++        return S_OK;
++    }
+     if (impl->kind == BUTTON_SCROLL || is_item_kind( impl ) || impl->kind == BUTTON_DIALOG)
+     {
+         if (IsEqualGUID( iid, &IID_IContentControl )) *out = &impl->IContentControl_iface;
+@@ -172,6 +184,11 @@ static void button_measure( struct xaml_element *element, struct layout_context
+         *width = *height = 0;
+         return;
+     }
++    if (is_bar_kind( impl ))
++    {
++        bar_measure( impl, ctx, avail_width, avail_height, width, height );
++        return;
++    }
+     child = button_content_element( impl );
+     root = button_template_root( impl );
+ 
+@@ -247,6 +264,11 @@ static void button_arrange( struct xaml_element *element, struct layout_context
+     float x, y, w, h;
+ 
+     if (is_range_kind( impl ) || is_text_kind( impl ) || impl->kind == BUTTON_DIALOG) return;
++    if (is_bar_kind( impl ))
++    {
++        bar_arrange( impl, ctx );
++        return;
++    }
+ 
+     if (root)
+     {
+@@ -499,6 +521,11 @@ static void button_render( struct xaml_element *element, struct layout_context *
+         return;
+     }
+     if (impl->kind == BUTTON_DIALOG) return;
++    if (is_bar_kind( impl ))
++    {
++        bar_render( impl, ctx );
++        return;
++    }
+     if (root)
+     {
+         element_render( root, ctx );   /* the template draws the button */
+@@ -562,6 +589,7 @@ static UINT32 button_child_count( struct xaml_element *element )
+     if (is_range_kind( impl )) return 0;
+     /* a shown ContentDialog's content is in its layer */
+     if (impl->kind == BUTTON_DIALOG) return impl->content_element && impl->content_element->parent == element ? 1 : 0;
++    if (is_bar_kind( impl )) return bar_child_count( impl );
+     if (impl->element.template_instance) return template_root( impl->element.template_instance ) ? 1 : 0;
+     return button_content_element( impl ) ? 1 : 0;
+ }
+@@ -569,6 +597,7 @@ static UINT32 button_child_count( struct xaml_element *element )
+ static struct xaml_element *button_child_at( struct xaml_element *element, UINT32 index )
+ {
+     struct button *impl = impl_from_element( element );
++    if (is_bar_kind( impl )) return bar_child_at( impl, index );
+     if (impl->element.template_instance) return template_root( impl->element.template_instance );
+     return button_content_element( impl );
+ }
+@@ -671,6 +700,7 @@ static void button_raise_click( struct button *impl )
+         item_clicked( impl );   /* the ListView handles it: selection and ItemClick */
+         return;
+     case BUTTON_PLAIN:
++    case BUTTON_APPBAR:
+         break;
+     case BUTTON_RADIO:
+         set_check( impl, CHECK_ON );
+@@ -682,6 +712,7 @@ static void button_raise_click( struct button *impl )
+         break;
+     }
+     raise_event( impl, &impl->click, "Click" );
++    if (impl->kind == BUTTON_APPBAR || impl->kind == BUTTON_APPBAR_TOGGLE) bar_command_clicked( impl );
+ }
+ 
+ static void button_pointer( struct xaml_element *element, UINT msg, float x, float y )
+@@ -705,6 +736,11 @@ static void button_pointer( struct xaml_element *element, UINT msg, float x, flo
+         textbox_pointer( impl, msg, x, y );
+         return;
+     }
++    if (impl->kind == BUTTON_APPBAR_SEPARATOR || impl->kind == BUTTON_COMMAND_BAR)
++    {
++        bar_pointer( impl, msg, x, y );
++        return;
++    }
+ 
+     switch (msg)
+     {
+@@ -752,6 +788,7 @@ static void button_destroy( struct xaml_element *element )
+     scroll_destroy( impl );
+     textbox_destroy( impl );
+     dialog_destroy( impl );
++    bar_destroy( impl );
+     event_list_clear( &impl->click );
+     event_list_clear( &impl->checked );
+     event_list_clear( &impl->unchecked );
+@@ -765,7 +802,7 @@ static BOOL button_focusable( struct xaml_element *element )
+     struct button *impl = impl_from_element( element );
+     /* a ListView takes the focus for its items */
+     return impl->enabled && impl->kind != BUTTON_PROGRESS && impl->kind != BUTTON_SCROLL && !is_item_kind( impl ) &&
+-           impl->kind != BUTTON_DIALOG;
++           impl->kind != BUTTON_DIALOG && impl->kind != BUTTON_APPBAR_SEPARATOR && impl->kind != BUTTON_COMMAND_BAR;
+ }
+ 
+ /* Space presses and releases a button (Click on release), Enter clicks a Button at once */
+@@ -776,7 +813,8 @@ static BOOL button_key( struct xaml_element *element, BOOL down, WPARAM vk )
+     if (impl->kind == BUTTON_SCROLL) return scroll_key( impl, down, vk );
+     if (is_text_kind( impl )) return textbox_key( impl, down, vk );
+     if (is_range_kind( impl )) return range_key( impl, down, vk );
+-    if (is_item_kind( impl ) || impl->kind == BUTTON_DIALOG) return FALSE;
++    if (is_item_kind( impl ) || impl->kind == BUTTON_DIALOG || impl->kind == BUTTON_APPBAR_SEPARATOR ||
++        impl->kind == BUTTON_COMMAND_BAR) return FALSE;
+     if (!impl->enabled || element_focus_state( element ) == FocusState_Unfocused) return FALSE;
+     if (vk == VK_SPACE)
+     {
+@@ -793,7 +831,7 @@ static BOOL button_key( struct xaml_element *element, BOOL down, WPARAM vk )
+         window_invalidate();
+         return TRUE;
+     }
+-    if (vk == VK_RETURN && down && impl->kind == BUTTON_PLAIN)
++    if (vk == VK_RETURN && down && (impl->kind == BUTTON_PLAIN || impl->kind == BUTTON_APPBAR))
+     {
+         button_raise_click( impl );
+         return TRUE;
+@@ -1576,6 +1614,10 @@ static HRESULT button_create( enum button_kind kind, IInspectable *outer, IInspe
+         RuntimeClass_Windows_UI_Xaml_Controls_ListViewItem,
+         RuntimeClass_Windows_UI_Xaml_Controls_GridViewItem,
+         RuntimeClass_Windows_UI_Xaml_Controls_ContentDialog,
++        RuntimeClass_Windows_UI_Xaml_Controls_AppBarButton,
++        RuntimeClass_Windows_UI_Xaml_Controls_AppBarToggleButton,
++        RuntimeClass_Windows_UI_Xaml_Controls_AppBarSeparator,
++        RuntimeClass_Windows_UI_Xaml_Controls_CommandBar,
+     };
+     struct button *impl;
+     void *iface;
+@@ -1625,6 +1667,11 @@ static HRESULT button_create( enum button_kind kind, IInspectable *outer, IInspe
+         free( impl );
+         return E_OUTOFMEMORY;
+     }
++    if (is_bar_kind( impl ) && FAILED(bar_init( impl )))
++    {
++        free( impl );
++        return E_OUTOFMEMORY;
++    }
+     if (kind == BUTTON_DIALOG && FAILED(dialog_init( impl )))
+     {
+         free( impl );
+@@ -1641,6 +1688,9 @@ static HRESULT button_create( enum button_kind kind, IInspectable *outer, IInspe
+     case BUTTON_SCROLL: iface = scroll_default_iface( impl ); break;
+     case BUTTON_LIST_ITEM: case BUTTON_GRID_ITEM: iface = item_default_iface( impl ); break;
+     case BUTTON_DIALOG: iface = dialog_default_iface( impl ); break;
++    case BUTTON_APPBAR: case BUTTON_APPBAR_TOGGLE: case BUTTON_APPBAR_SEPARATOR: case BUTTON_COMMAND_BAR:
++        iface = bar_default_iface( impl );
++        break;
+     case BUTTON_TOGGLE_SWITCH: case BUTTON_SLIDER: case BUTTON_PROGRESS: iface = range_default_iface( impl ); break;
+     case BUTTON_PLAIN: iface = &impl->IButton_iface; break;
+     case BUTTON_CHECK: iface = &impl->ICheckBox_iface; break;
+@@ -1666,6 +1716,10 @@ struct button_statics
+     IListViewItemFactory IListViewItemFactory_iface;
+     IGridViewItemFactory IGridViewItemFactory_iface;
+     IContentDialogFactory IContentDialogFactory_iface;
++    IAppBarButtonFactory IAppBarButtonFactory_iface;
++    IAppBarToggleButtonFactory IAppBarToggleButtonFactory_iface;
++    IAppBarSeparatorFactory IAppBarSeparatorFactory_iface;
++    ICommandBarFactory ICommandBarFactory_iface;
+     enum button_kind kind;
+ };
+ 
+@@ -1701,6 +1755,14 @@ static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID
+         *out = &impl->IGridViewItemFactory_iface;
+     else if (impl->kind == BUTTON_DIALOG && IsEqualGUID( iid, &IID_IContentDialogFactory ))
+         *out = &impl->IContentDialogFactory_iface;
++    else if (impl->kind == BUTTON_APPBAR && IsEqualGUID( iid, &IID_IAppBarButtonFactory ))
++        *out = &impl->IAppBarButtonFactory_iface;
++    else if (impl->kind == BUTTON_APPBAR_TOGGLE && IsEqualGUID( iid, &IID_IAppBarToggleButtonFactory ))
++        *out = &impl->IAppBarToggleButtonFactory_iface;
++    else if (impl->kind == BUTTON_APPBAR_SEPARATOR && IsEqualGUID( iid, &IID_IAppBarSeparatorFactory ))
++        *out = &impl->IAppBarSeparatorFactory_iface;
++    else if (impl->kind == BUTTON_COMMAND_BAR && IsEqualGUID( iid, &IID_ICommandBarFactory ))
++        *out = &impl->ICommandBarFactory_iface;
+     else
+     {
+         FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
+@@ -1779,12 +1841,17 @@ BUTTON_FACTORY( text_box_factory_iface, ITextBoxFactory, ITextBox, ITextBoxFacto
+ BUTTON_FACTORY( list_view_item_factory_iface, IListViewItemFactory, IListViewItem, IListViewItemFactory_iface, BUTTON_LIST_ITEM )
+ BUTTON_FACTORY( grid_view_item_factory_iface, IGridViewItemFactory, IGridViewItem, IGridViewItemFactory_iface, BUTTON_GRID_ITEM )
+ BUTTON_FACTORY( content_dialog_factory_iface, IContentDialogFactory, IContentDialog, IContentDialogFactory_iface, BUTTON_DIALOG )
++BUTTON_FACTORY( appbar_button_factory_iface, IAppBarButtonFactory, IAppBarButton, IAppBarButtonFactory_iface, BUTTON_APPBAR )
++BUTTON_FACTORY( appbar_toggle_factory_iface, IAppBarToggleButtonFactory, IAppBarToggleButton, IAppBarToggleButtonFactory_iface, BUTTON_APPBAR_TOGGLE )
++BUTTON_FACTORY( appbar_separator_factory_iface, IAppBarSeparatorFactory, IAppBarSeparator, IAppBarSeparatorFactory_iface, BUTTON_APPBAR_SEPARATOR )
++BUTTON_FACTORY( command_bar_factory_iface, ICommandBarFactory, ICommandBar, ICommandBarFactory_iface, BUTTON_COMMAND_BAR )
+ 
+ #define BUTTON_STATICS( kind ) \
+     { {&factory_vtbl}, {&button_factory_iface_vtbl}, {&toggle_button_factory_iface_vtbl}, \
+       {&check_box_factory_iface_vtbl}, {&radio_button_factory_iface_vtbl}, {&slider_factory_iface_vtbl}, \
+       {&progress_bar_factory_iface_vtbl}, {&text_box_factory_iface_vtbl}, {&list_view_item_factory_iface_vtbl}, \
+-      {&grid_view_item_factory_iface_vtbl}, {&content_dialog_factory_iface_vtbl}, kind }
++      {&grid_view_item_factory_iface_vtbl}, {&content_dialog_factory_iface_vtbl}, {&appbar_button_factory_iface_vtbl}, \
++      {&appbar_toggle_factory_iface_vtbl}, {&appbar_separator_factory_iface_vtbl}, {&command_bar_factory_iface_vtbl}, kind }
+ 
+ static struct button_statics button_statics = BUTTON_STATICS( BUTTON_PLAIN );
+ static struct button_statics toggle_button_statics = BUTTON_STATICS( BUTTON_TOGGLE );
+@@ -1816,3 +1883,11 @@ IActivationFactory *list_view_item_factory = &list_view_item_statics.IActivation
+ IActivationFactory *grid_view_item_factory = &grid_view_item_statics.IActivationFactory_iface;
+ static struct button_statics content_dialog_statics = BUTTON_STATICS( BUTTON_DIALOG );
+ IActivationFactory *content_dialog_factory = &content_dialog_statics.IActivationFactory_iface;
++static struct button_statics appbar_button_statics = BUTTON_STATICS( BUTTON_APPBAR );
++static struct button_statics appbar_toggle_statics = BUTTON_STATICS( BUTTON_APPBAR_TOGGLE );
++static struct button_statics appbar_separator_statics = BUTTON_STATICS( BUTTON_APPBAR_SEPARATOR );
++static struct button_statics command_bar_statics = BUTTON_STATICS( BUTTON_COMMAND_BAR );
++IActivationFactory *appbar_button_factory = &appbar_button_statics.IActivationFactory_iface;
++IActivationFactory *appbar_toggle_button_factory = &appbar_toggle_statics.IActivationFactory_iface;
++IActivationFactory *appbar_separator_factory = &appbar_separator_statics.IActivationFactory_iface;
++IActivationFactory *command_bar_factory = &command_bar_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/classes.idl b/dlls/windows.ui.xaml/classes.idl
+index 1d83af2..e71129b 100644
+--- a/dlls/windows.ui.xaml/classes.idl
++++ b/dlls/windows.ui.xaml/classes.idl
+@@ -35,12 +35,17 @@ namespace Windows.UI.Xaml {
+ }
+ 
+ namespace Windows.UI.Xaml.Controls {
++    runtimeclass AppBarButton;
++    runtimeclass AppBarSeparator;
++    runtimeclass AppBarToggleButton;
+     runtimeclass Border;
+     runtimeclass Button;
+     runtimeclass CheckBox;
+     runtimeclass ColumnDefinition;
++    runtimeclass CommandBar;
+     runtimeclass ContentDialog;
+     runtimeclass ContentPresenter;
++    runtimeclass FontIcon;
+     runtimeclass Frame;
+     runtimeclass Grid;
+     runtimeclass GridView;
+@@ -58,6 +63,7 @@ namespace Windows.UI.Xaml.Controls {
+     runtimeclass RowDefinition;
+     runtimeclass ScrollViewer;
+     runtimeclass Slider;
++    runtimeclass SymbolIcon;
+     runtimeclass StackPanel;
+     runtimeclass TextBlock;
+     runtimeclass TextBox;
+diff --git a/dlls/windows.ui.xaml/commandbar.c b/dlls/windows.ui.xaml/commandbar.c
+new file mode 100644
+index 0000000..bf6996d
+--- /dev/null
++++ b/dlls/windows.ui.xaml/commandbar.c
+@@ -0,0 +1,1116 @@
++/* WinRT Windows.UI.Xaml.Controls CommandBar, AppBarButton, AppBarToggleButton and AppBarSeparator implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <math.h>
++
++#include "private.h"
++#include "control.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* All four are kinds of the shared Button object (struct button), drawn with Windows 10's looks.
++ *
++ * An AppBarButton or AppBarToggleButton is 68 px wide: its Icon (an IconElement, 20 px) 14 px from the top, and its
++ * Label in 12 px text below unless it is compact (48 px high then, else 60). A checked AppBarToggleButton is
++ * filled with the accent colour. In a CommandBar's overflow menu they show as a 40 px high row with the Label.
++ * An AppBarSeparator is a 1 px line with 6 px either side.
++ *
++ * A CommandBar is 48 px high: its Content on the left, its PrimaryCommands (compact) on the right, then the "..."
++ * button. Opening it (the "..." button, or IsOpen) shows the labels, growing to 60 px over the page (down, or up
++ * when it is in the lower half of the window), and shows its SecondaryCommands in a menu below (or above) it, in a
++ * popup that closes the bar when the pointer is pressed anywhere else. A command closes the bar unless IsSticky.
++ * There is no ClosedDisplayMode, dynamic overflow, keyboard access or animation. */
++
++#define BAR_HEIGHT 48.0f
++#define BAR_OPEN_HEIGHT 60.0f
++#define BUTTON_WIDTH 68.0f
++#define MORE_WIDTH 48.0f
++#define MENU_ITEM_HEIGHT 40.0f
++#define MENU_MIN_WIDTH 160.0f
++
++struct command_list
++{
++    IObservableVector_ICommandBarElement IObservableVector_iface;
++    struct command_bar *bar;
++    BOOL secondary;
++    IInspectable *vector;                 /* our IVector<ICommandBarElement> */
++};
++
++struct bar_menu
++{
++    struct xaml_element element;
++    struct command_bar *bar;
++    struct layout_rect box;
++};
++
++struct command_bar
++{
++    IAppBar IAppBar_iface;
++    ICommandBar ICommandBar_iface;
++    struct button *button;
++    struct command_list primary, secondary;
++    boolean open, sticky, more_over, more_pressed;
++    struct event_list opened, closed;
++    struct layout_rect area;              /* where the bar is drawn: its bounds, or taller while open */
++    struct layout_rect more;              /* the "..." button */
++    struct bar_menu *menu;                /* while open (referenced through menu_object) */
++    IInspectable *menu_object;
++};
++
++static const struct vector_iids command_iids =
++{
++    &IID___FIVector_1_Windows__CUI__CXaml__CControls__CICommandBarElement,
++    &IID___FIVectorView_1_Windows__CUI__CXaml__CControls__CICommandBarElement,
++    &IID___FIIterable_1_Windows__CUI__CXaml__CControls__CICommandBarElement,
++    &IID___FIIterator_1_Windows__CUI__CXaml__CControls__CICommandBarElement,
++    &IID_ICommandBarElement,
++};
++
++static struct button *bar_button_from_object( IInspectable *object )
++{
++    struct xaml_element *element = object ? element_from_object( object ) : NULL;
++    ICommandBarElement *command;
++    struct button *impl;
++
++    if (!element || !element->ops->query_interface) return NULL;
++    if (FAILED(element->ops->query_interface( element, &IID_ICommandBarElement, (void **)&command ))) return NULL;
++    impl = CONTAINING_RECORD( command, struct button, ICommandBarElement_iface );
++    ICommandBarElement_Release( command );
++    return impl;
++}
++
++static UINT32 command_count( struct command_list *list )
++{
++    return vector_size( list->vector );
++}
++
++static struct button *command_at( struct command_list *list, UINT32 index )
++{
++    return bar_button_from_object( vector_get( list->vector, index ) );
++}
++
++/* ---- the overflow menu, a popup ---- */
++
++static inline struct bar_menu *menu_from_element( struct xaml_element *element )
++{
++    return CONTAINING_RECORD( element, struct bar_menu, element );
++}
++
++static void menu_measure( struct xaml_element *element, struct layout_context *ctx, float avail_width,
++                          float avail_height, float *width, float *height )
++{
++    struct command_bar *bar = menu_from_element( element )->bar;
++    struct button *item;
++    UINT32 i;
++
++    *width = isfinite( avail_width ) ? avail_width : 0;
++    *height = isfinite( avail_height ) ? avail_height : 0;
++    if (!bar) return;
++    for (i = 0; i < command_count( &bar->secondary ); i++)
++        if ((item = command_at( &bar->secondary, i ))) element_measure( &item->element, ctx, INFINITY, INFINITY );
++}
++
++static void menu_arrange( struct xaml_element *element, struct layout_context *ctx )
++{
++    struct bar_menu *menu = menu_from_element( element );
++    struct command_bar *bar = menu->bar;
++    const struct layout_rect *window = &element->bounds, *area;
++    float w = MENU_MIN_WIDTH, h = 0, y;
++    struct button *item;
++    UINT32 i, count;
++
++    if (!bar) return;
++    area = &bar->area;
++    count = command_count( &bar->secondary );
++    for (i = 0; i < count; i++)
++    {
++        if (!(item = command_at( &bar->secondary, i ))) continue;
++        w = max( w, item->element.desired_width );
++        h += item->element.desired_height;
++    }
++    if (count) h += 8;
++    menu->box.width = min( w, window->width );
++    menu->box.height = count ? h : 0;
++    menu->box.x = max( window->x, area->x + area->width - menu->box.width );
++    /* below the bar if it fits, else above it */
++    if (area->y + area->height + menu->box.height <= window->y + window->height) menu->box.y = area->y + area->height;
++    else menu->box.y = max( window->y, area->y - menu->box.height );
++    for (i = 0, y = menu->box.y + 4; i < count; i++)
++    {
++        if (!(item = command_at( &bar->secondary, i ))) continue;
++        element_arrange( &item->element, ctx, menu->box.x, y, menu->box.width, item->element.desired_height );
++        y += item->element.desired_height;
++    }
++}
++
++static void menu_render( struct xaml_element *element, struct layout_context *ctx )
++{
++    struct bar_menu *menu = menu_from_element( element );
++    struct command_bar *bar = menu->bar;
++    static const Thickness one = { 1, 1, 1, 1 };
++    Color background = { 0xff, 0xf2, 0xf2, 0xf2 };
++    struct button *item;
++    UINT32 i;
++
++    if (!bar || !menu->box.height) return;
++    if (ctx->dark) background.R = background.G = background.B = 0x2b;
++    element_fill_argb( ctx, &menu->box, background );
++    element_frame_color( ctx, &menu->box, &one, ctx->dark ? RGB(0x76, 0x76, 0x76) : RGB(0xcc, 0xcc, 0xcc) );
++    for (i = 0; i < command_count( &bar->secondary ); i++)
++        if ((item = command_at( &bar->secondary, i ))) element_render( &item->element, ctx );
++}
++
++static UINT32 menu_child_count( struct xaml_element *element )
++{
++    struct command_bar *bar = menu_from_element( element )->bar;
++    return bar ? command_count( &bar->secondary ) : 0;
++}
++
++static struct xaml_element *menu_child_at( struct xaml_element *element, UINT32 index )
++{
++    struct command_bar *bar = menu_from_element( element )->bar;
++    struct button *item = bar ? command_at( &bar->secondary, index ) : NULL;
++    return item ? &item->element : NULL;
++}
++
++/* everywhere but the bar: a press elsewhere closes it */
++static BOOL menu_hit_self( struct xaml_element *element, float x, float y )
++{
++    struct command_bar *bar = menu_from_element( element )->bar;
++    const struct layout_rect *a;
++
++    if (!bar) return FALSE;
++    a = &bar->area;
++    return !(x >= a->x && y >= a->y && x < a->x + a->width && y < a->y + a->height);
++}
++
++static void bar_set_open( struct command_bar *bar, BOOL open );
++
++static void menu_pointer( struct xaml_element *element, UINT msg, float x, float y )
++{
++    struct bar_menu *menu = menu_from_element( element );
++    const struct layout_rect *b = &menu->box;
++
++    if (msg != WM_LBUTTONDOWN || !menu->bar) return;
++    if (x >= b->x && y >= b->y && x < b->x + b->width && y < b->y + b->height) return;
++    TRACE( "light dismiss.\n" );
++    bar_set_open( menu->bar, FALSE );
++}
++
++static void menu_destroy( struct xaml_element *element )
++{
++    free( menu_from_element( element ) );
++}
++
++static const struct element_ops menu_ops =
++{
++    .measure = menu_measure,
++    .arrange = menu_arrange,
++    .render = menu_render,
++    .child_count = menu_child_count,
++    .child_at = menu_child_at,
++    .hit_self = menu_hit_self,
++    .pointer = menu_pointer,
++    .destroy = menu_destroy,
++};
++
++/* ---- opening and closing ---- */
++
++static void raise_bar_event( struct command_bar *bar, struct event_list *list, const char *name )
++{
++    IUnknown **handlers;
++    UINT32 i, count = list->count;
++    HRESULT hr;
++
++    TRACE( "%p: %s.\n", bar, name );
++    if (!count || !(handlers = calloc( count, sizeof(*handlers) ))) return;
++    for (i = 0; i < count; i++) if ((handlers[i] = list->handlers[i])) IUnknown_AddRef( handlers[i] );
++    for (i = 0; i < count; i++)
++    {
++        if (!handlers[i]) continue;
++        hr = IEventHandler_IInspectable_Invoke( (IEventHandler_IInspectable *)handlers[i], bar->button->element.outer, NULL );
++        if (FAILED(hr)) WARN( "%s handler %p failed, hr %#lx.\n", name, handlers[i], hr );
++    }
++    for (i = 0; i < count; i++) if (handlers[i]) IUnknown_Release( handlers[i] );
++    free( handlers );
++}
++
++static void set_compact( struct command_bar *bar )
++{
++    struct button *item;
++    UINT32 i;
++
++    for (i = 0; i < command_count( &bar->primary ); i++)
++        if ((item = command_at( &bar->primary, i ))) item->compact = !bar->open;
++}
++
++static void bar_set_open( struct command_bar *bar, BOOL open )
++{
++    struct button *item;
++    struct bar_menu *menu;
++    UINT32 i;
++
++    if (bar->open == !!open) return;
++    bar->open = !!open;
++    set_compact( bar );
++    if (open && (menu = calloc( 1, sizeof(*menu) )))
++    {
++        element_init( &menu->element, &menu_ops, L"Windows.UI.Xaml.Controls.CommandBar (overflow)", NULL );
++        menu->bar = bar;
++        if (SUCCEEDED(element_compose( &menu->element, NULL, NULL, &menu->element.IInspectable_inner, (void **)&bar->menu_object )))
++        {
++            bar->menu = menu;
++            for (i = 0; i < command_count( &bar->secondary ); i++)
++                if ((item = command_at( &bar->secondary, i ))) element_set_parent( &item->element, &menu->element );
++            window_popup_show( &menu->element, FALSE );
++        }
++    }
++    else if (!open && bar->menu)
++    {
++        window_popup_hide( &bar->menu->element );
++        for (i = 0; i < command_count( &bar->secondary ); i++)
++            if ((item = command_at( &bar->secondary, i ))) element_set_parent( &item->element, &bar->button->element );
++        bar->menu->bar = NULL;
++        bar->menu = NULL;
++        IInspectable_Release( bar->menu_object );
++        bar->menu_object = NULL;
++    }
++    element_property_changed( bar->button->element.outer, L"IsOpen" );
++    window_invalidate();
++    raise_bar_event( bar, open ? &bar->opened : &bar->closed, open ? "Opened" : "Closed" );
++}
++
++/* a command was clicked: the bar closes, unless it is sticky */
++void bar_command_clicked( struct button *impl )
++{
++    struct command_bar *bar = impl->owner_bar ? impl->owner_bar->bar : NULL;
++    if (bar && bar->open && !bar->sticky) bar_set_open( bar, FALSE );
++}
++
++/* ---- layout and drawing ---- */
++
++static BOOL is_toggle_checked( struct button *impl )
++{
++    return impl->kind == BUTTON_APPBAR_TOGGLE && impl->check == CHECK_ON;
++}
++
++static struct xaml_element *icon_element( struct button *impl )
++{
++    return impl->icon ? element_from_object( impl->icon ) : NULL;
++}
++
++static void label_format( struct text_format *format, double size, TextAlignment alignment )
++{
++    format->font_size = size;
++    format->weight = 400;
++    format->italic = FALSE;
++    format->wrap = FALSE;
++    format->alignment = alignment;
++}
++
++void bar_measure( struct button *impl, struct layout_context *ctx, float avail_width, float avail_height,
++                  float *width, float *height )
++{
++    struct command_bar *bar = impl->bar;
++    struct xaml_element *icon = icon_element( impl );
++    struct text_format format;
++    float w = 0, h = 0;
++    struct button *item;
++    UINT32 i;
++
++    switch (impl->kind)
++    {
++    case BUTTON_APPBAR_SEPARATOR:
++        *width = impl->in_overflow ? 0 : 13;
++        *height = impl->in_overflow ? 9 : impl->compact ? BAR_HEIGHT : BAR_OPEN_HEIGHT;
++        return;
++    case BUTTON_APPBAR:
++    case BUTTON_APPBAR_TOGGLE:
++        if (icon) element_measure( icon, ctx, 20, 20 );
++        if (impl->in_overflow)
++        {
++            label_format( &format, 14, TextAlignment_Left );
++            if (impl->label) text_measure( ctx, &format, impl->label, INFINITY, &w, &h );
++            *width = w + 24;
++            *height = MENU_ITEM_HEIGHT;
++            return;
++        }
++        *width = BUTTON_WIDTH;
++        *height = impl->compact ? BAR_HEIGHT : BAR_OPEN_HEIGHT;
++        return;
++    default:
++        break;
++    }
++
++    /* the CommandBar */
++    *width = MORE_WIDTH;
++    *height = BAR_HEIGHT;
++    for (i = 0; i < command_count( &bar->primary ); i++)
++    {
++        if (!(item = command_at( &bar->primary, i ))) continue;
++        element_measure( &item->element, ctx, INFINITY, INFINITY );
++        *width += item->element.desired_width;
++    }
++    if (impl->content_element)
++    {
++        element_measure( impl->content_element, ctx, max( 0.0f, avail_width - *width ), BAR_HEIGHT );
++        *width += impl->content_element->desired_width;
++        *height = max( *height, impl->content_element->desired_height );
++    }
++}
++
++void bar_arrange( struct button *impl, struct layout_context *ctx )
++{
++    struct command_bar *bar = impl->bar;
++    const struct layout_rect *b = &impl->element.bounds;
++    struct xaml_element *icon = icon_element( impl ), *root;
++    float x, total = 0;
++    struct button *item;
++    UINT32 i, count;
++
++    if (impl->kind == BUTTON_APPBAR || impl->kind == BUTTON_APPBAR_TOGGLE)
++    {
++        if (icon) element_arrange( icon, ctx, b->x + (b->width - 20) / 2, b->y + 14, 20, 20 );
++        return;
++    }
++    if (impl->kind != BUTTON_COMMAND_BAR) return;
++
++    /* open, the bar grows toward the middle of the window */
++    bar->area = *b;
++    if (bar->open && b->height < BAR_OPEN_HEIGHT)
++    {
++        root = window_content_element();
++        bar->area.height = BAR_OPEN_HEIGHT;
++        if (root && b->y + b->height / 2 > root->bounds.y + root->bounds.height / 2)
++            bar->area.y = b->y + b->height - BAR_OPEN_HEIGHT;
++    }
++    bar->more.x = bar->area.x + bar->area.width - MORE_WIDTH;
++    bar->more.y = bar->area.y;
++    bar->more.width = MORE_WIDTH;
++    bar->more.height = BAR_HEIGHT;
++
++    count = command_count( &bar->primary );
++    for (i = 0; i < count; i++) if ((item = command_at( &bar->primary, i ))) total += item->element.desired_width;
++    x = max( bar->area.x, bar->more.x - total );
++    if (impl->content_element)
++        element_arrange( impl->content_element, ctx, bar->area.x, b->y, max( 0.0f, x - bar->area.x ), b->height );
++    for (i = 0; i < count; i++)
++    {
++        if (!(item = command_at( &bar->primary, i ))) continue;
++        element_arrange( &item->element, ctx, x, bar->area.y, item->element.desired_width, item->element.desired_height );
++        x += item->element.desired_width;
++    }
++}
++
++static Color base_alpha( struct layout_context *ctx, BYTE alpha )
++{
++    Color c = { alpha, 0, 0, 0 };
++    if (ctx->dark) c.R = c.G = c.B = 255;
++    return c;
++}
++
++static void render_bar_button( struct button *impl, struct layout_context *ctx )
++{
++    const struct layout_rect *b = &impl->element.bounds;
++    struct xaml_element *icon = icon_element( impl );
++    Color accent = { 0xff, 0x00, 0x78, 0xd7 }, c;
++    COLORREF fg = ctx->foreground, saved = ctx->foreground;
++    BYTE saved_alpha = ctx->foreground_alpha;
++    struct text_format format;
++    struct layout_rect text;
++
++    if (impl->background && brush_get_color( impl->background, &c )) element_fill_argb( ctx, b, c );
++    if (is_toggle_checked( impl ) && !impl->in_overflow)
++    {
++        element_fill_argb( ctx, b, accent );
++        fg = RGB(255, 255, 255);
++    }
++    if (impl->pressed) element_fill_argb( ctx, b, base_alpha( ctx, 0x33 ) );
++    else if (impl->pointer_over) element_fill_argb( ctx, b, base_alpha( ctx, 0x19 ) );
++    if (impl->foreground && brush_get_color( impl->foreground, &c )) fg = RGB( c.R, c.G, c.B );
++    if (!impl->enabled) fg = ctx->dark ? RGB(102, 102, 102) : RGB(153, 153, 153);
++
++    if (impl->in_overflow)
++    {
++        if (!impl->label) return;
++        label_format( &format, 14, TextAlignment_Left );
++        text.x = b->x + 12 + (impl->kind == BUTTON_APPBAR_TOGGLE ? 0 : 0);
++        text.y = b->y + (b->height - 20) / 2;
++        text.width = max( 0.0f, b->width - 24 );
++        text.height = 20;
++        text_draw( ctx, &format, impl->label, &text, is_toggle_checked( impl ) ? RGB(0, 120, 215) : fg );
++        return;
++    }
++    if (icon)
++    {
++        ctx->foreground = fg;
++        ctx->foreground_alpha = 255;
++        element_render( icon, ctx );
++        ctx->foreground = saved;
++        ctx->foreground_alpha = saved_alpha;
++    }
++    if (!impl->compact && impl->label)
++    {
++        label_format( &format, 12, TextAlignment_Center );
++        text.x = b->x + 2;
++        text.y = b->y + 14 + 20 + 4;
++        text.width = max( 0.0f, b->width - 4 );
++        text.height = 16;
++        text_draw( ctx, &format, impl->label, &text, fg );
++    }
++}
++
++void bar_render( struct button *impl, struct layout_context *ctx )
++{
++    struct command_bar *bar = impl->bar;
++    const struct layout_rect *b = &impl->element.bounds;
++    Color background = { 0xff, 0xe6, 0xe6, 0xe6 }, fg = { 0xff, 0, 0, 0 }, c;
++    struct layout_rect line, dot;
++    struct button *item;
++    UINT32 i;
++
++    switch (impl->kind)
++    {
++    case BUTTON_APPBAR_SEPARATOR:
++        if (impl->in_overflow)
++        {
++            line.x = b->x + 12;
++            line.y = b->y + 4;
++            line.width = max( 0.0f, b->width - 24 );
++            line.height = 1;
++        }
++        else
++        {
++            line.x = b->x + 6;
++            line.y = b->y + 14;
++            line.width = 1;
++            line.height = 20;
++        }
++        element_fill_argb( ctx, &line, base_alpha( ctx, 0x66 ) );
++        return;
++    case BUTTON_APPBAR:
++    case BUTTON_APPBAR_TOGGLE:
++        render_bar_button( impl, ctx );
++        return;
++    default:
++        break;
++    }
++
++    /* the CommandBar: SystemControlBackgroundChromeMediumBrush unless it has a Background */
++    if (ctx->dark) background.R = background.G = background.B = 0x1f;
++    if (impl->background && brush_get_color( impl->background, &c )) background = c;
++    element_fill_argb( ctx, &bar->area, background );
++    if (impl->content_element) element_render( impl->content_element, ctx );
++    for (i = 0; i < command_count( &bar->primary ); i++)
++        if ((item = command_at( &bar->primary, i ))) element_render( &item->element, ctx );
++    /* the "..." button */
++    if (bar->more_pressed) element_fill_argb( ctx, &bar->more, base_alpha( ctx, 0x33 ) );
++    else if (bar->more_over) element_fill_argb( ctx, &bar->more, base_alpha( ctx, 0x19 ) );
++    if (ctx->dark) fg.R = fg.G = fg.B = 255;
++    if (impl->foreground && brush_get_color( impl->foreground, &c )) fg = c;
++    for (i = 0; i < 3; i++)
++    {
++        dot.x = bar->more.x + bar->more.width / 2 - 9 + i * 7;
++        dot.y = bar->more.y + 22;
++        dot.width = dot.height = 3;
++        element_fill_argb( ctx, &dot, fg );
++    }
++    (void)b;
++}
++
++UINT32 bar_child_count( struct button *impl )
++{
++    struct command_bar *bar = impl->bar;
++
++    if (impl->kind == BUTTON_APPBAR || impl->kind == BUTTON_APPBAR_TOGGLE)
++        return icon_element( impl ) && !impl->in_overflow ? 1 : 0;
++    if (impl->kind != BUTTON_COMMAND_BAR) return 0;
++    /* closed, the SecondaryCommands are here too (unarranged), for FindName */
++    return (impl->content_element ? 1 : 0) + command_count( &bar->primary ) + (bar->menu ? 0 : command_count( &bar->secondary ));
++}
++
++struct xaml_element *bar_child_at( struct button *impl, UINT32 index )
++{
++    struct command_bar *bar = impl->bar;
++    struct button *item;
++
++    if (impl->kind == BUTTON_APPBAR || impl->kind == BUTTON_APPBAR_TOGGLE) return icon_element( impl );
++    if (impl->kind != BUTTON_COMMAND_BAR) return NULL;
++    if (impl->content_element)
++    {
++        if (!index) return impl->content_element;
++        index--;
++    }
++    if (index < command_count( &bar->primary )) return (item = command_at( &bar->primary, index )) ? &item->element : NULL;
++    index -= command_count( &bar->primary );
++    return !bar->menu && (item = command_at( &bar->secondary, index )) ? &item->element : NULL;
++}
++
++/* the CommandBar's own pointer input: the "..." button */
++void bar_pointer( struct button *impl, UINT msg, float x, float y )
++{
++    struct command_bar *bar = impl->bar;
++    const struct layout_rect *m;
++    BOOL inside;
++
++    if (!bar) return;
++    m = &bar->more;
++    inside = x >= m->x && y >= m->y && x < m->x + m->width && y < m->y + m->height;
++    switch (msg)
++    {
++    case WM_MOUSEMOVE:
++        bar->more_over = inside;
++        if (bar->more_pressed && !inside) bar->more_pressed = FALSE;
++        break;
++    case WM_MOUSELEAVE:
++    case WM_CAPTURECHANGED:
++        bar->more_over = bar->more_pressed = FALSE;
++        break;
++    case WM_LBUTTONDOWN:
++        bar->more_pressed = inside;
++        break;
++    case WM_LBUTTONUP:
++        if (bar->more_pressed && inside) bar_set_open( bar, !bar->open );
++        bar->more_pressed = FALSE;
++        break;
++    }
++    window_invalidate();
++}
++
++/* ---- PrimaryCommands and SecondaryCommands ---- */
++
++static HRESULT command_inserted( void *owner, IInspectable *object )
++{
++    struct command_list *list = owner;
++    struct button *item = bar_button_from_object( object );
++
++    TRACE( "%p, %s: %p.\n", list->bar, list->secondary ? "secondary" : "primary", object );
++    if (!item)
++    {
++        WARN( "%p is not an ICommandBarElement of ours.\n", object );
++        return E_INVALIDARG;
++    }
++    item->owner_bar = list->bar->button;
++    item->in_overflow = list->secondary;
++    item->compact = !list->secondary && !list->bar->open;
++    element_set_parent( &item->element, list->secondary && list->bar->menu ? &list->bar->menu->element
++                                                                           : &list->bar->button->element );
++    window_invalidate();
++    return S_OK;
++}
++
++static void command_removed( void *owner, IInspectable *object )
++{
++    struct button *item = bar_button_from_object( object );
++
++    if (!item) return;
++    item->owner_bar = NULL;
++    item->in_overflow = item->compact = FALSE;
++    element_set_parent( &item->element, NULL );
++    window_invalidate();
++}
++
++static const struct vector_callbacks command_callbacks = { command_inserted, command_removed };
++
++static inline struct command_list *list_from_IObservableVector( IObservableVector_ICommandBarElement *iface )
++{
++    return CONTAINING_RECORD( iface, struct command_list, IObservableVector_iface );
++}
++
++static HRESULT WINAPI command_list_QueryInterface( IObservableVector_ICommandBarElement *iface, REFIID iid, void **out )
++{
++    struct command_list *list = list_from_IObservableVector( iface );
++
++    if (IsEqualGUID( iid, &IID_IObservableVector_ICommandBarElement ))
++    {
++        *out = iface;
++        IObservableVector_ICommandBarElement_AddRef( iface );
++        return S_OK;
++    }
++    return IInspectable_QueryInterface( list->vector, iid, out );
++}
++
++static ULONG WINAPI command_list_AddRef( IObservableVector_ICommandBarElement *iface )
++{
++    return IInspectable_AddRef( list_from_IObservableVector( iface )->bar->button->element.outer );
++}
++
++static ULONG WINAPI command_list_Release( IObservableVector_ICommandBarElement *iface )
++{
++    return IInspectable_Release( list_from_IObservableVector( iface )->bar->button->element.outer );
++}
++
++static HRESULT WINAPI command_list_GetIids( IObservableVector_ICommandBarElement *iface, ULONG *count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI command_list_GetRuntimeClassName( IObservableVector_ICommandBarElement *iface, HSTRING *name )
++{
++    return IInspectable_GetRuntimeClassName( list_from_IObservableVector( iface )->vector, name );
++}
++
++static HRESULT WINAPI command_list_GetTrustLevel( IObservableVector_ICommandBarElement *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI command_list_add_VectorChanged( IObservableVector_ICommandBarElement *iface,
++                                                      IVectorChangedEventHandler_ICommandBarElement *handler,
++                                                      EventRegistrationToken *token )
++{
++    FIXME( "iface %p, handler %p: no change events.\n", iface, handler );
++    token->value = 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI command_list_remove_VectorChanged( IObservableVector_ICommandBarElement *iface, EventRegistrationToken token )
++{
++    return S_OK;
++}
++
++static const struct IObservableVector_ICommandBarElementVtbl command_list_vtbl =
++{
++    command_list_QueryInterface,
++    command_list_AddRef,
++    command_list_Release,
++    /* IInspectable methods */
++    command_list_GetIids,
++    command_list_GetRuntimeClassName,
++    command_list_GetTrustLevel,
++    /* IObservableVector<ICommandBarElement *> methods */
++    command_list_add_VectorChanged,
++    command_list_remove_VectorChanged,
++};
++
++/* the CommandBar's collections for markup (PrimaryCommands, the content property, and SecondaryCommands) */
++IInspectable *command_bar_collection( IInspectable *object, const WCHAR *name )
++{
++    struct xaml_element *element = element_from_object( object );
++    struct button *impl;
++
++    if (!element || !element->class_name || wcscmp( element->class_name, RuntimeClass_Windows_UI_Xaml_Controls_CommandBar ))
++        return NULL;
++    impl = CONTAINING_RECORD( element, struct button, element );
++    if (!impl->bar) return NULL;
++    if (!wcscmp( name, L"PrimaryCommands" )) return impl->bar->primary.vector;
++    if (!wcscmp( name, L"SecondaryCommands" )) return impl->bar->secondary.vector;
++    return NULL;
++}
++
++/* ---- IAppBar and ICommandBar ---- */
++
++DEFINE_IINSPECTABLE_( app_bar, IAppBar, struct command_bar, impl_from_IAppBar, IAppBar_iface, impl->button->element.outer )
++
++static HRESULT WINAPI app_bar_get_IsOpen( IAppBar *iface, boolean *value )
++{
++    *value = impl_from_IAppBar( iface )->open;
++    return S_OK;
++}
++
++static HRESULT WINAPI app_bar_put_IsOpen( IAppBar *iface, boolean value )
++{
++    TRACE( "iface %p, value %d.\n", iface, value );
++    bar_set_open( impl_from_IAppBar( iface ), value );
++    return S_OK;
++}
++
++static HRESULT WINAPI app_bar_get_IsSticky( IAppBar *iface, boolean *value )
++{
++    *value = impl_from_IAppBar( iface )->sticky;
++    return S_OK;
++}
++
++static HRESULT WINAPI app_bar_put_IsSticky( IAppBar *iface, boolean value )
++{
++    impl_from_IAppBar( iface )->sticky = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI app_bar_add_Opened( IAppBar *iface, IEventHandler_IInspectable *handler, EventRegistrationToken *token )
++{
++    return event_list_add( &impl_from_IAppBar( iface )->opened, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI app_bar_remove_Opened( IAppBar *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IAppBar( iface )->opened, token );
++}
++
++static HRESULT WINAPI app_bar_add_Closed( IAppBar *iface, IEventHandler_IInspectable *handler, EventRegistrationToken *token )
++{
++    return event_list_add( &impl_from_IAppBar( iface )->closed, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI app_bar_remove_Closed( IAppBar *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IAppBar( iface )->closed, token );
++}
++
++static const struct IAppBarVtbl app_bar_vtbl =
++{
++    app_bar_QueryInterface,
++    app_bar_AddRef,
++    app_bar_Release,
++    /* IInspectable methods */
++    app_bar_GetIids,
++    app_bar_GetRuntimeClassName,
++    app_bar_GetTrustLevel,
++    /* IAppBar methods */
++    app_bar_get_IsOpen,
++    app_bar_put_IsOpen,
++    app_bar_get_IsSticky,
++    app_bar_put_IsSticky,
++    app_bar_add_Opened,
++    app_bar_remove_Opened,
++    app_bar_add_Closed,
++    app_bar_remove_Closed,
++};
++
++DEFINE_IINSPECTABLE_( command_bar, ICommandBar, struct command_bar, impl_from_ICommandBar, ICommandBar_iface, impl->button->element.outer )
++
++static HRESULT WINAPI command_bar_get_PrimaryCommands( ICommandBar *iface, IObservableVector_ICommandBarElement **value )
++{
++    *value = &impl_from_ICommandBar( iface )->primary.IObservableVector_iface;
++    IObservableVector_ICommandBarElement_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI command_bar_get_SecondaryCommands( ICommandBar *iface, IObservableVector_ICommandBarElement **value )
++{
++    *value = &impl_from_ICommandBar( iface )->secondary.IObservableVector_iface;
++    IObservableVector_ICommandBarElement_AddRef( *value );
++    return S_OK;
++}
++
++static const struct ICommandBarVtbl command_bar_vtbl =
++{
++    command_bar_QueryInterface,
++    command_bar_AddRef,
++    command_bar_Release,
++    /* IInspectable methods */
++    command_bar_GetIids,
++    command_bar_GetRuntimeClassName,
++    command_bar_GetTrustLevel,
++    /* ICommandBar methods */
++    command_bar_get_PrimaryCommands,
++    command_bar_get_SecondaryCommands,
++};
++
++/* ---- IAppBarButton, IAppBarToggleButton, IAppBarSeparator and ICommandBarElement ---- */
++
++static void set_icon( struct button *impl, IIconElement *value )
++{
++    struct xaml_element *old = icon_element( impl ), *icon;
++
++    if (old && old->parent == &impl->element) element_set_parent( old, NULL );
++    if (value) IIconElement_AddRef( value );
++    if (impl->icon) IInspectable_Release( impl->icon );
++    impl->icon = (IInspectable *)value;
++    if ((icon = icon_element( impl ))) element_set_parent( icon, &impl->element );
++    window_invalidate();
++}
++
++static HRESULT set_label( struct button *impl, HSTRING value )
++{
++    WindowsDeleteString( impl->label );
++    impl->label = NULL;
++    window_invalidate();
++    return WindowsDuplicateString( value, &impl->label );
++}
++
++DEFINE_IINSPECTABLE_( appbar_button, IAppBarButton, struct button, impl_from_IAppBarButton, IAppBarButton_iface, impl->element.outer )
++
++static HRESULT WINAPI appbar_button_get_Label( IAppBarButton *iface, HSTRING *value )
++{
++    return WindowsDuplicateString( impl_from_IAppBarButton( iface )->label, value );
++}
++
++static HRESULT WINAPI appbar_button_put_Label( IAppBarButton *iface, HSTRING value )
++{
++    return set_label( impl_from_IAppBarButton( iface ), value );
++}
++
++static HRESULT WINAPI appbar_button_get_Icon( IAppBarButton *iface, IIconElement **value )
++{
++    struct button *impl = impl_from_IAppBarButton( iface );
++    *value = NULL;
++    return impl->icon ? IInspectable_QueryInterface( impl->icon, &IID_IIconElement, (void **)value ) : S_OK;
++}
++
++static HRESULT WINAPI appbar_button_put_Icon( IAppBarButton *iface, IIconElement *value )
++{
++    set_icon( impl_from_IAppBarButton( iface ), value );
++    return S_OK;
++}
++
++static const struct IAppBarButtonVtbl appbar_button_vtbl =
++{
++    appbar_button_QueryInterface,
++    appbar_button_AddRef,
++    appbar_button_Release,
++    /* IInspectable methods */
++    appbar_button_GetIids,
++    appbar_button_GetRuntimeClassName,
++    appbar_button_GetTrustLevel,
++    /* IAppBarButton methods */
++    appbar_button_get_Label,
++    appbar_button_put_Label,
++    appbar_button_get_Icon,
++    appbar_button_put_Icon,
++};
++
++DEFINE_IINSPECTABLE_( appbar_toggle, IAppBarToggleButton, struct button, impl_from_IAppBarToggleButton,
++                      IAppBarToggleButton_iface, impl->element.outer )
++
++static HRESULT WINAPI appbar_toggle_get_Label( IAppBarToggleButton *iface, HSTRING *value )
++{
++    return WindowsDuplicateString( impl_from_IAppBarToggleButton( iface )->label, value );
++}
++
++static HRESULT WINAPI appbar_toggle_put_Label( IAppBarToggleButton *iface, HSTRING value )
++{
++    return set_label( impl_from_IAppBarToggleButton( iface ), value );
++}
++
++static HRESULT WINAPI appbar_toggle_get_Icon( IAppBarToggleButton *iface, IIconElement **value )
++{
++    struct button *impl = impl_from_IAppBarToggleButton( iface );
++    *value = NULL;
++    return impl->icon ? IInspectable_QueryInterface( impl->icon, &IID_IIconElement, (void **)value ) : S_OK;
++}
++
++static HRESULT WINAPI appbar_toggle_put_Icon( IAppBarToggleButton *iface, IIconElement *value )
++{
++    set_icon( impl_from_IAppBarToggleButton( iface ), value );
++    return S_OK;
++}
++
++static const struct IAppBarToggleButtonVtbl appbar_toggle_vtbl =
++{
++    appbar_toggle_QueryInterface,
++    appbar_toggle_AddRef,
++    appbar_toggle_Release,
++    /* IInspectable methods */
++    appbar_toggle_GetIids,
++    appbar_toggle_GetRuntimeClassName,
++    appbar_toggle_GetTrustLevel,
++    /* IAppBarToggleButton methods */
++    appbar_toggle_get_Label,
++    appbar_toggle_put_Label,
++    appbar_toggle_get_Icon,
++    appbar_toggle_put_Icon,
++};
++
++DEFINE_IINSPECTABLE_( appbar_separator, IAppBarSeparator, struct button, impl_from_IAppBarSeparator, IAppBarSeparator_iface,
++                      impl->element.outer )
++
++static const struct IAppBarSeparatorVtbl appbar_separator_vtbl =
++{
++    appbar_separator_QueryInterface,
++    appbar_separator_AddRef,
++    appbar_separator_Release,
++    /* IInspectable methods */
++    appbar_separator_GetIids,
++    appbar_separator_GetRuntimeClassName,
++    appbar_separator_GetTrustLevel,
++};
++
++DEFINE_IINSPECTABLE_( command_element, ICommandBarElement, struct button, impl_from_ICommandBarElement,
++                      ICommandBarElement_iface, impl->element.outer )
++
++static HRESULT WINAPI command_element_get_IsCompact( ICommandBarElement *iface, boolean *value )
++{
++    *value = impl_from_ICommandBarElement( iface )->compact;
++    return S_OK;
++}
++
++static HRESULT WINAPI command_element_put_IsCompact( ICommandBarElement *iface, boolean value )
++{
++    impl_from_ICommandBarElement( iface )->compact = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static const struct ICommandBarElementVtbl command_element_vtbl =
++{
++    command_element_QueryInterface,
++    command_element_AddRef,
++    command_element_Release,
++    /* IInspectable methods */
++    command_element_GetIids,
++    command_element_GetRuntimeClassName,
++    command_element_GetTrustLevel,
++    /* ICommandBarElement methods */
++    command_element_get_IsCompact,
++    command_element_put_IsCompact,
++};
++
++/* ---- the button.c side ---- */
++
++HRESULT bar_init( struct button *impl )
++{
++    struct command_bar *bar;
++    HRESULT hr;
++
++    impl->IAppBarButton_iface.lpVtbl = &appbar_button_vtbl;
++    impl->IAppBarToggleButton_iface.lpVtbl = &appbar_toggle_vtbl;
++    impl->IAppBarSeparator_iface.lpVtbl = &appbar_separator_vtbl;
++    impl->ICommandBarElement_iface.lpVtbl = &command_element_vtbl;
++    memset( &impl->border_thickness, 0, sizeof(impl->border_thickness) );
++    memset( &impl->padding, 0, sizeof(impl->padding) );
++    impl->element.vertical_alignment = VerticalAlignment_Top;
++    if (impl->kind == BUTTON_APPBAR_SEPARATOR) impl->element.is_tab_stop = FALSE;
++    if (impl->kind != BUTTON_COMMAND_BAR) return S_OK;
++
++    impl->element.horizontal_alignment = HorizontalAlignment_Stretch;
++    impl->element.is_tab_stop = FALSE;
++    impl->content_horizontal = HorizontalAlignment_Stretch;
++    impl->content_vertical = VerticalAlignment_Stretch;
++    if (!(bar = calloc( 1, sizeof(*bar) ))) return E_OUTOFMEMORY;
++    bar->IAppBar_iface.lpVtbl = &app_bar_vtbl;
++    bar->ICommandBar_iface.lpVtbl = &command_bar_vtbl;
++    bar->button = impl;
++    bar->primary.IObservableVector_iface.lpVtbl = &command_list_vtbl;
++    bar->primary.bar = bar;
++    bar->secondary.IObservableVector_iface.lpVtbl = &command_list_vtbl;
++    bar->secondary.bar = bar;
++    bar->secondary.secondary = TRUE;
++    if (FAILED(hr = vector_create( &command_iids, &command_callbacks, &bar->primary, &bar->primary.vector )) ||
++        FAILED(hr = vector_create( &command_iids, &command_callbacks, &bar->secondary, &bar->secondary.vector )))
++    {
++        if (bar->primary.vector) IInspectable_Release( bar->primary.vector );
++        free( bar );
++        return hr;
++    }
++    impl->bar = bar;
++    return S_OK;
++}
++
++void *bar_default_iface( struct button *impl )
++{
++    switch (impl->kind)
++    {
++    case BUTTON_APPBAR: return &impl->IAppBarButton_iface;
++    case BUTTON_APPBAR_TOGGLE: return &impl->IAppBarToggleButton_iface;
++    case BUTTON_APPBAR_SEPARATOR: return &impl->IAppBarSeparator_iface;
++    default: return &impl->bar->ICommandBar_iface;
++    }
++}
++
++HRESULT bar_query_interface( struct button *impl, REFIID iid, void **out )
++{
++    if (impl->kind == BUTTON_APPBAR && IsEqualGUID( iid, &IID_IAppBarButton )) *out = &impl->IAppBarButton_iface;
++    else if (impl->kind == BUTTON_APPBAR_TOGGLE && IsEqualGUID( iid, &IID_IAppBarToggleButton )) *out = &impl->IAppBarToggleButton_iface;
++    else if (impl->kind == BUTTON_APPBAR_SEPARATOR && IsEqualGUID( iid, &IID_IAppBarSeparator )) *out = &impl->IAppBarSeparator_iface;
++    else if (impl->kind != BUTTON_COMMAND_BAR && IsEqualGUID( iid, &IID_ICommandBarElement )) *out = &impl->ICommandBarElement_iface;
++    else if (impl->kind == BUTTON_COMMAND_BAR && IsEqualGUID( iid, &IID_ICommandBar )) *out = &impl->bar->ICommandBar_iface;
++    else if (impl->kind == BUTTON_COMMAND_BAR && IsEqualGUID( iid, &IID_IAppBar )) *out = &impl->bar->IAppBar_iface;
++    else return E_NOINTERFACE;
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++void bar_destroy( struct button *impl )
++{
++    struct command_bar *bar = impl->bar;
++    struct xaml_element *icon = icon_element( impl );
++
++    if (icon && icon->parent == &impl->element) element_set_parent( icon, NULL );
++    if (impl->icon) IInspectable_Release( impl->icon );
++    WindowsDeleteString( impl->label );
++    if (!bar) return;
++    if (bar->menu)
++    {
++        window_popup_hide( &bar->menu->element );
++        bar->menu->bar = NULL;
++        IInspectable_Release( bar->menu_object );
++    }
++    vector_detach( bar->primary.vector );
++    vector_detach( bar->secondary.vector );
++    IInspectable_Release( bar->primary.vector );
++    IInspectable_Release( bar->secondary.vector );
++    event_list_clear( &bar->opened );
++    event_list_clear( &bar->closed );
++    free( bar );
++    impl->bar = NULL;
++}
++
++/* AppBarButton's Label / Icon / IsCompact from markup; value is the text, or NULL for number or object */
++BOOL bar_set_markup( IInspectable *object, const WCHAR *name, const WCHAR *value, double number, IInspectable *object_value )
++{
++    struct xaml_element *element = element_from_object( object );
++    IIconElement *icon = NULL;
++    IInspectable *created;
++    struct button *impl;
++    HSTRING str;
++    Symbol symbol;
++
++    if (!element || !bar_button_from_object( object )) return FALSE;
++    impl = CONTAINING_RECORD( element, struct button, element );
++    if (!wcscmp( name, L"Label" ) && value)
++    {
++        if (FAILED(WindowsCreateString( value, wcslen( value ), &str ))) return FALSE;
++        set_label( impl, str );
++        WindowsDeleteString( str );
++        return TRUE;
++    }
++    if (!wcscmp( name, L"Icon" ))
++    {
++        /* Icon="Add" makes a SymbolIcon */
++        if (value && symbol_from_name( value, &symbol ) && (created = symbol_icon_create( symbol )))
++        {
++            IInspectable_QueryInterface( created, &IID_IIconElement, (void **)&icon );
++            IInspectable_Release( created );
++        }
++        else if (object_value) IInspectable_QueryInterface( object_value, &IID_IIconElement, (void **)&icon );
++        if (!icon)
++        {
++            FIXME( "Icon %s is not supported.\n", debugstr_w(value) );
++            return TRUE;
++        }
++        set_icon( impl, icon );
++        IIconElement_Release( icon );
++        return TRUE;
++    }
++    if (!wcscmp( name, L"IsCompact" ))
++    {
++        impl->compact = value ? !wcsicmp( value, L"True" ) : number != 0;
++        return TRUE;
++    }
++    return FALSE;
++}
++
++/* CommandBar.IsOpen / IsSticky from markup */
++BOOL command_bar_set_markup( IInspectable *object, const WCHAR *name, const WCHAR *value, double number )
++{
++    struct xaml_element *element = element_from_object( object );
++    struct button *impl;
++    BOOL flag = value ? !wcsicmp( value, L"True" ) : number != 0;
++
++    if (!element || !element->class_name || wcscmp( element->class_name, RuntimeClass_Windows_UI_Xaml_Controls_CommandBar ))
++        return FALSE;
++    impl = CONTAINING_RECORD( element, struct button, element );
++    if (!impl->bar) return FALSE;
++    if (!wcscmp( name, L"IsSticky" )) impl->bar->sticky = flag;
++    else if (!wcscmp( name, L"IsOpen" )) bar_set_open( impl->bar, flag );
++    else return FALSE;
++    return TRUE;
++}
+diff --git a/dlls/windows.ui.xaml/content.c b/dlls/windows.ui.xaml/content.c
+index e00a356..c8dcb06 100644
+--- a/dlls/windows.ui.xaml/content.c
++++ b/dlls/windows.ui.xaml/content.c
+@@ -17,6 +17,8 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++#include <math.h>
++
+ #include "private.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(xaml);
+@@ -49,6 +51,7 @@ struct content_host
+     Thickness padding;
+     TypeName page_type;           /* Frame: the current page's type */
+     IFrame *frame;                /* Page: the frame showing it (not referenced) */
++    IAppBar *bars[2];             /* Page: TopAppBar and BottomAppBar */
+     struct event_list navigated, navigating, navigation_failed, navigation_stopped;
+ };
+ 
+@@ -74,16 +77,33 @@ static HRESULT content_query_interface( struct xaml_element *element, REFIID iid
+     return S_OK;
+ }
+ 
++static struct xaml_element *app_bar( struct content_host *impl, int which )
++{
++    return impl->bars[which] ? element_from_object( (IInspectable *)impl->bars[which] ) : NULL;
++}
++
+ static void content_measure( struct xaml_element *element, struct layout_context *ctx, float avail_width,
+                              float avail_height, float *width, float *height )
+ {
+     struct content_host *impl = impl_from_element( element );
+     const Thickness *p = &impl->padding;
+     COLORREF saved = ctx->foreground;
++    struct xaml_element *bar;
++    float bars = 0;
++    int i;
+     Color c;
+ 
+     *width = p->Left + p->Right;
+     *height = p->Top + p->Bottom;
++    /* a Page's app bars take their height from the top and bottom */
++    for (i = 0; i < 2; i++)
++    {
++        if (!(bar = app_bar( impl, i ))) continue;
++        element_measure( bar, ctx, avail_width, INFINITY );
++        bars += bar->desired_height;
++    }
++    *height += bars;
++    avail_height = max( 0.0f, avail_height - bars );
+     if (!impl->child) return;
+     if (impl->foreground && brush_get_color( impl->foreground, &c ))
+     {
+@@ -101,10 +121,14 @@ static void content_arrange( struct xaml_element *element, struct layout_context
+     struct content_host *impl = impl_from_element( element );
+     const Thickness *p = &impl->padding;
+     const struct layout_rect *b = &element->bounds;
++    struct xaml_element *top = app_bar( impl, 0 ), *bottom = app_bar( impl, 1 );
++    float top_h = top ? top->desired_height : 0, bottom_h = bottom ? bottom->desired_height : 0;
+ 
++    if (top) element_arrange( top, ctx, b->x, b->y, b->width, top_h );
++    if (bottom) element_arrange( bottom, ctx, b->x, b->y + max( 0.0f, b->height - bottom_h ), b->width, bottom_h );
+     if (impl->child)
+-        element_arrange( impl->child, ctx, b->x + p->Left, b->y + p->Top, max( 0.0f, b->width - p->Left - p->Right ),
+-                         max( 0.0f, b->height - p->Top - p->Bottom ) );
++        element_arrange( impl->child, ctx, b->x + p->Left, b->y + top_h + p->Top, max( 0.0f, b->width - p->Left - p->Right ),
++                         max( 0.0f, b->height - top_h - bottom_h - p->Top - p->Bottom ) );
+ }
+ 
+ static void content_render( struct xaml_element *element, struct layout_context *ctx )
+@@ -113,25 +137,38 @@ static void content_render( struct xaml_element *element, struct layout_context
+     COLORREF saved = ctx->foreground;
+     Color c;
+ 
++    struct xaml_element *bar;
++    int i;
++
+     element_fill( ctx, &element->bounds, impl->background );
+-    if (!impl->child) return;
+     if (impl->foreground && brush_get_color( impl->foreground, &c ))
+     {
+         ctx->foreground = RGB( c.R, c.G, c.B );
+         ctx->foreground_alpha = c.A;
+     }
+-    element_render( impl->child, ctx );
++    if (impl->child) element_render( impl->child, ctx );
++    /* the app bars over the content: an open one grows over it */
++    for (i = 0; i < 2; i++) if ((bar = app_bar( impl, i ))) element_render( bar, ctx );
+     ctx->foreground = saved;
+ }
+ 
++/* the content, then the app bars (hit first) */
+ static UINT32 content_child_count( struct xaml_element *element )
+ {
+-    return impl_from_element( element )->child ? 1 : 0;
++    struct content_host *impl = impl_from_element( element );
++    return (impl->child ? 1 : 0) + (app_bar( impl, 0 ) ? 1 : 0) + (app_bar( impl, 1 ) ? 1 : 0);
+ }
+ 
+ static struct xaml_element *content_child_at( struct xaml_element *element, UINT32 index )
+ {
+-    return impl_from_element( element )->child;
++    struct content_host *impl = impl_from_element( element );
++    struct xaml_element *parts[3];
++    UINT32 n = 0;
++
++    if (impl->child) parts[n++] = impl->child;
++    if (app_bar( impl, 0 )) parts[n++] = app_bar( impl, 0 );
++    if (app_bar( impl, 1 )) parts[n++] = app_bar( impl, 1 );
++    return index < n ? parts[index] : NULL;
+ }
+ 
+ static BOOL content_hit_self( struct xaml_element *element, float x, float y )
+@@ -155,11 +192,15 @@ static void content_set( struct content_host *impl, IInspectable *value )
+     window_invalidate();
+ }
+ 
++static void set_app_bar( struct content_host *impl, int which, IAppBar *value );
++
+ static void content_destroy( struct xaml_element *element )
+ {
+     struct content_host *impl = impl_from_element( element );
+ 
+     content_set( impl, NULL );
++    set_app_bar( impl, 0, NULL );
++    set_app_bar( impl, 1, NULL );
+     if (impl->background) IBrush_Release( impl->background );
+     if (impl->foreground) IBrush_Release( impl->foreground );
+     WindowsDeleteString( impl->page_type.Name );
+@@ -272,28 +313,42 @@ static HRESULT WINAPI page_put_NavigationCacheMode(IPage *iface, __x_ABI_CWindow
+     return E_NOTIMPL;
+ }
+ 
+-static HRESULT WINAPI page_get_TopAppBar(IPage *iface, __x_ABI_CWindows_CUI_CXaml_CControls_CIAppBar **value)
++static void set_app_bar( struct content_host *impl, int which, IAppBar *value )
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    struct xaml_element *old = app_bar( impl, which ), *bar;
++
++    if (old && old->parent == &impl->element) element_set_parent( old, NULL );
++    if (value) IAppBar_AddRef( value );
++    if (impl->bars[which]) IAppBar_Release( impl->bars[which] );
++    impl->bars[which] = value;
++    if ((bar = app_bar( impl, which ))) element_set_parent( bar, &impl->element );
++    window_invalidate();
+ }
+ 
+-static HRESULT WINAPI page_put_TopAppBar(IPage *iface, __x_ABI_CWindows_CUI_CXaml_CControls_CIAppBar *value)
++static HRESULT WINAPI page_get_TopAppBar( IPage *iface, IAppBar **value )
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    if ((*value = impl_from_IPage( iface )->bars[0])) IAppBar_AddRef( *value );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI page_get_BottomAppBar(IPage *iface, __x_ABI_CWindows_CUI_CXaml_CControls_CIAppBar **value)
++static HRESULT WINAPI page_put_TopAppBar( IPage *iface, IAppBar *value )
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    set_app_bar( impl_from_IPage( iface ), 0, value );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI page_put_BottomAppBar(IPage *iface, __x_ABI_CWindows_CUI_CXaml_CControls_CIAppBar *value)
++static HRESULT WINAPI page_get_BottomAppBar( IPage *iface, IAppBar **value )
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    if ((*value = impl_from_IPage( iface )->bars[1])) IAppBar_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI page_put_BottomAppBar( IPage *iface, IAppBar *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    set_app_bar( impl_from_IPage( iface ), 1, value );
++    return S_OK;
+ }
+ 
+ static const struct IPageVtbl page_vtbl =
+diff --git a/dlls/windows.ui.xaml/control.h b/dlls/windows.ui.xaml/control.h
+index f8948b6..b4ac2f2 100644
+--- a/dlls/windows.ui.xaml/control.h
++++ b/dlls/windows.ui.xaml/control.h
+@@ -36,6 +36,10 @@ enum button_kind
+     BUTTON_LIST_ITEM,       /* listview.c: ListViewItem and GridViewItem, a ListView's / GridView's containers */
+     BUTTON_GRID_ITEM,
+     BUTTON_DIALOG,          /* dialog.c: ContentDialog, a ContentControl shown over the window */
++    BUTTON_APPBAR,          /* commandbar.c: AppBarButton, AppBarToggleButton, AppBarSeparator and CommandBar */
++    BUTTON_APPBAR_TOGGLE,
++    BUTTON_APPBAR_SEPARATOR,
++    BUTTON_COMMAND_BAR,
+ };
+ 
+ enum check_state
+@@ -101,6 +105,16 @@ struct button
+     boolean is_selected, is_current;
+     /* dialog.c: ContentDialog */
+     struct dialog_state *dialog;
++    /* commandbar.c: app bar buttons and the CommandBar */
++    IAppBarButton IAppBarButton_iface;
++    IAppBarToggleButton IAppBarToggleButton_iface;
++    IAppBarSeparator IAppBarSeparator_iface;
++    ICommandBarElement ICommandBarElement_iface;
++    HSTRING label;
++    IInspectable *icon;                  /* an IconElement */
++    boolean compact, in_overflow;
++    struct button *owner_bar;            /* the CommandBar it is in (not referenced) */
++    struct command_bar *bar;
+ };
+ 
+ static inline struct button *impl_from_element( struct xaml_element *element )
+@@ -174,6 +188,24 @@ void item_render_background( struct button *impl, struct layout_context *ctx );
+ void item_render_overlay( struct button *impl, struct layout_context *ctx );
+ void item_clicked( struct button *impl );
+ 
++/* commandbar.c */
++static inline BOOL is_bar_kind( struct button *impl )
++{
++    return impl->kind >= BUTTON_APPBAR && impl->kind <= BUTTON_COMMAND_BAR;
++}
++HRESULT bar_init( struct button *impl );
++void *bar_default_iface( struct button *impl );
++HRESULT bar_query_interface( struct button *impl, REFIID iid, void **out );
++void bar_measure( struct button *impl, struct layout_context *ctx, float avail_width, float avail_height,
++                  float *width, float *height );
++void bar_arrange( struct button *impl, struct layout_context *ctx );
++void bar_render( struct button *impl, struct layout_context *ctx );
++UINT32 bar_child_count( struct button *impl );
++struct xaml_element *bar_child_at( struct button *impl, UINT32 index );
++void bar_pointer( struct button *impl, UINT msg, float x, float y );
++void bar_command_clicked( struct button *impl );
++void bar_destroy( struct button *impl );
++
+ /* dialog.c */
+ HRESULT dialog_init( struct button *impl );
+ void *dialog_default_iface( struct button *impl );
+diff --git a/dlls/windows.ui.xaml/dialog.c b/dlls/windows.ui.xaml/dialog.c
+index 1f85f47..a103554 100644
+--- a/dlls/windows.ui.xaml/dialog.c
++++ b/dlls/windows.ui.xaml/dialog.c
+@@ -892,7 +892,7 @@ static HRESULT dialog_show( struct dialog_state *dialog, IAsyncOperation_Content
+         return E_ILLEGAL_METHOD_CALL;
+     }
+     if (!(dialog->async = async_create())) return E_OUTOFMEMORY;
+-    if (!build_layer( dialog ) || !window_popup_show( &dialog->layer->element ))
++    if (!build_layer( dialog ) || !window_popup_show( &dialog->layer->element, TRUE ))
+     {
+         free_layer( dialog );
+         IAsyncOperation_ContentDialogResult_Release( &dialog->async->IAsyncOperation_iface );
+diff --git a/dlls/windows.ui.xaml/icon.c b/dlls/windows.ui.xaml/icon.c
+new file mode 100644
+index 0000000..ac2c119
+--- /dev/null
++++ b/dlls/windows.ui.xaml/icon.c
+@@ -0,0 +1,721 @@
++/* WinRT Windows.UI.Xaml.Controls IconElement, SymbolIcon and FontIcon implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* SymbolIcon draws a Symbol, whose value is its character in the Segoe MDL2 Assets font, 20 px in a 20 x 20 box.
++ * Without that font (it comes with Windows, not Wine) a similar Unicode character from the usual fonts stands in,
++ * or a square. FontIcon draws its Glyph in its FontFamily (Segoe MDL2 Assets by default) at its FontSize. Both take
++ * the inherited foreground unless their Foreground is set. */
++
++#define MDL2 L"Segoe MDL2 Assets"
++
++enum icon_kind
++{
++    ICON_SYMBOL,
++    ICON_FONT,
++};
++
++struct icon
++{
++    struct xaml_element element;
++    IIconElement IIconElement_iface;
++    ISymbolIcon ISymbolIcon_iface;
++    IFontIcon IFontIcon_iface;
++    enum icon_kind kind;
++    Symbol symbol;
++    HSTRING glyph;
++    WCHAR family[64];
++    IFontFamily *font_family;
++    double font_size;
++    FontWeight weight;
++    FontStyle style;
++    IBrush *foreground;
++};
++
++static inline struct icon *impl_from_element( struct xaml_element *element )
++{
++    return CONTAINING_RECORD( element, struct icon, element );
++}
++
++/* generated from the Symbol enum: names for markup (Icon="Add"), sorted case-insensitively */
++static const struct { const WCHAR *name; Symbol value; } symbol_names[] =
++{
++    { L"Accept", 0xe10b },
++    { L"Account", 0xe168 },
++    { L"Add", 0xe109 },
++    { L"AddFriend", 0xe1e2 },
++    { L"Admin", 0xe1a7 },
++    { L"AlignCenter", 0xe1a1 },
++    { L"AlignLeft", 0xe1a2 },
++    { L"AlignRight", 0xe1a0 },
++    { L"AllApps", 0xe179 },
++    { L"Attach", 0xe16c },
++    { L"AttachCamera", 0xe12d },
++    { L"Audio", 0xe189 },
++    { L"Back", 0xe112 },
++    { L"BackToWindow", 0xe1d8 },
++    { L"BlockContact", 0xe1e0 },
++    { L"Bold", 0xe19b },
++    { L"Bookmarks", 0xe12f },
++    { L"BrowsePhotos", 0xe155 },
++    { L"Bullets", 0xe133 },
++    { L"Calculator", 0xe1d0 },
++    { L"Calendar", 0xe163 },
++    { L"CalendarDay", 0xe161 },
++    { L"CalendarReply", 0xe1db },
++    { L"CalendarWeek", 0xe162 },
++    { L"Camera", 0xe114 },
++    { L"Cancel", 0xe10a },
++    { L"Caption", 0xe15a },
++    { L"CellPhone", 0xe1c9 },
++    { L"Character", 0xe164 },
++    { L"Clear", 0xe106 },
++    { L"ClearSelection", 0xe1c5 },
++    { L"Clock", 0xe121 },
++    { L"ClosedCaption", 0xe190 },
++    { L"ClosePane", 0xe127 },
++    { L"Comment", 0xe134 },
++    { L"Contact", 0xe13d },
++    { L"Contact2", 0xe187 },
++    { L"ContactInfo", 0xe136 },
++    { L"ContactPresence", 0xe181 },
++    { L"Copy", 0xe16f },
++    { L"Crop", 0xe123 },
++    { L"Cut", 0xe16b },
++    { L"Delete", 0xe107 },
++    { L"Directions", 0xe1d1 },
++    { L"DisableUpdates", 0xe194 },
++    { L"DisconnectDrive", 0xe17a },
++    { L"Dislike", 0xe19e },
++    { L"DockBottom", 0xe147 },
++    { L"DockLeft", 0xe145 },
++    { L"DockRight", 0xe146 },
++    { L"Document", 0xe130 },
++    { L"Download", 0xe118 },
++    { L"Edit", 0xe104 },
++    { L"Emoji", 0xe11d },
++    { L"Emoji2", 0xe170 },
++    { L"Favorite", 0xe113 },
++    { L"Filter", 0xe16e },
++    { L"Find", 0xe11a },
++    { L"Flag", 0xe129 },
++    { L"Folder", 0xe188 },
++    { L"Font", 0xe185 },
++    { L"FontColor", 0xe186 },
++    { L"FontDecrease", 0xe1c6 },
++    { L"FontIncrease", 0xe1c7 },
++    { L"FontSize", 0xe1c8 },
++    { L"Forward", 0xe111 },
++    { L"FourBars", 0xe1e9 },
++    { L"FullScreen", 0xe1d9 },
++    { L"GlobalNavigationButton", 0xe700 },
++    { L"Globe", 0xe12b },
++    { L"Go", 0xe143 },
++    { L"GoToStart", 0xe1e4 },
++    { L"GoToToday", 0xe184 },
++    { L"HangUp", 0xe137 },
++    { L"Help", 0xe11b },
++    { L"HideBcc", 0xe16a },
++    { L"Highlight", 0xe193 },
++    { L"Home", 0xe10f },
++    { L"Import", 0xe150 },
++    { L"ImportAll", 0xe151 },
++    { L"Important", 0xe171 },
++    { L"Italic", 0xe199 },
++    { L"Keyboard", 0xe144 },
++    { L"LeaveChat", 0xe11f },
++    { L"Library", 0xe1d3 },
++    { L"Like", 0xe19f },
++    { L"LikeDislike", 0xe19d },
++    { L"Link", 0xe167 },
++    { L"List", 0xe14c },
++    { L"Mail", 0xe119 },
++    { L"MailFilled", 0xe135 },
++    { L"MailForward", 0xe120 },
++    { L"MailReply", 0xe172 },
++    { L"MailReplyAll", 0xe165 },
++    { L"Manage", 0xe178 },
++    { L"Map", 0xe1c4 },
++    { L"MapDrive", 0xe17b },
++    { L"MapPin", 0xe139 },
++    { L"Memo", 0xe1d5 },
++    { L"Message", 0xe15f },
++    { L"Microphone", 0xe1d6 },
++    { L"More", 0xe10c },
++    { L"MoveToFolder", 0xe19c },
++    { L"MusicInfo", 0xe142 },
++    { L"Mute", 0xe198 },
++    { L"NewFolder", 0xe1da },
++    { L"NewWindow", 0xe17c },
++    { L"Next", 0xe101 },
++    { L"OneBar", 0xe1e6 },
++    { L"OpenFile", 0xe1a5 },
++    { L"OpenLocal", 0xe197 },
++    { L"OpenPane", 0xe126 },
++    { L"OpenWith", 0xe17d },
++    { L"Orientation", 0xe14f },
++    { L"OtherUser", 0xe1a6 },
++    { L"OutlineStar", 0xe1ce },
++    { L"Page", 0xe132 },
++    { L"Page2", 0xe160 },
++    { L"Paste", 0xe16d },
++    { L"Pause", 0xe103 },
++    { L"People", 0xe125 },
++    { L"Permissions", 0xe192 },
++    { L"Phone", 0xe13a },
++    { L"PhoneBook", 0xe1d4 },
++    { L"Pictures", 0xe158 },
++    { L"Pin", 0xe141 },
++    { L"Placeholder", 0xe18a },
++    { L"Play", 0xe102 },
++    { L"PostUpdate", 0xe1d7 },
++    { L"Preview", 0xe295 },
++    { L"PreviewLink", 0xe12a },
++    { L"Previous", 0xe100 },
++    { L"Print", 0xe749 },
++    { L"Priority", 0xe182 },
++    { L"ProtectedDocument", 0xe131 },
++    { L"Read", 0xe166 },
++    { L"Redo", 0xe10d },
++    { L"Refresh", 0xe149 },
++    { L"Remote", 0xe148 },
++    { L"Remove", 0xe108 },
++    { L"Rename", 0xe13e },
++    { L"Repair", 0xe15e },
++    { L"RepeatAll", 0xe1cd },
++    { L"RepeatOne", 0xe1cc },
++    { L"ReportHacked", 0xe1de },
++    { L"ReShare", 0xe1ca },
++    { L"Rotate", 0xe14a },
++    { L"RotateCamera", 0xe124 },
++    { L"Save", 0xe105 },
++    { L"SaveLocal", 0xe159 },
++    { L"Scan", 0xe294 },
++    { L"SelectAll", 0xe14e },
++    { L"Send", 0xe122 },
++    { L"SetLockScreen", 0xe18c },
++    { L"SetTile", 0xe18d },
++    { L"Setting", 0xe115 },
++    { L"Share", 0xe72d },
++    { L"Shop", 0xe14d },
++    { L"ShowBcc", 0xe169 },
++    { L"ShowResults", 0xe15c },
++    { L"Shuffle", 0xe14b },
++    { L"SlideShow", 0xe173 },
++    { L"SolidStar", 0xe1cf },
++    { L"Sort", 0xe174 },
++    { L"Stop", 0xe15b },
++    { L"StopSlideShow", 0xe191 },
++    { L"Street", 0xe1c3 },
++    { L"Switch", 0xe13c },
++    { L"SwitchApps", 0xe1e1 },
++    { L"Sync", 0xe117 },
++    { L"SyncFolder", 0xe1df },
++    { L"Tag", 0xe1cb },
++    { L"Target", 0xe1d2 },
++    { L"ThreeBars", 0xe1e8 },
++    { L"TouchPointer", 0xe1e3 },
++    { L"Trim", 0xe12c },
++    { L"TwoBars", 0xe1e7 },
++    { L"TwoPage", 0xe11e },
++    { L"Underline", 0xe19a },
++    { L"Undo", 0xe10e },
++    { L"UnFavorite", 0xe195 },
++    { L"UnPin", 0xe196 },
++    { L"UnSyncFolder", 0xe1dd },
++    { L"Up", 0xe110 },
++    { L"Upload", 0xe11c },
++    { L"Video", 0xe116 },
++    { L"VideoChat", 0xe13b },
++    { L"View", 0xe18b },
++    { L"ViewAll", 0xe138 },
++    { L"Volume", 0xe15d },
++    { L"WebCam", 0xe156 },
++    { L"World", 0xe128 },
++    { L"XboxOneConsole", 0xe990 },
++    { L"ZeroBars", 0xe1e5 },
++    { L"Zoom", 0xe1a3 },
++    { L"ZoomIn", 0xe12e },
++    { L"ZoomOut", 0xe1a4 },
++};
++
++BOOL symbol_from_name( const WCHAR *name, Symbol *value )
++{
++    int lo = 0, hi = ARRAY_SIZE(symbol_names) - 1, mid, cmp;
++
++    while (lo <= hi)
++    {
++        mid = (lo + hi) / 2;
++        if (!(cmp = wcsicmp( name, symbol_names[mid].name )))
++        {
++            *value = symbol_names[mid].value;
++            return TRUE;
++        }
++        if (cmp < 0) hi = mid - 1;
++        else lo = mid + 1;
++    }
++    return FALSE;
++}
++
++/* stand-ins from the common fonts for the symbols apps use most */
++static WCHAR symbol_fallback( Symbol symbol )
++{
++    static const struct { Symbol symbol; WCHAR ch; } map[] =
++    {
++        { Symbol_Add, '+' }, { Symbol_Cancel, 0x2715 }, { Symbol_Accept, 0x2713 }, { Symbol_More, 0x22ef },
++        { Symbol_Back, 0x2190 }, { Symbol_Forward, 0x2192 }, { Symbol_Up, 0x2191 }, { Symbol_Download, 0x2193 },
++        { Symbol_Upload, 0x2191 }, { Symbol_Setting, 0x2699 }, { Symbol_Refresh, 0x27f3 }, { Symbol_Sync, 0x27f2 },
++        { Symbol_Home, 0x2302 }, { Symbol_Favorite, 0x2605 }, { Symbol_Play, 0x25b6 }, { Symbol_Pause, 0x2016 },
++        { Symbol_Stop, 0x25a0 }, { Symbol_Delete, 0x2717 }, { Symbol_Edit, 0x270e }, { Symbol_Find, 0x2315 },
++        { Symbol_Zoom, 0x2315 }, { Symbol_Mail, 0x2709 }, { Symbol_Remove, 0x2212 }, { Symbol_Help, '?' },
++        { Symbol_Previous, 0x25c0 }, { Symbol_Next, 0x25b6 }, { Symbol_Clear, 0x2715 }, { Symbol_List, 0x2630 },
++        { Symbol_Copy, 0x2398 }, { Symbol_Cut, 0x2702 }, { Symbol_Undo, 0x21b6 }, { Symbol_Redo, 0x21b7 },
++        { Symbol_Volume, 0x266a }, { Symbol_Contact, 0x263a }, { Symbol_Flag, 0x2691 }, { Symbol_Important, '!' },
++        { Symbol_Phone, 0x260e }, { Symbol_Send, 0x27a4 }, { Symbol_Print, 0x2399 }, { Symbol_Filter, 0x25bd },
++        { Symbol_Sort, 0x21c5 }, { Symbol_Clock, 0x25f7 }, { Symbol_Calendar, 0x25a6 }, { Symbol_Video, 0x25b6 },
++    };
++    UINT32 i;
++
++    for (i = 0; i < ARRAY_SIZE(map); i++) if (map[i].symbol == symbol) return map[i].ch;
++    return 0x25a1;   /* a square */
++}
++
++static BOOL have_mdl2(void)
++{
++    static int have = -1;
++    if (have < 0) have = dwrite_has_family( MDL2 );
++    return have;
++}
++
++static HRESULT icon_query_interface( struct xaml_element *element, REFIID iid, void **out )
++{
++    struct icon *impl = impl_from_element( element );
++
++    if (IsEqualGUID( iid, &IID_IIconElement )) *out = &impl->IIconElement_iface;
++    else if (impl->kind == ICON_SYMBOL && IsEqualGUID( iid, &IID_ISymbolIcon )) *out = &impl->ISymbolIcon_iface;
++    else if (impl->kind == ICON_FONT && IsEqualGUID( iid, &IID_IFontIcon )) *out = &impl->IFontIcon_iface;
++    else return E_NOINTERFACE;
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static void icon_measure( struct xaml_element *element, struct layout_context *ctx, float avail_width,
++                          float avail_height, float *width, float *height )
++{
++    struct icon *impl = impl_from_element( element );
++    *width = *height = impl->kind == ICON_SYMBOL ? 20.0f : impl->font_size;
++}
++
++static void icon_render( struct xaml_element *element, struct layout_context *ctx )
++{
++    struct icon *impl = impl_from_element( element );
++    Color color = { ctx->foreground_alpha, GetRValue( ctx->foreground ), GetGValue( ctx->foreground ), GetBValue( ctx->foreground ) };
++    const WCHAR *text, *family;
++    WCHAR ch;
++    UINT32 len;
++
++    if (impl->foreground) brush_get_color( impl->foreground, &color );
++    if (impl->kind == ICON_SYMBOL)
++    {
++        if (have_mdl2())
++        {
++            ch = impl->symbol;
++            d2d_draw_glyphs( ctx, MDL2, 20.0, 400, &ch, 1, &element->bounds, color );
++        }
++        else
++        {
++            ch = symbol_fallback( impl->symbol );
++            d2d_draw_glyphs( ctx, L"Segoe UI", 16.0, 400, &ch, 1, &element->bounds, color );
++        }
++        return;
++    }
++    text = WindowsGetStringRawBuffer( impl->glyph, &len );
++    family = impl->family[0] ? impl->family : MDL2;
++    if (len) d2d_draw_glyphs( ctx, family, impl->font_size, impl->weight.Weight, text, len, &element->bounds, color );
++}
++
++static void icon_destroy( struct xaml_element *element )
++{
++    struct icon *impl = impl_from_element( element );
++
++    WindowsDeleteString( impl->glyph );
++    if (impl->font_family) IFontFamily_Release( impl->font_family );
++    if (impl->foreground) IBrush_Release( impl->foreground );
++    free( impl );
++}
++
++static const struct element_ops icon_ops =
++{
++    .query_interface = icon_query_interface,
++    .measure = icon_measure,
++    .render = icon_render,
++    .destroy = icon_destroy,
++};
++
++/* IIconElement */
++
++DEFINE_IINSPECTABLE_( icon_element, IIconElement, struct icon, impl_from_IIconElement, IIconElement_iface, impl->element.outer )
++
++static HRESULT WINAPI icon_element_get_Foreground( IIconElement *iface, IBrush **value )
++{
++    if ((*value = impl_from_IIconElement( iface )->foreground)) IBrush_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI icon_element_put_Foreground( IIconElement *iface, IBrush *value )
++{
++    struct icon *impl = impl_from_IIconElement( iface );
++    if (value) IBrush_AddRef( value );
++    if (impl->foreground) IBrush_Release( impl->foreground );
++    impl->foreground = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static const struct IIconElementVtbl icon_element_vtbl =
++{
++    icon_element_QueryInterface,
++    icon_element_AddRef,
++    icon_element_Release,
++    /* IInspectable methods */
++    icon_element_GetIids,
++    icon_element_GetRuntimeClassName,
++    icon_element_GetTrustLevel,
++    /* IIconElement methods */
++    icon_element_get_Foreground,
++    icon_element_put_Foreground,
++};
++
++/* ISymbolIcon */
++
++DEFINE_IINSPECTABLE_( symbol_icon, ISymbolIcon, struct icon, impl_from_ISymbolIcon, ISymbolIcon_iface, impl->element.outer )
++
++static HRESULT WINAPI symbol_icon_get_Symbol( ISymbolIcon *iface, Symbol *value )
++{
++    *value = impl_from_ISymbolIcon( iface )->symbol;
++    return S_OK;
++}
++
++static HRESULT WINAPI symbol_icon_put_Symbol( ISymbolIcon *iface, Symbol value )
++{
++    TRACE( "iface %p, value %#x.\n", iface, value );
++    impl_from_ISymbolIcon( iface )->symbol = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static const struct ISymbolIconVtbl symbol_icon_vtbl =
++{
++    symbol_icon_QueryInterface,
++    symbol_icon_AddRef,
++    symbol_icon_Release,
++    /* IInspectable methods */
++    symbol_icon_GetIids,
++    symbol_icon_GetRuntimeClassName,
++    symbol_icon_GetTrustLevel,
++    /* ISymbolIcon methods */
++    symbol_icon_get_Symbol,
++    symbol_icon_put_Symbol,
++};
++
++/* IFontIcon */
++
++DEFINE_IINSPECTABLE_( font_icon, IFontIcon, struct icon, impl_from_IFontIcon, IFontIcon_iface, impl->element.outer )
++
++static HRESULT WINAPI font_icon_get_Glyph( IFontIcon *iface, HSTRING *value )
++{
++    return WindowsDuplicateString( impl_from_IFontIcon( iface )->glyph, value );
++}
++
++static HRESULT WINAPI font_icon_put_Glyph( IFontIcon *iface, HSTRING value )
++{
++    struct icon *impl = impl_from_IFontIcon( iface );
++    WindowsDeleteString( impl->glyph );
++    window_invalidate();
++    return WindowsDuplicateString( value, &impl->glyph );
++}
++
++static HRESULT WINAPI font_icon_get_FontSize( IFontIcon *iface, DOUBLE *value )
++{
++    *value = impl_from_IFontIcon( iface )->font_size;
++    return S_OK;
++}
++
++static HRESULT WINAPI font_icon_put_FontSize( IFontIcon *iface, DOUBLE value )
++{
++    impl_from_IFontIcon( iface )->font_size = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI font_icon_get_FontFamily( IFontIcon *iface, IFontFamily **value )
++{
++    if ((*value = impl_from_IFontIcon( iface )->font_family)) IFontFamily_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI font_icon_put_FontFamily( IFontIcon *iface, IFontFamily *value )
++{
++    struct icon *impl = impl_from_IFontIcon( iface );
++    HSTRING source = NULL;
++
++    if (value) IFontFamily_AddRef( value );
++    if (impl->font_family) IFontFamily_Release( impl->font_family );
++    impl->font_family = value;
++    impl->family[0] = 0;
++    if (value && SUCCEEDED(IFontFamily_get_Source( value, &source )))
++    {
++        lstrcpynW( impl->family, WindowsGetStringRawBuffer( source, NULL ), ARRAY_SIZE(impl->family) );
++        WindowsDeleteString( source );
++    }
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI font_icon_get_FontWeight( IFontIcon *iface, FontWeight *value )
++{
++    *value = impl_from_IFontIcon( iface )->weight;
++    return S_OK;
++}
++
++static HRESULT WINAPI font_icon_put_FontWeight( IFontIcon *iface, FontWeight value )
++{
++    impl_from_IFontIcon( iface )->weight = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI font_icon_get_FontStyle( IFontIcon *iface, FontStyle *value )
++{
++    *value = impl_from_IFontIcon( iface )->style;
++    return S_OK;
++}
++
++static HRESULT WINAPI font_icon_put_FontStyle( IFontIcon *iface, FontStyle value )
++{
++    impl_from_IFontIcon( iface )->style = value;
++    return S_OK;
++}
++
++static const struct IFontIconVtbl font_icon_vtbl =
++{
++    font_icon_QueryInterface,
++    font_icon_AddRef,
++    font_icon_Release,
++    /* IInspectable methods */
++    font_icon_GetIids,
++    font_icon_GetRuntimeClassName,
++    font_icon_GetTrustLevel,
++    /* IFontIcon methods */
++    font_icon_get_Glyph,
++    font_icon_put_Glyph,
++    font_icon_get_FontSize,
++    font_icon_put_FontSize,
++    font_icon_get_FontFamily,
++    font_icon_put_FontFamily,
++    font_icon_get_FontWeight,
++    font_icon_put_FontWeight,
++    font_icon_get_FontStyle,
++    font_icon_put_FontStyle,
++};
++
++static HRESULT icon_create( enum icon_kind kind, IInspectable *outer, IInspectable **inner, void **value )
++{
++    struct icon *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    element_init( &impl->element, &icon_ops, kind == ICON_SYMBOL ? RuntimeClass_Windows_UI_Xaml_Controls_SymbolIcon
++                                                                 : RuntimeClass_Windows_UI_Xaml_Controls_FontIcon, outer );
++    impl->IIconElement_iface.lpVtbl = &icon_element_vtbl;
++    impl->ISymbolIcon_iface.lpVtbl = &symbol_icon_vtbl;
++    impl->IFontIcon_iface.lpVtbl = &font_icon_vtbl;
++    impl->kind = kind;
++    impl->font_size = 20.0;
++    impl->weight.Weight = 400;
++    return element_compose( &impl->element, outer, inner, kind == ICON_SYMBOL ? (void *)&impl->ISymbolIcon_iface
++                                                                               : (void *)&impl->IFontIcon_iface, value );
++}
++
++/* a SymbolIcon for markup's Icon="Add" */
++IInspectable *symbol_icon_create( Symbol symbol )
++{
++    IInspectable *object = NULL;
++    struct icon *impl;
++
++    if (FAILED(icon_create( ICON_SYMBOL, NULL, NULL, (void **)&object ))) return NULL;
++    impl = impl_from_element( element_from_object( object ) );
++    impl->symbol = symbol;
++    return object;
++}
++
++/* SymbolIcon.Symbol, FontIcon.Glyph / FontFamily / FontSize from markup; value is the text, or NULL for number */
++BOOL icon_set_markup( IInspectable *object, const WCHAR *name, const WCHAR *value, double number )
++{
++    struct xaml_element *element = element_from_object( object );
++    struct icon *impl;
++    Symbol symbol;
++
++    if (!element || element->ops != &icon_ops) return FALSE;
++    impl = impl_from_element( element );
++    if (impl->kind == ICON_SYMBOL && !wcscmp( name, L"Symbol" ))
++    {
++        if (!value) impl->symbol = number;
++        else if (symbol_from_name( value, &symbol )) impl->symbol = symbol;
++        else FIXME( "unknown Symbol %s.\n", debugstr_w(value) );
++        return TRUE;
++    }
++    if (impl->kind != ICON_FONT) return FALSE;
++    if (!wcscmp( name, L"Glyph" ) && value)
++    {
++        WindowsDeleteString( impl->glyph );
++        WindowsCreateString( value, wcslen( value ), &impl->glyph );
++        return TRUE;
++    }
++    if (!wcscmp( name, L"FontFamily" ) && value)
++    {
++        lstrcpynW( impl->family, value, ARRAY_SIZE(impl->family) );
++        return TRUE;
++    }
++    if (!wcscmp( name, L"FontSize" ) && !value)
++    {
++        impl->font_size = number;
++        return TRUE;
++    }
++    return FALSE;
++}
++
++/* activation factories: SymbolIcon (and ISymbolIconFactory), FontIcon (composable) */
++
++struct icon_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    ISymbolIconFactory ISymbolIconFactory_iface;
++    IFontIconFactory IFontIconFactory_iface;
++    enum icon_kind kind;
++};
++
++static inline struct icon_statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct icon_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct icon_statics *impl = impl_from_IActivationFactory( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (impl->kind == ICON_SYMBOL && IsEqualGUID( iid, &IID_ISymbolIconFactory ))
++        *out = &impl->ISymbolIconFactory_iface;
++    else if (impl->kind == ICON_FONT && IsEqualGUID( iid, &IID_IFontIconFactory ))
++        *out = &impl->IFontIconFactory_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    return icon_create( impl_from_IActivationFactory( iface )->kind, NULL, NULL, (void **)instance );
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( symbol_factory, ISymbolIconFactory, struct icon_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI symbol_factory_CreateInstanceWithSymbol( ISymbolIconFactory *iface, Symbol symbol, ISymbolIcon **value )
++{
++    IInspectable *object;
++    HRESULT hr;
++
++    TRACE( "iface %p, symbol %#x.\n", iface, symbol );
++    if (!(object = symbol_icon_create( symbol ))) return E_OUTOFMEMORY;
++    hr = IInspectable_QueryInterface( object, &IID_ISymbolIcon, (void **)value );
++    IInspectable_Release( object );
++    return hr;
++}
++
++static const struct ISymbolIconFactoryVtbl symbol_factory_vtbl =
++{
++    symbol_factory_QueryInterface,
++    symbol_factory_AddRef,
++    symbol_factory_Release,
++    /* IInspectable methods */
++    symbol_factory_GetIids,
++    symbol_factory_GetRuntimeClassName,
++    symbol_factory_GetTrustLevel,
++    /* ISymbolIconFactory methods */
++    symbol_factory_CreateInstanceWithSymbol,
++};
++
++DEFINE_IINSPECTABLE( font_factory, IFontIconFactory, struct icon_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI font_factory_CreateInstance( IFontIconFactory *iface, IInspectable *outer, IInspectable **inner,
++                                                   IFontIcon **value )
++{
++    return icon_create( ICON_FONT, outer, inner, (void **)value );
++}
++
++static const struct IFontIconFactoryVtbl font_factory_vtbl =
++{
++    font_factory_QueryInterface,
++    font_factory_AddRef,
++    font_factory_Release,
++    /* IInspectable methods */
++    font_factory_GetIids,
++    font_factory_GetRuntimeClassName,
++    font_factory_GetTrustLevel,
++    /* IFontIconFactory methods */
++    font_factory_CreateInstance,
++};
++
++static struct icon_statics symbol_icon_statics = { {&factory_vtbl}, {&symbol_factory_vtbl}, {&font_factory_vtbl}, ICON_SYMBOL };
++static struct icon_statics font_icon_statics = { {&factory_vtbl}, {&symbol_factory_vtbl}, {&font_factory_vtbl}, ICON_FONT };
++IActivationFactory *symbol_icon_factory = &symbol_icon_statics.IActivationFactory_iface;
++IActivationFactory *font_icon_factory = &font_icon_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/main.c b/dlls/windows.ui.xaml/main.c
+index f847ecb..4396974 100644
+--- a/dlls/windows.ui.xaml/main.c
++++ b/dlls/windows.ui.xaml/main.c
+@@ -78,6 +78,18 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( property_changed_event_args_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ItemsControl ))
+         IActivationFactory_QueryInterface( items_control_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_AppBarButton ))
++        IActivationFactory_QueryInterface( appbar_button_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_AppBarToggleButton ))
++        IActivationFactory_QueryInterface( appbar_toggle_button_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_AppBarSeparator ))
++        IActivationFactory_QueryInterface( appbar_separator_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_CommandBar ))
++        IActivationFactory_QueryInterface( command_bar_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_SymbolIcon ))
++        IActivationFactory_QueryInterface( symbol_icon_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_FontIcon ))
++        IActivationFactory_QueryInterface( font_icon_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ContentDialog ))
+         IActivationFactory_QueryInterface( content_dialog_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ListView ))
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index dd81bb6..9ecc46a 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -89,6 +89,20 @@ extern IActivationFactory *grid_view_item_factory;
+ extern IActivationFactory *items_stack_panel_factory;
+ extern IActivationFactory *items_wrap_grid_factory;
+ extern IActivationFactory *content_dialog_factory;
++extern IActivationFactory *appbar_button_factory;
++extern IActivationFactory *appbar_toggle_button_factory;
++extern IActivationFactory *appbar_separator_factory;
++extern IActivationFactory *command_bar_factory;
++extern IActivationFactory *symbol_icon_factory;
++extern IActivationFactory *font_icon_factory;
++/* icon.c */
++BOOL symbol_from_name( const WCHAR *name, Symbol *value );
++IInspectable *symbol_icon_create( Symbol symbol );
++BOOL icon_set_markup( IInspectable *object, const WCHAR *name, const WCHAR *value, double number );
++/* commandbar.c: markup */
++BOOL bar_set_markup( IInspectable *object, const WCHAR *name, const WCHAR *value, double number, IInspectable *object_value );
++BOOL command_bar_set_markup( IInspectable *object, const WCHAR *name, const WCHAR *value, double number );
++IInspectable *command_bar_collection( IInspectable *object, const WCHAR *name );   /* not referenced */
+ /* dialog.c: ContentDialog properties from markup */
+ BOOL dialog_set_markup( IInspectable *object, const WCHAR *name, const WCHAR *value, double number );
+ BOOL dialog_set_title( IInspectable *object, IInspectable *title );
+@@ -206,7 +220,8 @@ HRESULT window_create_for_core_window( ICoreWindow *core_window );
+ void window_destroy_current(void);
+ struct xaml_element *window_content_element(void);   /* Window.Current.Content, not referenced, or NULL */
+ struct xaml_element *window_input_root(void);        /* the topmost popup, or the content */
+-BOOL window_popup_show( struct xaml_element *popup ); /* drawn over the content, getting the input, until hidden */
++/* drawn over the content until hidden; a modal popup gets all the input, others what they cover */
++BOOL window_popup_show( struct xaml_element *popup, BOOL modal );
+ void window_popup_hide( struct xaml_element *popup );
+ 
+ /* focus.c */
+@@ -421,6 +436,9 @@ BOOL dwrite_caret( const struct text_format *format, HSTRING text, float width,
+ BOOL dwrite_hit( const struct text_format *format, HSTRING text, float width, float x, float y, UINT32 *index );
+ BOOL d2d_draw_text( struct layout_context *ctx, const struct text_format *format, HSTRING text,
+                     const struct layout_rect *rect, Color color );
++BOOL dwrite_has_family( const WCHAR *family );
++BOOL d2d_draw_glyphs( struct layout_context *ctx, const WCHAR *family, double size, UINT16 weight, const WCHAR *text,
++                      UINT32 len, const struct layout_rect *rect, Color color );
+ void d2d_set_transform( struct layout_context *ctx, const float *m );
+ void d2d_push_clip( struct layout_context *ctx, const struct layout_rect *rect );
+ void d2d_pop_clip( struct layout_context *ctx );
+diff --git a/dlls/windows.ui.xaml/render.c b/dlls/windows.ui.xaml/render.c
+index bad1c2c..cfa1d87 100644
+--- a/dlls/windows.ui.xaml/render.c
++++ b/dlls/windows.ui.xaml/render.c
+@@ -532,6 +532,47 @@ BOOL d2d_draw_text( struct layout_context *ctx, const struct text_format *format
+     return TRUE;
+ }
+ 
++/* whether DirectWrite has a font family: icons fall back to other characters without Segoe MDL2 Assets */
++BOOL dwrite_has_family( const WCHAR *family )
++{
++    IDWriteFontCollection *collection;
++    BOOL exists = FALSE;
++    UINT32 index;
++
++    if (!init() || !dwrite || FAILED(IDWriteFactory_GetSystemFontCollection( dwrite, &collection, FALSE ))) return FALSE;
++    if (FAILED(IDWriteFontCollection_FindFamilyName( collection, family, &index, &exists ))) exists = FALSE;
++    IDWriteFontCollection_Release( collection );
++    return exists;
++}
++
++/* a glyph (or short text) of a font family, centred in rect: SymbolIcon and FontIcon */
++BOOL d2d_draw_glyphs( struct layout_context *ctx, const WCHAR *family, double size, UINT16 weight, const WCHAR *text,
++                      UINT32 len, const struct layout_rect *rect, Color color )
++{
++    IDWriteTextFormat *format;
++    IDWriteTextLayout *layout = NULL;
++    D2D1_POINT_2F origin = { rect->x, rect->y };
++    ID2D1Brush *brush;
++
++    if (!ctx->rt || !init() || !dwrite) return FALSE;
++    if (FAILED(IDWriteFactory_CreateTextFormat( dwrite, family, NULL, weight ? weight : 400, DWRITE_FONT_STYLE_NORMAL,
++                                                DWRITE_FONT_STRETCH_NORMAL, size, L"", &format )))
++        return FALSE;
++    IDWriteTextFormat_SetWordWrapping( format, DWRITE_WORD_WRAPPING_NO_WRAP );
++    IDWriteTextFormat_SetTextAlignment( format, DWRITE_TEXT_ALIGNMENT_CENTER );
++    IDWriteTextFormat_SetParagraphAlignment( format, DWRITE_PARAGRAPH_ALIGNMENT_CENTER );
++    IDWriteFactory_CreateTextLayout( dwrite, text, len, format, max( rect->width, 1.0f ), max( rect->height, 1.0f ), &layout );
++    IDWriteTextFormat_Release( format );
++    if (!layout) return FALSE;
++    if ((brush = solid( ctx, color )))
++    {
++        ID2D1RenderTarget_DrawTextLayout( RT(ctx), origin, layout, brush, D2D1_DRAW_TEXT_OPTIONS_NONE );
++        ID2D1Brush_Release( brush );
++    }
++    IDWriteTextLayout_Release( layout );
++    return TRUE;
++}
++
+ /* ---- transforms, clips, opacity ---- */
+ 
+ void d2d_set_transform( struct layout_context *ctx, const float *m )
+diff --git a/dlls/windows.ui.xaml/window.c b/dlls/windows.ui.xaml/window.c
+index 535e5f3..4655190 100644
+--- a/dlls/windows.ui.xaml/window.c
++++ b/dlls/windows.ui.xaml/window.c
+@@ -39,6 +39,7 @@ struct xaml_window
+     struct event_list activated, closed, size_changed, visibility_changed;
+     /* popups over the content, the topmost last (referenced): a ContentDialog's layer, a menu */
+     struct xaml_element *popups[8];
++    BOOL modal[8];                  /* a modal popup gets all the input; others what they hit */
+     UINT32 popup_count;
+ };
+ 
+@@ -66,19 +67,24 @@ struct xaml_element *window_content_element(void)
+     return element_from_iinspectable( (IInspectable *)current_window->content );
+ }
+ 
+-/* where input goes: the topmost popup, which is modal, or the content */
++/* where the keyboard focus may be: the topmost modal popup, or the content */
+ struct xaml_element *window_input_root(void)
+ {
+-    if (current_window && current_window->popup_count) return current_window->popups[current_window->popup_count - 1];
++    UINT32 i;
++
++    if (current_window)
++        for (i = current_window->popup_count; i > 0; i--)
++            if (current_window->modal[i - 1]) return current_window->popups[i - 1];
+     return window_content_element();
+ }
+ 
+-BOOL window_popup_show( struct xaml_element *popup )
++BOOL window_popup_show( struct xaml_element *popup, BOOL modal )
+ {
+     struct xaml_window *window = current_window;
+ 
+     if (!window || window->popup_count == ARRAY_SIZE(window->popups)) return FALSE;
+     IUIElement_AddRef( &popup->IUIElement_iface );
++    window->modal[window->popup_count] = modal;
+     window->popups[window->popup_count++] = popup;
+     window_invalidate();
+     return TRUE;
+@@ -95,6 +101,7 @@ void window_popup_hide( struct xaml_element *popup )
+     for (i = 0; i < window->popup_count; i++) if (window->popups[i] == popup) break;
+     if (i == window->popup_count) return;
+     memmove( window->popups + i, window->popups + i + 1, (window->popup_count - i - 1) * sizeof(*window->popups) );
++    memmove( window->modal + i, window->modal + i + 1, (window->popup_count - i - 1) * sizeof(*window->modal) );
+     window->popup_count--;
+     /* the pointer's elements may have been in it */
+     set_element_ref( &window->hover, NULL );
+@@ -197,9 +204,20 @@ static void set_element_ref( struct xaml_element **slot, struct xaml_element *el
+ /* the element that should get pointer input at x,y: the deepest hit element or its nearest ancestor that takes it */
+ static struct xaml_element *pointer_target( struct xaml_window *window, float x, float y )
+ {
+-    struct xaml_element *element;
++    struct xaml_element *element, *hit;
++    UINT32 i;
+ 
+-    if (!(element = window_input_root())) return NULL;
++    /* the popups from the top: one that is hit takes the pointer, a modal one even when it isn't */
++    for (i = window->popup_count; i > 0; i--)
++    {
++        if ((hit = element_hit_test( window->popups[i - 1], x, y )))
++        {
++            for (element = hit; element; element = element->parent) if (element->ops->pointer) return element;
++            return NULL;
++        }
++        if (window->modal[i - 1]) return NULL;
++    }
++    if (!(element = window_content_element())) return NULL;
+     for (element = element_hit_test( element, x, y ); element; element = element->parent)
+         if (element->ops->pointer) return element;
+     return NULL;
+diff --git a/dlls/windows.ui.xaml/xbf.c b/dlls/windows.ui.xaml/xbf.c
+index dcde8ce..80115e5 100644
+--- a/dlls/windows.ui.xaml/xbf.c
++++ b/dlls/windows.ui.xaml/xbf.c
+@@ -2200,9 +2200,30 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+         else if (str && to_double( value, &d ) && wcsicmp( str, L"Auto" )) str = NULL;
+         else if (!str) have = FALSE;
+         if (have && (list_view_set_markup( target, prop->name, str, d ) || wrap_grid_set_markup( target, prop->name, str, d ) ||
+-                     dialog_set_markup( target, prop->name, value->kind == XV_STRING ? value->s : str, d )))
++                     dialog_set_markup( target, prop->name, value->kind == XV_STRING ? value->s : str, d ) ||
++                     icon_set_markup( target, prop->name, value->kind == XV_STRING ? value->s : str, d ) ||
++                     command_bar_set_markup( target, prop->name, str, d ) ||
++                     bar_set_markup( target, prop->name, value->kind == XV_STRING ? value->s : str, d, NULL )))
+             return S_OK;
+     }
++    if (prop_is( prop, L"Icon" ) && value->kind == XV_OBJECT && bar_set_markup( target, L"Icon", NULL, 0, value->object ))
++        return S_OK;
++    if ((prop_is( prop, L"TopAppBar" ) || prop_is( prop, L"BottomAppBar" )) && value->kind == XV_OBJECT && value->object)
++    {
++        IPage *page_iface;
++        IAppBar *bar;
++        if (QI( target, IPage, &page_iface ))
++        {
++            if (QI( value->object, IAppBar, &bar ))
++            {
++                if (prop_is( prop, L"TopAppBar" )) IPage_put_TopAppBar( page_iface, bar );
++                else IPage_put_BottomAppBar( page_iface, bar );
++                IAppBar_Release( bar );
++            }
++            IPage_Release( page_iface );
++            return S_OK;
++        }
++    }
+     if (prop_is( prop, L"Title" ))
+     {
+         IInspectable *title = to_content( value );
+@@ -2822,6 +2843,11 @@ static IInspectable *get_property( IInspectable *target, const struct xprop *pro
+         IInspectable_AddRef( result );
+         return result;
+     }
++    if ((result = command_bar_collection( target, prop->name )))
++    {
++        IInspectable_AddRef( result );
++        return result;
++    }
+     if (prop_is( prop, L"VisualStateGroups" ))
+     {
+         struct xaml_element *element = element_from_object( target );
+@@ -2936,6 +2962,12 @@ IInspectable *create_builtin( const WCHAR *name )
+         { L"ItemsControl", &items_control_factory },
+         { L"ListView", &list_view_factory },
+         { L"ContentDialog", &content_dialog_factory },
++        { L"AppBarButton", &appbar_button_factory },
++        { L"AppBarToggleButton", &appbar_toggle_button_factory },
++        { L"AppBarSeparator", &appbar_separator_factory },
++        { L"CommandBar", &command_bar_factory },
++        { L"SymbolIcon", &symbol_icon_factory },
++        { L"FontIcon", &font_icon_factory },
+         { L"GridView", &grid_view_factory },
+         { L"ListViewItem", &list_view_item_factory },
+         { L"GridViewItem", &grid_view_item_factory },
+@@ -4093,7 +4125,7 @@ static BOOL is_collection_property( IInspectable *target, const WCHAR *name )
+     static const WCHAR *names[] =
+     {
+         L"Children", L"RowDefinitions", L"ColumnDefinitions", L"VisualStateGroups", L"MergedDictionaries", L"States",
+-        L"KeyFrames", L"Setters", L"Items", L"GradientStops",
++        L"KeyFrames", L"Setters", L"Items", L"GradientStops", L"PrimaryCommands", L"SecondaryCommands",
+     };
+     UINT32 i;
+ 
+@@ -4171,6 +4203,12 @@ static BOOL content_property( IInspectable *object, const WCHAR *type, struct xp
+         text_prop( prop, type, L"Items" );
+         return TRUE;
+     }
++    else if (command_bar_collection( object, L"PrimaryCommands" ))
++    {
++        /* CommandBar's content property */
++        text_prop( prop, type, L"PrimaryCommands" );
++        return TRUE;
++    }
+     else if (SUCCEEDED(IInspectable_QueryInterface( object, &IID_IPanel, (void **)&iface ))) name = L"Children";
+     else if (SUCCEEDED(IInspectable_QueryInterface( object, &IID_IBorder, (void **)&iface ))) name = L"Child";
+     else if (SUCCEEDED(IInspectable_QueryInterface( object, &IID_ITextBlock, (void **)&iface ))) name = L"Text";

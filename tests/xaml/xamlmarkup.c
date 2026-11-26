@@ -2894,6 +2894,221 @@ done:
     IInspectable_Release(root);
 }
 
+static int bar_opened, bar_closed;
+struct bar_event_handler
+{
+    IEventHandler_IInspectable iface;
+    int *count;
+};
+static HRESULT WINAPI bar_event_QueryInterface(IEventHandler_IInspectable *iface, REFIID iid, void **out)
+{
+    *out = iface;
+    return S_OK;
+}
+static ULONG WINAPI bar_event_AddRef(IEventHandler_IInspectable *iface) { return 2; }
+static ULONG WINAPI bar_event_Release(IEventHandler_IInspectable *iface) { return 1; }
+static HRESULT WINAPI bar_event_Invoke(IEventHandler_IInspectable *iface, IInspectable *sender, IInspectable *args)
+{
+    (*CONTAINING_RECORD(iface, struct bar_event_handler, iface)->count)++;
+    return S_OK;
+}
+static IEventHandler_IInspectableVtbl bar_event_vtbl = { bar_event_QueryInterface, bar_event_AddRef, bar_event_Release, bar_event_Invoke };
+static struct bar_event_handler on_bar_opened = { { &bar_event_vtbl }, &bar_opened }, on_bar_closed = { { &bar_event_vtbl }, &bar_closed };
+
+static const WCHAR bar_xaml[] =
+    L"<Grid xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\"\n"
+    L"      xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\" Grid.RowSpan=\"2\" Margin=\"20,385,0,0\"\n"
+    L"      HorizontalAlignment=\"Left\" VerticalAlignment=\"Top\" Width=\"420\" Height=\"48\">\n"
+    L"  <CommandBar x:Name=\"Bar\">\n"
+    L"    <CommandBar.Content><TextBlock Text=\"Bar\" Margin=\"12,14,0,0\"/></CommandBar.Content>\n"
+    L"    <AppBarButton x:Name=\"AddButton\" Icon=\"Add\" Label=\"Add\"/>\n"
+    L"    <AppBarSeparator/>\n"
+    L"    <AppBarToggleButton x:Name=\"Pin\" Label=\"Pin\">\n"
+    L"      <AppBarToggleButton.Icon><SymbolIcon Symbol=\"Pin\"/></AppBarToggleButton.Icon>\n"
+    L"    </AppBarToggleButton>\n"
+    L"    <CommandBar.SecondaryCommands>\n"
+    L"      <AppBarButton x:Name=\"SettingsButton\" Label=\"Settings\"/>\n"
+    L"    </CommandBar.SecondaryCommands>\n"
+    L"  </CommandBar>\n"
+    L"</Grid>\n";
+
+/* pixels darker than mid grey in a rectangle: a drawn glyph or label */
+static int count_dark(int x0, int y0, int x1, int y1)
+{
+    int x, y, n = 0;
+    for (y = y0; y < y1; y++) for (x = x0; x < x1; x++)
+    {
+        DWORD c = px(x, y);
+        if (((c >> 16) & 0xff) + ((c >> 8) & 0xff) + (c & 0xff) < 3 * 0x80) n++;
+    }
+    return n;
+}
+
+static UINT32 command_size(IObservableVector_ICommandBarElement *list)
+{
+    IVector_ICommandBarElement *vector;
+    UINT32 n = 0;
+    if (list && SUCCEEDED(IObservableVector_ICommandBarElement_QueryInterface(list, &IID_IVector_ICommandBarElement, (void **)&vector)))
+    {
+        IVector_ICommandBarElement_get_Size(vector, &n);
+        IVector_ICommandBarElement_Release(vector);
+    }
+    return n;
+}
+
+static void check_command_bar(struct main_page *page)
+{
+    IFrameworkElement2 *page_grid = page_root(page);
+    IInspectable *root, *bar_obj, *add_obj, *pin_obj, *settings_obj, *object = NULL;
+    IObservableVector_ICommandBarElement *primary = NULL, *secondary = NULL;
+    ICommandBar *bar = NULL;
+    IAppBar *app_bar = NULL;
+    IAppBarButton *add = NULL;
+    IAppBarToggleButton *pin = NULL;
+    IToggleButton *pin_toggle = NULL;
+    IButtonBase *base;
+    ISymbolIconFactory *symbol_factory;
+    ISymbolIcon *symbol_icon = NULL;
+    IReference_boolean *checked = NULL;
+    IVector_UIElement *children;
+    IUIElement *ui;
+    IPanel *panel;
+    EventRegistrationToken token;
+    static int add_clicks, settings_clicks;
+    static struct counter_handler on_add = { { &counter_vtbl }, &add_clicks }, on_settings = { { &counter_vtbl }, &settings_clicks };
+    Symbol symbol = 0;
+    boolean open = TRUE, b = FALSE;
+    HSTRING label = NULL;
+    HRESULT hr;
+    DWORD c;
+    int n;
+
+    root = xaml_load(bar_xaml, &hr);
+    check(hr == S_OK && root, "XamlReader.Load of a CommandBar, hr %#lx", hr);
+    if (!root || !page_grid) return;
+    IFrameworkElement2_QueryInterface(page_grid, &IID_IPanel, (void **)&panel);
+    IPanel_get_Children(panel, &children);
+    IInspectable_QueryInterface(root, &IID_IUIElement, (void **)&ui);
+    IVector_UIElement_Append(children, ui);
+    IUIElement_Release(ui);
+    pump(50);
+    bar_obj = find_in(root, L"Bar");
+    add_obj = find_in(root, L"AddButton");
+    pin_obj = find_in(root, L"Pin");
+    settings_obj = find_in(root, L"SettingsButton");
+    if (bar_obj)
+    {
+        IInspectable_QueryInterface(bar_obj, &IID_ICommandBar, (void **)&bar);
+        IInspectable_QueryInterface(bar_obj, &IID_IAppBar, (void **)&app_bar);
+    }
+    if (add_obj) IInspectable_QueryInterface(add_obj, &IID_IAppBarButton, (void **)&add);
+    if (pin_obj)
+    {
+        IInspectable_QueryInterface(pin_obj, &IID_IAppBarToggleButton, (void **)&pin);
+        IInspectable_QueryInterface(pin_obj, &IID_IToggleButton, (void **)&pin_toggle);
+    }
+    check(bar && app_bar && add && pin && pin_toggle && settings_obj,
+          "CommandBar is an ICommandBar and IAppBar, the buttons IAppBarButton and IAppBarToggleButton (%p %p %p %p %p %p)",
+          bar, app_bar, add, pin, pin_toggle, settings_obj);
+    if (!bar || !app_bar || !add || !pin || !pin_toggle || !settings_obj) goto done;
+    ICommandBar_get_PrimaryCommands(bar, &primary);
+    ICommandBar_get_SecondaryCommands(bar, &secondary);
+    check(command_size(primary) == 3 && command_size(secondary) == 1,
+          "markup fills PrimaryCommands (the content property) and SecondaryCommands (%u, %u)",
+          command_size(primary), command_size(secondary));
+    IAppBarButton_get_Label(add, &label);
+    check(!wcscmp(WindowsGetStringRawBuffer(label, NULL), L"Add"), "Label=\"Add\"");
+    WindowsDeleteString(label);
+    IAppBar_add_Opened(app_bar, &on_bar_opened.iface, &token);
+    IAppBar_add_Closed(app_bar, &on_bar_closed.iface, &token);
+    IInspectable_QueryInterface(add_obj, &IID_IButtonBase, (void **)&base);
+    IButtonBase_add_Click(base, &on_add.IRoutedEventHandler_iface, &token);
+    IButtonBase_Release(base);
+    IInspectable_QueryInterface(settings_obj, &IID_IButtonBase, (void **)&base);
+    IButtonBase_add_Click(base, &on_settings.IRoutedEventHandler_iface, &token);
+    IButtonBase_Release(base);
+
+    /* 48 px: the content on the left, Add (243), the separator, Pin (324) and "..." (392) on the right */
+    snapshot();
+    c = px(200, 400);
+    check(c == 0xe6e6e6, "the bar is SystemControlBackgroundChromeMediumBrush grey (%06lx)", c);
+    n = count_dark(243 + 20, 385 + 10, 243 + 48, 385 + 38);
+    check(n > 10, "Icon=\"Add\" draws the Add symbol (%d dark px)", n);
+    n = count_dark(324 + 20, 385 + 10, 324 + 48, 385 + 38);
+    check(n > 10, "and a SymbolIcon Pin (%d dark px)", n);
+    n = count_dark(243, 385 + 36, 311, 385 + 48);
+    check(n == 0, "closed, the commands are compact: no labels (%d)", n);
+    n = count_dark(392 + 10, 385 + 20, 392 + 38, 385 + 28);
+    check(n >= 18, "the \"...\" button's dots (%d)", n);
+
+    click_xy(277, 409);
+    check(add_clicks == 1, "clicking an AppBarButton raises Click (%d)", add_clicks);
+    click_xy(358, 409);
+    IToggleButton_get_IsChecked(pin_toggle, &checked);
+    if (checked) IReference_boolean_get_Value(checked, &b);
+    check(b, "clicking an AppBarToggleButton checks it");
+    if (checked) IReference_boolean_Release(checked);
+    SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(200, 400));   /* not over it: no hover shade */
+    snapshot();
+    c = px(330, 390);
+    check(c == 0x0078d7, "a checked AppBarToggleButton is accent-filled (%06lx)", c);
+
+    /* "..." opens it: labels, 60 px growing up (it is in the lower half), and the overflow menu below */
+    click_xy(416, 409);
+    IAppBar_get_IsOpen(app_bar, &open);
+    check(open && bar_opened == 1, "the \"...\" button opens the bar (%d, %d)", open, bar_opened);
+    pump(20);
+    snapshot();
+    c = px(200, 378);
+    check(c == 0xe6e6e6, "open, it grows up to 60 px over the page (%06lx)", c);
+    n = count_dark(243, 373 + 38, 311, 373 + 56);
+    check(n > 5, "and shows the labels (%d dark px)", n);
+    c = px(300, 440);
+    check(c == 0xf2f2f2, "the SecondaryCommands menu shows below the bar (%06lx)", c);
+    n = count_dark(292, 437, 440, 477);
+    check(n > 10, "with the Settings label (%d dark px)", n);
+    click_xy(330, 457);
+    IAppBar_get_IsOpen(app_bar, &open);
+    check(settings_clicks == 1 && !open && bar_closed == 1, "clicking Settings raises its Click and closes the bar (%d, %d, %d)",
+          settings_clicks, open, bar_closed);
+
+    /* light dismiss */
+    IAppBar_put_IsOpen(app_bar, TRUE);
+    pump(20);
+    click_xy(100, 600);
+    IAppBar_get_IsOpen(app_bar, &open);
+    check(!open && bar_closed == 2, "a press elsewhere closes it (%d, %d)", open, bar_closed);
+
+    /* a SymbolIcon from code */
+    symbol_factory = get_factory(L"Windows.UI.Xaml.Controls.SymbolIcon", &IID_ISymbolIconFactory);
+    if (symbol_factory)
+    {
+        ISymbolIconFactory_CreateInstanceWithSymbol(symbol_factory, Symbol_Accept, &symbol_icon);
+        if (symbol_icon) ISymbolIcon_get_Symbol(symbol_icon, &symbol);
+        ISymbolIconFactory_Release(symbol_factory);
+    }
+    check(symbol == Symbol_Accept, "SymbolIcon(Symbol.Accept) from code (%#x)", symbol);
+    if (symbol_icon) ISymbolIcon_Release(symbol_icon);
+    (void)object;
+
+done:
+    if (primary) IObservableVector_ICommandBarElement_Release(primary);
+    if (secondary) IObservableVector_ICommandBarElement_Release(secondary);
+    if (bar) ICommandBar_Release(bar);
+    if (app_bar) IAppBar_Release(app_bar);
+    if (add) IAppBarButton_Release(add);
+    if (pin) IAppBarToggleButton_Release(pin);
+    if (pin_toggle) IToggleButton_Release(pin_toggle);
+    if (bar_obj) IInspectable_Release(bar_obj);
+    if (add_obj) IInspectable_Release(add_obj);
+    if (pin_obj) IInspectable_Release(pin_obj);
+    if (settings_obj) IInspectable_Release(settings_obj);
+    IVector_UIElement_Release(children);
+    IPanel_Release(panel);
+    IFrameworkElement2_Release(page_grid);
+    IInspectable_Release(root);
+}
+
 static void check_microsoft_xbf(const WCHAR *file, const WCHAR *component_class)
 {
     IActivationFactory *factory;
@@ -3011,6 +3226,7 @@ static void CALLBACK verify(HWND unused, UINT msg, UINT_PTR id, DWORD time)
     check_images(the_page);
     check_lists(the_page);
     check_dialog(the_page);
+    check_command_bar(the_page);
     check(!wcscmp(text_of(the_page->title, buf, ARRAYSIZE(buf)), L"Clicked!"), "OnClick changed Title (%ls)", buf);
     snapshot();
 

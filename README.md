@@ -128,7 +128,9 @@ Wine has no `Windows.UI.Xaml`, the UI framework most non-game UWP apps are built
 
 **Milestone 5, part 5a (done): dialogs.** `ContentDialog` with `ShowAsync`, title, content, up to three buttons, `DefaultButton`, Enter and Escape, `Closing`/`Closed` with `Cancel`, over a modal layer.
 
-**Not yet:** command bars and app bar buttons, `x:Bind` beyond what its generated code calls, localized `x:Uid` strings and navigation history. Real Store apps will still often stop or look wrong where they need these; see [docs/xaml-plan.md](docs/xaml-plan.md).
+**Milestone 5, part 5b (done): command bars.** `CommandBar` with primary commands, a "..." overflow menu of secondary commands and light dismiss, `AppBarButton`, `AppBarToggleButton`, `AppBarSeparator`, `SymbolIcon` and `FontIcon` (Segoe MDL2 Assets glyphs, or Unicode stand-ins without that font), and `Page.TopAppBar`/`BottomAppBar`. That completes milestone 5.
+
+**Not yet:** flyouts, menus and the rest of milestone 6, `x:Bind` beyond what its generated code calls, localized `x:Uid` strings and navigation history. Real Store apps will still often stop or look wrong where they need these; see [docs/xaml-plan.md](docs/xaml-plan.md).
 
 To try it, build the test clients and run them in a throwaway prefix (each opens a window for a few seconds and checks what was drawn):
 
@@ -254,7 +256,8 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 on its window, 0041-0042 Forza Motorsport 7 and automatic dialog answers, 0043-0044 XAML
                 milestone 5 part 1 (ScrollViewer, keyboard focus, key events), 0045-0046 part 2 (TextBox,
                 PasswordBox), 0047-0048 part 3 (Image, BitmapImage, ImageBrush), 0049-0050 part 4 (ListView,
-                GridView, their items and panels), 0051-0052 part 5a (ContentDialog; 0051 has all of part 5's IDL)
+                GridView, their items and panels), 0051-0052 part 5a (ContentDialog; 0051 has all of part 5's IDL),
+                0053 part 5b (CommandBar, app bar buttons, icons)
 patches/dxvk/   patch against DXVK f90f1bf1 (v3.1.1-235)
 docker/         build containers
 apps/           optional per-app settings

@@ -765,3 +765,43 @@ Patch 0052 is the code: the new `dialog.c`, and a popup layer in `window.c`.
   - Escape raising `CloseButtonClick` and completing with None;
   - a click handler's `Cancel` keeping the dialog open, and `Hide()`.
 - With `XAMLHELLO_SCREENSHOT` set, the test also saves `xamlmarkup-dialog.bmp` while the dialog shows.
+
+## 22. Milestone 5, part 5b: CommandBar, app bar buttons and icons (patch 0053)
+
+The IDL is in patch 0051. Patch 0053 is the code: the new `icon.c` and `commandbar.c`, Page's app bars in `content.c`,
+and glyph drawing in `render.c`.
+
+**What was built:**
+
+- **`SymbolIcon`** draws its `Symbol` 20 px in a 20×20 box. A Symbol's value is its character in Segoe MDL2 Assets.
+  - That font comes with Windows, not Wine. If DirectWrite can't find it, a similar Unicode character stands in for about 40 common symbols (+, ✓, ✕, arrows, ⚙, ★, …), and a square for the rest.
+  - There is a generated table of the 197 Symbol names, for markup's `Symbol="Pin"` and `Icon="Add"`.
+- **`FontIcon`** draws its `Glyph` in its `FontFamily` (Segoe MDL2 Assets by default) at its `FontSize`. Both icons take the inherited foreground unless their `Foreground` is set.
+- **`AppBarButton` and `AppBarToggleButton`** are kinds of the shared Button object.
+  - **Size and parts:** 68 px wide, the Icon 14 px from the top, and the `Label` in 12 px text below. Compact, they are 48 px high with no label; otherwise 60.
+  - **Looks:** grey under the pointer and while pressed; a checked toggle is accent-filled.
+  - **In the overflow menu:** a 40 px row with the label.
+  - **`AppBarSeparator`:** a 1 px line.
+- **`CommandBar`** (`IAppBar`, `ICommandBar`) is 48 px high: its `Content` on the left, then its `PrimaryCommands` (compact) and a "..." button on the right.
+  - **Opening** (the "..." button or `IsOpen`) shows the labels. The bar grows to 60 px over the page: down, or up when it is in the lower half of the window.
+  - **Overflow menu:** the `SecondaryCommands` show in a menu below (or above) the bar, in a non-modal popup. Pressing anywhere else closes the bar (light dismiss).
+  - **Commands:** clicking one closes the bar unless `IsSticky`. `Opened` and `Closed` are raised.
+  - **The popup layer:** popups are now either modal (ContentDialog) or not. A non-modal popup takes only the input it covers, and the rest reaches the page.
+- **`Page.TopAppBar` and `BottomAppBar`** take their height from the page's top and bottom and are drawn over the content.
+- **Markup:**
+  - `PrimaryCommands` is CommandBar's content property, plus `CommandBar.SecondaryCommands`, `IsOpen` and `IsSticky`;
+  - `Label`, `Icon` (a Symbol name or an IconElement) and `IsCompact`;
+  - `SymbolIcon.Symbol`, and `FontIcon.Glyph`, `FontFamily` and `FontSize`;
+  - `Page.TopAppBar`/`BottomAppBar`.
+- **Not supported:** ClosedDisplayMode, dynamic overflow, keyboard access to the bar, animations, `LabelPosition`, and the newer `IAppBar2-4` and `ICommandBar2-3` interfaces.
+
+**Tests:**
+
+- **`xamlmarkup`: 256/256 checks pass**, 20 of them new. A CommandBar loaded from XAML checks:
+  - the interfaces, and markup filling PrimaryCommands (3) and SecondaryCommands (1);
+  - the bar's grey, the Add and Pin symbols drawn, no labels while closed, and the "..." dots;
+  - Click on an AppBarButton, and an AppBarToggleButton checking and filling with the accent colour;
+  - "..." opening the bar upward to 60 px with labels, and the menu below with Settings;
+  - clicking Settings raising its Click and closing the bar, and a press elsewhere closing it;
+  - `SymbolIcon(Symbol.Accept)` from code.
+- Page app bars are not covered by a test: setting one would move the test page's layout under the other checks.
