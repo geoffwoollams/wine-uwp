@@ -558,3 +558,51 @@ Patch 0034 is the IDL, generated with `winmd2idl.py` for `Media.Transform`, `Gen
 - Image and ImageBrush (WIC).
 - TransformGroup and rotated clips.
 - Faster frames: drawing straight to the window instead of through the DC render target's copies.
+
+## 17. Milestone 5, part 1: ScrollViewer, keyboard focus, Tab navigation and key events (patches 0043-0044)
+
+Milestone 5 (everyday app controls) lands in parts like milestone 4. Part 1 is the two pieces every other control in it
+leans on: scrolling, and the keyboard.
+
+Patch 0043 is the IDL, generated with `winmd2idl.py` for `Controls.ScrollViewer` (with `IScrollViewer2` to `4` and its
+statics), `ScrollViewerViewChangedEventArgs` and `Input.FocusManager`. Declarations already in the file are left out of
+the new `declare` block, because widl rejects them twice, and `AsyncOperationCompletedHandler<FocusMovementResult>`
+is added, which the generator missed.
+
+**What was built:**
+
+- **`ScrollViewer`** (`scroll.c`) is a ContentControl kind of `struct button`, like the range controls.
+  - **Layout:** the content is measured without a limit along each axis that scrolls, arranged at minus the offset and drawn clipped to the viewport. Windows' defaults apply: vertical scrolling with a visible bar, horizontal disabled, where the content gets the viewport's width.
+  - **API:** `HorizontalOffset`/`VerticalOffset`, `Extent*`, `Viewport*`, `Scrollable*`, `Computed*ScrollBarVisibility`, `ChangeView` (both overloads), `ScrollToHorizontalOffset`/`ScrollToVerticalOffset` and `ViewChanged`. The scroll modes, bar visibilities and the other `IScrollViewer` settings are kept. Changes happen at once, so there is no animation and `IsIntermediate` is always false.
+  - **Input:** the mouse wheel scrolls 48 px a notch, and Shift or a horizontal wheel scrolls sideways. The arrow keys scroll 16 px, Page Up/Down a viewport, Home/End to the ends.
+  - **Scroll bars:** Windows 10's look, a thin indicator that widens to a 12 px bar while the pointer is over the ScrollViewer. The thumb can be dragged, and a press on the track pages.
+  - **Markup:** `ScrollViewer.*` properties set on a ScrollViewer work from XAML. Attached to other elements (ListView templates do this) they are accepted and ignored.
+  - **Hit testing:** a new element operation, `child_clip`, keeps content scrolled out of view from taking clicks.
+  - **Not supported:** zooming (`ZoomFactor` stays 1), snap points, headers (kept, not drawn), inertia and touch panning.
+- **Keyboard focus** (`focus.c`): one element has the focus and is referenced while it does.
+  - **Taking it:** `Control.Focus`, `IsTabStop`, `TabIndex` and `FocusState` work, and a pointer press focuses the nearest control that takes it.
+  - **Tab:** Tab and Shift+Tab go through the focusable elements in `TabIndex` order, then tree order, wrapping round.
+  - **Focus visual:** a keyboard-focused control gets Windows 10's two-colour outline.
+  - **Events:** UIElement's `GotFocus`/`LostFocus` bubble from the element.
+- **Key events:** `KeyDown`/`KeyUp` with `KeyRoutedEventArgs` (`Key`, `KeyStatus`, `Handled`, `OriginalSource`) bubble from the focused element, or from the window's content when nothing is focused.
+  - Keys no handler marked handled get the controls' defaults: Space presses a button and clicks it on release, Enter clicks a Button, Space toggles a ToggleSwitch, the arrow keys, Page Up/Down, Home and End move a Slider, and the ScrollViewer keys above.
+  - CoreWindow still raises its own key events.
+- **`FocusManager`:** `GetFocusedElement` (both overloads), `TryMoveFocus`, `FindNextFocusableElement`, `FindNextElement`, `FindFirstFocusableElement`/`FindLastFocusableElement`, and the static `GotFocus`/`LostFocus` events.
+  - Directional (XY) navigation follows the Tab order.
+  - `GettingFocus`/`LosingFocus` and the async methods aren't implemented.
+
+**Tests:**
+
+- **`xamlmarkup`: 161/161 checks pass.** 30 are new. A ScrollViewer over three 80 px items checks:
+  - its extent (240), viewport (100) and scrollable height (140), and the disabled horizontal axis;
+  - the content clipped below the viewport;
+  - `ChangeView` to 100, the moved pixels and `ViewChanged`;
+  - the wheel up a notch and three notches down to the end;
+  - `ScrollToVerticalOffset`.
+- **Focus checks:**
+  - `Focus(Programmatic)` with `FocusState`, `GotFocus` and `FocusManager.GetFocusedElement`;
+  - Tab to the next button, focused by the keyboard and drawn with the focus visual;
+  - KeyDown bubbling to the buttons' panel;
+  - Space clicking on release, Enter clicking;
+  - Tab skipping `IsTabStop=False`.
+- Milestones 1 and 2 still pass 34/34.

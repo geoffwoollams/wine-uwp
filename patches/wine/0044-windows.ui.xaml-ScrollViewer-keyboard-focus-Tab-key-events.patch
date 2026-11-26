@@ -1,0 +1,2197 @@
+Subject: windows.ui.xaml: ScrollViewer, keyboard focus, Tab navigation and key events (milestone 5 part 1)
+
+diff --git a/dlls/windows.ui.xaml/Makefile.in b/dlls/windows.ui.xaml/Makefile.in
+index e2851b1..696902b 100644
+--- a/dlls/windows.ui.xaml/Makefile.in
++++ b/dlls/windows.ui.xaml/Makefile.in
+@@ -14,6 +14,7 @@ SOURCES = \
+ 	content.c \
+ 	definitions.c \
+ 	element.c \
++	focus.c \
+ 	items.c \
+ 	main.c \
+ 	media.c \
+@@ -21,6 +22,7 @@ SOURCES = \
+ 	presenter.c \
+ 	range.c \
+ 	render.c \
++	scroll.c \
+ 	reader.c \
+ 	shapes.c \
+ 	resources.c \
+diff --git a/dlls/windows.ui.xaml/button.c b/dlls/windows.ui.xaml/button.c
+index c49d082..1905e30 100644
+--- a/dlls/windows.ui.xaml/button.c
++++ b/dlls/windows.ui.xaml/button.c
+@@ -120,6 +120,14 @@ static HRESULT button_query_interface( struct xaml_element *element, REFIID iid,
+ {
+     struct button *impl = impl_from_element( element );
+ 
++    if (impl->kind == BUTTON_SCROLL)
++    {
++        if (IsEqualGUID( iid, &IID_IContentControl )) *out = &impl->IContentControl_iface;
++        else if (IsEqualGUID( iid, &IID_IControl )) *out = &impl->IControl_iface;
++        else return scroll_query_interface( impl, iid, out );
++        IInspectable_AddRef( (IInspectable *)*out );
++        return S_OK;
++    }
+     if (is_range_kind( impl ))
+     {
+         if (IsEqualGUID( iid, &IID_IControl )) *out = &impl->IControl_iface;
+@@ -153,6 +161,11 @@ static void button_measure( struct xaml_element *element, struct layout_context
+         range_measure( impl, ctx, avail_width, avail_height, width, height );
+         return;
+     }
++    if (impl->kind == BUTTON_SCROLL && !root)
++    {
++        scroll_measure( impl, ctx, avail_width, avail_height, width, height );
++        return;
++    }
+ 
+     *width = *height = 0;
+     if (root)
+@@ -210,6 +223,11 @@ static void button_arrange( struct xaml_element *element, struct layout_context
+         element_arrange( root, ctx, element->bounds.x, element->bounds.y, element->bounds.width, element->bounds.height );
+         return;
+     }
++    if (impl->kind == BUTTON_SCROLL)
++    {
++        scroll_arrange( impl, ctx );
++        return;
++    }
+     if (!child) return;
+     button_inner_rect( impl, &inner );
+     /* the content presenter: Stretch fills, otherwise the content's desired size placed by the content alignment */
+@@ -444,6 +462,11 @@ static void button_render( struct xaml_element *element, struct layout_context *
+         element_render( root, ctx );   /* the template draws the button */
+         return;
+     }
++    if (impl->kind == BUTTON_SCROLL)
++    {
++        scroll_render( impl, ctx );
++        return;
++    }
+     if (has_glyph( impl ))
+     {
+         render_glyph_control( impl, ctx );
+@@ -611,6 +634,11 @@ static void button_pointer( struct xaml_element *element, UINT msg, float x, flo
+         range_pointer( impl, msg, x, y );
+         return;
+     }
++    if (impl->kind == BUTTON_SCROLL)
++    {
++        scroll_pointer( impl, msg, x, y );
++        return;
++    }
+ 
+     switch (msg)
+     {
+@@ -655,6 +683,7 @@ static void button_destroy( struct xaml_element *element )
+     if (impl->foreground) IBrush_Release( impl->foreground );
+     if (impl->border_brush) IBrush_Release( impl->border_brush );
+     range_destroy( impl );
++    scroll_destroy( impl );
+     event_list_clear( &impl->click );
+     event_list_clear( &impl->checked );
+     event_list_clear( &impl->unchecked );
+@@ -663,8 +692,63 @@ static void button_destroy( struct xaml_element *element )
+     free( impl );
+ }
+ 
++static BOOL button_focusable( struct xaml_element *element )
++{
++    struct button *impl = impl_from_element( element );
++    return impl->enabled && impl->kind != BUTTON_PROGRESS;
++}
++
++/* Space presses and releases a button (Click on release), Enter clicks a Button at once */
++static BOOL button_key( struct xaml_element *element, BOOL down, WPARAM vk )
++{
++    struct button *impl = impl_from_element( element );
++
++    if (impl->kind == BUTTON_SCROLL) return scroll_key( impl, down, vk );
++    if (is_range_kind( impl )) return range_key( impl, down, vk );
++    if (!impl->enabled || element_focus_state( element ) == FocusState_Unfocused) return FALSE;
++    if (vk == VK_SPACE)
++    {
++        if (down) impl->pressed = TRUE;
++        else if (impl->pressed)
++        {
++            impl->pressed = FALSE;
++            button_update_state( impl );
++            window_invalidate();
++            button_raise_click( impl );
++            return TRUE;
++        }
++        button_update_state( impl );
++        window_invalidate();
++        return TRUE;
++    }
++    if (vk == VK_RETURN && down && impl->kind == BUTTON_PLAIN)
++    {
++        button_raise_click( impl );
++        return TRUE;
++    }
++    return FALSE;
++}
++
++static BOOL button_wheel( struct xaml_element *element, INT32 delta, BOOL horizontal )
++{
++    struct button *impl = impl_from_element( element );
++    return impl->kind == BUTTON_SCROLL && scroll_wheel( impl, delta, horizontal );
++}
++
++static BOOL button_child_clip( struct xaml_element *element, struct layout_rect *rect )
++{
++    struct button *impl = impl_from_element( element );
++    if (impl->kind != BUTTON_SCROLL) return FALSE;
++    *rect = element->bounds;
++    return TRUE;
++}
++
+ static const struct element_ops button_ops =
+ {
++    .focusable = button_focusable,
++    .key = button_key,
++    .wheel = button_wheel,
++    .child_clip = button_child_clip,
+     .query_interface = button_query_interface,
+     .measure = button_measure,
+     .arrange = button_arrange,
+@@ -1114,26 +1198,29 @@ static HRESULT WINAPI control_put_CharacterSpacing(IControl *iface, INT32 value)
+ 
+ static HRESULT WINAPI control_get_IsTabStop(IControl *iface, boolean *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    *value = impl_from_IControl( iface )->element.is_tab_stop;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_put_IsTabStop(IControl *iface, boolean value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %d.\n", iface, value );
++    impl_from_IControl( iface )->element.is_tab_stop = value;
++    element_mark_local( &impl_from_IControl( iface )->element, L"IsTabStop" );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_get_TabIndex(IControl *iface, INT32 *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    *value = impl_from_IControl( iface )->element.tab_index;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_put_TabIndex(IControl *iface, INT32 value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %d.\n", iface, value );
++    impl_from_IControl( iface )->element.tab_index = value;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_get_TabNavigation(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CKeyboardNavigationMode *value)
+@@ -1170,8 +1257,8 @@ static HRESULT WINAPI control_put_Template(IControl *iface, __x_ABI_CWindows_CUI
+ 
+ static HRESULT WINAPI control_get_FocusState(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CFocusState *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    *value = element_focus_state( &impl_from_IControl( iface )->element );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_add_IsEnabledChanged(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyPropertyChangedEventHandler *handler, EventRegistrationToken *value)
+@@ -1188,8 +1275,13 @@ static HRESULT WINAPI control_remove_IsEnabledChanged(IControl *iface, EventRegi
+ 
+ static HRESULT WINAPI control_Focus(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CFocusState value, boolean *result)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    struct button *impl = impl_from_IControl( iface );
++
++    TRACE( "iface %p, state %d.\n", iface, value );
++    if (value == FocusState_Unfocused) return E_INVALIDARG;
++    /* a control with IsTabStop false can't be focused this way either */
++    *result = impl->element.is_tab_stop && focus_set( &impl->element, value );
++    return S_OK;
+ }
+ 
+ static const struct IControlVtbl control_vtbl =
+@@ -1399,6 +1491,7 @@ static HRESULT button_create( enum button_kind kind, IInspectable *outer, IInspe
+         RuntimeClass_Windows_UI_Xaml_Controls_ToggleSwitch,
+         RuntimeClass_Windows_UI_Xaml_Controls_Slider,
+         RuntimeClass_Windows_UI_Xaml_Controls_ProgressBar,
++        RuntimeClass_Windows_UI_Xaml_Controls_ScrollViewer,
+     };
+     struct button *impl;
+     void *iface;
+@@ -1440,8 +1533,16 @@ static HRESULT button_create( enum button_kind kind, IInspectable *outer, IInspe
+         impl->content_vertical = VerticalAlignment_Center;
+     }
+     if (is_range_kind( impl )) range_init( impl );
++    /* not tab stops by default: a ProgressBar, and a ScrollViewer (its content is) */
++    if (kind == BUTTON_PROGRESS || kind == BUTTON_SCROLL) impl->element.is_tab_stop = FALSE;
++    if (kind == BUTTON_SCROLL && FAILED(scroll_init( impl )))
++    {
++        free( impl );
++        return E_OUTOFMEMORY;
++    }
+     switch (kind)
+     {
++    case BUTTON_SCROLL: iface = scroll_default_iface( impl ); break;
+     case BUTTON_TOGGLE_SWITCH: case BUTTON_SLIDER: case BUTTON_PROGRESS: iface = range_default_iface( impl ); break;
+     case BUTTON_PLAIN: iface = &impl->IButton_iface; break;
+     case BUTTON_CHECK: iface = &impl->ICheckBox_iface; break;
+@@ -1581,8 +1682,10 @@ IActivationFactory *check_box_factory = &check_box_statics.IActivationFactory_if
+ static struct button_statics toggle_switch_statics = BUTTON_STATICS( BUTTON_TOGGLE_SWITCH );
+ static struct button_statics slider_statics = BUTTON_STATICS( BUTTON_SLIDER );
+ static struct button_statics progress_bar_statics = BUTTON_STATICS( BUTTON_PROGRESS );
++static struct button_statics scroll_viewer_statics = BUTTON_STATICS( BUTTON_SCROLL );
+ 
+ IActivationFactory *radio_button_factory = &radio_button_statics.IActivationFactory_iface;
+ IActivationFactory *toggle_switch_factory = &toggle_switch_statics.IActivationFactory_iface;
+ IActivationFactory *slider_factory = &slider_statics.IActivationFactory_iface;
+ IActivationFactory *progress_bar_factory = &progress_bar_statics.IActivationFactory_iface;
++IActivationFactory *scroll_viewer_factory = &scroll_viewer_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/classes.idl b/dlls/windows.ui.xaml/classes.idl
+index b0b72f5..49bb1a5 100644
+--- a/dlls/windows.ui.xaml/classes.idl
++++ b/dlls/windows.ui.xaml/classes.idl
+@@ -47,6 +47,7 @@ namespace Windows.UI.Xaml.Controls {
+     runtimeclass ProgressBar;
+     runtimeclass RadioButton;
+     runtimeclass RowDefinition;
++    runtimeclass ScrollViewer;
+     runtimeclass Slider;
+     runtimeclass StackPanel;
+     runtimeclass TextBlock;
+@@ -62,6 +63,10 @@ namespace Windows.UI.Xaml.Data {
+     runtimeclass PropertyChangedEventArgs;
+ }
+ 
++namespace Windows.UI.Xaml.Input {
++    runtimeclass FocusManager;
++}
++
+ namespace Windows.UI.Xaml.Markup {
+     runtimeclass XamlReader;
+ }
+diff --git a/dlls/windows.ui.xaml/control.h b/dlls/windows.ui.xaml/control.h
+index d4de5fa..06b4f93 100644
+--- a/dlls/windows.ui.xaml/control.h
++++ b/dlls/windows.ui.xaml/control.h
+@@ -30,6 +30,7 @@ enum button_kind
+     BUTTON_TOGGLE_SWITCH,   /* range.c: these draw themselves and aren't ButtonBase or ContentControl */
+     BUTTON_SLIDER,
+     BUTTON_PROGRESS,
++    BUTTON_SCROLL,          /* scroll.c: ScrollViewer, a ContentControl that scrolls its content */
+ };
+ 
+ enum check_state
+@@ -82,6 +83,9 @@ struct button
+     boolean is_on;
+     IInspectable *header, *on_content, *off_content;
+     struct event_list toggled;
++
++    /* scroll.c: ScrollViewer */
++    struct scroll_state *scroll;
+ };
+ 
+ static inline struct button *impl_from_element( struct xaml_element *element )
+@@ -112,6 +116,20 @@ void range_render( struct button *impl, struct layout_context *ctx );
+ void range_pointer( struct button *impl, UINT msg, float x, float y );
+ void range_destroy( struct button *impl );
+ void *range_default_iface( struct button *impl );
++BOOL range_key( struct button *impl, BOOL down, WPARAM vk );
++
++/* scroll.c */
++HRESULT scroll_init( struct button *impl );
++void *scroll_default_iface( struct button *impl );
++HRESULT scroll_query_interface( struct button *impl, REFIID iid, void **out );
++void scroll_measure( struct button *impl, struct layout_context *ctx, float avail_width, float avail_height,
++                     float *width, float *height );
++void scroll_arrange( struct button *impl, struct layout_context *ctx );
++void scroll_render( struct button *impl, struct layout_context *ctx );
++void scroll_pointer( struct button *impl, UINT msg, float x, float y );
++BOOL scroll_key( struct button *impl, BOOL down, WPARAM vk );
++BOOL scroll_wheel( struct button *impl, INT32 delta, BOOL horizontal );
++void scroll_destroy( struct button *impl );
+ 
+ 
+ 
+diff --git a/dlls/windows.ui.xaml/element.c b/dlls/windows.ui.xaml/element.c
+index 7447763..ac4cab7 100644
+--- a/dlls/windows.ui.xaml/element.c
++++ b/dlls/windows.ui.xaml/element.c
+@@ -96,6 +96,10 @@ static ULONG WINAPI inner_Release( IInspectable *iface )
+         if (impl->clip) IInspectable_Release( impl->clip );
+         while (impl->local_count) free( impl->local_properties[--impl->local_count] );
+         free( impl->local_properties );
++        event_list_clear( &impl->key_down );
++        event_list_clear( &impl->key_up );
++        event_list_clear( &impl->got_focus );
++        event_list_clear( &impl->lost_focus );
+         impl->ops->destroy( impl );
+     }
+     return ref;
+@@ -388,50 +392,46 @@ static HRESULT WINAPI uielement_get_PointerCaptures(IUIElement *iface, __FIVecto
+ 
+ static HRESULT WINAPI uielement_add_KeyUp(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIKeyEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return event_list_add( &impl_from_IUIElement( iface )->key_up, (IUnknown *)handler, value );
+ }
+ 
+ static HRESULT WINAPI uielement_remove_KeyUp(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return event_list_remove( &impl_from_IUIElement( iface )->key_up, token );
+ }
+ 
+ static HRESULT WINAPI uielement_add_KeyDown(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIKeyEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return event_list_add( &impl_from_IUIElement( iface )->key_down, (IUnknown *)handler, value );
+ }
+ 
+ static HRESULT WINAPI uielement_remove_KeyDown(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return event_list_remove( &impl_from_IUIElement( iface )->key_down, token );
+ }
+ 
+ static HRESULT WINAPI uielement_add_GotFocus(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CIRoutedEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return event_list_add( &impl_from_IUIElement( iface )->got_focus, (IUnknown *)handler, value );
+ }
+ 
+ static HRESULT WINAPI uielement_remove_GotFocus(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return event_list_remove( &impl_from_IUIElement( iface )->got_focus, token );
+ }
+ 
+ static HRESULT WINAPI uielement_add_LostFocus(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CIRoutedEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return event_list_add( &impl_from_IUIElement( iface )->lost_focus, (IUnknown *)handler, value );
+ }
+ 
+ static HRESULT WINAPI uielement_remove_LostFocus(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return event_list_remove( &impl_from_IUIElement( iface )->lost_focus, token );
+ }
+ 
+ static HRESULT WINAPI uielement_add_DragEnter(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CIDragEventHandler *handler, EventRegistrationToken *value)
+@@ -1432,6 +1432,8 @@ void element_init( struct xaml_element *element, const struct element_ops *ops,
+     element->opacity = 1.0;
+     element->hit_test_visible = TRUE;
+     element->row_span = element->column_span = 1;
++    element->is_tab_stop = TRUE;
++    element->tab_index = 0x7fffffff;   /* Int32.MaxValue: after every element with a TabIndex */
+ }
+ 
+ /* Hand out a new element the way a composable factory's CreateInstance does: iface is the class's default
+@@ -1501,6 +1503,7 @@ IInspectable *element_lookup_resource( struct xaml_element *element, const WCHAR
+ void element_set_parent( struct xaml_element *child, struct xaml_element *parent )
+ {
+     if (!child) return;
++    if (!parent) focus_element_removed( child );
+     child->parent = parent;
+     element_data_context_changed( child );   /* it may inherit a different DataContext now */
+     window_invalidate();
+@@ -1690,6 +1693,16 @@ void element_render( struct xaml_element *element, struct layout_context *ctx )
+         }
+     }
+     element->ops->render( element, ctx );
++    if (element_focus_state( element ) == FocusState_Keyboard)
++    {
++        /* Windows 10's focus visual: a 2 px outer line in the base high colour and a 1 px inner line in the page
++         * background colour */
++        Thickness outer = { 2, 2, 2, 2 }, inner = { 1, 1, 1, 1 };
++        struct layout_rect r = element->bounds;
++        element_frame_color( ctx, &r, &outer, ctx->dark ? RGB(255, 255, 255) : RGB(0, 0, 0) );
++        r.x += 2; r.y += 2; r.width = max( 0.0f, r.width - 4 ); r.height = max( 0.0f, r.height - 4 );
++        element_frame_color( ctx, &r, &inner, ctx->dark ? RGB(0, 0, 0) : RGB(255, 255, 255) );
++    }
+     ctx->dark = dark;
+     ctx->foreground = foreground;
+     ctx->foreground_alpha = foreground_alpha;
+@@ -1720,6 +1733,14 @@ struct xaml_element *element_hit_test( struct xaml_element *element, float x, fl
+         x = tx;
+         y = ty;
+     }
++    if (element->ops->child_clip)
++    {
++        /* children outside the element's viewport (a ScrollViewer's) aren't visible, so they aren't hit */
++        struct layout_rect clip;
++        if (element->ops->child_clip( element, &clip ) &&
++            (x < clip.x || y < clip.y || x >= clip.x + clip.width || y >= clip.y + clip.height))
++            goto self;
++    }
+     if (element->ops->child_count)
+     {
+         for (i = element->ops->child_count( element ); i > 0; i--)
+@@ -1728,6 +1749,7 @@ struct xaml_element *element_hit_test( struct xaml_element *element, float x, fl
+             if (child && (hit = element_hit_test( child, x, y ))) return hit;
+         }
+     }
++self:
+     if (x >= b->x && y >= b->y && x < b->x + b->width && y < b->y + b->height &&
+         element->ops->hit_self && element->ops->hit_self( element, x, y ))
+         return element;
+diff --git a/dlls/windows.ui.xaml/focus.c b/dlls/windows.ui.xaml/focus.c
+new file mode 100644
+index 0000000..9faedbf
+--- /dev/null
++++ b/dlls/windows.ui.xaml/focus.c
+@@ -0,0 +1,661 @@
++/* Keyboard focus, Tab navigation and key events for Windows.UI.Xaml
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* One element has the keyboard focus (referenced while it does). Elements whose ops have focusable() can take it:
++ * Control.Focus, a pointer press on them, or Tab / Shift+Tab, which go through the focusable elements of the tree
++ * in TabIndex order, then tree order, wrapping round. Keys go to the focused element first as routed KeyDown /
++ * KeyUp events, bubbling to its ancestors until one sets Handled; then, unhandled, to the element's own key()
++ * (Space and Enter press buttons, the arrow keys scroll a ScrollViewer, ...) and its ancestors'. With nothing
++ * focused, keys start at the window's content. A keyboard-focused element is drawn with Windows 10's focus visual. */
++
++static struct xaml_element *focused;
++static FocusState focused_state = FocusState_Unfocused;
++static struct event_list manager_got_focus, manager_lost_focus;
++
++struct xaml_element *focus_get(void)
++{
++    return focused;
++}
++
++FocusState element_focus_state( struct xaml_element *element )
++{
++    return element && element == focused ? focused_state : FocusState_Unfocused;
++}
++
++/* visible all the way up, and in the window */
++static BOOL element_shown( struct xaml_element *element )
++{
++    struct xaml_element *root = window_content_element();
++
++    for (; element; element = element->parent)
++    {
++        if (element->visibility != Visibility_Visible) return FALSE;
++        if (element == root) return TRUE;
++    }
++    return FALSE;
++}
++
++BOOL element_can_focus( struct xaml_element *element )
++{
++    return element && element->ops->focusable && element->ops->focusable( element ) && element_shown( element );
++}
++
++static void raise_routed( struct xaml_element *element, BOOL got, struct xaml_element *source )
++{
++    IRoutedEventArgs *args;
++    IUnknown **handlers;
++    UINT32 i, count;
++
++    if (FAILED(routed_event_args_create( source->outer, &args ))) return;
++    for (; element; element = element->parent)
++    {
++        struct event_list *list = got ? &element->got_focus : &element->lost_focus;
++
++        if (!(count = list->count) || !(handlers = calloc( count, sizeof(*handlers) ))) continue;
++        IUIElement_AddRef( &element->IUIElement_iface );
++        for (i = 0; i < count; i++) if ((handlers[i] = list->handlers[i])) IUnknown_AddRef( handlers[i] );
++        for (i = 0; i < count; i++)
++        {
++            if (!handlers[i]) continue;
++            IRoutedEventHandler_Invoke( (IRoutedEventHandler *)handlers[i], element->outer, args );
++            IUnknown_Release( handlers[i] );
++        }
++        free( handlers );
++        IUIElement_Release( &element->IUIElement_iface );
++    }
++    IRoutedEventArgs_Release( args );
++}
++
++static void raise_manager_event( struct event_list *list )
++{
++    UINT32 i;
++
++    /* FocusManager.GotFocus / LostFocus: the args aren't implemented, so handlers get NULL */
++    for (i = 0; i < list->count; i++)
++        if (list->handlers[i])
++            IEventHandler_IInspectable_Invoke( (IEventHandler_IInspectable *)list->handlers[i], NULL, NULL );
++}
++
++BOOL focus_set( struct xaml_element *element, FocusState state )
++{
++    struct xaml_element *old = focused;
++
++    if (state == FocusState_Unfocused) return FALSE;
++    if (!element_can_focus( element ))
++    {
++        TRACE( "%s can't take the focus.\n", element ? debugstr_w(element->class_name) : "NULL" );
++        return FALSE;
++    }
++    if (element == focused)
++    {
++        if (focused_state != state) { focused_state = state; window_invalidate(); }
++        return TRUE;
++    }
++    TRACE( "focus to %s (%p), state %d.\n", debugstr_w(element->class_name), element, state );
++    IUIElement_AddRef( &element->IUIElement_iface );
++    focused = element;
++    focused_state = state;
++    if (old)
++    {
++        if (old->ops->focus_changed) old->ops->focus_changed( old );
++        raise_routed( old, FALSE, old );
++        raise_manager_event( &manager_lost_focus );
++        IUIElement_Release( &old->IUIElement_iface );
++    }
++    if (focused == element)
++    {
++        if (element->ops->focus_changed) element->ops->focus_changed( element );
++        raise_routed( element, TRUE, element );
++        raise_manager_event( &manager_got_focus );
++    }
++    window_invalidate();
++    return TRUE;
++}
++
++void focus_clear(void)
++{
++    struct xaml_element *old = focused;
++
++    if (!old) return;
++    focused = NULL;
++    focused_state = FocusState_Unfocused;
++    IUIElement_Release( &old->IUIElement_iface );
++}
++
++/* the element is going away or leaving the tree: nothing may stay focused inside it */
++void focus_element_removed( struct xaml_element *element )
++{
++    struct xaml_element *e;
++
++    for (e = focused; e; e = e->parent) if (e == element) { focus_clear(); return; }
++}
++
++/* ---- Tab order ---- */
++
++struct tab_list
++{
++    struct xaml_element **items;
++    UINT32 count, capacity;
++};
++
++static void collect_focusable( struct xaml_element *element, struct tab_list *list )
++{
++    UINT32 i, count;
++
++    if (element->visibility != Visibility_Visible) return;
++    if (element->ops->focusable && element->ops->focusable( element ) && element->is_tab_stop)
++    {
++        if (list->count == list->capacity)
++        {
++            UINT32 capacity = max( 16, list->capacity * 2 );
++            struct xaml_element **items = realloc( list->items, capacity * sizeof(*items) );
++            if (!items) return;
++            list->items = items;
++            list->capacity = capacity;
++        }
++        list->items[list->count++] = element;
++    }
++    if (!element->ops->child_count) return;
++    count = element->ops->child_count( element );
++    for (i = 0; i < count; i++)
++    {
++        struct xaml_element *child = element->ops->child_at( element, i );
++        if (child) collect_focusable( child, list );
++    }
++}
++
++/* TabIndex first, then tree order: an insertion sort keeps equal indices in tree order */
++static void sort_tab_order( struct tab_list *list )
++{
++    UINT32 i, j;
++
++    for (i = 1; i < list->count; i++)
++    {
++        struct xaml_element *item = list->items[i];
++        for (j = i; j > 0 && list->items[j - 1]->tab_index > item->tab_index; j--) list->items[j] = list->items[j - 1];
++        list->items[j] = item;
++    }
++}
++
++/* the next (or previous) focusable element after the focused one, in a scope; NULL if there are none */
++static struct xaml_element *find_tab_target( struct xaml_element *scope, BOOL backwards )
++{
++    struct tab_list list = {0};
++    struct xaml_element *found = NULL;
++    UINT32 i;
++
++    if (!scope) return NULL;
++    collect_focusable( scope, &list );
++    sort_tab_order( &list );
++    if (list.count)
++    {
++        for (i = 0; i < list.count; i++) if (list.items[i] == focused) break;
++        if (i == list.count) found = list.items[backwards ? list.count - 1 : 0];
++        else found = list.items[(i + (backwards ? list.count - 1 : 1)) % list.count];
++    }
++    free( list.items );
++    return found;
++}
++
++BOOL focus_move( BOOL backwards, FocusState state )
++{
++    struct xaml_element *target = find_tab_target( window_content_element(), backwards );
++
++    return target && focus_set( target, state );
++}
++
++static struct xaml_element *find_edge( struct xaml_element *scope, BOOL last )
++{
++    struct tab_list list = {0};
++    struct xaml_element *found = NULL;
++
++    if (!scope) return NULL;
++    collect_focusable( scope, &list );
++    sort_tab_order( &list );
++    if (list.count) found = list.items[last ? list.count - 1 : 0];
++    free( list.items );
++    return found;
++}
++
++/* ---- key events ---- */
++
++struct key_args
++{
++    IKeyRoutedEventArgs IKeyRoutedEventArgs_iface;
++    IRoutedEventArgs IRoutedEventArgs_iface;
++    LONG ref;
++    __x_ABI_CWindows_CSystem_CVirtualKey key;
++    CorePhysicalKeyStatus status;
++    boolean handled;
++    IInspectable *source;
++};
++
++static inline struct key_args *impl_from_IKeyRoutedEventArgs( IKeyRoutedEventArgs *iface )
++{
++    return CONTAINING_RECORD( iface, struct key_args, IKeyRoutedEventArgs_iface );
++}
++
++static HRESULT WINAPI key_args_QueryInterface( IKeyRoutedEventArgs *iface, REFIID iid, void **out )
++{
++    struct key_args *impl = impl_from_IKeyRoutedEventArgs( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IKeyRoutedEventArgs ))
++        *out = &impl->IKeyRoutedEventArgs_iface;
++    else if (IsEqualGUID( iid, &IID_IRoutedEventArgs ))
++        *out = &impl->IRoutedEventArgs_iface;
++    else
++    {
++        report_missing_interface( L"KeyRoutedEventArgs", iid );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI key_args_AddRef( IKeyRoutedEventArgs *iface )
++{
++    return InterlockedIncrement( &impl_from_IKeyRoutedEventArgs( iface )->ref );
++}
++
++static ULONG WINAPI key_args_Release( IKeyRoutedEventArgs *iface )
++{
++    struct key_args *impl = impl_from_IKeyRoutedEventArgs( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        if (impl->source) IInspectable_Release( impl->source );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI key_args_GetIids( IKeyRoutedEventArgs *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI key_args_GetRuntimeClassName( IKeyRoutedEventArgs *iface, HSTRING *name )
++{
++    return WindowsCreateString( L"Windows.UI.Xaml.Input.KeyRoutedEventArgs", 40, name );
++}
++
++static HRESULT WINAPI key_args_GetTrustLevel( IKeyRoutedEventArgs *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI key_args_get_Key( IKeyRoutedEventArgs *iface, __x_ABI_CWindows_CSystem_CVirtualKey *value )
++{
++    *value = impl_from_IKeyRoutedEventArgs( iface )->key;
++    return S_OK;
++}
++
++static HRESULT WINAPI key_args_get_KeyStatus( IKeyRoutedEventArgs *iface, CorePhysicalKeyStatus *value )
++{
++    *value = impl_from_IKeyRoutedEventArgs( iface )->status;
++    return S_OK;
++}
++
++static HRESULT WINAPI key_args_get_Handled( IKeyRoutedEventArgs *iface, boolean *value )
++{
++    *value = impl_from_IKeyRoutedEventArgs( iface )->handled;
++    return S_OK;
++}
++
++static HRESULT WINAPI key_args_put_Handled( IKeyRoutedEventArgs *iface, boolean value )
++{
++    impl_from_IKeyRoutedEventArgs( iface )->handled = value;
++    return S_OK;
++}
++
++static const struct IKeyRoutedEventArgsVtbl key_args_vtbl =
++{
++    key_args_QueryInterface, key_args_AddRef, key_args_Release,
++    key_args_GetIids, key_args_GetRuntimeClassName, key_args_GetTrustLevel,
++    key_args_get_Key, key_args_get_KeyStatus, key_args_get_Handled, key_args_put_Handled,
++};
++
++DEFINE_IINSPECTABLE( key_routed, IRoutedEventArgs, struct key_args, IKeyRoutedEventArgs_iface )
++
++static HRESULT WINAPI key_routed_get_OriginalSource( IRoutedEventArgs *iface, IInspectable **value )
++{
++    struct key_args *impl = impl_from_IRoutedEventArgs( iface );
++    if ((*value = impl->source)) IInspectable_AddRef( *value );
++    return S_OK;
++}
++
++static const struct IRoutedEventArgsVtbl key_routed_vtbl =
++{
++    key_routed_QueryInterface, key_routed_AddRef, key_routed_Release,
++    key_routed_GetIids, key_routed_GetRuntimeClassName, key_routed_GetTrustLevel,
++    key_routed_get_OriginalSource,
++};
++
++/* KeyDown or KeyUp from the element up the tree; TRUE if a handler set Handled */
++static BOOL raise_key_event( struct xaml_element *start, BOOL down, WPARAM vk, LPARAM lparam )
++{
++    struct key_args *args;
++    struct xaml_element *element;
++    IUnknown **handlers;
++    BOOL handled;
++    UINT32 i, count;
++
++    if (!(args = calloc( 1, sizeof(*args) ))) return FALSE;
++    args->IKeyRoutedEventArgs_iface.lpVtbl = &key_args_vtbl;
++    args->IRoutedEventArgs_iface.lpVtbl = &key_routed_vtbl;
++    args->ref = 1;
++    args->key = vk;
++    args->status.RepeatCount = LOWORD( lparam );
++    args->status.ScanCode = (lparam >> 16) & 0xff;
++    args->status.IsExtendedKey = (lparam >> 24) & 1;
++    args->status.IsMenuKeyDown = (lparam >> 29) & 1;
++    args->status.WasKeyDown = (lparam >> 30) & 1;
++    args->status.IsKeyReleased = !down;
++    if ((args->source = start->outer)) IInspectable_AddRef( args->source );
++
++    for (element = start; element && !args->handled; element = element->parent)
++    {
++        struct event_list *list = down ? &element->key_down : &element->key_up;
++
++        if (!(count = list->count) || !(handlers = calloc( count, sizeof(*handlers) ))) continue;
++        for (i = 0; i < count; i++) if ((handlers[i] = list->handlers[i])) IUnknown_AddRef( handlers[i] );
++        for (i = 0; i < count; i++)
++        {
++            if (!handlers[i]) continue;
++            if (!args->handled)
++                IKeyEventHandler_Invoke( (IKeyEventHandler *)handlers[i], element->outer, &args->IKeyRoutedEventArgs_iface );
++            IUnknown_Release( handlers[i] );
++        }
++        free( handlers );
++    }
++    handled = args->handled;
++    IKeyRoutedEventArgs_Release( &args->IKeyRoutedEventArgs_iface );
++    return handled;
++}
++
++/* WM_KEYDOWN / WM_KEYUP for the XAML window; TRUE if XAML used the key */
++BOOL focus_key( BOOL down, WPARAM vk, LPARAM lparam )
++{
++    struct xaml_element *start = focused ? focused : window_content_element(), *element;
++    BOOL handled;
++
++    if (!start) return FALSE;
++    IUIElement_AddRef( &start->IUIElement_iface );
++    handled = raise_key_event( start, down, vk, lparam );
++    if (!handled && down && vk == VK_TAB)
++        handled = focus_move( GetKeyState( VK_SHIFT ) < 0, FocusState_Keyboard );
++    for (element = start; !handled && element; element = element->parent)
++        if (element->ops->key) handled = element->ops->key( element, down, vk );
++    IUIElement_Release( &start->IUIElement_iface );
++    return handled;
++}
++
++/* ---- FocusManager ---- */
++
++struct focus_manager
++{
++    IActivationFactory IActivationFactory_iface;
++    IFocusManagerStatics IFocusManagerStatics_iface;
++    IFocusManagerStatics2 IFocusManagerStatics2_iface;
++    IFocusManagerStatics3 IFocusManagerStatics3_iface;
++    IFocusManagerStatics4 IFocusManagerStatics4_iface;
++    IFocusManagerStatics6 IFocusManagerStatics6_iface;
++    IFocusManagerStatics7 IFocusManagerStatics7_iface;
++};
++
++static struct focus_manager focus_manager;
++
++static HRESULT WINAPI manager_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s.\n", iface, debugstr_guid(iid) );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &focus_manager.IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IFocusManagerStatics )) *out = &focus_manager.IFocusManagerStatics_iface;
++    else if (IsEqualGUID( iid, &IID_IFocusManagerStatics2 )) *out = &focus_manager.IFocusManagerStatics2_iface;
++    else if (IsEqualGUID( iid, &IID_IFocusManagerStatics3 )) *out = &focus_manager.IFocusManagerStatics3_iface;
++    else if (IsEqualGUID( iid, &IID_IFocusManagerStatics4 )) *out = &focus_manager.IFocusManagerStatics4_iface;
++    else if (IsEqualGUID( iid, &IID_IFocusManagerStatics6 )) *out = &focus_manager.IFocusManagerStatics6_iface;
++    else if (IsEqualGUID( iid, &IID_IFocusManagerStatics7 )) *out = &focus_manager.IFocusManagerStatics7_iface;
++    else
++    {
++        report_missing_interface( L"FocusManager", iid );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI manager_factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI manager_factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI manager_factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI manager_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI manager_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI manager_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance ) { return E_NOTIMPL; }
++
++static const IActivationFactoryVtbl manager_factory_vtbl =
++{
++    manager_factory_QueryInterface, manager_factory_AddRef, manager_factory_Release,
++    manager_factory_GetIids, manager_factory_GetRuntimeClassName, manager_factory_GetTrustLevel,
++    manager_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( manager1, IFocusManagerStatics, struct focus_manager, IActivationFactory_iface )
++
++static HRESULT WINAPI manager1_GetFocusedElement( IFocusManagerStatics *iface, IInspectable **value )
++{
++    TRACE( "-> %p.\n", focused );
++    if ((*value = focused ? focused->outer : NULL)) IInspectable_AddRef( *value );
++    return S_OK;
++}
++
++static const struct IFocusManagerStaticsVtbl manager1_vtbl =
++{
++    manager1_QueryInterface, manager1_AddRef, manager1_Release,
++    manager1_GetIids, manager1_GetRuntimeClassName, manager1_GetTrustLevel,
++    manager1_GetFocusedElement,
++};
++
++/* Next and Previous follow the Tab order; Up, Down, Left and Right (XY navigation) are approximated by it too */
++static struct xaml_element *find_direction( FocusNavigationDirection direction )
++{
++    BOOL backwards = direction == FocusNavigationDirection_Previous || direction == FocusNavigationDirection_Up ||
++                     direction == FocusNavigationDirection_Left;
++    if (direction == FocusNavigationDirection_None) return NULL;
++    return find_tab_target( window_content_element(), backwards );
++}
++
++DEFINE_IINSPECTABLE( manager2, IFocusManagerStatics2, struct focus_manager, IActivationFactory_iface )
++
++static HRESULT WINAPI manager2_TryMoveFocus( IFocusManagerStatics2 *iface, FocusNavigationDirection direction, boolean *value )
++{
++    struct xaml_element *target = find_direction( direction );
++
++    TRACE( "direction %d.\n", direction );
++    *value = target && focus_set( target, FocusState_Programmatic );
++    return S_OK;
++}
++
++static const struct IFocusManagerStatics2Vtbl manager2_vtbl =
++{
++    manager2_QueryInterface, manager2_AddRef, manager2_Release,
++    manager2_GetIids, manager2_GetRuntimeClassName, manager2_GetTrustLevel,
++    manager2_TryMoveFocus,
++};
++
++DEFINE_IINSPECTABLE( manager3, IFocusManagerStatics3, struct focus_manager, IActivationFactory_iface )
++
++static HRESULT WINAPI manager3_FindNextFocusableElement( IFocusManagerStatics3 *iface, FocusNavigationDirection direction,
++                                                          IUIElement **value )
++{
++    struct xaml_element *target = find_direction( direction );
++
++    if ((*value = target ? &target->IUIElement_iface : NULL)) IUIElement_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI manager3_FindNextFocusableElementWithHint( IFocusManagerStatics3 *iface, FocusNavigationDirection direction,
++                                                                  Rect hint, IUIElement **value )
++{
++    return manager3_FindNextFocusableElement( iface, direction, value );
++}
++
++static const struct IFocusManagerStatics3Vtbl manager3_vtbl =
++{
++    manager3_QueryInterface, manager3_AddRef, manager3_Release,
++    manager3_GetIids, manager3_GetRuntimeClassName, manager3_GetTrustLevel,
++    manager3_FindNextFocusableElement, manager3_FindNextFocusableElementWithHint,
++};
++
++DEFINE_IINSPECTABLE( manager4, IFocusManagerStatics4, struct focus_manager, IActivationFactory_iface )
++
++static HRESULT WINAPI manager4_TryMoveFocusWithOptions( IFocusManagerStatics4 *iface, FocusNavigationDirection direction,
++                                                        IFindNextElementOptions *options, boolean *value )
++{
++    return manager2_TryMoveFocus( &focus_manager.IFocusManagerStatics2_iface, direction, value );
++}
++
++static HRESULT element_as_dependency_object( struct xaml_element *element, IDependencyObject **value )
++{
++    if ((*value = element ? &element->IDependencyObject_iface : NULL)) IDependencyObject_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI manager4_FindNextElement( IFocusManagerStatics4 *iface, FocusNavigationDirection direction,
++                                                IDependencyObject **value )
++{
++    return element_as_dependency_object( find_direction( direction ), value );
++}
++
++static HRESULT WINAPI manager4_FindFirstFocusableElement( IFocusManagerStatics4 *iface, IDependencyObject *scope,
++                                                          IDependencyObject **value )
++{
++    struct xaml_element *element = scope ? element_from_object( (IInspectable *)scope ) : window_content_element();
++    return element_as_dependency_object( find_edge( element, FALSE ), value );
++}
++
++static HRESULT WINAPI manager4_FindLastFocusableElement( IFocusManagerStatics4 *iface, IDependencyObject *scope,
++                                                         IDependencyObject **value )
++{
++    struct xaml_element *element = scope ? element_from_object( (IInspectable *)scope ) : window_content_element();
++    return element_as_dependency_object( find_edge( element, TRUE ), value );
++}
++
++static HRESULT WINAPI manager4_FindNextElementWithOptions( IFocusManagerStatics4 *iface, FocusNavigationDirection direction,
++                                                           IFindNextElementOptions *options, IDependencyObject **value )
++{
++    return manager4_FindNextElement( iface, direction, value );
++}
++
++static const struct IFocusManagerStatics4Vtbl manager4_vtbl =
++{
++    manager4_QueryInterface, manager4_AddRef, manager4_Release,
++    manager4_GetIids, manager4_GetRuntimeClassName, manager4_GetTrustLevel,
++    manager4_TryMoveFocusWithOptions, manager4_FindNextElement, manager4_FindFirstFocusableElement,
++    manager4_FindLastFocusableElement, manager4_FindNextElementWithOptions,
++};
++
++DEFINE_IINSPECTABLE( manager6, IFocusManagerStatics6, struct focus_manager, IActivationFactory_iface )
++
++static HRESULT WINAPI manager6_add_GotFocus( IFocusManagerStatics6 *iface, IEventHandler_FocusManagerGotFocusEventArgs *handler,
++                                             EventRegistrationToken *token )
++{
++    return event_list_add( &manager_got_focus, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI manager6_remove_GotFocus( IFocusManagerStatics6 *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &manager_got_focus, token );
++}
++
++static HRESULT WINAPI manager6_add_LostFocus( IFocusManagerStatics6 *iface, IEventHandler_FocusManagerLostFocusEventArgs *handler,
++                                              EventRegistrationToken *token )
++{
++    return event_list_add( &manager_lost_focus, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI manager6_remove_LostFocus( IFocusManagerStatics6 *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &manager_lost_focus, token );
++}
++
++static LONG unused_token;
++
++static HRESULT WINAPI manager6_add_GettingFocus( IFocusManagerStatics6 *iface, IEventHandler_GettingFocusEventArgs *handler,
++                                                 EventRegistrationToken *token )
++{
++    FIXME( "GettingFocus is never raised.\n" );
++    token->value = InterlockedIncrement( &unused_token ) | 0x40000000;
++    return S_OK;
++}
++
++static HRESULT WINAPI manager6_remove_GettingFocus( IFocusManagerStatics6 *iface, EventRegistrationToken token )
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI manager6_add_LosingFocus( IFocusManagerStatics6 *iface, IEventHandler_LosingFocusEventArgs *handler,
++                                                EventRegistrationToken *token )
++{
++    FIXME( "LosingFocus is never raised.\n" );
++    token->value = InterlockedIncrement( &unused_token ) | 0x40000000;
++    return S_OK;
++}
++
++static HRESULT WINAPI manager6_remove_LosingFocus( IFocusManagerStatics6 *iface, EventRegistrationToken token )
++{
++    return S_OK;
++}
++
++static const struct IFocusManagerStatics6Vtbl manager6_vtbl =
++{
++    manager6_QueryInterface, manager6_AddRef, manager6_Release,
++    manager6_GetIids, manager6_GetRuntimeClassName, manager6_GetTrustLevel,
++    manager6_add_GotFocus, manager6_remove_GotFocus, manager6_add_LostFocus, manager6_remove_LostFocus,
++    manager6_add_GettingFocus, manager6_remove_GettingFocus, manager6_add_LosingFocus, manager6_remove_LosingFocus,
++};
++
++DEFINE_IINSPECTABLE( manager7, IFocusManagerStatics7, struct focus_manager, IActivationFactory_iface )
++
++static HRESULT WINAPI manager7_GetFocusedElement( IFocusManagerStatics7 *iface, IXamlRoot *root, IInspectable **value )
++{
++    return manager1_GetFocusedElement( &focus_manager.IFocusManagerStatics_iface, value );
++}
++
++static const struct IFocusManagerStatics7Vtbl manager7_vtbl =
++{
++    manager7_QueryInterface, manager7_AddRef, manager7_Release,
++    manager7_GetIids, manager7_GetRuntimeClassName, manager7_GetTrustLevel,
++    manager7_GetFocusedElement,
++};
++
++static struct focus_manager focus_manager =
++{
++    { &manager_factory_vtbl },
++    { &manager1_vtbl },
++    { &manager2_vtbl },
++    { &manager3_vtbl },
++    { &manager4_vtbl },
++    { &manager6_vtbl },
++    { &manager7_vtbl },
++};
++
++IActivationFactory *focus_manager_factory = &focus_manager.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/main.c b/dlls/windows.ui.xaml/main.c
+index cd35fe4..ece234a 100644
+--- a/dlls/windows.ui.xaml/main.c
++++ b/dlls/windows.ui.xaml/main.c
+@@ -60,6 +60,10 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( slider_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ProgressBar ))
+         IActivationFactory_QueryInterface( progress_bar_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ScrollViewer ))
++        IActivationFactory_QueryInterface( scroll_viewer_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Input_FocusManager ))
++        IActivationFactory_QueryInterface( focus_manager_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Data_PropertyChangedEventArgs ))
+         IActivationFactory_QueryInterface( property_changed_event_args_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ItemsControl ))
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index 5d5440c..65fdcd8 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -53,6 +53,9 @@
+ #define WIDL_using_Windows_UI_Xaml_Media
+ #define WIDL_using_Windows_UI_Xaml_Media_Animation
+ #define WIDL_using_Windows_UI_Xaml_Data
++#define WIDL_using_Windows_UI_Xaml_Input
++#define WIDL_using_Windows_System
++#include "windows.system.h"
+ #define WIDL_using_Windows_UI_Xaml_Interop
+ #define WIDL_using_Windows_UI_Xaml_Markup
+ #define WIDL_using_Windows_UI_Xaml_Interop
+@@ -177,6 +180,22 @@ IInspectable *create_builtin( const WCHAR *name );
+ /* window.c */
+ HRESULT window_create_for_core_window( ICoreWindow *core_window );
+ void window_destroy_current(void);
++struct xaml_element *window_content_element(void);   /* Window.Current.Content, not referenced, or NULL */
++
++/* focus.c */
++extern IActivationFactory *focus_manager_factory;
++struct xaml_element *focus_get(void);
++FocusState element_focus_state( struct xaml_element *element );
++BOOL element_can_focus( struct xaml_element *element );
++BOOL focus_set( struct xaml_element *element, FocusState state );
++BOOL focus_move( BOOL backwards, FocusState state );
++void focus_clear(void);
++void focus_element_removed( struct xaml_element *element );
++BOOL focus_key( BOOL down, WPARAM vk, LPARAM lparam );
++
++/* scroll.c */
++extern IActivationFactory *scroll_viewer_factory;
++BOOL scroll_set_markup( IInspectable *target, const WCHAR *owner, const WCHAR *name, const WCHAR *value, INT32 number );
+ 
+ /* collections: one IVector<T *> implementation for any interface-pointer element type T */
+ struct vector_iids
+@@ -213,6 +232,7 @@ struct layout_context
+ };
+ 
+ struct xaml_element;
++struct layout_rect;
+ struct element_ops
+ {
+     HRESULT (*query_interface)( struct xaml_element *element, REFIID iid, void **out );
+@@ -231,6 +251,15 @@ struct element_ops
+     /* pointer input for elements that handle it (optional) */
+     void (*pointer)( struct xaml_element *element, UINT msg, float x, float y );
+     void (*destroy)( struct xaml_element *element );
++    /* focus.c: whether the element can take the keyboard focus now (optional; default: no) */
++    BOOL (*focusable)( struct xaml_element *element );
++    /* a key the routed key events didn't handle, for the focused element and then its ancestors (optional) */
++    BOOL (*key)( struct xaml_element *element, BOOL down, WPARAM vk );
++    void (*focus_changed)( struct xaml_element *element );   /* took or lost the focus (optional) */
++    /* the area children are hit-tested in, for elements that clip their children (optional) */
++    BOOL (*child_clip)( struct xaml_element *element, struct layout_rect *rect );
++    /* a mouse wheel turn over the element or its children (optional); TRUE if it scrolled */
++    BOOL (*wheel)( struct xaml_element *element, INT32 delta, BOOL horizontal );
+ };
+ 
+ struct layout_rect
+@@ -282,6 +311,9 @@ struct xaml_element
+     struct template_instance *template_instance;
+     WCHAR **local_properties;                  /* set directly (not by a style): styles don't override them */
+     UINT32 local_count;
++    struct event_list key_down, key_up, got_focus, lost_focus;   /* UIElement's routed key and focus events */
++    boolean is_tab_stop;                       /* Control.IsTabStop */
++    INT32 tab_index;                           /* Control.TabIndex */
+ 
+     /* layout results */
+     float desired_width, desired_height;  /* including margin */
+diff --git a/dlls/windows.ui.xaml/range.c b/dlls/windows.ui.xaml/range.c
+index 2719a9a..b6141ad 100644
+--- a/dlls/windows.ui.xaml/range.c
++++ b/dlls/windows.ui.xaml/range.c
+@@ -874,3 +874,30 @@ static const struct IToggleSwitchVtbl toggle_switch_vtbl =
+     toggle_switch_add_Toggled,
+     toggle_switch_remove_Toggled
+ };
++
++/* keyboard: Space toggles a ToggleSwitch; the arrow keys move a Slider by SmallChange (or StepFrequency), Page Up
++ * and Page Down by LargeChange, Home and End to its ends */
++BOOL range_key( struct button *impl, BOOL down, WPARAM vk )
++{
++    double step;
++
++    if (!impl->enabled || element_focus_state( &impl->element ) == FocusState_Unfocused) return FALSE;
++    if (impl->kind == BUTTON_TOGGLE_SWITCH)
++    {
++        if (vk != VK_SPACE) return FALSE;
++        if (!down) toggle( impl );
++        return TRUE;
++    }
++    if (impl->kind != BUTTON_SLIDER || !down) return FALSE;
++    step = impl->step > 0 ? impl->step : impl->small_change;
++    switch (vk)
++    {
++    case VK_RIGHT: case VK_UP: set_value( impl, impl->value + step ); return TRUE;
++    case VK_LEFT: case VK_DOWN: set_value( impl, impl->value - step ); return TRUE;
++    case VK_PRIOR: set_value( impl, impl->value + impl->large_change ); return TRUE;
++    case VK_NEXT: set_value( impl, impl->value - impl->large_change ); return TRUE;
++    case VK_HOME: set_value( impl, impl->minimum ); return TRUE;
++    case VK_END: set_value( impl, impl->maximum ); return TRUE;
++    }
++    return FALSE;
++}
+diff --git a/dlls/windows.ui.xaml/scroll.c b/dlls/windows.ui.xaml/scroll.c
+new file mode 100644
+index 0000000..589a0b5
+--- /dev/null
++++ b/dlls/windows.ui.xaml/scroll.c
+@@ -0,0 +1,824 @@
++/* Windows.UI.Xaml.Controls.ScrollViewer
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <math.h>
++
++#include "private.h"
++#include "control.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* A ScrollViewer is a ContentControl (struct button, kind BUTTON_SCROLL) whose content is measured without a limit
++ * along each axis that scrolls, arranged at minus the scroll offset and drawn clipped to the viewport. Along an
++ * axis whose ScrollBarVisibility is Disabled the content gets the viewport's size instead, like Windows' default
++ * horizontal axis. The mouse wheel scrolls 48 px a notch (Shift or a horizontal wheel scroll sideways); the arrow
++ * keys 16 px, Page Up / Down a viewport, Home / End to the ends. The scroll bars are Windows 10's: a thin panning
++ * indicator, widened to a draggable 12 px bar while the pointer is over the ScrollViewer; a press on the track
++ * pages. ChangeView and ScrollToHorizontal/VerticalOffset scroll at once (no animation), and ViewChanged follows
++ * every change. Zooming isn't supported (ZoomFactor stays 1). */
++
++#define WHEEL_STEP 48.0
++#define LINE_STEP 16.0
++#define BAR_WIDE 12.0f
++#define BAR_THIN 3.0f
++#define THUMB_MIN 20.0f
++
++struct scroll_state
++{
++    IScrollViewer IScrollViewer_iface;
++    IScrollViewer2 IScrollViewer2_iface;
++    IScrollViewer3 IScrollViewer3_iface;
++    IScrollViewer4 IScrollViewer4_iface;
++    struct button *button;
++
++    ScrollBarVisibility h_bar, v_bar;
++    ScrollMode h_mode, v_mode;
++    ZoomMode zoom_mode;
++    boolean h_rail, v_rail, h_chain, v_chain, zoom_chain, scroll_inertia, zoom_inertia, deferred, bring_into_view;
++    boolean reduce_for_occlusions, render_outside;
++    SnapPointsAlignment h_snap_align, v_snap_align;
++    SnapPointsType h_snap, v_snap, zoom_snap;
++    float min_zoom, max_zoom;
++    double anchor_h, anchor_v;
++    IUIElement *top_left_header, *left_header, *top_header;
++
++    double h_offset, v_offset;
++    double extent_w, extent_h, viewport_w, viewport_h;
++    struct event_list view_changed, view_changing, manipulation_started, manipulation_completed, anchor_requested;
++
++    BOOL pointer_over;
++    int dragging;             /* 0, or 1 / 2 while the horizontal / vertical thumb is dragged */
++    float drag_start, drag_offset;
++};
++
++static inline struct scroll_state *scroll_of( struct button *impl )
++{
++    return impl->scroll;
++}
++
++static double scrollable_w( struct scroll_state *s ) { return max( 0.0, s->extent_w - s->viewport_w ); }
++static double scrollable_h( struct scroll_state *s ) { return max( 0.0, s->extent_h - s->viewport_h ); }
++
++static BOOL scrolls_h( struct scroll_state *s )
++{
++    return s->h_bar != ScrollBarVisibility_Disabled && s->h_mode != ScrollMode_Disabled;
++}
++
++static BOOL scrolls_v( struct scroll_state *s )
++{
++    return s->v_bar != ScrollBarVisibility_Disabled && s->v_mode != ScrollMode_Disabled;
++}
++
++static BOOL bar_shown( ScrollBarVisibility visibility, double scrollable )
++{
++    return visibility == ScrollBarVisibility_Visible || (visibility == ScrollBarVisibility_Auto && scrollable > 0);
++}
++
++/* ViewChanged: the args only have IsIntermediate, always FALSE here (every change is final) */
++struct view_args
++{
++    IScrollViewerViewChangedEventArgs IScrollViewerViewChangedEventArgs_iface;
++    LONG ref;
++};
++
++static inline struct view_args *impl_from_view_args( IScrollViewerViewChangedEventArgs *iface )
++{
++    return CONTAINING_RECORD( iface, struct view_args, IScrollViewerViewChangedEventArgs_iface );
++}
++
++static HRESULT WINAPI view_args_QueryInterface( IScrollViewerViewChangedEventArgs *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IScrollViewerViewChangedEventArgs ))
++    {
++        *out = iface;
++        IScrollViewerViewChangedEventArgs_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI view_args_AddRef( IScrollViewerViewChangedEventArgs *iface )
++{
++    return InterlockedIncrement( &impl_from_view_args( iface )->ref );
++}
++
++static ULONG WINAPI view_args_Release( IScrollViewerViewChangedEventArgs *iface )
++{
++    struct view_args *impl = impl_from_view_args( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI view_args_GetIids( IScrollViewerViewChangedEventArgs *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI view_args_GetRuntimeClassName( IScrollViewerViewChangedEventArgs *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI view_args_GetTrustLevel( IScrollViewerViewChangedEventArgs *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI view_args_get_IsIntermediate( IScrollViewerViewChangedEventArgs *iface, boolean *value )
++{
++    *value = FALSE;
++    return S_OK;
++}
++
++static const struct IScrollViewerViewChangedEventArgsVtbl view_args_vtbl =
++{
++    view_args_QueryInterface, view_args_AddRef, view_args_Release,
++    view_args_GetIids, view_args_GetRuntimeClassName, view_args_GetTrustLevel,
++    view_args_get_IsIntermediate,
++};
++
++static void raise_view_changed( struct scroll_state *s )
++{
++    struct view_args *args;
++    IUnknown **handlers;
++    UINT32 i, count = s->view_changed.count;
++
++    if (!count || !(args = calloc( 1, sizeof(*args) ))) return;
++    args->IScrollViewerViewChangedEventArgs_iface.lpVtbl = &view_args_vtbl;
++    args->ref = 1;
++    if ((handlers = calloc( count, sizeof(*handlers) )))
++    {
++        for (i = 0; i < count; i++) if ((handlers[i] = s->view_changed.handlers[i])) IUnknown_AddRef( handlers[i] );
++        for (i = 0; i < count; i++)
++        {
++            if (!handlers[i]) continue;
++            IEventHandler_ScrollViewerViewChangedEventArgs_Invoke( (IEventHandler_ScrollViewerViewChangedEventArgs *)handlers[i],
++                    s->button->element.outer, &args->IScrollViewerViewChangedEventArgs_iface );
++            IUnknown_Release( handlers[i] );
++        }
++        free( handlers );
++    }
++    IScrollViewerViewChangedEventArgs_Release( &args->IScrollViewerViewChangedEventArgs_iface );
++}
++
++/* scroll to an offset, kept inside the scrollable range; TRUE if the view moved */
++static BOOL scroll_to( struct scroll_state *s, double h, double v )
++{
++    h = min( max( h, 0.0 ), scrollable_w( s ) );
++    v = min( max( v, 0.0 ), scrollable_h( s ) );
++    if (!scrolls_h( s )) h = 0;
++    if (!scrolls_v( s )) v = 0;
++    if (h == s->h_offset && v == s->v_offset) return FALSE;
++    TRACE( "%p: offset %.1f,%.1f.\n", s, h, v );
++    s->h_offset = h;
++    s->v_offset = v;
++    window_invalidate();
++    element_property_changed( s->button->element.outer, L"VerticalOffset" );
++    element_property_changed( s->button->element.outer, L"HorizontalOffset" );
++    raise_view_changed( s );
++    return TRUE;
++}
++
++/* ---- layout and drawing ---- */
++
++void scroll_measure( struct button *impl, struct layout_context *ctx, float avail_width, float avail_height,
++                     float *width, float *height )
++{
++    struct scroll_state *s = scroll_of( impl );
++    struct xaml_element *child = impl->content_element;
++    const Thickness *b = &impl->border_thickness, *p = &impl->padding;
++    float extra_w = b->Left + b->Right + p->Left + p->Right, extra_h = b->Top + b->Bottom + p->Top + p->Bottom;
++
++    *width = *height = 0;
++    if (!child) return;
++    /* along the axes that scroll the content may be as big as it likes */
++    element_measure( child, ctx, scrolls_h( s ) ? INFINITY : max( 0.0f, avail_width - extra_w ),
++                     scrolls_v( s ) ? INFINITY : max( 0.0f, avail_height - extra_h ) );
++    *width = min( child->desired_width + extra_w, avail_width );
++    *height = min( child->desired_height + extra_h, avail_height );
++}
++
++static void viewport_rect( struct button *impl, struct layout_rect *rect )
++{
++    const Thickness *b = &impl->border_thickness, *p = &impl->padding;
++    const struct layout_rect *r = &impl->element.bounds;
++
++    rect->x = r->x + b->Left + p->Left;
++    rect->y = r->y + b->Top + p->Top;
++    rect->width = max( 0.0f, r->width - b->Left - b->Right - p->Left - p->Right );
++    rect->height = max( 0.0f, r->height - b->Top - b->Bottom - p->Top - p->Bottom );
++}
++
++void scroll_arrange( struct button *impl, struct layout_context *ctx )
++{
++    struct scroll_state *s = scroll_of( impl );
++    struct xaml_element *child = impl->content_element;
++    struct layout_rect view;
++    double old_h = s->h_offset, old_v = s->v_offset;
++    float w, h;
++
++    viewport_rect( impl, &view );
++    s->viewport_w = view.width;
++    s->viewport_h = view.height;
++    if (!child)
++    {
++        s->extent_w = s->extent_h = 0;
++        s->h_offset = s->v_offset = 0;
++        return;
++    }
++    /* the content's own size, filling the viewport when it is smaller; an axis that doesn't scroll gets the viewport */
++    w = scrolls_h( s ) ? max( child->desired_width, view.width ) : view.width;
++    h = scrolls_v( s ) ? max( child->desired_height, view.height ) : view.height;
++    s->extent_w = scrolls_h( s ) ? child->desired_width : view.width;
++    s->extent_h = scrolls_v( s ) ? child->desired_height : view.height;
++    /* the content may have shrunk */
++    s->h_offset = min( s->h_offset, scrollable_w( s ) );
++    s->v_offset = min( s->v_offset, scrollable_h( s ) );
++    element_arrange( child, ctx, view.x - s->h_offset, view.y - s->v_offset, w, h );
++    if (s->h_offset != old_h || s->v_offset != old_v) raise_view_changed( s );
++}
++
++/* the vertical (or horizontal) scroll bar's track and thumb */
++static BOOL bar_rects( struct button *impl, BOOL vertical, struct layout_rect *track, struct layout_rect *thumb )
++{
++    struct scroll_state *s = scroll_of( impl );
++    double scrollable = vertical ? scrollable_h( s ) : scrollable_w( s ), extent = vertical ? s->extent_h : s->extent_w;
++    double viewport = vertical ? s->viewport_h : s->viewport_w, offset = vertical ? s->v_offset : s->h_offset;
++    float size = s->pointer_over || s->dragging ? BAR_WIDE : BAR_THIN, length, thumb_length;
++    struct layout_rect view;
++
++    if (!bar_shown( vertical ? s->v_bar : s->h_bar, scrollable ) || scrollable <= 0 || extent <= 0) return FALSE;
++    viewport_rect( impl, &view );
++    if (vertical)
++    {
++        track->x = view.x + view.width - size;
++        track->y = view.y;
++        track->width = size;
++        track->height = view.height;
++        length = track->height;
++    }
++    else
++    {
++        track->x = view.x;
++        track->y = view.y + view.height - size;
++        track->width = view.width;
++        track->height = size;
++        length = track->width;
++    }
++    thumb_length = max( THUMB_MIN, length * viewport / extent );
++    thumb_length = min( thumb_length, length );
++    *thumb = *track;
++    if (vertical)
++    {
++        thumb->y = track->y + (length - thumb_length) * offset / scrollable;
++        thumb->height = thumb_length;
++    }
++    else
++    {
++        thumb->x = track->x + (length - thumb_length) * offset / scrollable;
++        thumb->width = thumb_length;
++    }
++    return TRUE;
++}
++
++void scroll_render( struct button *impl, struct layout_context *ctx )
++{
++    struct scroll_state *s = scroll_of( impl );
++    struct xaml_element *child = impl->content_element;
++    struct layout_rect view, track, thumb;
++    struct look background = {0};
++    /* Windows 10's scroll bar colours: base medium low for the thumb, chrome low (alpha 0x99) for the track */
++    COLORREF thumb_color = ctx->dark ? RGB(102, 102, 102) : RGB(153, 153, 153);
++    COLORREF track_color = ctx->dark ? RGB(23, 23, 23) : RGB(242, 242, 242);
++    BOOL vertical;
++
++    if (impl->background) brush_look( impl->background, &background );
++    if (background.paint) element_fill_color( ctx, &impl->element.bounds, background.color );
++    if (impl->border_brush) element_frame( ctx, &impl->element.bounds, &impl->border_thickness, impl->border_brush );
++    viewport_rect( impl, &view );
++    if (child)
++    {
++        if (ctx->rt) d2d_push_clip( ctx, &view );
++        element_render( child, ctx );
++        if (ctx->rt) d2d_pop_clip( ctx );
++    }
++    for (vertical = FALSE; vertical <= TRUE; vertical++)
++    {
++        if (!bar_rects( impl, vertical, &track, &thumb )) continue;
++        if (s->pointer_over || s->dragging) element_fill_color( ctx, &track, track_color );
++        element_fill_color( ctx, &thumb, thumb_color );
++    }
++}
++
++/* ---- input ---- */
++
++static BOOL inside( const struct layout_rect *r, float x, float y )
++{
++    return x >= r->x && y >= r->y && x < r->x + r->width && y < r->y + r->height;
++}
++
++void scroll_pointer( struct button *impl, UINT msg, float x, float y )
++{
++    struct scroll_state *s = scroll_of( impl );
++    struct layout_rect track, thumb;
++    BOOL vertical;
++
++    switch (msg)
++    {
++    case WM_MOUSEMOVE:
++        if (!s->pointer_over) { s->pointer_over = TRUE; window_invalidate(); }
++        if (s->dragging && bar_rects( impl, s->dragging == 2, &track, &thumb ))
++        {
++            BOOL v = s->dragging == 2;
++            float length = v ? track.height - thumb.height : track.width - thumb.width;
++            float moved = (v ? y : x) - s->drag_start;
++            double scrollable = v ? scrollable_h( s ) : scrollable_w( s ), offset;
++            if (length <= 0) break;
++            offset = s->drag_offset + moved * scrollable / length;
++            if (v) scroll_to( s, s->h_offset, offset );
++            else scroll_to( s, offset, s->v_offset );
++        }
++        break;
++    case WM_MOUSELEAVE:
++        if (s->pointer_over && !s->dragging) { s->pointer_over = FALSE; window_invalidate(); }
++        break;
++    case WM_LBUTTONDOWN:
++        for (vertical = FALSE; vertical <= TRUE; vertical++)
++        {
++            if (!bar_rects( impl, vertical, &track, &thumb ) || !inside( &track, x, y )) continue;
++            if (inside( &thumb, x, y ))
++            {
++                s->dragging = vertical ? 2 : 1;
++                s->drag_start = vertical ? y : x;
++                s->drag_offset = vertical ? s->v_offset : s->h_offset;
++            }
++            /* a press on the track pages towards it */
++            else if (vertical) scroll_to( s, s->h_offset, s->v_offset + (y < thumb.y ? -s->viewport_h : s->viewport_h) );
++            else scroll_to( s, s->h_offset + (x < thumb.x ? -s->viewport_w : s->viewport_w), s->v_offset );
++            break;
++        }
++        break;
++    case WM_LBUTTONUP:
++    case WM_CAPTURECHANGED:
++        if (s->dragging) { s->dragging = 0; window_invalidate(); }
++        break;
++    }
++}
++
++BOOL scroll_wheel( struct button *impl, INT32 delta, BOOL horizontal )
++{
++    struct scroll_state *s = scroll_of( impl );
++    double step = WHEEL_STEP * delta / WHEEL_DELTA;
++
++    /* Windows' wheel scrolls down for a negative delta; a horizontal wheel's positive delta scrolls right */
++    if (horizontal ? !scrolls_h( s ) || scrollable_w( s ) <= 0 : !scrolls_v( s ) || scrollable_h( s ) <= 0) return FALSE;
++    if (horizontal) return scroll_to( s, s->h_offset + step, s->v_offset ) || TRUE;
++    return scroll_to( s, s->h_offset, s->v_offset - step ) || TRUE;
++}
++
++BOOL scroll_key( struct button *impl, BOOL down, WPARAM vk )
++{
++    struct scroll_state *s = scroll_of( impl );
++
++    if (!down) return FALSE;
++    switch (vk)
++    {
++    case VK_UP: return scroll_to( s, s->h_offset, s->v_offset - LINE_STEP );
++    case VK_DOWN: return scroll_to( s, s->h_offset, s->v_offset + LINE_STEP );
++    case VK_LEFT: return scroll_to( s, s->h_offset - LINE_STEP, s->v_offset );
++    case VK_RIGHT: return scroll_to( s, s->h_offset + LINE_STEP, s->v_offset );
++    case VK_PRIOR: return scroll_to( s, s->h_offset, s->v_offset - s->viewport_h );
++    case VK_NEXT: return scroll_to( s, s->h_offset, s->v_offset + s->viewport_h );
++    case VK_HOME: return scroll_to( s, s->h_offset, 0 );
++    case VK_END: return scroll_to( s, s->h_offset, scrollable_h( s ) );
++    }
++    return FALSE;
++}
++
++/* ---- markup: ScrollViewer's properties, and its attached properties on other elements ---- */
++
++/* the value is text (from XAML text) or, with value NULL, a number (an enum or boolean from compiled XAML) */
++static BOOL parse_enum( const WCHAR *value, INT32 number, const WCHAR *const *names, UINT32 count, INT32 *out )
++{
++    UINT32 i;
++    if (!value) { *out = number; return number >= 0 && number < count; }
++    for (i = 0; i < count; i++) if (!wcsicmp( value, names[i] )) { *out = i; return TRUE; }
++    return FALSE;
++}
++
++static boolean parse_bool( const WCHAR *value, INT32 number )
++{
++    return value ? parse_bool( value, number ) : number != 0;
++}
++
++BOOL scroll_set_markup( IInspectable *target, const WCHAR *owner, const WCHAR *name, const WCHAR *value, INT32 number )
++{
++    static const WCHAR *const bar_names[] = { L"Disabled", L"Auto", L"Hidden", L"Visible" };
++    static const WCHAR *const mode_names[] = { L"Disabled", L"Enabled", L"Auto" };
++    static const WCHAR *const zoom_names[] = { L"Disabled", L"Enabled" };
++    struct xaml_element *element = element_from_object( target );
++    struct scroll_state *s = NULL;
++    INT32 e;
++
++    if (element && element->class_name && !wcscmp( element->class_name, RuntimeClass_Windows_UI_Xaml_Controls_ScrollViewer ))
++        s = scroll_of( impl_from_element( element ) );
++    if (!s && wcscmp( owner, L"ScrollViewer" )) return FALSE;
++    if (!s)
++    {
++        /* ScrollViewer.* attached to another element: only the ScrollViewers in templates read them */
++        TRACE( "ScrollViewer.%s=%s (%d) on a %s is ignored.\n", debugstr_w(name), debugstr_w(value), number,
++               element ? debugstr_w(element->class_name) : "non-element" );
++        return TRUE;
++    }
++    if (!wcscmp( name, L"HorizontalScrollBarVisibility" ) && parse_enum( value, number, bar_names, 4, &e )) s->h_bar = e;
++    else if (!wcscmp( name, L"VerticalScrollBarVisibility" ) && parse_enum( value, number, bar_names, 4, &e )) s->v_bar = e;
++    else if (!wcscmp( name, L"HorizontalScrollMode" ) && parse_enum( value, number, mode_names, 3, &e )) s->h_mode = e;
++    else if (!wcscmp( name, L"VerticalScrollMode" ) && parse_enum( value, number, mode_names, 3, &e )) s->v_mode = e;
++    else if (!wcscmp( name, L"ZoomMode" ) && parse_enum( value, number, zoom_names, 2, &e )) s->zoom_mode = e;
++    else if (!wcscmp( name, L"IsHorizontalRailEnabled" )) s->h_rail = parse_bool( value, number );
++    else if (!wcscmp( name, L"IsVerticalRailEnabled" )) s->v_rail = parse_bool( value, number );
++    else if (!wcscmp( name, L"IsDeferredScrollingEnabled" )) s->deferred = parse_bool( value, number );
++    else if (!wcscmp( name, L"BringIntoViewOnFocusChange" )) s->bring_into_view = parse_bool( value, number );
++    else return FALSE;
++    TRACE( "ScrollViewer %p: %s=%s (%d).\n", s, debugstr_w(name), debugstr_w(value), number );
++    window_invalidate();
++    return TRUE;
++}
++
++/* ---- IScrollViewer ---- */
++
++static inline struct scroll_state *impl_from_IScrollViewer( IScrollViewer *iface )
++{
++    return CONTAINING_RECORD( iface, struct scroll_state, IScrollViewer_iface );
++}
++
++static HRESULT WINAPI sv_QueryInterface( IScrollViewer *iface, REFIID iid, void **out )
++{
++    return IInspectable_QueryInterface( impl_from_IScrollViewer( iface )->button->element.outer, iid, out );
++}
++static ULONG WINAPI sv_AddRef( IScrollViewer *iface )
++{
++    return IInspectable_AddRef( impl_from_IScrollViewer( iface )->button->element.outer );
++}
++static ULONG WINAPI sv_Release( IScrollViewer *iface )
++{
++    return IInspectable_Release( impl_from_IScrollViewer( iface )->button->element.outer );
++}
++static HRESULT WINAPI sv_GetIids( IScrollViewer *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI sv_GetRuntimeClassName( IScrollViewer *iface, HSTRING *name )
++{
++    return WindowsCreateString( RuntimeClass_Windows_UI_Xaml_Controls_ScrollViewer,
++                                wcslen( RuntimeClass_Windows_UI_Xaml_Controls_ScrollViewer ), name );
++}
++static HRESULT WINAPI sv_GetTrustLevel( IScrollViewer *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++/* a stored property: get and put */
++#define SV_PROP( name, type, field ) \
++    static HRESULT WINAPI sv_get_##name( IScrollViewer *iface, type *value ) \
++    { *value = impl_from_IScrollViewer( iface )->field; return S_OK; } \
++    static HRESULT WINAPI sv_put_##name( IScrollViewer *iface, type value ) \
++    { impl_from_IScrollViewer( iface )->field = value; window_invalidate(); return S_OK; }
++#define SV_GET( name, type, expr ) \
++    static HRESULT WINAPI sv_get_##name( IScrollViewer *iface, type *value ) \
++    { struct scroll_state *s = impl_from_IScrollViewer( iface ); *value = (expr); (void)s; return S_OK; }
++
++SV_PROP( HorizontalScrollBarVisibility, ScrollBarVisibility, h_bar )
++SV_PROP( VerticalScrollBarVisibility, ScrollBarVisibility, v_bar )
++SV_PROP( IsHorizontalRailEnabled, boolean, h_rail )
++SV_PROP( IsVerticalRailEnabled, boolean, v_rail )
++SV_PROP( IsHorizontalScrollChainingEnabled, boolean, h_chain )
++SV_PROP( IsVerticalScrollChainingEnabled, boolean, v_chain )
++SV_PROP( IsZoomChainingEnabled, boolean, zoom_chain )
++SV_PROP( IsScrollInertiaEnabled, boolean, scroll_inertia )
++SV_PROP( IsZoomInertiaEnabled, boolean, zoom_inertia )
++SV_PROP( HorizontalScrollMode, ScrollMode, h_mode )
++SV_PROP( VerticalScrollMode, ScrollMode, v_mode )
++SV_PROP( ZoomMode, ZoomMode, zoom_mode )
++SV_PROP( HorizontalSnapPointsAlignment, SnapPointsAlignment, h_snap_align )
++SV_PROP( VerticalSnapPointsAlignment, SnapPointsAlignment, v_snap_align )
++SV_PROP( HorizontalSnapPointsType, SnapPointsType, h_snap )
++SV_PROP( VerticalSnapPointsType, SnapPointsType, v_snap )
++SV_PROP( ZoomSnapPointsType, SnapPointsType, zoom_snap )
++SV_GET( HorizontalOffset, DOUBLE, s->h_offset )
++SV_GET( ViewportWidth, DOUBLE, s->viewport_w )
++SV_GET( ScrollableWidth, DOUBLE, scrollable_w( s ) )
++SV_GET( ComputedHorizontalScrollBarVisibility, Visibility,
++        bar_shown( s->h_bar, scrollable_w( s ) ) ? Visibility_Visible : Visibility_Collapsed )
++SV_GET( ExtentWidth, DOUBLE, s->extent_w )
++SV_GET( VerticalOffset, DOUBLE, s->v_offset )
++SV_GET( ViewportHeight, DOUBLE, s->viewport_h )
++SV_GET( ScrollableHeight, DOUBLE, scrollable_h( s ) )
++SV_GET( ComputedVerticalScrollBarVisibility, Visibility,
++        bar_shown( s->v_bar, scrollable_h( s ) ) ? Visibility_Visible : Visibility_Collapsed )
++SV_GET( ExtentHeight, DOUBLE, s->extent_h )
++SV_PROP( MinZoomFactor, FLOAT, min_zoom )
++SV_PROP( MaxZoomFactor, FLOAT, max_zoom )
++SV_GET( ZoomFactor, FLOAT, 1.0f )
++SV_PROP( IsDeferredScrollingEnabled, boolean, deferred )
++SV_PROP( BringIntoViewOnFocusChange, boolean, bring_into_view )
++
++static HRESULT WINAPI sv_get_ZoomSnapPoints( IScrollViewer *iface, IVector_FLOAT **value )
++{
++    FIXME( "iface %p: zoom snap points aren't supported.\n", iface );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI sv_add_ViewChanged( IScrollViewer *iface, IEventHandler_ScrollViewerViewChangedEventArgs *handler,
++                                          EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return event_list_add( &impl_from_IScrollViewer( iface )->view_changed, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI sv_remove_ViewChanged( IScrollViewer *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IScrollViewer( iface )->view_changed, token );
++}
++
++static HRESULT WINAPI sv_ScrollToHorizontalOffset( IScrollViewer *iface, DOUBLE offset )
++{
++    struct scroll_state *s = impl_from_IScrollViewer( iface );
++    TRACE( "iface %p, offset %f.\n", iface, offset );
++    scroll_to( s, offset, s->v_offset );
++    return S_OK;
++}
++
++static HRESULT WINAPI sv_ScrollToVerticalOffset( IScrollViewer *iface, DOUBLE offset )
++{
++    struct scroll_state *s = impl_from_IScrollViewer( iface );
++    TRACE( "iface %p, offset %f.\n", iface, offset );
++    scroll_to( s, s->h_offset, offset );
++    return S_OK;
++}
++
++static HRESULT WINAPI sv_ZoomToFactor( IScrollViewer *iface, FLOAT factor )
++{
++    FIXME( "iface %p, factor %f: zooming isn't supported.\n", iface, factor );
++    return S_OK;
++}
++
++static HRESULT WINAPI sv_InvalidateScrollInfo( IScrollViewer *iface )
++{
++    window_invalidate();
++    return S_OK;
++}
++
++static const struct IScrollViewerVtbl sv_vtbl =
++{
++    sv_QueryInterface, sv_AddRef, sv_Release, sv_GetIids, sv_GetRuntimeClassName, sv_GetTrustLevel,
++    sv_get_HorizontalScrollBarVisibility, sv_put_HorizontalScrollBarVisibility,
++    sv_get_VerticalScrollBarVisibility, sv_put_VerticalScrollBarVisibility,
++    sv_get_IsHorizontalRailEnabled, sv_put_IsHorizontalRailEnabled,
++    sv_get_IsVerticalRailEnabled, sv_put_IsVerticalRailEnabled,
++    sv_get_IsHorizontalScrollChainingEnabled, sv_put_IsHorizontalScrollChainingEnabled,
++    sv_get_IsVerticalScrollChainingEnabled, sv_put_IsVerticalScrollChainingEnabled,
++    sv_get_IsZoomChainingEnabled, sv_put_IsZoomChainingEnabled,
++    sv_get_IsScrollInertiaEnabled, sv_put_IsScrollInertiaEnabled,
++    sv_get_IsZoomInertiaEnabled, sv_put_IsZoomInertiaEnabled,
++    sv_get_HorizontalScrollMode, sv_put_HorizontalScrollMode,
++    sv_get_VerticalScrollMode, sv_put_VerticalScrollMode,
++    sv_get_ZoomMode, sv_put_ZoomMode,
++    sv_get_HorizontalSnapPointsAlignment, sv_put_HorizontalSnapPointsAlignment,
++    sv_get_VerticalSnapPointsAlignment, sv_put_VerticalSnapPointsAlignment,
++    sv_get_HorizontalSnapPointsType, sv_put_HorizontalSnapPointsType,
++    sv_get_VerticalSnapPointsType, sv_put_VerticalSnapPointsType,
++    sv_get_ZoomSnapPointsType, sv_put_ZoomSnapPointsType,
++    sv_get_HorizontalOffset, sv_get_ViewportWidth, sv_get_ScrollableWidth,
++    sv_get_ComputedHorizontalScrollBarVisibility, sv_get_ExtentWidth,
++    sv_get_VerticalOffset, sv_get_ViewportHeight, sv_get_ScrollableHeight,
++    sv_get_ComputedVerticalScrollBarVisibility, sv_get_ExtentHeight,
++    sv_get_MinZoomFactor, sv_put_MinZoomFactor, sv_get_MaxZoomFactor, sv_put_MaxZoomFactor,
++    sv_get_ZoomFactor, sv_get_ZoomSnapPoints,
++    sv_add_ViewChanged, sv_remove_ViewChanged,
++    sv_ScrollToHorizontalOffset, sv_ScrollToVerticalOffset, sv_ZoomToFactor, sv_InvalidateScrollInfo,
++    sv_get_IsDeferredScrollingEnabled, sv_put_IsDeferredScrollingEnabled,
++    sv_get_BringIntoViewOnFocusChange, sv_put_BringIntoViewOnFocusChange,
++};
++
++/* ---- IScrollViewer2: headers, ViewChanging, ChangeView ---- */
++
++DEFINE_IINSPECTABLE_( sv2, IScrollViewer2, struct scroll_state, impl_from_IScrollViewer2, IScrollViewer2_iface,
++                      impl->button->element.outer )
++
++static HRESULT get_header( IUIElement *header, IUIElement **value )
++{
++    if ((*value = header)) IUIElement_AddRef( header );
++    return S_OK;
++}
++
++static HRESULT put_header( IUIElement **slot, IUIElement *value )
++{
++    if (value) IUIElement_AddRef( value );
++    if (*slot) IUIElement_Release( *slot );
++    *slot = value;
++    if (value) FIXME( "ScrollViewer headers aren't drawn.\n" );
++    return S_OK;
++}
++
++static HRESULT WINAPI sv2_get_TopLeftHeader( IScrollViewer2 *iface, IUIElement **value )
++{ return get_header( impl_from_IScrollViewer2( iface )->top_left_header, value ); }
++static HRESULT WINAPI sv2_put_TopLeftHeader( IScrollViewer2 *iface, IUIElement *value )
++{ return put_header( &impl_from_IScrollViewer2( iface )->top_left_header, value ); }
++static HRESULT WINAPI sv2_get_LeftHeader( IScrollViewer2 *iface, IUIElement **value )
++{ return get_header( impl_from_IScrollViewer2( iface )->left_header, value ); }
++static HRESULT WINAPI sv2_put_LeftHeader( IScrollViewer2 *iface, IUIElement *value )
++{ return put_header( &impl_from_IScrollViewer2( iface )->left_header, value ); }
++static HRESULT WINAPI sv2_get_TopHeader( IScrollViewer2 *iface, IUIElement **value )
++{ return get_header( impl_from_IScrollViewer2( iface )->top_header, value ); }
++static HRESULT WINAPI sv2_put_TopHeader( IScrollViewer2 *iface, IUIElement *value )
++{ return put_header( &impl_from_IScrollViewer2( iface )->top_header, value ); }
++
++static HRESULT WINAPI sv2_add_ViewChanging( IScrollViewer2 *iface, IEventHandler_ScrollViewerViewChangingEventArgs *handler,
++                                            EventRegistrationToken *token )
++{
++    /* every change is immediate, so there are no intermediate views to report */
++    return event_list_add( &impl_from_IScrollViewer2( iface )->view_changing, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI sv2_remove_ViewChanging( IScrollViewer2 *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IScrollViewer2( iface )->view_changing, token );
++}
++
++static BOOL reference_double( IReference_DOUBLE *ref, double *out )
++{
++    return ref && SUCCEEDED(IReference_DOUBLE_get_Value( ref, out ));
++}
++
++static HRESULT WINAPI sv2_ChangeView( IScrollViewer2 *iface, IReference_DOUBLE *h, IReference_DOUBLE *v,
++                                      IReference_FLOAT *zoom, boolean *result )
++{
++    struct scroll_state *s = impl_from_IScrollViewer2( iface );
++    double h_offset = s->h_offset, v_offset = s->v_offset;
++
++    reference_double( h, &h_offset );
++    reference_double( v, &v_offset );
++    TRACE( "iface %p, offset %.1f,%.1f.\n", iface, h_offset, v_offset );
++    if (zoom) FIXME( "zooming isn't supported.\n" );
++    scroll_to( s, h_offset, v_offset );
++    *result = TRUE;
++    return S_OK;
++}
++
++static HRESULT WINAPI sv2_ChangeViewWithOptionalAnimation( IScrollViewer2 *iface, IReference_DOUBLE *h, IReference_DOUBLE *v,
++                                                           IReference_FLOAT *zoom, boolean disable_animation, boolean *result )
++{
++    return sv2_ChangeView( iface, h, v, zoom, result );
++}
++
++static const struct IScrollViewer2Vtbl sv2_vtbl =
++{
++    sv2_QueryInterface, sv2_AddRef, sv2_Release, sv2_GetIids, sv2_GetRuntimeClassName, sv2_GetTrustLevel,
++    sv2_get_TopLeftHeader, sv2_put_TopLeftHeader, sv2_get_LeftHeader, sv2_put_LeftHeader,
++    sv2_get_TopHeader, sv2_put_TopHeader,
++    sv2_add_ViewChanging, sv2_remove_ViewChanging,
++    sv2_ChangeView, sv2_ChangeViewWithOptionalAnimation,
++};
++
++/* ---- IScrollViewer3: direct manipulation (touch panning), never started here ---- */
++
++DEFINE_IINSPECTABLE_( sv3, IScrollViewer3, struct scroll_state, impl_from_IScrollViewer3, IScrollViewer3_iface,
++                      impl->button->element.outer )
++
++static HRESULT WINAPI sv3_add_DirectManipulationStarted( IScrollViewer3 *iface, IEventHandler_IInspectable *handler,
++                                                         EventRegistrationToken *token )
++{
++    return event_list_add( &impl_from_IScrollViewer3( iface )->manipulation_started, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI sv3_remove_DirectManipulationStarted( IScrollViewer3 *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IScrollViewer3( iface )->manipulation_started, token );
++}
++
++static HRESULT WINAPI sv3_add_DirectManipulationCompleted( IScrollViewer3 *iface, IEventHandler_IInspectable *handler,
++                                                           EventRegistrationToken *token )
++{
++    return event_list_add( &impl_from_IScrollViewer3( iface )->manipulation_completed, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI sv3_remove_DirectManipulationCompleted( IScrollViewer3 *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IScrollViewer3( iface )->manipulation_completed, token );
++}
++
++static const struct IScrollViewer3Vtbl sv3_vtbl =
++{
++    sv3_QueryInterface, sv3_AddRef, sv3_Release, sv3_GetIids, sv3_GetRuntimeClassName, sv3_GetTrustLevel,
++    sv3_add_DirectManipulationStarted, sv3_remove_DirectManipulationStarted,
++    sv3_add_DirectManipulationCompleted, sv3_remove_DirectManipulationCompleted,
++};
++
++/* ---- IScrollViewer4: anchoring settings, kept but not acted on ---- */
++
++DEFINE_IINSPECTABLE_( sv4, IScrollViewer4, struct scroll_state, impl_from_IScrollViewer4, IScrollViewer4_iface,
++                      impl->button->element.outer )
++
++#define SV4_PROP( name, type, field ) \
++    static HRESULT WINAPI sv4_get_##name( IScrollViewer4 *iface, type *value ) \
++    { *value = impl_from_IScrollViewer4( iface )->field; return S_OK; } \
++    static HRESULT WINAPI sv4_put_##name( IScrollViewer4 *iface, type value ) \
++    { impl_from_IScrollViewer4( iface )->field = value; return S_OK; }
++
++SV4_PROP( ReduceViewportForCoreInputViewOcclusions, boolean, reduce_for_occlusions )
++SV4_PROP( HorizontalAnchorRatio, DOUBLE, anchor_h )
++SV4_PROP( VerticalAnchorRatio, DOUBLE, anchor_v )
++SV4_PROP( CanContentRenderOutsideBounds, boolean, render_outside )
++
++static HRESULT WINAPI sv4_add_AnchorRequested( IScrollViewer4 *iface,
++                                               ITypedEventHandler_ScrollViewer_AnchorRequestedEventArgs *handler,
++                                               EventRegistrationToken *token )
++{
++    return event_list_add( &impl_from_IScrollViewer4( iface )->anchor_requested, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI sv4_remove_AnchorRequested( IScrollViewer4 *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IScrollViewer4( iface )->anchor_requested, token );
++}
++
++static const struct IScrollViewer4Vtbl sv4_vtbl =
++{
++    sv4_QueryInterface, sv4_AddRef, sv4_Release, sv4_GetIids, sv4_GetRuntimeClassName, sv4_GetTrustLevel,
++    sv4_get_ReduceViewportForCoreInputViewOcclusions, sv4_put_ReduceViewportForCoreInputViewOcclusions,
++    sv4_get_HorizontalAnchorRatio, sv4_put_HorizontalAnchorRatio,
++    sv4_get_VerticalAnchorRatio, sv4_put_VerticalAnchorRatio,
++    sv4_get_CanContentRenderOutsideBounds, sv4_put_CanContentRenderOutsideBounds,
++    sv4_add_AnchorRequested, sv4_remove_AnchorRequested,
++};
++
++/* ---- the control ---- */
++
++HRESULT scroll_init( struct button *impl )
++{
++    struct scroll_state *s;
++
++    if (!(s = calloc( 1, sizeof(*s) ))) return E_OUTOFMEMORY;
++    s->IScrollViewer_iface.lpVtbl = &sv_vtbl;
++    s->IScrollViewer2_iface.lpVtbl = &sv2_vtbl;
++    s->IScrollViewer3_iface.lpVtbl = &sv3_vtbl;
++    s->IScrollViewer4_iface.lpVtbl = &sv4_vtbl;
++    s->button = impl;
++    /* the defaults of Windows' ScrollViewer: vertical scrolling with a visible bar, horizontal disabled */
++    s->h_bar = ScrollBarVisibility_Disabled;
++    s->v_bar = ScrollBarVisibility_Visible;
++    s->h_mode = s->v_mode = ScrollMode_Enabled;
++    s->zoom_mode = ZoomMode_Disabled;
++    s->h_rail = s->v_rail = s->h_chain = s->v_chain = s->zoom_chain = TRUE;
++    s->scroll_inertia = s->zoom_inertia = s->bring_into_view = TRUE;
++    s->min_zoom = 0.1f;
++    s->max_zoom = 10.0f;
++    impl->scroll = s;
++    /* a ScrollViewer stretches to fill its slot and shows its content from the top left */
++    impl->element.horizontal_alignment = HorizontalAlignment_Stretch;
++    impl->element.vertical_alignment = VerticalAlignment_Stretch;
++    impl->content_horizontal = HorizontalAlignment_Left;
++    impl->content_vertical = VerticalAlignment_Top;
++    impl->border_thickness.Left = impl->border_thickness.Top = impl->border_thickness.Right = impl->border_thickness.Bottom = 0;
++    impl->padding.Left = impl->padding.Top = impl->padding.Right = impl->padding.Bottom = 0;
++    return S_OK;
++}
++
++void *scroll_default_iface( struct button *impl )
++{
++    return &impl->scroll->IScrollViewer_iface;
++}
++
++HRESULT scroll_query_interface( struct button *impl, REFIID iid, void **out )
++{
++    struct scroll_state *s = impl->scroll;
++
++    if (IsEqualGUID( iid, &IID_IScrollViewer )) *out = &s->IScrollViewer_iface;
++    else if (IsEqualGUID( iid, &IID_IScrollViewer2 )) *out = &s->IScrollViewer2_iface;
++    else if (IsEqualGUID( iid, &IID_IScrollViewer3 )) *out = &s->IScrollViewer3_iface;
++    else if (IsEqualGUID( iid, &IID_IScrollViewer4 )) *out = &s->IScrollViewer4_iface;
++    else return E_NOINTERFACE;
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++void scroll_destroy( struct button *impl )
++{
++    struct scroll_state *s = impl->scroll;
++
++    if (!s) return;
++    event_list_clear( &s->view_changed );
++    event_list_clear( &s->view_changing );
++    event_list_clear( &s->manipulation_started );
++    event_list_clear( &s->manipulation_completed );
++    event_list_clear( &s->anchor_requested );
++    if (s->top_left_header) IUIElement_Release( s->top_left_header );
++    if (s->left_header) IUIElement_Release( s->left_header );
++    if (s->top_header) IUIElement_Release( s->top_header );
++    free( s );
++    impl->scroll = NULL;
++}
+diff --git a/dlls/windows.ui.xaml/window.c b/dlls/windows.ui.xaml/window.c
+index 548daf2..5970d9b 100644
+--- a/dlls/windows.ui.xaml/window.c
++++ b/dlls/windows.ui.xaml/window.c
+@@ -57,6 +57,12 @@ static float view_scale(void)
+     return 1.0f;
+ }
+ 
++struct xaml_element *window_content_element(void)
++{
++    if (!current_window || !current_window->content) return NULL;
++    return element_from_iinspectable( (IInspectable *)current_window->content );
++}
++
+ void window_invalidate(void)
+ {
+     if (current_window && current_window->hwnd) InvalidateRect( current_window->hwnd, NULL, FALSE );
+@@ -175,6 +181,12 @@ static void window_pointer( struct xaml_window *window, UINT msg, LPARAM lparam
+         break;
+     case WM_LBUTTONDOWN:
+         if (!target) break;
++        {
++            /* a press focuses the nearest control that can take the focus */
++            struct xaml_element *element;
++            for (element = target; element; element = element->parent)
++                if (element_can_focus( element ) && element->is_tab_stop) { focus_set( element, FocusState_Pointer ); break; }
++        }
+         set_element_ref( &window->captured, target );
+         SetCapture( window->hwnd );
+         target->ops->pointer( target, WM_LBUTTONDOWN, x, y );
+@@ -192,6 +204,21 @@ static void window_pointer( struct xaml_window *window, UINT msg, LPARAM lparam
+     }
+ }
+ 
++/* the wheel scrolls the nearest element under the pointer that scrolls: a ScrollViewer */
++static void window_wheel( struct xaml_window *window, WPARAM wparam, LPARAM lparam, BOOL horizontal )
++{
++    POINT pt = { (short)LOWORD( lparam ), (short)HIWORD( lparam ) };
++    struct xaml_element *element, *root = window_content_element();
++    float scale = view_scale();
++
++    if (!root) return;
++    ScreenToClient( window->hwnd, &pt );
++    /* Shift turns the vertical wheel into a horizontal one, as on Windows */
++    if (!horizontal && (GET_KEYSTATE_WPARAM( wparam ) & MK_SHIFT)) horizontal = TRUE;
++    for (element = element_hit_test( root, pt.x / scale, pt.y / scale ); element; element = element->parent)
++        if (element->ops->wheel && element->ops->wheel( element, GET_WHEEL_DELTA_WPARAM( wparam ), horizontal )) break;
++}
++
+ static LRESULT CALLBACK window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
+ {
+     struct xaml_window *window = current_window;
+@@ -219,6 +246,15 @@ static LRESULT CALLBACK window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM
+     case WM_MOUSELEAVE:
+         window_pointer( window, msg, lparam );
+         break;
++    case WM_MOUSEWHEEL:
++    case WM_MOUSEHWHEEL:
++        window_wheel( window, wparam, lparam, msg == WM_MOUSEHWHEEL );
++        break;
++    case WM_KEYDOWN:
++    case WM_KEYUP:
++        /* XAML's own key events and keyboard navigation; CoreWindow still raises its key events */
++        focus_key( msg == WM_KEYDOWN, wparam, lparam );
++        break;
+     case WM_CAPTURECHANGED:
+         if (window->captured && (HWND)lparam != hwnd)
+         {
+@@ -343,6 +379,7 @@ static HRESULT WINAPI window_put_Content( IWindow *iface, IUIElement *value )
+     TRACE( "iface %p, value %p.\n", iface, value );
+ 
+     if (value) IUIElement_AddRef( value );
++    focus_clear();   /* the focused element was in the old content */
+     if (impl->content) IUIElement_Release( impl->content );
+     impl->content = value;
+     window_invalidate();
+diff --git a/dlls/windows.ui.xaml/xbf.c b/dlls/windows.ui.xaml/xbf.c
+index d4a2112..a9b37ca 100644
+--- a/dlls/windows.ui.xaml/xbf.c
++++ b/dlls/windows.ui.xaml/xbf.c
+@@ -2098,6 +2098,27 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+         }
+     }
+ 
++    /* ScrollViewer's properties, set on it or attached to another element */
++    if (!wcscmp( prop->owner, L"ScrollViewer" ) ||
++        ((element = element_from_object( target )) && element->class_name &&
++         !wcscmp( element->class_name, RuntimeClass_Windows_UI_Xaml_Controls_ScrollViewer )))
++    {
++        INT32 number = value->kind == XV_ENUM ? value->e.value : value->kind == XV_BOOL ? value->b : 0;
++        if ((value->kind == XV_STRING || value->kind == XV_ENUM || value->kind == XV_BOOL) &&
++            scroll_set_markup( target, prop->owner, prop->name, value->kind == XV_STRING ? value->s : NULL, number ))
++            return S_OK;
++    }
++    if ((prop_is( prop, L"IsTabStop" ) || prop_is( prop, L"TabIndex" )) && QI( target, IControl, &control ))
++    {
++        boolean b;
++        double d;
++        BOOL done = FALSE;
++        if (prop_is( prop, L"IsTabStop" ) && to_bool( value, &b )) { IControl_put_IsTabStop( control, b ); done = TRUE; }
++        else if (prop_is( prop, L"TabIndex" ) && to_double( value, &d )) { IControl_put_TabIndex( control, (INT32)d ); done = TRUE; }
++        IControl_Release( control );
++        if (done) return S_OK;
++    }
++
+     /* Grid attached properties */
+     if (!wcscmp( prop->owner, L"Grid" ) && (prop_is( prop, L"Row" ) || prop_is( prop, L"Column" ) ||
+         prop_is( prop, L"RowSpan" ) || prop_is( prop, L"ColumnSpan" )))
+@@ -2782,6 +2803,7 @@ IInspectable *create_builtin( const WCHAR *name )
+         { L"ToggleSwitch", &toggle_switch_factory },
+         { L"Slider", &slider_factory },
+         { L"ProgressBar", &progress_bar_factory },
++        { L"ScrollViewer", &scroll_viewer_factory },
+         { L"ItemsControl", &items_control_factory },
+         { L"UserControl", &user_control_factory },
+     };

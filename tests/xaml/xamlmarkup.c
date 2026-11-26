@@ -44,6 +44,7 @@
 #define WIDL_using_Windows_UI_Xaml_Markup
 #define WIDL_using_Windows_UI_Xaml_Interop
 #define WIDL_using_Windows_UI_Xaml_Data
+#define WIDL_using_Windows_UI_Xaml_Input
 #define WIDL_using_Windows_UI_Xaml_Media_Animation
 #define WIDL_using_Windows_UI_Xaml_Controls_Primitives
 #include "windows.ui.xaml.h"
@@ -1854,6 +1855,235 @@ static void check_d2d(struct main_page *page)
     IInspectable_Release(root);
 }
 
+/* milestone 5 part 1: ScrollViewer, keyboard focus, Tab, key events (an overlay at 950,300) */
+
+static int view_changed_count;
+static HRESULT WINAPI view_changed_QueryInterface(IEventHandler_ScrollViewerViewChangedEventArgs *iface, REFIID iid, void **out)
+{
+    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IAgileObject) ||
+        IsEqualGUID(iid, &IID_IEventHandler_ScrollViewerViewChangedEventArgs)) { *out = iface; return S_OK; }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI view_changed_AddRef(IEventHandler_ScrollViewerViewChangedEventArgs *iface) { return 2; }
+static ULONG WINAPI view_changed_Release(IEventHandler_ScrollViewerViewChangedEventArgs *iface) { return 1; }
+static HRESULT WINAPI view_changed_Invoke(IEventHandler_ScrollViewerViewChangedEventArgs *iface, IInspectable *sender,
+                                          IScrollViewerViewChangedEventArgs *args)
+{
+    boolean intermediate = TRUE;
+    IScrollViewerViewChangedEventArgs_get_IsIntermediate(args, &intermediate);
+    if (!intermediate) view_changed_count++;
+    return S_OK;
+}
+static IEventHandler_ScrollViewerViewChangedEventArgsVtbl view_changed_vtbl =
+    { view_changed_QueryInterface, view_changed_AddRef, view_changed_Release, view_changed_Invoke };
+static IEventHandler_ScrollViewerViewChangedEventArgs on_view_changed = { &view_changed_vtbl };
+
+static int key_down_count, last_key;
+static HRESULT WINAPI key_QueryInterface(IKeyEventHandler *iface, REFIID iid, void **out)
+{
+    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IKeyEventHandler))
+    { *out = iface; return S_OK; }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI key_AddRef(IKeyEventHandler *iface) { return 2; }
+static ULONG WINAPI key_Release(IKeyEventHandler *iface) { return 1; }
+static HRESULT WINAPI key_Invoke(IKeyEventHandler *iface, IInspectable *sender, IKeyRoutedEventArgs *args)
+{
+    __x_ABI_CWindows_CSystem_CVirtualKey key;
+    IKeyRoutedEventArgs_get_Key(args, &key);
+    key_down_count++;
+    last_key = key;
+    if (key == 'H') IKeyRoutedEventArgs_put_Handled(args, TRUE);   /* handled: no default action */
+    return S_OK;
+}
+static IKeyEventHandlerVtbl key_vtbl = { key_QueryInterface, key_AddRef, key_Release, key_Invoke };
+static IKeyEventHandler on_key_down = { &key_vtbl };
+
+static const WCHAR scroll_xaml[] =
+    L"<Grid xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\"\n"
+    L"      xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\" Grid.RowSpan=\"2\" Margin=\"950,300,0,0\"\n"
+    L"      HorizontalAlignment=\"Left\" VerticalAlignment=\"Top\" Width=\"300\" Height=\"200\" Background=\"White\">\n"
+    L"  <ScrollViewer x:Name=\"Scroller\" Width=\"200\" Height=\"100\" HorizontalAlignment=\"Left\" VerticalAlignment=\"Top\">\n"
+    L"    <StackPanel>\n"
+    L"      <Border Height=\"80\" Background=\"#FFFF0000\"/>\n"
+    L"      <Border Height=\"80\" Background=\"#FF00FF00\"/>\n"
+    L"      <Border Height=\"80\" Background=\"#FF0000FF\"/>\n"
+    L"    </StackPanel>\n"
+    L"  </ScrollViewer>\n"
+    L"  <StackPanel x:Name=\"Keys\" Margin=\"210,0,0,0\" HorizontalAlignment=\"Left\" VerticalAlignment=\"Top\">\n"
+    L"    <Button x:Name=\"First\" Content=\"One\"/>\n"
+    L"    <Button x:Name=\"Second\" Content=\"Two\"/>\n"
+    L"    <Button x:Name=\"Skipped\" Content=\"No\" IsTabStop=\"False\"/>\n"
+    L"  </StackPanel>\n"
+    L"</Grid>\n";
+
+static IInspectable *double_ref(double d)
+{
+    IPropertyValueStatics *pv = get_factory(L"Windows.Foundation.PropertyValue", &IID_IPropertyValueStatics);
+    IInspectable *value = NULL, *ref = NULL;
+
+    IPropertyValueStatics_CreateDouble(pv, d, &value);
+    if (value) IInspectable_QueryInterface(value, &IID_IReference_DOUBLE, (void **)&ref);
+    if (value) IInspectable_Release(value);
+    IPropertyValueStatics_Release(pv);
+    return ref;
+}
+
+static void check_scroll_focus(struct main_page *page)
+{
+    IFrameworkElement2 *page_grid = page_root(page);
+    IFocusManagerStatics *focus_manager = get_factory(L"Windows.UI.Xaml.Input.FocusManager", &IID_IFocusManagerStatics);
+    IInspectable *root, *scroller, *first, *second, *skipped, *keys, *focused, *ref;
+    IVector_UIElement *children;
+    IScrollViewer *sv = NULL;
+    IScrollViewer2 *sv2 = NULL;
+    IControl *control = NULL;
+    IButtonBase *bb = NULL;
+    IUIElement *ui, *keys_ui = NULL;
+    EventRegistrationToken token;
+    int got_focus = 0, clicks = 0;
+    struct counter_handler on_got_focus = { { &counter_vtbl }, &got_focus }, on_second_click = { { &counter_vtbl }, &clicks };
+    Visibility visibility;
+    FocusState state;
+    boolean result;
+    double d;
+    HRESULT hr;
+    POINT pt;
+    DWORD c;
+    IPanel *panel;
+    int x = 950, y = 300;
+
+    root = xaml_load(scroll_xaml, &hr);
+    check(hr == S_OK && root, "XamlReader.Load of a ScrollViewer and buttons, hr %#lx", hr);
+    check(focus_manager != NULL, "FocusManager's statics");
+    if (!root || !page_grid || !focus_manager) return;
+    IFrameworkElement2_QueryInterface(page_grid, &IID_IPanel, (void **)&panel);
+    IPanel_get_Children(panel, &children);
+    IInspectable_QueryInterface(root, &IID_IUIElement, (void **)&ui);
+    IVector_UIElement_Append(children, ui);
+    scroller = find_in(root, L"Scroller");
+    first = find_in(root, L"First");
+    second = find_in(root, L"Second");
+    skipped = find_in(root, L"Skipped");
+    keys = find_in(root, L"Keys");
+    check(scroller && first && second && skipped && keys, "the named elements");
+    if (!scroller || !first || !second || !skipped || !keys) goto done;
+    IInspectable_QueryInterface(scroller, &IID_IScrollViewer, (void **)&sv);
+    IInspectable_QueryInterface(scroller, &IID_IScrollViewer2, (void **)&sv2);
+    check(sv && sv2, "ScrollViewer is an IScrollViewer and IScrollViewer2");
+    if (!sv || !sv2) goto done;
+    IScrollViewer_add_ViewChanged(sv, &on_view_changed, &token);
+    snapshot();
+
+    IScrollViewer_get_ExtentHeight(sv, &d);
+    check(d == 240, "ExtentHeight is the content's 240 (%g)", d);
+    IScrollViewer_get_ViewportHeight(sv, &d);
+    check(d == 100, "ViewportHeight is the ScrollViewer's 100 (%g)", d);
+    IScrollViewer_get_ScrollableHeight(sv, &d);
+    check(d == 140, "ScrollableHeight is 140 (%g)", d);
+    IScrollViewer_get_ExtentWidth(sv, &d);
+    check(d == 200, "horizontal scrolling is disabled: ExtentWidth is the viewport's 200 (%g)", d);
+    IScrollViewer_get_ComputedVerticalScrollBarVisibility(sv, &visibility);
+    check(visibility == Visibility_Visible, "the vertical scroll bar is shown (%d)", visibility);
+    c = px(x + 10, y + 10);
+    check(c == 0xff0000, "before scrolling the first (red) item is at the top (%06lx)", c);
+    c = px(x + 10, y + 120);
+    check(c == 0xffffff, "and the content is clipped below the viewport (%06lx at 10,120)", c);
+
+    ref = double_ref(100);
+    IScrollViewer2_ChangeView(sv2, NULL, (IReference_DOUBLE *)ref, NULL, &result);
+    if (ref) IInspectable_Release(ref);
+    IScrollViewer_get_VerticalOffset(sv, &d);
+    check(result && d == 100, "ChangeView(null, 100, null) scrolls to 100 (%g)", d);
+    check(view_changed_count == 1, "and raises ViewChanged once (%d)", view_changed_count);
+    snapshot();
+    c = px(x + 10, y + 10);
+    check(c == 0x00ff00, "after it the second (green) item is at the top (%06lx)", c);
+    c = px(x + 10, y + 70);
+    check(c == 0x0000ff, "and the third (blue) item below it (%06lx)", c);
+
+    pt.x = x + 50;
+    pt.y = y + 50;
+    ClientToScreen(hwnd, &pt);
+    SendMessageW(hwnd, WM_MOUSEWHEEL, MAKEWPARAM(0, WHEEL_DELTA), MAKELPARAM(pt.x, pt.y));
+    IScrollViewer_get_VerticalOffset(sv, &d);
+    check(d == 52, "the wheel turned up a notch scrolls up 48 px (%g)", d);
+    SendMessageW(hwnd, WM_MOUSEWHEEL, MAKEWPARAM(0, -3 * WHEEL_DELTA), MAKELPARAM(pt.x, pt.y));
+    IScrollViewer_get_VerticalOffset(sv, &d);
+    check(d == 140, "and three notches down stop at the end, 140 (%g)", d);
+    IScrollViewer_ScrollToVerticalOffset(sv, 0);
+    IScrollViewer_get_VerticalOffset(sv, &d);
+    check(d == 0, "ScrollToVerticalOffset(0) goes back to the top (%g)", d);
+
+    /* focus */
+    IInspectable_QueryInterface(first, &IID_IControl, (void **)&control);
+    IInspectable_QueryInterface(first, &IID_IUIElement, (void **)&ui);
+    IUIElement_add_GotFocus(ui, &on_got_focus.IRoutedEventHandler_iface, &token);
+    IUIElement_Release(ui);
+    result = FALSE;
+    IControl_Focus(control, FocusState_Programmatic, &result);
+    check(result, "Button.Focus(Programmatic) succeeds");
+    IControl_get_FocusState(control, &state);
+    check(state == FocusState_Programmatic, "and its FocusState is Programmatic (%d)", state);
+    check(got_focus == 1, "and GotFocus is raised (%d)", got_focus);
+    focused = NULL;
+    IFocusManagerStatics_GetFocusedElement(focus_manager, &focused);
+    check(focused == first, "FocusManager.GetFocusedElement is that button (%p, %p)", focused, first);
+    if (focused) IInspectable_Release(focused);
+    IControl_Release(control);
+
+    IInspectable_QueryInterface(keys, &IID_IUIElement, (void **)&keys_ui);
+    IUIElement_add_KeyDown(keys_ui, &on_key_down, &token);
+    SendMessageW(hwnd, WM_KEYDOWN, VK_TAB, 0);
+    SendMessageW(hwnd, WM_KEYUP, VK_TAB, 0);
+    focused = NULL;
+    IFocusManagerStatics_GetFocusedElement(focus_manager, &focused);
+    check(focused == second, "Tab moves the focus to the next button (%p, %p)", focused, second);
+    if (focused) IInspectable_Release(focused);
+    check(key_down_count == 1 && last_key == VK_TAB, "and the focused button's KeyDown bubbles to its panel (%d, %#x)",
+          key_down_count, last_key);
+    IInspectable_QueryInterface(second, &IID_IControl, (void **)&control);
+    IControl_get_FocusState(control, &state);
+    check(state == FocusState_Keyboard, "focused by the keyboard (%d)", state);
+    IControl_Release(control);
+    snapshot();
+    c = px(x + 211, y + 40);
+    check(c == 0x000000, "and drawn with the focus visual (%06lx)", c);
+
+    IInspectable_QueryInterface(second, &IID_IButtonBase, (void **)&bb);
+    IButtonBase_add_Click(bb, &on_second_click.IRoutedEventHandler_iface, &token);
+    SendMessageW(hwnd, WM_KEYDOWN, VK_SPACE, 0);
+    check(clicks == 0, "Space doesn't click until it is released (%d)", clicks);
+    SendMessageW(hwnd, WM_KEYUP, VK_SPACE, 0);
+    check(clicks == 1, "and clicks the focused button when it is (%d)", clicks);
+    SendMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0);
+    check(clicks == 2, "Enter clicks it too (%d)", clicks);
+    SendMessageW(hwnd, WM_KEYDOWN, 'H', 0);
+    SendMessageW(hwnd, WM_KEYDOWN, VK_TAB, 0);
+    focused = NULL;
+    IFocusManagerStatics_GetFocusedElement(focus_manager, &focused);
+    check(focused && focused != skipped, "Tab skips a button with IsTabStop=False (%p, %p)", focused, skipped);
+    if (focused) IInspectable_Release(focused);
+    IButtonBase_Release(bb);
+
+done:
+    if (keys_ui) IUIElement_Release(keys_ui);
+    if (sv) IScrollViewer_Release(sv);
+    if (sv2) IScrollViewer2_Release(sv2);
+    if (scroller) IInspectable_Release(scroller);
+    if (first) IInspectable_Release(first);
+    if (second) IInspectable_Release(second);
+    if (skipped) IInspectable_Release(skipped);
+    if (keys) IInspectable_Release(keys);
+    IFocusManagerStatics_Release(focus_manager);
+    IVector_UIElement_Release(children);
+    IPanel_Release(panel);
+    IFrameworkElement2_Release(page_grid);
+    IInspectable_Release(root);
+}
+
 static void check_microsoft_xbf(const WCHAR *file, const WCHAR *component_class)
 {
     IActivationFactory *factory;
@@ -1966,6 +2196,7 @@ static void CALLBACK verify(HWND unused, UINT msg, UINT_PTR id, DWORD time)
     check_loose_xaml();
     check_part6(the_page);
     check_d2d(the_page);
+    check_scroll_focus(the_page);
     check(!wcscmp(text_of(the_page->title, buf, ARRAYSIZE(buf)), L"Clicked!"), "OnClick changed Title (%ls)", buf);
     snapshot();
 
