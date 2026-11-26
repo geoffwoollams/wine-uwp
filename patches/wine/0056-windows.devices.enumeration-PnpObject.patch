@@ -1,0 +1,404 @@
+Subject: windows.devices.enumeration: Windows.Devices.Enumeration.Pnp.PnpObject statics (empty searches)
+
+diff --git a/dlls/windows.devices.enumeration/Makefile.in b/dlls/windows.devices.enumeration/Makefile.in
+index c1892dc..963e771 100644
+--- a/dlls/windows.devices.enumeration/Makefile.in
++++ b/dlls/windows.devices.enumeration/Makefile.in
+@@ -10,5 +10,6 @@ SOURCES = \
+ 	event_handlers.c \
+ 	information.c \
+ 	main.c \
++	pnp.c \
+ 	vector.c \
+ 	weakref.c
+diff --git a/dlls/windows.devices.enumeration/classes.idl b/dlls/windows.devices.enumeration/classes.idl
+index 5e36e5f..ca56757 100644
+--- a/dlls/windows.devices.enumeration/classes.idl
++++ b/dlls/windows.devices.enumeration/classes.idl
+@@ -27,3 +27,7 @@ namespace Windows.Devices.Enumeration {
+     runtimeclass DeviceInformation;
+     runtimeclass DeviceAccessInformation;
+ }
++
++namespace Windows.Devices.Enumeration.Pnp {
++    runtimeclass PnpObject;
++}
+diff --git a/dlls/windows.devices.enumeration/main.c b/dlls/windows.devices.enumeration/main.c
+index 602f464..9f6536a 100644
+--- a/dlls/windows.devices.enumeration/main.c
++++ b/dlls/windows.devices.enumeration/main.c
+@@ -1045,6 +1045,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+                 &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, RuntimeClass_Windows_Devices_Enumeration_DeviceAccessInformation ))
+         IActivationFactory_QueryInterface( device_access_factory, &IID_IActivationFactory, (void **)factory );
++    else if (!wcscmp( buffer, L"Windows.Devices.Enumeration.Pnp.PnpObject" ))
++        IActivationFactory_QueryInterface( pnp_object_factory, &IID_IActivationFactory, (void **)factory );
+ 
+     if (*factory) return S_OK;
+     return CLASS_E_CLASSNOTAVAILABLE;
+diff --git a/dlls/windows.devices.enumeration/pnp.c b/dlls/windows.devices.enumeration/pnp.c
+new file mode 100644
+index 0000000..1a7621c
+--- /dev/null
++++ b/dlls/windows.devices.enumeration/pnp.c
+@@ -0,0 +1,171 @@
++/* WinRT Windows.Devices.Enumeration.Pnp.PnpObject implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(enumeration);
++
++/* PnpObject's statics. Unity asks for monitors and other device objects through FindAllAsync; Wine's device
++ * properties don't map to PnpObject's property names yet, so the searches find nothing (an empty collection), and
++ * CreateFromIdAsync and watchers aren't supported. */
++
++struct pnp_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IPnpObjectStatics IPnpObjectStatics_iface;
++};
++
++static inline struct pnp_statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct pnp_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct pnp_statics *impl = impl_from_IActivationFactory( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IPnpObjectStatics ))
++        *out = &impl->IPnpObjectStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( pnp, IPnpObjectStatics, struct pnp_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI pnp_CreateFromIdAsync( IPnpObjectStatics *iface, PnpObjectType type, HSTRING id,
++                                             IIterable_HSTRING *properties, IAsyncOperation_PnpObject **value )
++{
++    FIXME( "iface %p, type %d, id %s, properties %p stub!\n", iface, type, debugstr_hstring(id), properties );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++/* an empty PnpObjectCollection */
++static HRESULT find_all_async( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
++{
++    static const struct vector_iids iids =
++    {
++        .vector = &IID_IVector_IInspectable,
++        .view = &IID_IVectorView_PnpObject,
++        .iterable = &IID_IIterable_PnpObject,
++        .iterator = &IID_IIterator_PnpObject,
++    };
++    IVector_IInspectable *vector;
++    IInspectable *view;
++    HRESULT hr;
++
++    if (!called_async) return STATUS_PENDING;
++    if (FAILED(hr = vector_create( &iids, (void **)&vector ))) return hr;
++    hr = IVector_IInspectable_GetView( vector, (void *)&view );
++    IVector_IInspectable_Release( vector );
++    if (FAILED(hr)) return hr;
++    result->vt = VT_UNKNOWN;
++    result->punkVal = (IUnknown *)view;
++    return S_OK;
++}
++
++static HRESULT WINAPI pnp_FindAllAsyncAqsFilter( IPnpObjectStatics *iface, PnpObjectType type, IIterable_HSTRING *properties,
++                                                 HSTRING filter, IAsyncOperation_PnpObjectCollection **value )
++{
++    FIXME( "iface %p, type %d, properties %p, filter %s: no objects are found.\n", iface, type, properties, debugstr_hstring(filter) );
++    return async_operation_inspectable_create( &IID_IAsyncOperation_PnpObjectCollection, (IUnknown *)iface, NULL,
++                                               find_all_async, (IAsyncOperation_IInspectable **)value );
++}
++
++static HRESULT WINAPI pnp_FindAllAsync( IPnpObjectStatics *iface, PnpObjectType type, IIterable_HSTRING *properties,
++                                        IAsyncOperation_PnpObjectCollection **value )
++{
++    return pnp_FindAllAsyncAqsFilter( iface, type, properties, NULL, value );
++}
++
++static HRESULT WINAPI pnp_CreateWatcher( IPnpObjectStatics *iface, PnpObjectType type, IIterable_HSTRING *properties,
++                                         IPnpObjectWatcher **value )
++{
++    FIXME( "iface %p, type %d, properties %p stub!\n", iface, type, properties );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI pnp_CreateWatcherAqsFilter( IPnpObjectStatics *iface, PnpObjectType type, IIterable_HSTRING *properties,
++                                                  HSTRING filter, IPnpObjectWatcher **value )
++{
++    FIXME( "iface %p, type %d, properties %p, filter %s stub!\n", iface, type, properties, debugstr_hstring(filter) );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct IPnpObjectStaticsVtbl pnp_vtbl =
++{
++    pnp_QueryInterface,
++    pnp_AddRef,
++    pnp_Release,
++    /* IInspectable methods */
++    pnp_GetIids,
++    pnp_GetRuntimeClassName,
++    pnp_GetTrustLevel,
++    /* IPnpObjectStatics methods */
++    pnp_CreateFromIdAsync,
++    pnp_FindAllAsync,
++    pnp_FindAllAsyncAqsFilter,
++    pnp_CreateWatcher,
++    pnp_CreateWatcherAqsFilter,
++};
++
++static struct pnp_statics pnp_statics = { {&factory_vtbl}, {&pnp_vtbl} };
++IActivationFactory *pnp_object_factory = &pnp_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.devices.enumeration/private.h b/dlls/windows.devices.enumeration/private.h
+index 033e866..e360375 100644
+--- a/dlls/windows.devices.enumeration/private.h
++++ b/dlls/windows.devices.enumeration/private.h
+@@ -39,6 +39,7 @@
+ #define WIDL_using_Windows_Foundation_Collections
+ #include "windows.foundation.h"
+ #define WIDL_using_Windows_Devices_Enumeration
++#define WIDL_using_Windows_Devices_Enumeration_Pnp
+ #include "windows.devices.enumeration.h"
+ 
+ #include "wine/list.h"
+@@ -55,6 +56,7 @@ struct vector_iids
+ };
+ 
+ extern IActivationFactory *device_access_factory;
++extern IActivationFactory *pnp_object_factory;
+ 
+ HRESULT typed_event_handlers_append( struct list *list, ITypedEventHandler_IInspectable_IInspectable *handler, EventRegistrationToken *token );
+ HRESULT typed_event_handlers_remove( struct list *list, EventRegistrationToken *token );
+diff --git a/include/windows.devices.enumeration.idl b/include/windows.devices.enumeration.idl
+index 72e7beb..0e7ecda 100644
+--- a/include/windows.devices.enumeration.idl
++++ b/include/windows.devices.enumeration.idl
+@@ -388,3 +388,164 @@ namespace Windows.Devices.Enumeration {
+     }
+ 
+ }
++
++/* generated by scripts/winmd2idl.py: Windows.Devices.Enumeration.Pnp.PnpObject and PnpObjectCollection */
++
++namespace Windows.Devices.Enumeration.Pnp {
++    interface IPnpObject;
++    interface IPnpObjectStatics;
++    interface IPnpObjectUpdate;
++    interface IPnpObjectWatcher;
++    runtimeclass PnpObject;
++    runtimeclass PnpObjectCollection;
++    typedef enum PnpObjectType PnpObjectType;
++    runtimeclass PnpObjectUpdate;
++    runtimeclass PnpObjectWatcher;
++}
++
++namespace Windows.Devices.Enumeration.Pnp {
++    declare {
++        interface Windows.Foundation.Collections.IKeyValuePair<HSTRING, IInspectable *>;
++        interface Windows.Foundation.Collections.IIterator<Windows.Foundation.Collections.IKeyValuePair<HSTRING, IInspectable *> *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.Foundation.Collections.IKeyValuePair<HSTRING, IInspectable *> *>;
++        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.Devices.Enumeration.Pnp.PnpObject *>;
++        interface Windows.Foundation.IAsyncOperation<Windows.Devices.Enumeration.Pnp.PnpObject *>;
++        interface Windows.Foundation.Collections.IIterator<HSTRING>;
++        interface Windows.Foundation.Collections.IIterable<HSTRING>;
++        interface Windows.Foundation.Collections.IIterator<Windows.Devices.Enumeration.Pnp.PnpObject *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.Devices.Enumeration.Pnp.PnpObject *>;
++        interface Windows.Foundation.Collections.IVectorView<Windows.Devices.Enumeration.Pnp.PnpObject *>;
++        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.Devices.Enumeration.Pnp.PnpObjectCollection *>;
++        interface Windows.Foundation.IAsyncOperation<Windows.Devices.Enumeration.Pnp.PnpObjectCollection *>;
++        interface Windows.Foundation.TypedEventHandler<Windows.Devices.Enumeration.Pnp.PnpObjectWatcher *, Windows.Devices.Enumeration.Pnp.PnpObject *>;
++        interface Windows.Foundation.TypedEventHandler<Windows.Devices.Enumeration.Pnp.PnpObjectWatcher *, Windows.Devices.Enumeration.Pnp.PnpObjectUpdate *>;
++        interface Windows.Foundation.TypedEventHandler<Windows.Devices.Enumeration.Pnp.PnpObjectWatcher *, IInspectable *>;
++    }
++}
++
++namespace Windows.Devices.Enumeration.Pnp {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum PnpObjectType
++    {
++        Unknown = 0,
++        DeviceInterface = 1,
++        DeviceContainer = 2,
++        Device = 3,
++        DeviceInterfaceClass = 4,
++        AssociationEndpoint = 5,
++        AssociationEndpointContainer = 6,
++        AssociationEndpointService = 7,
++        DevicePanel = 8,
++        AssociationEndpointProtocol = 9
++    };
++
++}
++
++namespace Windows.Devices.Enumeration.Pnp {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.Enumeration.Pnp.PnpObject),
++        uuid(95c66258-733b-4a8f-93a3-db078ac870c1)
++    ]
++    interface IPnpObject : IInspectable
++    {
++        [propget] HRESULT Type([out, retval] Windows.Devices.Enumeration.Pnp.PnpObjectType *value);
++        [propget] HRESULT Id([out, retval] HSTRING *value);
++        [propget] HRESULT Properties([out, retval] Windows.Foundation.Collections.IMapView<HSTRING, IInspectable *> * *value);
++        HRESULT Update([in] Windows.Devices.Enumeration.Pnp.PnpObjectUpdate * updateInfo);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.Enumeration.Pnp.PnpObject),
++        uuid(b3c32a3d-d168-4660-bbf3-a733b14b6e01)
++    ]
++    interface IPnpObjectStatics : IInspectable
++    {
++        HRESULT CreateFromIdAsync([in] Windows.Devices.Enumeration.Pnp.PnpObjectType type, [in] HSTRING id, [in] Windows.Foundation.Collections.IIterable<HSTRING> * requestedProperties, [out, retval] Windows.Foundation.IAsyncOperation<Windows.Devices.Enumeration.Pnp.PnpObject *> * *value);
++        [overload("FindAllAsync")] HRESULT FindAllAsync([in] Windows.Devices.Enumeration.Pnp.PnpObjectType type, [in] Windows.Foundation.Collections.IIterable<HSTRING> * requestedProperties, [out, retval] Windows.Foundation.IAsyncOperation<Windows.Devices.Enumeration.Pnp.PnpObjectCollection *> * *value);
++        [overload("FindAllAsync")] HRESULT FindAllAsyncAqsFilter([in] Windows.Devices.Enumeration.Pnp.PnpObjectType type, [in] Windows.Foundation.Collections.IIterable<HSTRING> * requestedProperties, [in] HSTRING aqsFilter, [out, retval] Windows.Foundation.IAsyncOperation<Windows.Devices.Enumeration.Pnp.PnpObjectCollection *> * *value);
++        [overload("CreateWatcher")] HRESULT CreateWatcher([in] Windows.Devices.Enumeration.Pnp.PnpObjectType type, [in] Windows.Foundation.Collections.IIterable<HSTRING> * requestedProperties, [out, retval] Windows.Devices.Enumeration.Pnp.PnpObjectWatcher * *value);
++        [overload("CreateWatcher")] HRESULT CreateWatcherAqsFilter([in] Windows.Devices.Enumeration.Pnp.PnpObjectType type, [in] Windows.Foundation.Collections.IIterable<HSTRING> * requestedProperties, [in] HSTRING aqsFilter, [out, retval] Windows.Devices.Enumeration.Pnp.PnpObjectWatcher * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.Enumeration.Pnp.PnpObjectUpdate),
++        uuid(6f59e812-001e-4844-bcc6-432886856a17)
++    ]
++    interface IPnpObjectUpdate : IInspectable
++    {
++        [propget] HRESULT Type([out, retval] Windows.Devices.Enumeration.Pnp.PnpObjectType *value);
++        [propget] HRESULT Id([out, retval] HSTRING *value);
++        [propget] HRESULT Properties([out, retval] Windows.Foundation.Collections.IMapView<HSTRING, IInspectable *> * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.Enumeration.Pnp.PnpObjectWatcher),
++        uuid(83c95ca8-4772-4a7a-aca8-e48c42a89c44)
++    ]
++    interface IPnpObjectWatcher : IInspectable
++    {
++        [eventadd] HRESULT Added([in] Windows.Foundation.TypedEventHandler<Windows.Devices.Enumeration.Pnp.PnpObjectWatcher *, Windows.Devices.Enumeration.Pnp.PnpObject *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT Added([in] Windows.Foundation.EventRegistrationToken token);
++        [eventadd] HRESULT Updated([in] Windows.Foundation.TypedEventHandler<Windows.Devices.Enumeration.Pnp.PnpObjectWatcher *, Windows.Devices.Enumeration.Pnp.PnpObjectUpdate *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT Updated([in] Windows.Foundation.EventRegistrationToken token);
++        [eventadd] HRESULT Removed([in] Windows.Foundation.TypedEventHandler<Windows.Devices.Enumeration.Pnp.PnpObjectWatcher *, Windows.Devices.Enumeration.Pnp.PnpObjectUpdate *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT Removed([in] Windows.Foundation.EventRegistrationToken token);
++        [eventadd] HRESULT EnumerationCompleted([in] Windows.Foundation.TypedEventHandler<Windows.Devices.Enumeration.Pnp.PnpObjectWatcher *, IInspectable *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT EnumerationCompleted([in] Windows.Foundation.EventRegistrationToken token);
++        [eventadd] HRESULT Stopped([in] Windows.Foundation.TypedEventHandler<Windows.Devices.Enumeration.Pnp.PnpObjectWatcher *, IInspectable *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT Stopped([in] Windows.Foundation.EventRegistrationToken token);
++        [propget] HRESULT Status([out, retval] Windows.Devices.Enumeration.DeviceWatcherStatus *value);
++        HRESULT Start();
++        HRESULT Stop();
++    }
++
++}
++
++namespace Windows.Devices.Enumeration.Pnp {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.Devices.Enumeration.Pnp.IPnpObjectStatics, Windows.Foundation.UniversalApiContract, 1.0),
++        threading(both)
++    ]
++    runtimeclass PnpObject
++    {
++        [default] interface Windows.Devices.Enumeration.Pnp.IPnpObject;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile)
++    ]
++    runtimeclass PnpObjectCollection
++    {
++        [default] [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Foundation.Collections.IVectorView<Windows.Devices.Enumeration.Pnp.PnpObject *>;
++        [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Foundation.Collections.IIterable<Windows.Devices.Enumeration.Pnp.PnpObject *>;
++    }
++
++}
++
++namespace Windows.Devices.Enumeration.Pnp {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass PnpObjectUpdate
++    {
++        [default] interface Windows.Devices.Enumeration.Pnp.IPnpObjectUpdate;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass PnpObjectWatcher
++    {
++        [default] interface Windows.Devices.Enumeration.Pnp.IPnpObjectWatcher;
++    }
++
++}

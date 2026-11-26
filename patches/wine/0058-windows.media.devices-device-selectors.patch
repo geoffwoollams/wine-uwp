@@ -1,0 +1,41 @@
+Subject: windows.media.devices: MediaDevice audio and video capture selectors
+
+diff --git a/dlls/windows.media.devices/main.c b/dlls/windows.media.devices/main.c
+index 22562f9..8ca51b7 100644
+--- a/dlls/windows.media.devices/main.c
++++ b/dlls/windows.media.devices/main.c
+@@ -261,22 +261,28 @@ static HRESULT WINAPI media_device_statics_GetTrustLevel(IMediaDeviceStatics *if
+ static HRESULT WINAPI media_device_statics_GetAudioCaptureSelector(IMediaDeviceStatics *iface,
+         HSTRING *value)
+ {
+-    FIXME("iface %p, value %p stub!\n", iface, value);
+-    return E_NOTIMPL;
++    static const WCHAR selector[] = L"System.Devices.InterfaceClassGuid:=\"{2EEF81BE-33FA-4800-9670-1CD474972C3F}\""
++                                    L" AND System.Devices.InterfaceEnabled:=System.StructuredQueryType.Boolean#True";
++    TRACE("iface %p, value %p\n", iface, value);
++    return WindowsCreateString(selector, ARRAY_SIZE(selector) - 1, value);
+ }
+ 
+ static HRESULT WINAPI media_device_statics_GetAudioRenderSelector(IMediaDeviceStatics *iface,
+         HSTRING *value)
+ {
+-    FIXME("iface %p, value %p stub!\n", iface, value);
+-    return E_NOTIMPL;
++    static const WCHAR selector[] = L"System.Devices.InterfaceClassGuid:=\"{E6327CAD-DCEC-4949-AE8A-991E976A79D2}\""
++                                    L" AND System.Devices.InterfaceEnabled:=System.StructuredQueryType.Boolean#True";
++    TRACE("iface %p, value %p\n", iface, value);
++    return WindowsCreateString(selector, ARRAY_SIZE(selector) - 1, value);
+ }
+ 
+ static HRESULT WINAPI media_device_statics_GetVideoCaptureSelector(IMediaDeviceStatics *iface,
+         HSTRING *value)
+ {
+-    FIXME("iface %p, value %p stub!\n", iface, value);
+-    return E_NOTIMPL;
++    static const WCHAR selector[] = L"System.Devices.InterfaceClassGuid:=\"{E5323777-F976-4F5B-9B55-B94699C46E44}\""
++                                    L" AND System.Devices.InterfaceEnabled:=System.StructuredQueryType.Boolean#True";
++    TRACE("iface %p, value %p\n", iface, value);
++    return WindowsCreateString(selector, ARRAY_SIZE(selector) - 1, value);
+ }
+ 
+ static HRESULT WINAPI media_device_statics_GetDefaultAudioCaptureId(IMediaDeviceStatics *iface,

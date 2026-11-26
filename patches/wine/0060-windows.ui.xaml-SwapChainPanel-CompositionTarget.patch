@@ -1,0 +1,1794 @@
+Subject: windows.ui.xaml: SwapChainPanel, CompositionTarget, Loaded and SizeChanged, TransformToVisual
+
+diff --git a/dlls/windows.ui.xaml/Makefile.in b/dlls/windows.ui.xaml/Makefile.in
+index eb6d4e4..307d70b 100644
+--- a/dlls/windows.ui.xaml/Makefile.in
++++ b/dlls/windows.ui.xaml/Makefile.in
+@@ -11,6 +11,7 @@ SOURCES = \
+ 	classes.idl \
+ 	collection.c \
+ 	commandbar.c \
++	composition.c \
+ 	color_helper.c \
+ 	content.c \
+ 	definitions.c \
+@@ -31,6 +32,7 @@ SOURCES = \
+ 	scroll.c \
+ 	reader.c \
+ 	shapes.c \
++	swapchain.c \
+ 	resources.c \
+ 	text_block.c \
+ 	textbox.c \
+diff --git a/dlls/windows.ui.xaml/classes.idl b/dlls/windows.ui.xaml/classes.idl
+index e71129b..0653abb 100644
+--- a/dlls/windows.ui.xaml/classes.idl
++++ b/dlls/windows.ui.xaml/classes.idl
+@@ -63,6 +63,7 @@ namespace Windows.UI.Xaml.Controls {
+     runtimeclass RowDefinition;
+     runtimeclass ScrollViewer;
+     runtimeclass Slider;
++    runtimeclass SwapChainPanel;
+     runtimeclass SymbolIcon;
+     runtimeclass StackPanel;
+     runtimeclass TextBlock;
+@@ -98,6 +99,7 @@ namespace Windows.UI.Xaml.Media.Imaging {
+ }
+ 
+ namespace Windows.UI.Xaml.Media {
++    runtimeclass CompositionTarget;
+     runtimeclass ImageBrush;
+     runtimeclass CompositeTransform;
+     runtimeclass EllipseGeometry;
+diff --git a/dlls/windows.ui.xaml/composition.c b/dlls/windows.ui.xaml/composition.c
+new file mode 100644
+index 0000000..04e907e
+--- /dev/null
++++ b/dlls/windows.ui.xaml/composition.c
+@@ -0,0 +1,333 @@
++/* WinRT Windows.UI.Xaml.Media.CompositionTarget implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* CompositionTarget.Rendering is raised once a frame on the UI thread, for apps and engines that do per-frame work
++ * (Unity hooks it); Rendered follows it. Without a compositor, a frame is a 60 Hz window timer that runs while
++ * there are handlers (window.c). SurfaceContentsLost never happens. */
++
++static struct event_list rendering, rendered, contents_lost;
++static ULONGLONG start_time;
++
++struct frame_args
++{
++    IRenderingEventArgs IRenderingEventArgs_iface;
++    IRenderedEventArgs IRenderedEventArgs_iface;
++    LONG ref;
++    TimeSpan time, duration;
++};
++
++static inline struct frame_args *impl_from_IRenderingEventArgs( IRenderingEventArgs *iface )
++{
++    return CONTAINING_RECORD( iface, struct frame_args, IRenderingEventArgs_iface );
++}
++
++static HRESULT WINAPI rendering_args_QueryInterface( IRenderingEventArgs *iface, REFIID iid, void **out )
++{
++    struct frame_args *impl = impl_from_IRenderingEventArgs( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IRenderingEventArgs ))
++        *out = &impl->IRenderingEventArgs_iface;
++    else if (IsEqualGUID( iid, &IID_IRenderedEventArgs ))
++        *out = &impl->IRenderedEventArgs_iface;
++    else
++    {
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    InterlockedIncrement( &impl->ref );
++    return S_OK;
++}
++
++static ULONG WINAPI rendering_args_AddRef( IRenderingEventArgs *iface )
++{
++    return InterlockedIncrement( &impl_from_IRenderingEventArgs( iface )->ref );
++}
++
++static ULONG WINAPI rendering_args_Release( IRenderingEventArgs *iface )
++{
++    struct frame_args *impl = impl_from_IRenderingEventArgs( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI rendering_args_GetIids( IRenderingEventArgs *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI rendering_args_GetRuntimeClassName( IRenderingEventArgs *iface, HSTRING *name )
++{
++    return WindowsCreateString( RuntimeClass_Windows_UI_Xaml_Media_RenderingEventArgs,
++                                wcslen( RuntimeClass_Windows_UI_Xaml_Media_RenderingEventArgs ), name );
++}
++
++static HRESULT WINAPI rendering_args_GetTrustLevel( IRenderingEventArgs *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI rendering_args_get_RenderingTime( IRenderingEventArgs *iface, TimeSpan *value )
++{
++    *value = impl_from_IRenderingEventArgs( iface )->time;
++    return S_OK;
++}
++
++static const struct IRenderingEventArgsVtbl rendering_args_vtbl =
++{
++    rendering_args_QueryInterface,
++    rendering_args_AddRef,
++    rendering_args_Release,
++    /* IInspectable methods */
++    rendering_args_GetIids,
++    rendering_args_GetRuntimeClassName,
++    rendering_args_GetTrustLevel,
++    /* IRenderingEventArgs methods */
++    rendering_args_get_RenderingTime,
++};
++
++DEFINE_IINSPECTABLE( rendered_args, IRenderedEventArgs, struct frame_args, IRenderingEventArgs_iface )
++
++static HRESULT WINAPI rendered_args_get_FrameDuration( IRenderedEventArgs *iface, TimeSpan *value )
++{
++    *value = impl_from_IRenderedEventArgs( iface )->duration;
++    return S_OK;
++}
++
++static const struct IRenderedEventArgsVtbl rendered_args_vtbl =
++{
++    rendered_args_QueryInterface,
++    rendered_args_AddRef,
++    rendered_args_Release,
++    /* IInspectable methods */
++    rendered_args_GetIids,
++    rendered_args_GetRuntimeClassName,
++    rendered_args_GetTrustLevel,
++    /* IRenderedEventArgs methods */
++    rendered_args_get_FrameDuration,
++};
++
++static void raise_frame_event( struct event_list *list, IInspectable *args, const char *name )
++{
++    IUnknown **handlers;
++    UINT32 i, count = list->count;
++    HRESULT hr;
++
++    if (!count || !(handlers = calloc( count, sizeof(*handlers) ))) return;
++    for (i = 0; i < count; i++) if ((handlers[i] = list->handlers[i])) IUnknown_AddRef( handlers[i] );
++    for (i = 0; i < count; i++)
++    {
++        if (!handlers[i]) continue;
++        /* EventHandler<IInspectable> and EventHandler<RenderedEventArgs> have the same Invoke */
++        hr = IEventHandler_IInspectable_Invoke( (IEventHandler_IInspectable *)handlers[i], NULL, args );
++        if (FAILED(hr)) WARN( "%s handler %p failed, hr %#lx.\n", name, handlers[i], hr );
++        IUnknown_Release( handlers[i] );
++    }
++    free( handlers );
++}
++
++/* a frame: from window.c's frame timer */
++void composition_frame(void)
++{
++    static ULONGLONG last;
++    ULONGLONG now = GetTickCount64();
++    struct frame_args *args;
++    INT64 ticks;
++
++    if (!(args = calloc( 1, sizeof(*args) ))) return;
++    args->IRenderingEventArgs_iface.lpVtbl = &rendering_args_vtbl;
++    args->IRenderedEventArgs_iface.lpVtbl = &rendered_args_vtbl;
++    args->ref = 1;
++    /* TimeSpan's one member, in 100 ns units (its name is also XAML's Duration type) */
++    ticks = (now - start_time) * 10000;
++    memcpy( &args->time, &ticks, sizeof(ticks) );
++    ticks = (last ? now - last : 16) * 10000;
++    memcpy( &args->duration, &ticks, sizeof(ticks) );
++    last = now;
++    raise_frame_event( &rendering, (IInspectable *)&args->IRenderingEventArgs_iface, "Rendering" );
++    raise_frame_event( &rendered, (IInspectable *)&args->IRenderedEventArgs_iface, "Rendered" );
++    IRenderingEventArgs_Release( &args->IRenderingEventArgs_iface );
++}
++
++static BOOL has_handlers( const struct event_list *list )
++{
++    UINT32 i;
++    for (i = 0; i < list->count; i++) if (list->handlers[i]) return TRUE;
++    return FALSE;
++}
++
++BOOL composition_wants_frames(void)
++{
++    return has_handlers( &rendering ) || has_handlers( &rendered );
++}
++
++static void frames_changed(void)
++{
++    if (!start_time) start_time = GetTickCount64();
++    window_frame_timer( composition_wants_frames() );
++}
++
++/* ---- the statics ---- */
++
++struct statics
++{
++    IActivationFactory IActivationFactory_iface;
++    ICompositionTargetStatics ICompositionTargetStatics_iface;
++    ICompositionTargetStatics3 ICompositionTargetStatics3_iface;
++};
++
++static inline struct statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct statics *impl = impl_from_IActivationFactory( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_ICompositionTargetStatics ))
++        *out = &impl->ICompositionTargetStatics_iface;
++    else if (IsEqualGUID( iid, &IID_ICompositionTargetStatics3 ))
++        *out = &impl->ICompositionTargetStatics3_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( ct_statics, ICompositionTargetStatics, struct statics, IActivationFactory_iface )
++
++static HRESULT WINAPI ct_statics_add_Rendering( ICompositionTargetStatics *iface, IEventHandler_IInspectable *handler,
++                                                EventRegistrationToken *token )
++{
++    HRESULT hr;
++
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    if (SUCCEEDED(hr = event_list_add( &rendering, (IUnknown *)handler, token ))) frames_changed();
++    return hr;
++}
++
++static HRESULT WINAPI ct_statics_remove_Rendering( ICompositionTargetStatics *iface, EventRegistrationToken token )
++{
++    HRESULT hr = event_list_remove( &rendering, token );
++    frames_changed();
++    return hr;
++}
++
++static HRESULT WINAPI ct_statics_add_SurfaceContentsLost( ICompositionTargetStatics *iface, IEventHandler_IInspectable *handler,
++                                                          EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p: never raised.\n", iface, handler );
++    return event_list_add( &contents_lost, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI ct_statics_remove_SurfaceContentsLost( ICompositionTargetStatics *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &contents_lost, token );
++}
++
++static const struct ICompositionTargetStaticsVtbl ct_statics_vtbl =
++{
++    ct_statics_QueryInterface,
++    ct_statics_AddRef,
++    ct_statics_Release,
++    /* IInspectable methods */
++    ct_statics_GetIids,
++    ct_statics_GetRuntimeClassName,
++    ct_statics_GetTrustLevel,
++    /* ICompositionTargetStatics methods */
++    ct_statics_add_Rendering,
++    ct_statics_remove_Rendering,
++    ct_statics_add_SurfaceContentsLost,
++    ct_statics_remove_SurfaceContentsLost,
++};
++
++DEFINE_IINSPECTABLE( ct_statics3, ICompositionTargetStatics3, struct statics, IActivationFactory_iface )
++
++static HRESULT WINAPI ct_statics3_add_Rendered( ICompositionTargetStatics3 *iface, IEventHandler_RenderedEventArgs *handler,
++                                                EventRegistrationToken *token )
++{
++    HRESULT hr;
++
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    if (SUCCEEDED(hr = event_list_add( &rendered, (IUnknown *)handler, token ))) frames_changed();
++    return hr;
++}
++
++static HRESULT WINAPI ct_statics3_remove_Rendered( ICompositionTargetStatics3 *iface, EventRegistrationToken token )
++{
++    HRESULT hr = event_list_remove( &rendered, token );
++    frames_changed();
++    return hr;
++}
++
++static const struct ICompositionTargetStatics3Vtbl ct_statics3_vtbl =
++{
++    ct_statics3_QueryInterface,
++    ct_statics3_AddRef,
++    ct_statics3_Release,
++    /* IInspectable methods */
++    ct_statics3_GetIids,
++    ct_statics3_GetRuntimeClassName,
++    ct_statics3_GetTrustLevel,
++    /* ICompositionTargetStatics3 methods */
++    ct_statics3_add_Rendered,
++    ct_statics3_remove_Rendered,
++};
++
++static struct statics statics = { {&factory_vtbl}, {&ct_statics_vtbl}, {&ct_statics3_vtbl} };
++IActivationFactory *composition_target_factory = &statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/element.c b/dlls/windows.ui.xaml/element.c
+index 6fb78c9..0b1ab72 100644
+--- a/dlls/windows.ui.xaml/element.c
++++ b/dlls/windows.ui.xaml/element.c
+@@ -100,6 +100,9 @@ static ULONG WINAPI inner_Release( IInspectable *iface )
+         event_list_clear( &impl->key_up );
+         event_list_clear( &impl->got_focus );
+         event_list_clear( &impl->lost_focus );
++        event_list_clear( &impl->loaded );
++        event_list_clear( &impl->unloaded );
++        event_list_clear( &impl->size_changed );
+         impl->ops->destroy( impl );
+     }
+     return ref;
+@@ -728,10 +731,27 @@ static HRESULT WINAPI uielement_RemoveHandler(IUIElement *iface, __x_ABI_CWindow
+     return E_NOTIMPL;
+ }
+ 
+-static HRESULT WINAPI uielement_TransformToVisual(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CIUIElement *visual, __x_ABI_CWindows_CUI_CXaml_CMedia_CIGeneralTransform **value)
++/* the offset from this element's layout position to visual's (or the window's); render transforms are left out */
++static HRESULT WINAPI uielement_TransformToVisual( IUIElement *iface, IUIElement *visual, IGeneralTransform **value )
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    struct xaml_element *impl = impl_from_IUIElement( iface ), *other = visual ? element_from_object( (IInspectable *)visual ) : NULL;
++    float x = impl->bounds.x - (other ? other->bounds.x : 0), y = impl->bounds.y - (other ? other->bounds.y : 0);
++    ITranslateTransform *translate;
++    IInspectable *object;
++    HRESULT hr;
++
++    TRACE( "iface %p, visual %p: offset %.1f,%.1f.\n", iface, visual, x, y );
++    *value = NULL;
++    if (FAILED(hr = IActivationFactory_ActivateInstance( translate_transform_factory, &object ))) return hr;
++    if (SUCCEEDED(IInspectable_QueryInterface( object, &IID_ITranslateTransform, (void **)&translate )))
++    {
++        ITranslateTransform_put_X( translate, x );
++        ITranslateTransform_put_Y( translate, y );
++        ITranslateTransform_Release( translate );
++    }
++    hr = IInspectable_QueryInterface( object, &IID_IGeneralTransform, (void **)value );
++    IInspectable_Release( object );
++    return hr;
+ }
+ 
+ static const struct IUIElementVtbl uielement_vtbl =
+@@ -1098,40 +1118,39 @@ static HRESULT WINAPI framework_element_put_FlowDirection(IFrameworkElement *ifa
+     return E_NOTIMPL;
+ }
+ 
+-static HRESULT WINAPI framework_element_add_Loaded(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CIRoutedEventHandler *handler, EventRegistrationToken *value)
++/* Loaded after the element's first layout in the window, SizeChanged when its arranged size changes (both raised
++ * after the layout pass); Unloaded handlers are kept but not raised */
++static HRESULT WINAPI framework_element_add_Loaded( IFrameworkElement *iface, IRoutedEventHandler *handler, EventRegistrationToken *value )
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return event_list_add( &impl_from_IFrameworkElement( iface )->loaded, (IUnknown *)handler, value );
+ }
+ 
+-static HRESULT WINAPI framework_element_remove_Loaded(IFrameworkElement *iface, EventRegistrationToken token)
++static HRESULT WINAPI framework_element_remove_Loaded( IFrameworkElement *iface, EventRegistrationToken token )
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return event_list_remove( &impl_from_IFrameworkElement( iface )->loaded, token );
+ }
+ 
+-static HRESULT WINAPI framework_element_add_Unloaded(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CIRoutedEventHandler *handler, EventRegistrationToken *value)
++static HRESULT WINAPI framework_element_add_Unloaded( IFrameworkElement *iface, IRoutedEventHandler *handler, EventRegistrationToken *value )
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p, handler %p: Unloaded isn't raised.\n", iface, handler );
++    return event_list_add( &impl_from_IFrameworkElement( iface )->unloaded, (IUnknown *)handler, value );
+ }
+ 
+-static HRESULT WINAPI framework_element_remove_Unloaded(IFrameworkElement *iface, EventRegistrationToken token)
++static HRESULT WINAPI framework_element_remove_Unloaded( IFrameworkElement *iface, EventRegistrationToken token )
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return event_list_remove( &impl_from_IFrameworkElement( iface )->unloaded, token );
+ }
+ 
+-static HRESULT WINAPI framework_element_add_SizeChanged(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CISizeChangedEventHandler *handler, EventRegistrationToken *value)
++static HRESULT WINAPI framework_element_add_SizeChanged( IFrameworkElement *iface, ISizeChangedEventHandler *handler, EventRegistrationToken *value )
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return event_list_add( &impl_from_IFrameworkElement( iface )->size_changed, (IUnknown *)handler, value );
+ }
+ 
+-static HRESULT WINAPI framework_element_remove_SizeChanged(IFrameworkElement *iface, EventRegistrationToken token)
++static HRESULT WINAPI framework_element_remove_SizeChanged( IFrameworkElement *iface, EventRegistrationToken token )
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return event_list_remove( &impl_from_IFrameworkElement( iface )->size_changed, token );
+ }
+ 
+ static HRESULT WINAPI framework_element_add_LayoutUpdated(IFrameworkElement *iface, __FIEventHandler_1_IInspectable *handler, EventRegistrationToken *value)
+@@ -1434,6 +1453,7 @@ void element_init( struct xaml_element *element, const struct element_ops *ops,
+     element->row_span = element->column_span = 1;
+     element->is_tab_stop = TRUE;
+     element->tab_index = 0x7fffffff;   /* Int32.MaxValue: after every element with a TabIndex */
++    element->reported_width = element->reported_height = -1;
+ }
+ 
+ /* Hand out a new element the way a composable factory's CreateInstance does: iface is the class's default
+@@ -1541,6 +1561,221 @@ void element_measure( struct xaml_element *element, struct layout_context *ctx,
+            element->desired_height, avail_width, avail_height );
+ }
+ 
++/* ---- Loaded and SizeChanged: queued during layout, raised after it ---- */
++
++enum layout_event { LAYOUT_LOADED, LAYOUT_SIZE_CHANGED };
++
++struct pending_layout_event
++{
++    struct xaml_element *element;   /* referenced */
++    enum layout_event kind;
++};
++
++static struct pending_layout_event *pending_events;
++static UINT32 pending_count, pending_capacity;
++
++static void queue_layout_event( struct xaml_element *element, enum layout_event kind )
++{
++    UINT32 i;
++    void *grow;
++
++    for (i = 0; i < pending_count; i++)
++        if (pending_events[i].element == element && pending_events[i].kind == kind) return;
++    if (pending_count == pending_capacity)
++    {
++        UINT32 capacity = max( 16, pending_capacity * 2 );
++        if (!(grow = realloc( pending_events, capacity * sizeof(*pending_events) ))) return;
++        pending_events = grow;
++        pending_capacity = capacity;
++    }
++    IUIElement_AddRef( &element->IUIElement_iface );
++    pending_events[pending_count].element = element;
++    pending_events[pending_count++].kind = kind;
++}
++
++struct size_args
++{
++    ISizeChangedEventArgs ISizeChangedEventArgs_iface;
++    IRoutedEventArgs IRoutedEventArgs_iface;
++    LONG ref;
++    IInspectable *source;
++    Size previous, size;
++};
++
++static inline struct size_args *size_args_from_ISizeChangedEventArgs( ISizeChangedEventArgs *iface )
++{
++    return CONTAINING_RECORD( iface, struct size_args, ISizeChangedEventArgs_iface );
++}
++
++static HRESULT WINAPI size_args_QueryInterface( ISizeChangedEventArgs *iface, REFIID iid, void **out )
++{
++    struct size_args *impl = size_args_from_ISizeChangedEventArgs( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_ISizeChangedEventArgs ))
++        *out = &impl->ISizeChangedEventArgs_iface;
++    else if (IsEqualGUID( iid, &IID_IRoutedEventArgs ))
++        *out = &impl->IRoutedEventArgs_iface;
++    else
++    {
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    InterlockedIncrement( &impl->ref );
++    return S_OK;
++}
++
++static ULONG WINAPI size_args_AddRef( ISizeChangedEventArgs *iface )
++{
++    return InterlockedIncrement( &size_args_from_ISizeChangedEventArgs( iface )->ref );
++}
++
++static ULONG WINAPI size_args_Release( ISizeChangedEventArgs *iface )
++{
++    struct size_args *impl = size_args_from_ISizeChangedEventArgs( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        if (impl->source) IInspectable_Release( impl->source );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI size_args_GetIids( ISizeChangedEventArgs *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI size_args_GetRuntimeClassName( ISizeChangedEventArgs *iface, HSTRING *name )
++{
++    return WindowsCreateString( RuntimeClass_Windows_UI_Xaml_SizeChangedEventArgs,
++                                wcslen( RuntimeClass_Windows_UI_Xaml_SizeChangedEventArgs ), name );
++}
++
++static HRESULT WINAPI size_args_GetTrustLevel( ISizeChangedEventArgs *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI size_args_get_PreviousSize( ISizeChangedEventArgs *iface, Size *value )
++{
++    *value = size_args_from_ISizeChangedEventArgs( iface )->previous;
++    return S_OK;
++}
++
++static HRESULT WINAPI size_args_get_NewSize( ISizeChangedEventArgs *iface, Size *value )
++{
++    *value = size_args_from_ISizeChangedEventArgs( iface )->size;
++    return S_OK;
++}
++
++static const struct ISizeChangedEventArgsVtbl size_args_vtbl =
++{
++    size_args_QueryInterface,
++    size_args_AddRef,
++    size_args_Release,
++    /* IInspectable methods */
++    size_args_GetIids,
++    size_args_GetRuntimeClassName,
++    size_args_GetTrustLevel,
++    /* ISizeChangedEventArgs methods */
++    size_args_get_PreviousSize,
++    size_args_get_NewSize,
++};
++
++DEFINE_IINSPECTABLE_( size_routed, IRoutedEventArgs, struct size_args, size_args_from_IRoutedEventArgs, IRoutedEventArgs_iface,
++                      &impl->ISizeChangedEventArgs_iface )
++
++static HRESULT WINAPI size_routed_get_OriginalSource( IRoutedEventArgs *iface, IInspectable **value )
++{
++    if ((*value = size_args_from_IRoutedEventArgs( iface )->source)) IInspectable_AddRef( *value );
++    return S_OK;
++}
++
++static const struct IRoutedEventArgsVtbl size_routed_vtbl =
++{
++    size_routed_QueryInterface,
++    size_routed_AddRef,
++    size_routed_Release,
++    /* IInspectable methods */
++    size_routed_GetIids,
++    size_routed_GetRuntimeClassName,
++    size_routed_GetTrustLevel,
++    /* IRoutedEventArgs methods */
++    size_routed_get_OriginalSource,
++};
++
++static void raise_layout_event( struct xaml_element *element, enum layout_event kind )
++{
++    struct event_list *list = kind == LAYOUT_LOADED ? &element->loaded : &element->size_changed;
++    IRoutedEventArgs *routed = NULL;
++    struct size_args *args = NULL;
++    IUnknown **handlers;
++    UINT32 i, count = list->count;
++    HRESULT hr;
++
++    if (kind == LAYOUT_SIZE_CHANGED)
++    {
++        if (element->reported_width == element->bounds.width && element->reported_height == element->bounds.height) return;
++        if (!(args = calloc( 1, sizeof(*args) ))) return;
++        args->ISizeChangedEventArgs_iface.lpVtbl = &size_args_vtbl;
++        args->IRoutedEventArgs_iface.lpVtbl = &size_routed_vtbl;
++        args->ref = 1;
++        IInspectable_AddRef( (args->source = element->outer) );
++        args->previous.Width = max( 0.0f, element->reported_width );
++        args->previous.Height = max( 0.0f, element->reported_height );
++        args->size.Width = element->reported_width = element->bounds.width;
++        args->size.Height = element->reported_height = element->bounds.height;
++        TRACE( "%s %p: SizeChanged to %.1fx%.1f.\n", debugstr_w(element->class_name), element,
++               args->size.Width, args->size.Height );
++    }
++    else
++    {
++        if (FAILED(routed_event_args_create( element->outer, &routed ))) return;
++        TRACE( "%s %p: Loaded.\n", debugstr_w(element->class_name), element );
++    }
++    if (count && (handlers = calloc( count, sizeof(*handlers) )))
++    {
++        for (i = 0; i < count; i++) if ((handlers[i] = list->handlers[i])) IUnknown_AddRef( handlers[i] );
++        for (i = 0; i < count; i++)
++        {
++            if (!handlers[i]) continue;
++            if (kind == LAYOUT_LOADED)
++                hr = IRoutedEventHandler_Invoke( (IRoutedEventHandler *)handlers[i], element->outer, routed );
++            else
++                hr = ISizeChangedEventHandler_Invoke( (ISizeChangedEventHandler *)handlers[i], element->outer,
++                                                      &args->ISizeChangedEventArgs_iface );
++            if (FAILED(hr)) WARN( "handler %p failed, hr %#lx.\n", handlers[i], hr );
++            IUnknown_Release( handlers[i] );
++        }
++        free( handlers );
++    }
++    if (routed) IRoutedEventArgs_Release( routed );
++    if (args) ISizeChangedEventArgs_Release( &args->ISizeChangedEventArgs_iface );
++}
++
++void element_raise_layout_events(void)
++{
++    struct pending_layout_event *events;
++    UINT32 i, count;
++
++    /* handlers may change the tree, so a later layout may queue more */
++    while (pending_count)
++    {
++        events = pending_events;
++        count = pending_count;
++        pending_events = NULL;
++        pending_count = pending_capacity = 0;
++        for (i = 0; i < count; i++)
++        {
++            raise_layout_event( events[i].element, events[i].kind );
++            IUIElement_Release( &events[i].element->IUIElement_iface );
++        }
++        free( events );
++        break;   /* what they queue waits for the next layout */
++    }
++}
++
+ void element_arrange( struct xaml_element *element, struct layout_context *ctx, float x, float y, float width, float height )
+ {
+     const Thickness *m = &element->margin;
+@@ -1582,6 +1817,20 @@ void element_arrange( struct xaml_element *element, struct layout_context *ctx,
+     element->bounds.height = final_height;
+     TRACE( "%s arranged at %.1f,%.1f %.1fx%.1f.\n", debugstr_w(element->class_name), element->bounds.x, element->bounds.y,
+            final_width, final_height );
++    if (!element->loaded_done)
++    {
++        element->loaded_done = TRUE;
++        if (element->loaded.count) queue_layout_event( element, LAYOUT_LOADED );
++    }
++    if (element->reported_width != final_width || element->reported_height != final_height)
++    {
++        if (element->size_changed.count) queue_layout_event( element, LAYOUT_SIZE_CHANGED );
++        else
++        {
++            element->reported_width = final_width;
++            element->reported_height = final_height;
++        }
++    }
+ 
+     if (element->ops->arrange) element->ops->arrange( element, ctx );
+ }
+diff --git a/dlls/windows.ui.xaml/main.c b/dlls/windows.ui.xaml/main.c
+index 4396974..1e76f31 100644
+--- a/dlls/windows.ui.xaml/main.c
++++ b/dlls/windows.ui.xaml/main.c
+@@ -90,6 +90,10 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( symbol_icon_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_FontIcon ))
+         IActivationFactory_QueryInterface( font_icon_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_CompositionTarget ))
++        IActivationFactory_QueryInterface( composition_target_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_SwapChainPanel ))
++        IActivationFactory_QueryInterface( swapchain_panel_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ContentDialog ))
+         IActivationFactory_QueryInterface( content_dialog_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ListView ))
+diff --git a/dlls/windows.ui.xaml/panel.c b/dlls/windows.ui.xaml/panel.c
+index f6bf7ca..b4f89aa 100644
+--- a/dlls/windows.ui.xaml/panel.c
++++ b/dlls/windows.ui.xaml/panel.c
+@@ -34,6 +34,7 @@ enum panel_kind
+     PANEL_GRID,
+     PANEL_ITEMS_STACK,
+     PANEL_WRAP,
++    PANEL_SWAPCHAIN,   /* swapchain.c: SwapChainPanel, a Grid */
+ };
+ 
+ struct panel
+@@ -44,6 +45,7 @@ struct panel
+     IGrid IGrid_iface;
+     IItemsStackPanel IItemsStackPanel_iface;
+     IItemsWrapGrid IItemsWrapGrid_iface;
++    struct swapchain_panel *swapchain;
+     enum panel_kind kind;
+     IInspectable *children;   /* IVector<UIElement *> */
+     IBrush *background;
+@@ -487,7 +489,8 @@ static HRESULT panel_query_interface( struct xaml_element *element, REFIID iid,
+ 
+     if (IsEqualGUID( iid, &IID_IPanel )) *out = &impl->IPanel_iface;
+     else if (impl->kind == PANEL_STACK && IsEqualGUID( iid, &IID_IStackPanel )) *out = &impl->IStackPanel_iface;
+-    else if (impl->kind == PANEL_GRID && IsEqualGUID( iid, &IID_IGrid )) *out = &impl->IGrid_iface;
++    else if ((impl->kind == PANEL_GRID || impl->kind == PANEL_SWAPCHAIN) && IsEqualGUID( iid, &IID_IGrid )) *out = &impl->IGrid_iface;
++    else if (impl->kind == PANEL_SWAPCHAIN) return swapchain_panel_query_interface( impl->swapchain, iid, out );
+     else if (impl->kind == PANEL_ITEMS_STACK && IsEqualGUID( iid, &IID_IItemsStackPanel )) *out = &impl->IItemsStackPanel_iface;
+     else if (impl->kind == PANEL_WRAP && IsEqualGUID( iid, &IID_IItemsWrapGrid )) *out = &impl->IItemsWrapGrid_iface;
+     else return E_NOINTERFACE;
+@@ -551,6 +554,7 @@ static void panel_destroy( struct xaml_element *element )
+     if (impl->background) IBrush_Release( impl->background );
+     free( impl->track_content[0] );
+     free( impl->track_content[1] );
++    swapchain_panel_destroy( impl->swapchain );
+     free( impl );
+ }
+ 
+@@ -933,6 +937,7 @@ static HRESULT panel_create( enum panel_kind kind, IInspectable *outer, IInspect
+         RuntimeClass_Windows_UI_Xaml_Controls_Grid,
+         RuntimeClass_Windows_UI_Xaml_Controls_ItemsStackPanel,
+         RuntimeClass_Windows_UI_Xaml_Controls_ItemsWrapGrid,
++        RuntimeClass_Windows_UI_Xaml_Controls_SwapChainPanel,
+     };
+     void *iface;
+ 
+@@ -950,7 +955,12 @@ static HRESULT panel_create( enum panel_kind kind, IInspectable *outer, IInspect
+     impl->cache_length = 4.0;
+     if (FAILED(hr = vector_create( &uielement_collection_iids, &children_callbacks, &impl->element, &impl->children )))
+         goto failed;
+-    if (kind == PANEL_GRID)
++    if (kind == PANEL_SWAPCHAIN && !(impl->swapchain = swapchain_panel_create( &impl->element )))
++    {
++        hr = E_OUTOFMEMORY;
++        goto failed;
++    }
++    if (kind == PANEL_GRID || kind == PANEL_SWAPCHAIN)
+     {
+         if (FAILED(hr = vector_create( &row_collection_iids, &definitions_callbacks, impl, &impl->rows ))) goto failed;
+         if (FAILED(hr = vector_create( &column_collection_iids, &definitions_callbacks, impl, &impl->columns ))) goto failed;
+@@ -961,6 +971,7 @@ static HRESULT panel_create( enum panel_kind kind, IInspectable *outer, IInspect
+     case PANEL_STACK: iface = &impl->IStackPanel_iface; break;
+     case PANEL_GRID: iface = &impl->IGrid_iface; break;
+     case PANEL_ITEMS_STACK: iface = &impl->IItemsStackPanel_iface; break;
++    case PANEL_SWAPCHAIN: iface = swapchain_panel_default_iface( impl->swapchain ); break;
+     default: iface = &impl->IItemsWrapGrid_iface; break;
+     }
+     return element_compose( &impl->element, outer, inner, iface, value );
+@@ -981,6 +992,7 @@ struct panel_statics
+     IGridFactory IGridFactory_iface;
+     IGridStatics IGridStatics_iface;
+     enum panel_kind kind;
++    ISwapChainPanelFactory ISwapChainPanelFactory_iface;
+ };
+ 
+ static inline struct panel_statics *impl_from_IActivationFactory( IActivationFactory *iface )
+@@ -1001,6 +1013,8 @@ static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID
+         *out = &impl->IStackPanelFactory_iface;
+     else if (impl->kind == PANEL_GRID && IsEqualGUID( iid, &IID_IGridFactory ))
+         *out = &impl->IGridFactory_iface;
++    else if (impl->kind == PANEL_SWAPCHAIN && IsEqualGUID( iid, &IID_ISwapChainPanelFactory ))
++        *out = &impl->ISwapChainPanelFactory_iface;
+     else if (impl->kind == PANEL_GRID && IsEqualGUID( iid, &IID_IGridStatics ))
+         *out = &impl->IGridStatics_iface;
+     else
+@@ -1186,3 +1200,34 @@ static struct panel_statics items_wrap_statics =
+ 
+ IActivationFactory *items_stack_panel_factory = &items_stack_statics.IActivationFactory_iface;
+ IActivationFactory *items_wrap_grid_factory = &items_wrap_statics.IActivationFactory_iface;
++
++/* SwapChainPanel: IActivationFactory and the composable ISwapChainPanelFactory */
++
++DEFINE_IINSPECTABLE( swapchain_factory, ISwapChainPanelFactory, struct panel_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI swapchain_factory_CreateInstance( ISwapChainPanelFactory *iface, IInspectable *outer, IInspectable **inner,
++                                                        ISwapChainPanel **value )
++{
++    TRACE( "iface %p, outer %p, inner %p, value %p.\n", iface, outer, inner, value );
++    return panel_create( PANEL_SWAPCHAIN, outer, inner, (void **)value );
++}
++
++static const struct ISwapChainPanelFactoryVtbl swapchain_factory_vtbl =
++{
++    swapchain_factory_QueryInterface,
++    swapchain_factory_AddRef,
++    swapchain_factory_Release,
++    /* IInspectable methods */
++    swapchain_factory_GetIids,
++    swapchain_factory_GetRuntimeClassName,
++    swapchain_factory_GetTrustLevel,
++    /* ISwapChainPanelFactory methods */
++    swapchain_factory_CreateInstance,
++};
++
++static struct panel_statics swapchain_statics =
++{
++    {&factory_vtbl}, {&stack_factory_vtbl}, {&grid_factory_iface_vtbl}, {&grid_statics_vtbl}, PANEL_SWAPCHAIN, {&swapchain_factory_vtbl}
++};
++
++IActivationFactory *swapchain_panel_factory = &swapchain_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index 5096604..7c32398 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -220,6 +220,20 @@ HRESULT window_create_for_core_window( ICoreWindow *core_window );
+ void window_destroy_current(void);
+ struct xaml_element *window_content_element(void);   /* Window.Current.Content, not referenced, or NULL */
+ struct xaml_element *window_input_root(void);        /* the topmost popup, or the content */
++ICoreWindow *window_core_window(void);               /* the view's CoreWindow, not referenced */
++/* swapchain.c: SwapChainPanel */
++struct swapchain_panel;
++struct swapchain_panel *swapchain_panel_create( struct xaml_element *element );
++void *swapchain_panel_default_iface( struct swapchain_panel *impl );
++HRESULT swapchain_panel_query_interface( struct swapchain_panel *impl, REFIID iid, void **out );
++void swapchain_panel_destroy( struct swapchain_panel *impl );
++BOOL window_swapchain_active(void);   /* a SwapChainPanel's swap chain is on the window: XAML doesn't draw */
++extern IActivationFactory *swapchain_panel_factory;
++/* composition.c: CompositionTarget */
++extern IActivationFactory *composition_target_factory;
++void composition_frame(void);
++BOOL composition_wants_frames(void);
++void window_frame_timer( BOOL on );
+ /* drawn over the content until hidden; a modal popup gets all the input, others what they cover */
+ BOOL window_popup_show( struct xaml_element *popup, BOOL modal );
+ void window_popup_hide( struct xaml_element *popup );
+@@ -362,6 +376,9 @@ struct xaml_element
+     WCHAR **local_properties;                  /* set directly (not by a style): styles don't override them */
+     UINT32 local_count;
+     struct event_list key_down, key_up, got_focus, lost_focus;   /* UIElement's routed key and focus events */
++    struct event_list loaded, unloaded, size_changed;            /* FrameworkElement's */
++    BOOL loaded_done;                          /* Loaded was raised (after the first layout) */
++    float reported_width, reported_height;     /* the size SizeChanged last reported, or -1 */
+     boolean is_tab_stop;                       /* Control.IsTabStop */
+     INT32 tab_index;                           /* Control.TabIndex */
+ 
+@@ -519,6 +536,7 @@ void text_draw_argb( struct layout_context *ctx, const struct text_format *forma
+                      const struct layout_rect *rect, Color color );
+ 
+ void window_invalidate(void);
++void element_raise_layout_events(void);   /* element.c: Loaded and SizeChanged, after a layout pass */
+ void window_theme_changed(void);   /* re-resolve the whole tree's theme resources on the next layout */
+ BOOL brush_get_color( IBrush *brush, Color *color );
+ 
+diff --git a/dlls/windows.ui.xaml/swapchain.c b/dlls/windows.ui.xaml/swapchain.c
+new file mode 100644
+index 0000000..bbd8cd8
+--- /dev/null
++++ b/dlls/windows.ui.xaml/swapchain.c
+@@ -0,0 +1,519 @@
++/* WinRT Windows.UI.Xaml.Controls.SwapChainPanel implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#include "initguid.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* A SwapChainPanel is a Grid (panel.c, PANEL_SWAPCHAIN) that shows a DirectX composition swap chain: games (Unity
++ * among them) draw into it and give it to the panel with ISwapChainPanelNative::SetSwapChain. Wine has no XAML
++ * compositor, so the patched DXVK dxgi presents composition swap chains straight to the core window, and while a
++ * panel holds a swap chain XAML stops drawing the window (window_swapchain_active): the game's frames fill it, and
++ * XAML content over the panel (a splash screen, say) isn't shown. That is right for the usual case of a panel
++ * filling the window.
++ *
++ * CreateCoreIndependentInputSource gives games pointer input off the UI thread: here a source that passes on the
++ * CoreWindow's pointer events (raised on the UI thread), with the CoreWindow's dispatcher. */
++
++DEFINE_GUID( IID_ISwapChainPanelNative, 0xf92f19d2, 0x3ade, 0x45a6, 0xa2, 0x0c, 0xf6, 0xf1, 0xea, 0x90, 0x55, 0x4b );
++DEFINE_GUID( IID_ISwapChainPanelNative2, 0xd5a2f60c, 0x37b2, 0x44a2, 0x93, 0x7b, 0x8d, 0x8e, 0xb9, 0x72, 0x68, 0x21 );
++
++/* ISwapChainPanelNative2, which derives from ISwapChainPanelNative (windows.ui.xaml.media.dxinterop.h) */
++typedef struct ISwapChainPanelNative2 ISwapChainPanelNative2;
++struct ISwapChainPanelNative2Vtbl
++{
++    HRESULT (WINAPI *QueryInterface)( ISwapChainPanelNative2 *iface, REFIID iid, void **out );
++    ULONG (WINAPI *AddRef)( ISwapChainPanelNative2 *iface );
++    ULONG (WINAPI *Release)( ISwapChainPanelNative2 *iface );
++    HRESULT (WINAPI *SetSwapChain)( ISwapChainPanelNative2 *iface, IUnknown *swapchain );
++    HRESULT (WINAPI *SetSwapChainHandle)( ISwapChainPanelNative2 *iface, HANDLE handle );
++};
++struct ISwapChainPanelNative2 { const struct ISwapChainPanelNative2Vtbl *lpVtbl; };
++
++struct swapchain_panel
++{
++    ISwapChainPanel ISwapChainPanel_iface;
++    ISwapChainPanelNative2 ISwapChainPanelNative2_iface;
++    struct xaml_element *element;
++    IUnknown *swapchain;
++    struct event_list scale_changed;
++};
++
++static struct swapchain_panel *active_panel;   /* the panel whose swap chain is on the window */
++
++BOOL window_swapchain_active(void)
++{
++    return active_panel && active_panel->element->visibility == Visibility_Visible;
++}
++
++/* ---- ISwapChainPanel ---- */
++
++DEFINE_IINSPECTABLE_( panel_iface, ISwapChainPanel, struct swapchain_panel, impl_from_ISwapChainPanel, ISwapChainPanel_iface,
++                      impl->element->outer )
++
++static HRESULT WINAPI panel_iface_get_CompositionScaleX( ISwapChainPanel *iface, FLOAT *value )
++{
++    *value = 1.0f;
++    return S_OK;
++}
++
++static HRESULT WINAPI panel_iface_get_CompositionScaleY( ISwapChainPanel *iface, FLOAT *value )
++{
++    *value = 1.0f;
++    return S_OK;
++}
++
++static HRESULT WINAPI panel_iface_add_CompositionScaleChanged( ISwapChainPanel *iface,
++        ITypedEventHandler_SwapChainPanel_IInspectable *handler, EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p: the scale doesn't change.\n", iface, handler );
++    return event_list_add( &impl_from_ISwapChainPanel( iface )->scale_changed, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI panel_iface_remove_CompositionScaleChanged( ISwapChainPanel *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_ISwapChainPanel( iface )->scale_changed, token );
++}
++
++static HRESULT input_source_create( ICoreInputSourceBase **out );
++
++static HRESULT WINAPI panel_iface_CreateCoreIndependentInputSource( ISwapChainPanel *iface, CoreInputDeviceTypes types,
++                                                                    ICoreInputSourceBase **value )
++{
++    TRACE( "iface %p, types %#x.\n", iface, types );
++    return input_source_create( value );
++}
++
++static const struct ISwapChainPanelVtbl panel_iface_vtbl =
++{
++    panel_iface_QueryInterface,
++    panel_iface_AddRef,
++    panel_iface_Release,
++    /* IInspectable methods */
++    panel_iface_GetIids,
++    panel_iface_GetRuntimeClassName,
++    panel_iface_GetTrustLevel,
++    /* ISwapChainPanel methods */
++    panel_iface_get_CompositionScaleX,
++    panel_iface_get_CompositionScaleY,
++    panel_iface_add_CompositionScaleChanged,
++    panel_iface_remove_CompositionScaleChanged,
++    panel_iface_CreateCoreIndependentInputSource,
++};
++
++/* ---- ISwapChainPanelNative(2) ---- */
++
++static inline struct swapchain_panel *impl_from_native( ISwapChainPanelNative2 *iface )
++{
++    return CONTAINING_RECORD( iface, struct swapchain_panel, ISwapChainPanelNative2_iface );
++}
++
++static HRESULT WINAPI native_QueryInterface( ISwapChainPanelNative2 *iface, REFIID iid, void **out )
++{
++    return IInspectable_QueryInterface( impl_from_native( iface )->element->outer, iid, out );
++}
++
++static ULONG WINAPI native_AddRef( ISwapChainPanelNative2 *iface )
++{
++    return IInspectable_AddRef( impl_from_native( iface )->element->outer );
++}
++
++static ULONG WINAPI native_Release( ISwapChainPanelNative2 *iface )
++{
++    return IInspectable_Release( impl_from_native( iface )->element->outer );
++}
++
++static HRESULT WINAPI native_SetSwapChain( ISwapChainPanelNative2 *iface, IUnknown *swapchain )
++{
++    struct swapchain_panel *impl = impl_from_native( iface );
++
++    TRACE( "iface %p, swapchain %p.\n", iface, swapchain );
++    if (swapchain) IUnknown_AddRef( swapchain );
++    if (impl->swapchain) IUnknown_Release( impl->swapchain );
++    impl->swapchain = swapchain;
++    if (swapchain) active_panel = impl;
++    else if (active_panel == impl) active_panel = NULL;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI native_SetSwapChainHandle( ISwapChainPanelNative2 *iface, HANDLE handle )
++{
++    FIXME( "iface %p, handle %p: swap chain handles (DCompositionCreateSurfaceHandle) aren't supported.\n", iface, handle );
++    return E_NOTIMPL;
++}
++
++static const struct ISwapChainPanelNative2Vtbl native_vtbl =
++{
++    native_QueryInterface,
++    native_AddRef,
++    native_Release,
++    native_SetSwapChain,
++    native_SetSwapChainHandle,
++};
++
++/* ---- the panel.c side ---- */
++
++struct swapchain_panel *swapchain_panel_create( struct xaml_element *element )
++{
++    struct swapchain_panel *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return NULL;
++    impl->ISwapChainPanel_iface.lpVtbl = &panel_iface_vtbl;
++    impl->ISwapChainPanelNative2_iface.lpVtbl = &native_vtbl;
++    impl->element = element;
++    return impl;
++}
++
++void *swapchain_panel_default_iface( struct swapchain_panel *impl )
++{
++    return &impl->ISwapChainPanel_iface;
++}
++
++HRESULT swapchain_panel_query_interface( struct swapchain_panel *impl, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_ISwapChainPanel )) *out = &impl->ISwapChainPanel_iface;
++    else if (IsEqualGUID( iid, &IID_ISwapChainPanelNative ) || IsEqualGUID( iid, &IID_ISwapChainPanelNative2 ))
++        *out = &impl->ISwapChainPanelNative2_iface;
++    else return E_NOINTERFACE;
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++void swapchain_panel_destroy( struct swapchain_panel *impl )
++{
++    if (!impl) return;
++    if (active_panel == impl) active_panel = NULL;
++    if (impl->swapchain) IUnknown_Release( impl->swapchain );
++    event_list_clear( &impl->scale_changed );
++    free( impl );
++}
++
++/* ---- CoreIndependentInputSource ---- */
++
++enum pointer_event { EVENT_CAPTURE_LOST, EVENT_ENTERED, EVENT_EXITED, EVENT_MOVED, EVENT_PRESSED, EVENT_RELEASED, EVENT_WHEEL, EVENT_COUNT };
++
++struct input_source;
++
++struct forward_handler
++{
++    ITypedEventHandler_CoreWindow_PointerEventArgs ITypedEventHandler_iface;
++    struct input_source *source;
++    enum pointer_event event;
++};
++
++struct input_source
++{
++    ICoreInputSourceBase ICoreInputSourceBase_iface;
++    ICorePointerInputSource ICorePointerInputSource_iface;
++    LONG ref;
++    ICoreWindow *window;
++    boolean enabled;
++    struct event_list events[EVENT_COUNT], input_enabled;
++    struct forward_handler forward[EVENT_COUNT];
++    EventRegistrationToken tokens[EVENT_COUNT];
++};
++
++static inline struct input_source *source_from_ICoreInputSourceBase( ICoreInputSourceBase *iface )
++{
++    return CONTAINING_RECORD( iface, struct input_source, ICoreInputSourceBase_iface );
++}
++
++static HRESULT WINAPI source_QueryInterface( ICoreInputSourceBase *iface, REFIID iid, void **out )
++{
++    struct input_source *impl = source_from_ICoreInputSourceBase( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_ICoreInputSourceBase ))
++        *out = &impl->ICoreInputSourceBase_iface;
++    else if (IsEqualGUID( iid, &IID_ICorePointerInputSource ))
++        *out = &impl->ICorePointerInputSource_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    InterlockedIncrement( &impl->ref );
++    return S_OK;
++}
++
++static ULONG WINAPI source_AddRef( ICoreInputSourceBase *iface )
++{
++    return InterlockedIncrement( &source_from_ICoreInputSourceBase( iface )->ref );
++}
++
++static ULONG WINAPI source_Release( ICoreInputSourceBase *iface )
++{
++    struct input_source *impl = source_from_ICoreInputSourceBase( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    int i;
++
++    if (!ref)
++    {
++        for (i = 0; i < EVENT_COUNT; i++) event_list_clear( &impl->events[i] );
++        event_list_clear( &impl->input_enabled );
++        if (impl->window) ICoreWindow_Release( impl->window );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI source_GetIids( ICoreInputSourceBase *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI source_GetRuntimeClassName( ICoreInputSourceBase *iface, HSTRING *name )
++{
++    static const WCHAR class_name[] = L"Windows.UI.Core.CoreIndependentInputSource";
++    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
++}
++
++static HRESULT WINAPI source_GetTrustLevel( ICoreInputSourceBase *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI source_get_Dispatcher( ICoreInputSourceBase *iface, ICoreDispatcher **value )
++{
++    struct input_source *impl = source_from_ICoreInputSourceBase( iface );
++    *value = NULL;
++    return impl->window ? ICoreWindow_get_Dispatcher( impl->window, value ) : E_FAIL;
++}
++
++static HRESULT WINAPI source_get_IsInputEnabled( ICoreInputSourceBase *iface, boolean *value )
++{
++    *value = source_from_ICoreInputSourceBase( iface )->enabled;
++    return S_OK;
++}
++
++static HRESULT WINAPI source_put_IsInputEnabled( ICoreInputSourceBase *iface, boolean value )
++{
++    source_from_ICoreInputSourceBase( iface )->enabled = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI source_add_InputEnabled( ICoreInputSourceBase *iface, ITypedEventHandler_IInspectable_InputEnabledEventArgs *handler,
++                                               EventRegistrationToken *token )
++{
++    return event_list_add( &source_from_ICoreInputSourceBase( iface )->input_enabled, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI source_remove_InputEnabled( ICoreInputSourceBase *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &source_from_ICoreInputSourceBase( iface )->input_enabled, token );
++}
++
++static const struct ICoreInputSourceBaseVtbl source_vtbl =
++{
++    source_QueryInterface,
++    source_AddRef,
++    source_Release,
++    /* IInspectable methods */
++    source_GetIids,
++    source_GetRuntimeClassName,
++    source_GetTrustLevel,
++    /* ICoreInputSourceBase methods */
++    source_get_Dispatcher,
++    source_get_IsInputEnabled,
++    source_put_IsInputEnabled,
++    source_add_InputEnabled,
++    source_remove_InputEnabled,
++};
++
++DEFINE_IINSPECTABLE( pointer_source, ICorePointerInputSource, struct input_source, ICoreInputSourceBase_iface )
++
++static HRESULT WINAPI pointer_source_ReleasePointerCapture( ICorePointerInputSource *iface )
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI pointer_source_SetPointerCapture( ICorePointerInputSource *iface )
++{
++    TRACE( "iface %p: the window captures the pointer while a button is down anyway.\n", iface );
++    return S_OK;
++}
++
++static HRESULT WINAPI pointer_source_get_HasCapture( ICorePointerInputSource *iface, boolean *value )
++{
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI pointer_source_get_PointerPosition( ICorePointerInputSource *iface, Point *value )
++{
++    struct input_source *impl = impl_from_ICorePointerInputSource( iface );
++    return impl->window ? ICoreWindow_get_PointerPosition( impl->window, value ) : E_FAIL;
++}
++
++static HRESULT WINAPI pointer_source_get_PointerCursor( ICorePointerInputSource *iface, ICoreCursor **value )
++{
++    struct input_source *impl = impl_from_ICorePointerInputSource( iface );
++    *value = NULL;
++    return impl->window ? ICoreWindow_get_PointerCursor( impl->window, value ) : E_FAIL;
++}
++
++static HRESULT WINAPI pointer_source_put_PointerCursor( ICorePointerInputSource *iface, ICoreCursor *value )
++{
++    struct input_source *impl = impl_from_ICorePointerInputSource( iface );
++    return impl->window ? ICoreWindow_put_PointerCursor( impl->window, value ) : E_FAIL;
++}
++
++#define POINTER_EVENT( Name, event ) \
++static HRESULT WINAPI pointer_source_add_##Name( ICorePointerInputSource *iface, \
++        ITypedEventHandler_IInspectable_PointerEventArgs *handler, EventRegistrationToken *token ) \
++{ \
++    TRACE( "iface %p, handler %p.\n", iface, handler ); \
++    return event_list_add( &impl_from_ICorePointerInputSource( iface )->events[event], (IUnknown *)handler, token ); \
++} \
++static HRESULT WINAPI pointer_source_remove_##Name( ICorePointerInputSource *iface, EventRegistrationToken token ) \
++{ \
++    return event_list_remove( &impl_from_ICorePointerInputSource( iface )->events[event], token ); \
++}
++
++POINTER_EVENT( PointerCaptureLost, EVENT_CAPTURE_LOST )
++POINTER_EVENT( PointerEntered, EVENT_ENTERED )
++POINTER_EVENT( PointerExited, EVENT_EXITED )
++POINTER_EVENT( PointerMoved, EVENT_MOVED )
++POINTER_EVENT( PointerPressed, EVENT_PRESSED )
++POINTER_EVENT( PointerReleased, EVENT_RELEASED )
++POINTER_EVENT( PointerWheelChanged, EVENT_WHEEL )
++
++static const struct ICorePointerInputSourceVtbl pointer_source_vtbl =
++{
++    pointer_source_QueryInterface,
++    pointer_source_AddRef,
++    pointer_source_Release,
++    /* IInspectable methods */
++    pointer_source_GetIids,
++    pointer_source_GetRuntimeClassName,
++    pointer_source_GetTrustLevel,
++    /* ICorePointerInputSource methods */
++    pointer_source_ReleasePointerCapture,
++    pointer_source_SetPointerCapture,
++    pointer_source_get_HasCapture,
++    pointer_source_get_PointerPosition,
++    pointer_source_get_PointerCursor,
++    pointer_source_put_PointerCursor,
++    pointer_source_add_PointerCaptureLost,
++    pointer_source_remove_PointerCaptureLost,
++    pointer_source_add_PointerEntered,
++    pointer_source_remove_PointerEntered,
++    pointer_source_add_PointerExited,
++    pointer_source_remove_PointerExited,
++    pointer_source_add_PointerMoved,
++    pointer_source_remove_PointerMoved,
++    pointer_source_add_PointerPressed,
++    pointer_source_remove_PointerPressed,
++    pointer_source_add_PointerReleased,
++    pointer_source_remove_PointerReleased,
++    pointer_source_add_PointerWheelChanged,
++    pointer_source_remove_PointerWheelChanged,
++};
++
++/* the CoreWindow's pointer events, passed on with the source as the sender */
++
++static inline struct forward_handler *forward_from_iface( ITypedEventHandler_CoreWindow_PointerEventArgs *iface )
++{
++    return CONTAINING_RECORD( iface, struct forward_handler, ITypedEventHandler_iface );
++}
++
++static HRESULT WINAPI forward_QueryInterface( ITypedEventHandler_CoreWindow_PointerEventArgs *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_ITypedEventHandler_CoreWindow_PointerEventArgs ))
++    {
++        *out = iface;
++        ITypedEventHandler_CoreWindow_PointerEventArgs_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++/* the source lives as long as the window's handlers do: they keep it */
++static ULONG WINAPI forward_AddRef( ITypedEventHandler_CoreWindow_PointerEventArgs *iface )
++{
++    return ICoreInputSourceBase_AddRef( &forward_from_iface( iface )->source->ICoreInputSourceBase_iface );
++}
++
++static ULONG WINAPI forward_Release( ITypedEventHandler_CoreWindow_PointerEventArgs *iface )
++{
++    return ICoreInputSourceBase_Release( &forward_from_iface( iface )->source->ICoreInputSourceBase_iface );
++}
++
++static HRESULT WINAPI forward_Invoke( ITypedEventHandler_CoreWindow_PointerEventArgs *iface, ICoreWindow *sender, IPointerEventArgs *args )
++{
++    struct forward_handler *handler = forward_from_iface( iface );
++    struct input_source *source = handler->source;
++    struct event_list *list = &source->events[handler->event];
++    IUnknown **handlers;
++    UINT32 i, count = list->count;
++
++    if (!source->enabled || !count || !(handlers = calloc( count, sizeof(*handlers) ))) return S_OK;
++    for (i = 0; i < count; i++) if ((handlers[i] = list->handlers[i])) IUnknown_AddRef( handlers[i] );
++    for (i = 0; i < count; i++)
++    {
++        if (!handlers[i]) continue;
++        ITypedEventHandler_IInspectable_IInspectable_Invoke( (ITypedEventHandler_IInspectable_IInspectable *)handlers[i],
++                                                             (IInspectable *)&source->ICoreInputSourceBase_iface, (IInspectable *)args );
++        IUnknown_Release( handlers[i] );
++    }
++    free( handlers );
++    return S_OK;
++}
++
++static const struct ITypedEventHandler_CoreWindow_PointerEventArgsVtbl forward_vtbl =
++{
++    forward_QueryInterface,
++    forward_AddRef,
++    forward_Release,
++    forward_Invoke,
++};
++
++static HRESULT input_source_create( ICoreInputSourceBase **out )
++{
++    struct input_source *impl;
++    ICoreWindow *window;
++    int i;
++
++    if (!(window = window_core_window())) return E_FAIL;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->ICoreInputSourceBase_iface.lpVtbl = &source_vtbl;
++    impl->ICorePointerInputSource_iface.lpVtbl = &pointer_source_vtbl;
++    impl->ref = 1;
++    impl->enabled = TRUE;
++    ICoreWindow_AddRef( (impl->window = window) );
++    for (i = 0; i < EVENT_COUNT; i++)
++    {
++        impl->forward[i].ITypedEventHandler_iface.lpVtbl = &forward_vtbl;
++        impl->forward[i].source = impl;
++        impl->forward[i].event = i;
++    }
++    ICoreWindow_add_PointerCaptureLost( window, &impl->forward[EVENT_CAPTURE_LOST].ITypedEventHandler_iface, &impl->tokens[EVENT_CAPTURE_LOST] );
++    ICoreWindow_add_PointerEntered( window, &impl->forward[EVENT_ENTERED].ITypedEventHandler_iface, &impl->tokens[EVENT_ENTERED] );
++    ICoreWindow_add_PointerExited( window, &impl->forward[EVENT_EXITED].ITypedEventHandler_iface, &impl->tokens[EVENT_EXITED] );
++    ICoreWindow_add_PointerMoved( window, &impl->forward[EVENT_MOVED].ITypedEventHandler_iface, &impl->tokens[EVENT_MOVED] );
++    ICoreWindow_add_PointerPressed( window, &impl->forward[EVENT_PRESSED].ITypedEventHandler_iface, &impl->tokens[EVENT_PRESSED] );
++    ICoreWindow_add_PointerReleased( window, &impl->forward[EVENT_RELEASED].ITypedEventHandler_iface, &impl->tokens[EVENT_RELEASED] );
++    ICoreWindow_add_PointerWheelChanged( window, &impl->forward[EVENT_WHEEL].ITypedEventHandler_iface, &impl->tokens[EVENT_WHEEL] );
++    TRACE( "created %p for window %p.\n", impl, window );
++    *out = &impl->ICoreInputSourceBase_iface;
++    return S_OK;
++}
+diff --git a/dlls/windows.ui.xaml/window.c b/dlls/windows.ui.xaml/window.c
+index 4655190..6b1f7af 100644
+--- a/dlls/windows.ui.xaml/window.c
++++ b/dlls/windows.ui.xaml/window.c
+@@ -45,6 +45,18 @@ struct xaml_window
+ 
+ static struct xaml_window *current_window;
+ 
++#define FRAME_TIMER_ID 0x5ea1   /* CompositionTarget.Rendering, at 60 Hz */
++static BOOL frame_timer_wanted;
++
++/* composition.c: run the frame timer while CompositionTarget has handlers */
++void window_frame_timer( BOOL on )
++{
++    frame_timer_wanted = on;
++    if (!current_window || !current_window->hwnd) return;   /* started when the window is */
++    if (on) SetTimer( current_window->hwnd, FRAME_TIMER_ID, 16, NULL );
++    else KillTimer( current_window->hwnd, FRAME_TIMER_ID );
++}
++
+ static inline struct xaml_window *impl_from_IWindow( IWindow *iface )
+ {
+     return CONTAINING_RECORD( iface, struct xaml_window, IWindow_iface );
+@@ -68,6 +80,12 @@ struct xaml_element *window_content_element(void)
+ }
+ 
+ /* where the keyboard focus may be: the topmost modal popup, or the content */
++/* the view's CoreWindow, not referenced */
++ICoreWindow *window_core_window(void)
++{
++    return current_window ? current_window->core_window : NULL;
++}
++
+ struct xaml_element *window_input_root(void)
+ {
+     UINT32 i;
+@@ -167,6 +185,12 @@ static void window_paint( struct xaml_window *window )
+     ULONGLONG start = GetTickCount64();
+ 
+     hdc = BeginPaint( window->hwnd, &ps );
++    if (window_swapchain_active())
++    {
++        /* a SwapChainPanel's swap chain is presented to the window: leave it to the game */
++        EndPaint( window->hwnd, &ps );
++        return;
++    }
+     GetClientRect( window->hwnd, &client );
+     mem = CreateCompatibleDC( hdc );
+     bitmap = CreateCompatibleBitmap( hdc, max( 1, client.right ), max( 1, client.bottom ) );
+@@ -174,6 +198,7 @@ static void window_paint( struct xaml_window *window )
+ 
+     memset( &ctx, 0, sizeof(ctx) );
+     window_layout( window, &ctx, mem );
++    if (window->content) element_raise_layout_events();   /* may run app code, which may change the tree */
+     background = CreateSolidBrush( ctx.dark ? RGB(0, 0, 0) : RGB(255, 255, 255) );
+     FillRect( mem, &client, background );
+     DeleteObject( background );
+@@ -298,6 +323,10 @@ static LRESULT CALLBACK window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM
+     {
+     case WM_ERASEBKGND:
+         return 1;
++    case WM_TIMER:
++        if (wparam != FRAME_TIMER_ID) break;
++        composition_frame();
++        return 0;
+     case WM_PAINT:
+         window_paint( window );
+         return 0;
+@@ -584,7 +613,10 @@ HRESULT window_create_for_core_window( ICoreWindow *core_window )
+ 
+     EnumThreadWindows( GetCurrentThreadId(), find_core_hwnd, (LPARAM)&impl->hwnd );
+     if (impl->hwnd)
++    {
+         impl->old_proc = (WNDPROC)SetWindowLongPtrW( impl->hwnd, GWLP_WNDPROC, (LONG_PTR)window_proc );
++        if (frame_timer_wanted) SetTimer( impl->hwnd, FRAME_TIMER_ID, 16, NULL );
++    }
+     else
+         ERR( "CoreWindow %p has no HWND on this thread; nothing will be drawn.\n", core_window );
+ 
+diff --git a/dlls/windows.ui.xaml/xbf.c b/dlls/windows.ui.xaml/xbf.c
+index 3a069ca..0c51bcf 100644
+--- a/dlls/windows.ui.xaml/xbf.c
++++ b/dlls/windows.ui.xaml/xbf.c
+@@ -2962,6 +2962,7 @@ IInspectable *create_builtin( const WCHAR *name )
+         { L"ItemsControl", &items_control_factory },
+         { L"ListView", &list_view_factory },
+         { L"ContentDialog", &content_dialog_factory },
++        { L"SwapChainPanel", &swapchain_panel_factory },
+         { L"AppBarButton", &appbar_button_factory },
+         { L"AppBarToggleButton", &appbar_toggle_button_factory },
+         { L"AppBarSeparator", &appbar_separator_factory },
+diff --git a/include/windows.ui.xaml.idl b/include/windows.ui.xaml.idl
+index 127dba4..45c67f3 100644
+--- a/include/windows.ui.xaml.idl
++++ b/include/windows.ui.xaml.idl
+@@ -14549,3 +14549,260 @@ namespace Windows.UI.Xaml.Controls.Primitives {
+     }
+ 
+ }
++
++/* generated by scripts/winmd2idl.py: Controls.SwapChainPanel, and Windows.UI.Core.CoreIndependentInputSource with
++ * ICorePointerInputSource for it. */
++
++namespace Windows.UI.Core {
++    runtimeclass CoreIndependentInputSource;
++    typedef enum CoreInputDeviceTypes CoreInputDeviceTypes;
++    interface ICoreInputSourceBase;
++    interface ICorePointerInputSource;
++}
++
++namespace Windows.UI.Xaml.Controls {
++    interface ISwapChainPanel;
++    interface ISwapChainPanelFactory;
++    interface ISwapChainPanelStatics;
++    runtimeclass SwapChainPanel;
++}
++
++namespace Windows.UI.Xaml {
++    declare {
++        interface Windows.Foundation.TypedEventHandler<Windows.UI.Xaml.Controls.SwapChainPanel *, IInspectable *>;
++        interface Windows.Foundation.TypedEventHandler<IInspectable *, Windows.UI.Core.InputEnabledEventArgs *>;
++        interface Windows.Foundation.TypedEventHandler<IInspectable *, Windows.UI.Core.PointerEventArgs *>;
++    }
++}
++
++namespace Windows.UI.Core {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum CoreInputDeviceTypes
++    {
++        None = 0,
++        Touch = 1,
++        Pen = 2,
++        Mouse = 4
++    };
++
++}
++
++namespace Windows.UI.Core {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        uuid(9f488807-4580-4be8-be68-92a9311713bb)
++    ]
++    interface ICoreInputSourceBase : IInspectable
++    {
++        [propget] HRESULT Dispatcher([out, retval] Windows.UI.Core.CoreDispatcher * *value);
++        [propget] HRESULT IsInputEnabled([out, retval] boolean *value);
++        [propput] HRESULT IsInputEnabled([in] boolean value);
++        [eventadd] HRESULT InputEnabled([in] Windows.Foundation.TypedEventHandler<IInspectable *, Windows.UI.Core.InputEnabledEventArgs *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT InputEnabled([in] Windows.Foundation.EventRegistrationToken token);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        uuid(bbf1bb18-e47a-48eb-8807-f8f8d3ea4551)
++    ]
++    interface ICorePointerInputSource : IInspectable
++    {
++        HRESULT ReleasePointerCapture();
++        HRESULT SetPointerCapture();
++        [propget] HRESULT HasCapture([out, retval] boolean *value);
++        [propget] HRESULT PointerPosition([out, retval] Windows.Foundation.Point *value);
++        [propget] HRESULT PointerCursor([out, retval] Windows.UI.Core.CoreCursor * *value);
++        [propput] HRESULT PointerCursor([in] Windows.UI.Core.CoreCursor * value);
++        [eventadd] HRESULT PointerCaptureLost([in] Windows.Foundation.TypedEventHandler<IInspectable *, Windows.UI.Core.PointerEventArgs *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT PointerCaptureLost([in] Windows.Foundation.EventRegistrationToken token);
++        [eventadd] HRESULT PointerEntered([in] Windows.Foundation.TypedEventHandler<IInspectable *, Windows.UI.Core.PointerEventArgs *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT PointerEntered([in] Windows.Foundation.EventRegistrationToken token);
++        [eventadd] HRESULT PointerExited([in] Windows.Foundation.TypedEventHandler<IInspectable *, Windows.UI.Core.PointerEventArgs *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT PointerExited([in] Windows.Foundation.EventRegistrationToken token);
++        [eventadd] HRESULT PointerMoved([in] Windows.Foundation.TypedEventHandler<IInspectable *, Windows.UI.Core.PointerEventArgs *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT PointerMoved([in] Windows.Foundation.EventRegistrationToken token);
++        [eventadd] HRESULT PointerPressed([in] Windows.Foundation.TypedEventHandler<IInspectable *, Windows.UI.Core.PointerEventArgs *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT PointerPressed([in] Windows.Foundation.EventRegistrationToken token);
++        [eventadd] HRESULT PointerReleased([in] Windows.Foundation.TypedEventHandler<IInspectable *, Windows.UI.Core.PointerEventArgs *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT PointerReleased([in] Windows.Foundation.EventRegistrationToken token);
++        [eventadd] HRESULT PointerWheelChanged([in] Windows.Foundation.TypedEventHandler<IInspectable *, Windows.UI.Core.PointerEventArgs *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT PointerWheelChanged([in] Windows.Foundation.EventRegistrationToken token);
++    }
++
++}
++
++namespace Windows.UI.Xaml.Controls {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Controls.SwapChainPanel),
++        uuid(c589644f-eba8-427a-b75a-9f1f93a11ae9)
++    ]
++    interface ISwapChainPanel : IInspectable
++    {
++        [propget] HRESULT CompositionScaleX([out, retval] FLOAT *value);
++        [propget] HRESULT CompositionScaleY([out, retval] FLOAT *value);
++        [eventadd] HRESULT CompositionScaleChanged([in] Windows.Foundation.TypedEventHandler<Windows.UI.Xaml.Controls.SwapChainPanel *, IInspectable *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT CompositionScaleChanged([in] Windows.Foundation.EventRegistrationToken token);
++        HRESULT CreateCoreIndependentInputSource([in] Windows.UI.Core.CoreInputDeviceTypes deviceTypes, [out, retval] Windows.UI.Core.CoreIndependentInputSource * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Controls.SwapChainPanel),
++        uuid(f38f8d7f-1a48-49cb-86d2-10eaaaf6fd70)
++    ]
++    interface ISwapChainPanelFactory : IInspectable
++    {
++        HRESULT CreateInstance([in] IInspectable * baseInterface, [out] IInspectable * *innerInterface, [out, retval] Windows.UI.Xaml.Controls.SwapChainPanel * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Controls.SwapChainPanel),
++        uuid(f89c0297-eea8-498c-99c4-257e3660df7e)
++    ]
++    interface ISwapChainPanelStatics : IInspectable
++    {
++        [propget] HRESULT CompositionScaleXProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        [propget] HRESULT CompositionScaleYProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++    }
++
++}
++
++namespace Windows.UI.Xaml.Controls {
++    [
++        composable(Windows.UI.Xaml.Controls.ISwapChainPanelFactory, public, Windows.Foundation.UniversalApiContract, 1.0),
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.UI.Xaml.Controls.ISwapChainPanelStatics, Windows.Foundation.UniversalApiContract, 1.0),
++        threading(both)
++    ]
++    runtimeclass SwapChainPanel : Windows.UI.Xaml.Controls.Grid
++    {
++        [default] interface Windows.UI.Xaml.Controls.ISwapChainPanel;
++    }
++
++}
++
++namespace Windows.UI.Core {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass CoreIndependentInputSource
++    {
++        [default] interface Windows.UI.Core.ICoreInputSourceBase;
++    }
++
++}
++
++/* generated by scripts/winmd2idl.py: Media.CompositionTarget, RenderingEventArgs and RenderedEventArgs */
++
++namespace Windows.UI.Xaml.Media {
++    runtimeclass CompositionTarget;
++    interface ICompositionTarget;
++    interface ICompositionTargetStatics;
++    interface ICompositionTargetStatics3;
++    interface IRenderedEventArgs;
++    interface IRenderingEventArgs;
++    runtimeclass RenderedEventArgs;
++    runtimeclass RenderingEventArgs;
++}
++
++namespace Windows.UI.Xaml {
++    declare {
++        interface Windows.Foundation.EventHandler<Windows.UI.Xaml.Media.RenderedEventArgs *>;
++    }
++}
++
++namespace Windows.UI.Xaml.Media {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Media.CompositionTarget),
++        uuid(26cfbff0-713c-4bec-8803-e101f7b14ed3)
++    ]
++    interface ICompositionTarget : IInspectable
++    {
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Media.CompositionTarget),
++        uuid(2b1af03d-1ed2-4b59-bd00-7594ee92832b)
++    ]
++    interface ICompositionTargetStatics : IInspectable
++    {
++        [eventadd] HRESULT Rendering([in] Windows.Foundation.EventHandler<IInspectable *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT Rendering([in] Windows.Foundation.EventRegistrationToken token);
++        [eventadd] HRESULT SurfaceContentsLost([in] Windows.Foundation.EventHandler<IInspectable *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT SurfaceContentsLost([in] Windows.Foundation.EventRegistrationToken token);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 6.0),
++        exclusiveto(Windows.UI.Xaml.Media.CompositionTarget),
++        uuid(bc0a7cd9-6750-4708-994c-2028e0312ac8)
++    ]
++    interface ICompositionTargetStatics3 : IInspectable
++    {
++        [eventadd] HRESULT Rendered([in] Windows.Foundation.EventHandler<Windows.UI.Xaml.Media.RenderedEventArgs *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT Rendered([in] Windows.Foundation.EventRegistrationToken token);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 6.0),
++        exclusiveto(Windows.UI.Xaml.Media.RenderedEventArgs),
++        uuid(e349817d-81c7-4938-828c-a7e2797b35a6)
++    ]
++    interface IRenderedEventArgs : IInspectable
++    {
++        [propget] HRESULT FrameDuration([out, retval] Windows.Foundation.TimeSpan *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Media.RenderingEventArgs),
++        uuid(5bf7d30d-9748-4aed-8380-d7890eb776a0)
++    ]
++    interface IRenderingEventArgs : IInspectable
++    {
++        [propget] HRESULT RenderingTime([out, retval] Windows.Foundation.TimeSpan *value);
++    }
++
++}
++
++namespace Windows.UI.Xaml.Media {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.UI.Xaml.Media.ICompositionTargetStatics, Windows.Foundation.UniversalApiContract, 1.0),
++        static(Windows.UI.Xaml.Media.ICompositionTargetStatics3, Windows.Foundation.UniversalApiContract, 6.0),
++        threading(both)
++    ]
++    runtimeclass CompositionTarget
++    {
++        [default] interface Windows.UI.Xaml.Media.ICompositionTarget;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile)
++    ]
++    runtimeclass RenderingEventArgs
++    {
++        [default] interface Windows.UI.Xaml.Media.IRenderingEventArgs;
++    }
++
++}
++
++namespace Windows.UI.Xaml.Media {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 6.0)
++    ]
++    runtimeclass RenderedEventArgs
++    {
++        [default] interface Windows.UI.Xaml.Media.IRenderedEventArgs;
++    }
++
++}

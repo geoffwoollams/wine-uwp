@@ -1,0 +1,228 @@
+Subject: threadpoolwinrt: RunAsync's IAsyncAction reports status, errors and Completed
+
+diff --git a/dlls/threadpoolwinrt/main.c b/dlls/threadpoolwinrt/main.c
+index d047d3c..11f699b 100644
+--- a/dlls/threadpoolwinrt/main.c
++++ b/dlls/threadpoolwinrt/main.c
+@@ -49,8 +49,17 @@ struct async_action
+     IAsyncAction IAsyncAction_iface;
+     IAsyncInfo IAsyncInfo_iface;
+     LONG refcount;
++
++    SRWLOCK lock;
++    UINT32 id;
++    AsyncStatus status;
++    HRESULT error;
++    IAsyncActionCompletedHandler *handler;
++    BOOL handler_called;
+ };
+ 
++static LONG next_action_id;
++
+ static inline struct threadpool_factory *impl_from_IActivationFactory(IActivationFactory *iface)
+ {
+     return CONTAINING_RECORD(iface, struct threadpool_factory, IActivationFactory_iface);
+@@ -116,7 +125,10 @@ static ULONG STDMETHODCALLTYPE async_action_Release(IAsyncAction *iface)
+     TRACE("iface %p, refcount %lu.\n", iface, refcount);
+ 
+     if (!refcount)
++    {
++        if (action->handler) IAsyncActionCompletedHandler_Release(action->handler);
+         free(action);
++    }
+ 
+     return refcount;
+ }
+@@ -132,38 +144,89 @@ static HRESULT STDMETHODCALLTYPE async_action_GetIids(
+ static HRESULT STDMETHODCALLTYPE async_action_GetRuntimeClassName(
+         IAsyncAction *iface, HSTRING *class_name)
+ {
+-    FIXME("iface %p, class_name %p stub!\n", iface, class_name);
++    static const WCHAR name[] = L"Windows.Foundation.IAsyncAction";
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, class_name %p.\n", iface, class_name);
++
++    return WindowsCreateString(name, ARRAY_SIZE(name) - 1, class_name);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE async_action_GetTrustLevel(
+         IAsyncAction *iface, TrustLevel *trust_level)
+ {
+-    FIXME("iface %p, trust_level %p stub!\n", iface, trust_level);
++    TRACE("iface %p, trust_level %p.\n", iface, trust_level);
+ 
+-    return E_NOTIMPL;
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++/* calls the Completed handler once the action has finished and has one; takes the lock, releases it */
++static void async_action_notify(struct async_action *action)
++{
++    IAsyncActionCompletedHandler *handler = NULL;
++    AsyncStatus status = action->status;
++
++    if (action->handler && !action->handler_called && action->status != Started)
++    {
++        action->handler_called = TRUE;
++        IAsyncActionCompletedHandler_AddRef((handler = action->handler));
++    }
++    ReleaseSRWLockExclusive(&action->lock);
++
++    if (handler)
++    {
++        IAsyncActionCompletedHandler_Invoke(handler, &action->IAsyncAction_iface, status);
++        IAsyncActionCompletedHandler_Release(handler);
++    }
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE async_action_put_Completed(IAsyncAction *iface, IAsyncActionCompletedHandler *handler)
+ {
+-    FIXME("iface %p, handler %p stub!\n", iface, handler);
++    struct async_action *action = impl_from_IAsyncAction(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, handler %p.\n", iface, handler);
++
++    if (!handler) return E_POINTER;
++    AcquireSRWLockExclusive(&action->lock);
++    if (action->handler)
++    {
++        ReleaseSRWLockExclusive(&action->lock);
++        return E_ILLEGAL_DELEGATE_ASSIGNMENT;
++    }
++    IAsyncActionCompletedHandler_AddRef((action->handler = handler));
++    async_action_notify(action);   /* at once if it has finished */
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE async_action_get_Completed(IAsyncAction *iface, IAsyncActionCompletedHandler **handler)
+ {
+-    FIXME("iface %p, handler %p stub!\n", iface, handler);
++    struct async_action *action = impl_from_IAsyncAction(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, handler %p.\n", iface, handler);
++
++    AcquireSRWLockExclusive(&action->lock);
++    if ((*handler = action->handler)) IAsyncActionCompletedHandler_AddRef(*handler);
++    ReleaseSRWLockExclusive(&action->lock);
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE async_action_GetResults(IAsyncAction *iface)
+ {
+-    FIXME("iface %p stub!\n", iface);
++    struct async_action *action = impl_from_IAsyncAction(iface);
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p.\n", iface);
++
++    AcquireSRWLockExclusive(&action->lock);
++    switch (action->status)
++    {
++    case Completed: hr = S_OK; break;
++    case Error: hr = action->error; break;
++    case Canceled: hr = HRESULT_FROM_WIN32(ERROR_CANCELLED); break;
++    default: hr = E_ILLEGAL_METHOD_CALL; break;
++    }
++    ReleaseSRWLockExclusive(&action->lock);
++    return hr;
+ }
+ 
+ static const IAsyncActionVtbl async_action_vtbl =
+@@ -217,37 +280,54 @@ static HRESULT STDMETHODCALLTYPE async_info_GetTrustLevel(IAsyncInfo *iface, Tru
+ 
+ static HRESULT STDMETHODCALLTYPE async_info_get_Id(IAsyncInfo *iface, UINT32 *id)
+ {
+-    FIXME("iface %p, id %p stub!\n", iface, id);
++    TRACE("iface %p, id %p.\n", iface, id);
+ 
+-    return E_NOTIMPL;
++    *id = impl_from_IAsyncInfo(iface)->id;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE async_info_get_Status(IAsyncInfo *iface, AsyncStatus *status)
+ {
+-    FIXME("iface %p, status %p stub!\n", iface, status);
++    struct async_action *action = impl_from_IAsyncInfo(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, status %p.\n", iface, status);
++
++    AcquireSRWLockExclusive(&action->lock);
++    *status = action->status;
++    ReleaseSRWLockExclusive(&action->lock);
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE async_info_get_ErrorCode(IAsyncInfo *iface, HRESULT *error_code)
+ {
+-    FIXME("iface %p, error_code %p stub!\n", iface, error_code);
++    struct async_action *action = impl_from_IAsyncInfo(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, error_code %p.\n", iface, error_code);
++
++    AcquireSRWLockExclusive(&action->lock);
++    *error_code = action->status == Error ? action->error : action->status == Canceled ? HRESULT_FROM_WIN32(ERROR_CANCELLED) : S_OK;
++    ReleaseSRWLockExclusive(&action->lock);
++    return S_OK;
+ }
+ 
++/* the work item still runs (it can check the status), but the action reports it as cancelled */
+ static HRESULT STDMETHODCALLTYPE async_info_Cancel(IAsyncInfo *iface)
+ {
+-    FIXME("iface %p stub!\n", iface);
++    struct async_action *action = impl_from_IAsyncInfo(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p.\n", iface);
++
++    AcquireSRWLockExclusive(&action->lock);
++    if (action->status == Started) action->status = Canceled;
++    async_action_notify(action);
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE async_info_Close(IAsyncInfo *iface)
+ {
+-    FIXME("iface %p stub!\n", iface);
++    TRACE("iface %p.\n", iface);
+ 
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static const IAsyncInfoVtbl async_info_vtbl =
+@@ -277,6 +357,9 @@ static HRESULT async_action_create(IAsyncAction **ret)
+     object->IAsyncAction_iface.lpVtbl = &async_action_vtbl;
+     object->IAsyncInfo_iface.lpVtbl = &async_info_vtbl;
+     object->refcount = 1;
++    InitializeSRWLock(&object->lock);
++    object->id = InterlockedIncrement(&next_action_id);
++    object->status = Started;
+ 
+     *ret = &object->IAsyncAction_iface;
+ 
+@@ -321,7 +404,16 @@ static HRESULT alloc_work_item(IWorkItemHandler *handler, struct work_item **ret
+ 
+ static void work_item_invoke_release(struct work_item *item)
+ {
+-    IWorkItemHandler_Invoke(item->handler, item->action);
++    struct async_action *action = impl_from_IAsyncAction(item->action);
++    HRESULT hr = IWorkItemHandler_Invoke(item->handler, item->action);
++
++    AcquireSRWLockExclusive(&action->lock);
++    if (action->status == Started)
++    {
++        action->status = FAILED(hr) ? Error : Completed;
++        action->error = hr;
++    }
++    async_action_notify(action);
+     release_work_item(item);
+ }
+ 

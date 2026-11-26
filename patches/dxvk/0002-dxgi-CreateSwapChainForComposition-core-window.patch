@@ -1,0 +1,35 @@
+Subject: dxgi: present composition swap chains (SwapChainPanel) to Wine's core window
+
+diff --git a/src/dxgi/dxgi_factory.cpp b/src/dxgi/dxgi_factory.cpp
+--- a/src/dxgi/dxgi_factory.cpp	2026-11-26 19:26:52.363683558 +1300
++++ b/src/dxgi/dxgi_factory.cpp	2026-11-26 19:26:52.370683542 +1300
+@@ -322,6 +322,29 @@
+           IDXGISwapChain1**     ppSwapChain) {
+     InitReturnPtr(ppSwapChain);
+ 
++    // XAML's SwapChainPanel and SurfaceImageSource show composition swap
++    // chains. With Wine's CoreWindow, whose XAML stops drawing while a
++    // SwapChainPanel holds one, presenting to the core window's HWND
++    // shows the frames where they belong (for a panel filling the window).
++    HWND coreWindow = nullptr;
++
++    while ((coreWindow = FindWindowExW(nullptr, coreWindow, L"WineCoreWindow", nullptr))) {
++      DWORD pid = 0;
++      GetWindowThreadProcessId(coreWindow, &pid);
++
++      if (pid == GetCurrentProcessId())
++        break;
++    }
++
++    if (coreWindow && pDesc) {
++      DXGI_SWAP_CHAIN_DESC1 desc = *pDesc;
++      desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
++      desc.Scaling = DXGI_SCALING_STRETCH;
++
++      Logger::warn(str::format("DxgiFactory::CreateSwapChainForComposition: Using core window HWND ", coreWindow));
++      return CreateSwapChainForHwnd(pDevice, coreWindow, &desc, nullptr, pRestrictToOutput, ppSwapChain);
++    }
++
+     if (!m_options->enableDummyCompositionSwapchain) {
+       Logger::err("DxgiFactory::CreateSwapChainForComposition: Not implemented");
+       return E_NOTIMPL;

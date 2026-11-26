@@ -261,7 +261,10 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 PasswordBox), 0047-0048 part 3 (Image, BitmapImage, ImageBrush), 0049-0050 part 4 (ListView,
                 GridView, their items and panels), 0051-0052 part 5a (ContentDialog; 0051 has all of part 5's IDL),
                 0053 part 5b (CommandBar, app bar buttons, icons), 0054 compiled XAML read from resources.pri
-                and app pages from C++/CX TypeNames, 0055 PointerVisualizationSettings (Microsoft Minesweeper)
+                and app pages from C++/CX TypeNames, 0055-0060 for Microsoft Minesweeper (a Unity XAML game):
+                PointerVisualizationSettings, PnpObject, SystemNavigationManager, input capabilities,
+                ICoreApplication2, MediaDevice selectors, the thread pool's IAsyncAction, SwapChainPanel,
+                CompositionTarget, Loaded/SizeChanged
 patches/dxvk/   patch against DXVK f90f1bf1 (v3.1.1-235)
 docker/         build containers
 apps/           optional per-app settings

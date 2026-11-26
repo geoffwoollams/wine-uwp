@@ -1,0 +1,816 @@
+Subject: twinapi.appcore: SystemNavigationManager, Keyboard/Mouse/TouchCapabilities and ICoreApplication2
+
+diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
+index c6a2331..87486a8 100644
+--- a/dlls/twinapi.appcore/Makefile.in
++++ b/dlls/twinapi.appcore/Makefile.in
+@@ -16,6 +16,7 @@ SOURCES = \
+ 	data_transfer.c \
+ 	core_input_gen.c \
+ 	sink.c \
++	system_navigation.c \
+ 	store.c \
+ 	xbox_identity.c \
+ 	xboxlive_address.c \
+@@ -33,5 +34,6 @@ SOURCES = \
+ 	mouse.c \
+ 	pointer_visualization.c \
+ 	hardware_identification.c \
++	input_capabilities.c \
+ 	main.c \
+ 	manifest.c
+diff --git a/dlls/twinapi.appcore/core_gen.c b/dlls/twinapi.appcore/core_gen.c
+index 4c34b0d..cd1b928 100644
+--- a/dlls/twinapi.appcore/core_gen.c
++++ b/dlls/twinapi.appcore/core_gen.c
+@@ -170,6 +170,7 @@ struct core_app
+     ICoreApplicationExit ICoreApplicationExit_iface;
+     ICoreImmersiveApplication ICoreImmersiveApplication_iface;
+     ICoreApplicationUnhandledError ICoreApplicationUnhandledError_iface;
++    ICoreApplication2 ICoreApplication2_iface;
+     LONG ref;
+     struct core_view *view;
+     BOOL exit_requested;
+@@ -523,6 +524,8 @@ static HRESULT core_app_qi(struct core_app *impl, REFIID iid, void **out)
+         *out = &impl->ICoreImmersiveApplication_iface;
+     else if (IsEqualGUID(iid, &IID_ICoreApplicationUnhandledError))
+         *out = &impl->ICoreApplicationUnhandledError_iface;
++    else if (IsEqualGUID(iid, &IID_ICoreApplication2))
++        *out = &impl->ICoreApplication2_iface;
+     else
+     {
+         FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
+@@ -1877,6 +1880,48 @@ static const ICoreApplicationExitVtbl core_app_exit_vtbl =
+     core_app_exit_remove_Exiting,
+ };
+ 
++/* ---- ICoreApplication2 on core_app: there is no prelaunch or background activation, so its events never fire ---- */
++static inline struct core_app *impl_from_core_app2(ICoreApplication2 *iface)
++{ return CONTAINING_RECORD(iface, struct core_app, ICoreApplication2_iface); }
++static HRESULT WINAPI core_app2_QueryInterface(ICoreApplication2 *iface, REFIID iid, void **out)
++{ return core_app_qi(impl_from_core_app2(iface), iid, out); }
++static ULONG WINAPI core_app2_AddRef(ICoreApplication2 *iface) { return core_app_addref(impl_from_core_app2(iface)); }
++static ULONG WINAPI core_app2_Release(ICoreApplication2 *iface) { return core_app_release(impl_from_core_app2(iface)); }
++static HRESULT WINAPI core_app2_GetIids(ICoreApplication2 *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI core_app2_GetRuntimeClassName(ICoreApplication2 *iface, HSTRING *name) { return E_NOTIMPL; }
++static HRESULT WINAPI core_app2_GetTrustLevel(ICoreApplication2 *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI core_app2_add_event(ICoreApplication2 *iface, void *handler, EventRegistrationToken *token)
++{
++    TRACE("iface %p, handler %p (never raised).\n", iface, handler);
++    token->value = InterlockedIncrement(&event_token_counter);
++    return S_OK;
++}
++static HRESULT WINAPI core_app2_remove_event(ICoreApplication2 *iface, EventRegistrationToken token) { return S_OK; }
++
++static HRESULT WINAPI core_app2_EnablePrelaunch(ICoreApplication2 *iface, boolean value)
++{
++    TRACE("iface %p, value %d: apps aren't prelaunched.\n", iface, value);
++    return S_OK;
++}
++
++static const ICoreApplication2Vtbl core_app2_vtbl =
++{
++    core_app2_QueryInterface,
++    core_app2_AddRef,
++    core_app2_Release,
++    core_app2_GetIids,
++    core_app2_GetRuntimeClassName,
++    core_app2_GetTrustLevel,
++    (void *)core_app2_add_event,   /* BackgroundActivated */
++    core_app2_remove_event,
++    (void *)core_app2_add_event,   /* LeavingBackground */
++    core_app2_remove_event,
++    (void *)core_app2_add_event,   /* EnteredBackground */
++    core_app2_remove_event,
++    core_app2_EnablePrelaunch,
++};
++
+ /* ---- ICoreApplicationUnhandledError on core_app ---- */
+ /* Gears of War 4 subscribes to UnhandledErrorDetected in Initialize and stops if it can't. The event is never
+  * raised: errors that would raise it end the process here instead. */
+@@ -2225,6 +2270,7 @@ void core_application_init(void)
+     core_app_instance.IActivationFactory_iface.lpVtbl = &factory_vtbl;
+     core_app_instance.ICoreApplication_iface.lpVtbl = &core_app_vtbl;
+     core_app_instance.ICoreApplicationExit_iface.lpVtbl = &core_app_exit_vtbl;
++    core_app_instance.ICoreApplication2_iface.lpVtbl = &core_app2_vtbl;
+     core_app_instance.ICoreApplicationUnhandledError_iface.lpVtbl = &core_app_unhandled_vtbl;
+     core_app_instance.ICoreImmersiveApplication_iface.lpVtbl = &core_immersive_vtbl;
+     core_app_instance.ref = 1;
+diff --git a/dlls/twinapi.appcore/input_capabilities.c b/dlls/twinapi.appcore/input_capabilities.c
+new file mode 100644
+index 0000000..6dc9aa4
+--- /dev/null
++++ b/dlls/twinapi.appcore/input_capabilities.c
+@@ -0,0 +1,202 @@
++/* WinRT Windows.Devices.Input KeyboardCapabilities, MouseCapabilities and TouchCapabilities implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
++
++/* What input the machine has: a keyboard and a mouse (its buttons from the system metrics), and no touch screen,
++ * which Wine doesn't pass on as touch. Each class's instances are one static object. */
++
++#define CAPS_IUNKNOWN( pfx, Iface, class_name ) \
++static HRESULT WINAPI pfx##_QueryInterface( Iface *iface, REFIID iid, void **out ) \
++{ \
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) || \
++        IsEqualGUID( iid, &IID_##Iface )) \
++    { \
++        *out = iface; \
++        return S_OK; \
++    } \
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) ); \
++    *out = NULL; \
++    return E_NOINTERFACE; \
++} \
++static ULONG WINAPI pfx##_AddRef( Iface *iface ) { return 2; } \
++static ULONG WINAPI pfx##_Release( Iface *iface ) { return 1; } \
++static HRESULT WINAPI pfx##_GetIids( Iface *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; } \
++static HRESULT WINAPI pfx##_GetRuntimeClassName( Iface *iface, HSTRING *name ) \
++{ \
++    return WindowsCreateString( class_name, wcslen( class_name ), name ); \
++} \
++static HRESULT WINAPI pfx##_GetTrustLevel( Iface *iface, TrustLevel *level ) \
++{ \
++    *level = BaseTrust; \
++    return S_OK; \
++}
++
++CAPS_IUNKNOWN( keyboard, IKeyboardCapabilities, L"Windows.Devices.Input.KeyboardCapabilities" )
++
++static HRESULT WINAPI keyboard_get_KeyboardPresent( IKeyboardCapabilities *iface, INT32 *value )
++{
++    *value = 1;
++    return S_OK;
++}
++
++static const struct IKeyboardCapabilitiesVtbl keyboard_vtbl =
++{
++    keyboard_QueryInterface, keyboard_AddRef, keyboard_Release,
++    keyboard_GetIids, keyboard_GetRuntimeClassName, keyboard_GetTrustLevel,
++    keyboard_get_KeyboardPresent,
++};
++
++static IKeyboardCapabilities keyboard_caps = { &keyboard_vtbl };
++
++CAPS_IUNKNOWN( mouse_caps, IMouseCapabilities, L"Windows.Devices.Input.MouseCapabilities" )
++
++static HRESULT WINAPI mouse_caps_get_MousePresent( IMouseCapabilities *iface, INT32 *value )
++{
++    *value = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI mouse_caps_get_VerticalWheelPresent( IMouseCapabilities *iface, INT32 *value )
++{
++    *value = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI mouse_caps_get_HorizontalWheelPresent( IMouseCapabilities *iface, INT32 *value )
++{
++    *value = 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI mouse_caps_get_SwapButtons( IMouseCapabilities *iface, INT32 *value )
++{
++    *value = GetSystemMetrics( SM_SWAPBUTTON ) ? 1 : 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI mouse_caps_get_NumberOfButtons( IMouseCapabilities *iface, UINT32 *value )
++{
++    *value = max( 3, GetSystemMetrics( SM_CMOUSEBUTTONS ) );
++    return S_OK;
++}
++
++static const struct IMouseCapabilitiesVtbl mouse_caps_vtbl =
++{
++    mouse_caps_QueryInterface, mouse_caps_AddRef, mouse_caps_Release,
++    mouse_caps_GetIids, mouse_caps_GetRuntimeClassName, mouse_caps_GetTrustLevel,
++    mouse_caps_get_MousePresent,
++    mouse_caps_get_VerticalWheelPresent,
++    mouse_caps_get_HorizontalWheelPresent,
++    mouse_caps_get_SwapButtons,
++    mouse_caps_get_NumberOfButtons,
++};
++
++static IMouseCapabilities mouse_caps = { &mouse_caps_vtbl };
++
++CAPS_IUNKNOWN( touch_caps, ITouchCapabilities, L"Windows.Devices.Input.TouchCapabilities" )
++
++static HRESULT WINAPI touch_caps_get_TouchPresent( ITouchCapabilities *iface, INT32 *value )
++{
++    *value = 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI touch_caps_get_Contacts( ITouchCapabilities *iface, UINT32 *value )
++{
++    *value = 0;
++    return S_OK;
++}
++
++static const struct ITouchCapabilitiesVtbl touch_caps_vtbl =
++{
++    touch_caps_QueryInterface, touch_caps_AddRef, touch_caps_Release,
++    touch_caps_GetIids, touch_caps_GetRuntimeClassName, touch_caps_GetTrustLevel,
++    touch_caps_get_TouchPresent,
++    touch_caps_get_Contacts,
++};
++
++static ITouchCapabilities touch_caps = { &touch_caps_vtbl };
++
++/* the factories: ActivateInstance gives the object */
++
++struct caps_factory
++{
++    IActivationFactory IActivationFactory_iface;
++    IInspectable *instance;
++};
++
++static inline struct caps_factory *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct caps_factory, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++    *instance = impl_from_IActivationFactory( iface )->instance;
++    return S_OK;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++static struct caps_factory keyboard_factory = { {&factory_vtbl}, (IInspectable *)&keyboard_caps };
++static struct caps_factory mouse_factory = { {&factory_vtbl}, (IInspectable *)&mouse_caps };
++static struct caps_factory touch_factory = { {&factory_vtbl}, (IInspectable *)&touch_caps };
++
++IActivationFactory *keyboard_capabilities_factory = &keyboard_factory.IActivationFactory_iface;
++IActivationFactory *mouse_capabilities_factory = &mouse_factory.IActivationFactory_iface;
++IActivationFactory *touch_capabilities_factory = &touch_factory.IActivationFactory_iface;
+diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
+index b7e30f3..1cf715a 100644
+--- a/dlls/twinapi.appcore/main.c
++++ b/dlls/twinapi.appcore/main.c
+@@ -116,9 +116,21 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+     else if (!wcscmp( buffer, L"Windows.Devices.Input.PointerDevice" ))
+         IActivationFactory_QueryInterface( pointer_device_factory, &IID_IActivationFactory, (void **)factory );
+ 
++    else if (!wcscmp( buffer, L"Windows.UI.Core.SystemNavigationManager" ))
++        IActivationFactory_QueryInterface( system_navigation_factory, &IID_IActivationFactory, (void **)factory );
++
+     else if (!wcscmp( buffer, L"Windows.UI.Input.PointerVisualizationSettings" ))
+         IActivationFactory_QueryInterface( pointer_visualization_factory, &IID_IActivationFactory, (void **)factory );
+ 
++    else if (!wcscmp( buffer, L"Windows.Devices.Input.KeyboardCapabilities" ))
++        IActivationFactory_QueryInterface( keyboard_capabilities_factory, &IID_IActivationFactory, (void **)factory );
++
++    else if (!wcscmp( buffer, L"Windows.Devices.Input.MouseCapabilities" ))
++        IActivationFactory_QueryInterface( mouse_capabilities_factory, &IID_IActivationFactory, (void **)factory );
++
++    else if (!wcscmp( buffer, L"Windows.Devices.Input.TouchCapabilities" ))
++        IActivationFactory_QueryInterface( touch_capabilities_factory, &IID_IActivationFactory, (void **)factory );
++
+     else if (!wcscmp( buffer, L"Windows.Devices.Input.MouseDevice" ))
+         IActivationFactory_QueryInterface( mouse_device_factory, &IID_IActivationFactory, (void **)factory );
+ 
+diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
+index a2e49d6..6383172 100644
+--- a/dlls/twinapi.appcore/private.h
++++ b/dlls/twinapi.appcore/private.h
+@@ -66,6 +66,10 @@ extern void display_information_init(void);
+ extern IActivationFactory *extended_execution_factory;
+ extern IActivationFactory *core_cursor_factory;
+ extern IActivationFactory *pointer_visualization_factory;
++extern IActivationFactory *system_navigation_factory;
++extern IActivationFactory *keyboard_capabilities_factory;
++extern IActivationFactory *mouse_capabilities_factory;
++extern IActivationFactory *touch_capabilities_factory;
+ extern void core_cursor_init(void);
+ extern IActivationFactory *message_dialog_factory;
+ extern void message_dialog_init(void);
+diff --git a/dlls/twinapi.appcore/system_navigation.c b/dlls/twinapi.appcore/system_navigation.c
+new file mode 100644
+index 0000000..36a8b62
+--- /dev/null
++++ b/dlls/twinapi.appcore/system_navigation.c
+@@ -0,0 +1,232 @@
++/* WinRT Windows.UI.Core.SystemNavigationManager implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
++
++/* SystemNavigationManager.GetForCurrentView(): the title bar's back button and the system's back request (the
++ * phone's back key, Win+Backspace). The window has no back button and nothing sends back requests, so the
++ * visibility is kept and BackRequested handlers are kept but never called. */
++
++#define MAX_HANDLERS 16
++
++struct navigation
++{
++    ISystemNavigationManager ISystemNavigationManager_iface;
++    ISystemNavigationManager2 ISystemNavigationManager2_iface;
++    AppViewBackButtonVisibility visibility;
++    IEventHandler_BackRequestedEventArgs *handlers[MAX_HANDLERS];
++};
++
++static inline struct navigation *impl_from_ISystemNavigationManager( ISystemNavigationManager *iface )
++{
++    return CONTAINING_RECORD( iface, struct navigation, ISystemNavigationManager_iface );
++}
++
++static HRESULT WINAPI navigation_QueryInterface( ISystemNavigationManager *iface, REFIID iid, void **out )
++{
++    struct navigation *impl = impl_from_ISystemNavigationManager( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_ISystemNavigationManager ))
++        *out = &impl->ISystemNavigationManager_iface;
++    else if (IsEqualGUID( iid, &IID_ISystemNavigationManager2 ))
++        *out = &impl->ISystemNavigationManager2_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI navigation_AddRef( ISystemNavigationManager *iface ) { return 2; }
++static ULONG WINAPI navigation_Release( ISystemNavigationManager *iface ) { return 1; }
++static HRESULT WINAPI navigation_GetIids( ISystemNavigationManager *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI navigation_GetRuntimeClassName( ISystemNavigationManager *iface, HSTRING *name )
++{
++    static const WCHAR class_name[] = L"Windows.UI.Core.SystemNavigationManager";
++    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
++}
++
++static HRESULT WINAPI navigation_GetTrustLevel( ISystemNavigationManager *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI navigation_add_BackRequested( ISystemNavigationManager *iface, IEventHandler_BackRequestedEventArgs *handler,
++                                                    EventRegistrationToken *token )
++{
++    struct navigation *impl = impl_from_ISystemNavigationManager( iface );
++    UINT32 i;
++
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    for (i = 0; i < MAX_HANDLERS; i++)
++    {
++        if (impl->handlers[i]) continue;
++        IEventHandler_BackRequestedEventArgs_AddRef( (impl->handlers[i] = handler) );
++        token->value = i + 1;
++        return S_OK;
++    }
++    token->value = 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI navigation_remove_BackRequested( ISystemNavigationManager *iface, EventRegistrationToken token )
++{
++    struct navigation *impl = impl_from_ISystemNavigationManager( iface );
++
++    if (token.value < 1 || token.value > MAX_HANDLERS || !impl->handlers[token.value - 1]) return S_OK;
++    IEventHandler_BackRequestedEventArgs_Release( impl->handlers[token.value - 1] );
++    impl->handlers[token.value - 1] = NULL;
++    return S_OK;
++}
++
++static const struct ISystemNavigationManagerVtbl navigation_vtbl =
++{
++    navigation_QueryInterface,
++    navigation_AddRef,
++    navigation_Release,
++    /* IInspectable methods */
++    navigation_GetIids,
++    navigation_GetRuntimeClassName,
++    navigation_GetTrustLevel,
++    /* ISystemNavigationManager methods */
++    navigation_add_BackRequested,
++    navigation_remove_BackRequested,
++};
++
++DEFINE_IINSPECTABLE( navigation2, ISystemNavigationManager2, struct navigation, ISystemNavigationManager_iface )
++
++static HRESULT WINAPI navigation2_get_AppViewBackButtonVisibility( ISystemNavigationManager2 *iface, AppViewBackButtonVisibility *value )
++{
++    *value = impl_from_ISystemNavigationManager2( iface )->visibility;
++    return S_OK;
++}
++
++static HRESULT WINAPI navigation2_put_AppViewBackButtonVisibility( ISystemNavigationManager2 *iface, AppViewBackButtonVisibility value )
++{
++    TRACE( "iface %p, value %d: the window has no back button.\n", iface, value );
++    impl_from_ISystemNavigationManager2( iface )->visibility = value;
++    return S_OK;
++}
++
++static const struct ISystemNavigationManager2Vtbl navigation2_vtbl =
++{
++    navigation2_QueryInterface,
++    navigation2_AddRef,
++    navigation2_Release,
++    /* IInspectable methods */
++    navigation2_GetIids,
++    navigation2_GetRuntimeClassName,
++    navigation2_GetTrustLevel,
++    /* ISystemNavigationManager2 methods */
++    navigation2_get_AppViewBackButtonVisibility,
++    navigation2_put_AppViewBackButtonVisibility,
++};
++
++/* one view, so one manager */
++static struct navigation navigation = { {&navigation_vtbl}, {&navigation2_vtbl}, AppViewBackButtonVisibility_Collapsed };
++
++struct statics
++{
++    IActivationFactory IActivationFactory_iface;
++    ISystemNavigationManagerStatics ISystemNavigationManagerStatics_iface;
++};
++
++static inline struct statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct statics *impl = impl_from_IActivationFactory( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_ISystemNavigationManagerStatics ))
++        *out = &impl->ISystemNavigationManagerStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( nav_statics, ISystemNavigationManagerStatics, struct statics, IActivationFactory_iface )
++
++static HRESULT WINAPI nav_statics_GetForCurrentView( ISystemNavigationManagerStatics *iface, ISystemNavigationManager **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = &navigation.ISystemNavigationManager_iface;
++    return S_OK;
++}
++
++static const struct ISystemNavigationManagerStaticsVtbl nav_statics_vtbl =
++{
++    nav_statics_QueryInterface,
++    nav_statics_AddRef,
++    nav_statics_Release,
++    /* IInspectable methods */
++    nav_statics_GetIids,
++    nav_statics_GetRuntimeClassName,
++    nav_statics_GetTrustLevel,
++    /* ISystemNavigationManagerStatics methods */
++    nav_statics_GetForCurrentView,
++};
++
++static struct statics statics = { {&factory_vtbl}, {&nav_statics_vtbl} };
++IActivationFactory *system_navigation_factory = &statics.IActivationFactory_iface;
+diff --git a/dlls/twinapi.appcore/twinapi.appcore.rgs b/dlls/twinapi.appcore/twinapi.appcore.rgs
+index 7d16e9f..d6346d5 100644
+--- a/dlls/twinapi.appcore/twinapi.appcore.rgs
++++ b/dlls/twinapi.appcore/twinapi.appcore.rgs
+@@ -116,10 +116,26 @@ HKLM
+                     {
+                         val 'DllPath' = s '%MODULE%'
+                     }
++                    ForceRemove Windows.Devices.Input.KeyboardCapabilities
++                    {
++                        val 'DllPath' = s '%MODULE%'
++                    }
++                    ForceRemove Windows.Devices.Input.MouseCapabilities
++                    {
++                        val 'DllPath' = s '%MODULE%'
++                    }
++                    ForceRemove Windows.Devices.Input.TouchCapabilities
++                    {
++                        val 'DllPath' = s '%MODULE%'
++                    }
+                     ForceRemove Windows.Devices.Input.MouseDevice
+                     {
+                         val 'DllPath' = s '%MODULE%'
+                     }
++                    ForceRemove Windows.UI.Core.SystemNavigationManager
++                    {
++                        val 'DllPath' = s '%MODULE%'
++                    }
+                     ForceRemove Windows.UI.Input.PointerVisualizationSettings
+                     {
+                         val 'DllPath' = s '%MODULE%'
+diff --git a/include/windows.devices.input.idl b/include/windows.devices.input.idl
+index ff7ebb6..390ece3 100644
+--- a/include/windows.devices.input.idl
++++ b/include/windows.devices.input.idl
+@@ -198,3 +198,84 @@ namespace Windows.Devices.Input {
+     }
+ 
+ }
++
++/* generated by scripts/winmd2idl.py: Windows.Devices.Input Keyboard, Mouse and TouchCapabilities */
++namespace Windows.Devices.Input {
++    interface IKeyboardCapabilities;
++    interface IMouseCapabilities;
++    interface ITouchCapabilities;
++    runtimeclass KeyboardCapabilities;
++    runtimeclass MouseCapabilities;
++    runtimeclass TouchCapabilities;
++}
++
++namespace Windows.Devices.Input {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.Input.KeyboardCapabilities),
++        uuid(3a3f9b56-6798-4bbc-833e-0f34b17c65ff)
++    ]
++    interface IKeyboardCapabilities : IInspectable
++    {
++        [propget] HRESULT KeyboardPresent([out, retval] INT32 *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.Input.MouseCapabilities),
++        uuid(bca5e023-7dd9-4b6b-9a92-55d43cb38f73)
++    ]
++    interface IMouseCapabilities : IInspectable
++    {
++        [propget] HRESULT MousePresent([out, retval] INT32 *value);
++        [propget] HRESULT VerticalWheelPresent([out, retval] INT32 *value);
++        [propget] HRESULT HorizontalWheelPresent([out, retval] INT32 *value);
++        [propget] HRESULT SwapButtons([out, retval] INT32 *value);
++        [propget] HRESULT NumberOfButtons([out, retval] UINT32 *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.Input.TouchCapabilities),
++        uuid(20dd55f9-13f1-46c8-9285-2c05fa3eda6f)
++    ]
++    interface ITouchCapabilities : IInspectable
++    {
++        [propget] HRESULT TouchPresent([out, retval] INT32 *value);
++        [propget] HRESULT Contacts([out, retval] UINT32 *value);
++    }
++
++}
++
++namespace Windows.Devices.Input {
++    [
++        activatable(Windows.Foundation.UniversalApiContract, 1.0),
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile)
++    ]
++    runtimeclass KeyboardCapabilities
++    {
++        [default] interface Windows.Devices.Input.IKeyboardCapabilities;
++    }
++
++    [
++        activatable(Windows.Foundation.UniversalApiContract, 1.0),
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile)
++    ]
++    runtimeclass MouseCapabilities
++    {
++        [default] interface Windows.Devices.Input.IMouseCapabilities;
++    }
++
++    [
++        activatable(Windows.Foundation.UniversalApiContract, 1.0),
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile)
++    ]
++    runtimeclass TouchCapabilities
++    {
++        [default] interface Windows.Devices.Input.ITouchCapabilities;
++    }
++
++}
+diff --git a/include/windows.ui.core.idl b/include/windows.ui.core.idl
+index 68159d7..c1a6645 100644
+--- a/include/windows.ui.core.idl
++++ b/include/windows.ui.core.idl
+@@ -747,3 +747,105 @@ namespace Windows.UI.Core {
+         interface Windows.UI.Core.ICoreWindowEventArgs;
+     }
+ }
++
++/* generated by scripts/winmd2idl.py: Windows.UI.Core.SystemNavigationManager */
++
++namespace Windows.UI.Core {
++    typedef enum AppViewBackButtonVisibility AppViewBackButtonVisibility;
++    runtimeclass BackRequestedEventArgs;
++    interface IBackRequestedEventArgs;
++    interface ISystemNavigationManager;
++    interface ISystemNavigationManager2;
++    interface ISystemNavigationManagerStatics;
++    runtimeclass SystemNavigationManager;
++}
++
++namespace Windows.UI.Core {
++    declare {
++        interface Windows.Foundation.EventHandler<Windows.UI.Core.BackRequestedEventArgs *>;
++    }
++}
++
++namespace Windows.UI.Core {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum AppViewBackButtonVisibility
++    {
++        Visible = 0,
++        Collapsed = 1,
++        Disabled = 2
++    };
++
++}
++
++namespace Windows.UI.Core {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Core.BackRequestedEventArgs),
++        uuid(d603d28a-e411-4a4e-ba41-6a327a8675bc)
++    ]
++    interface IBackRequestedEventArgs : IInspectable
++    {
++        [propget] HRESULT Handled([out, retval] boolean *value);
++        [propput] HRESULT Handled([in] boolean value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Core.SystemNavigationManager),
++        uuid(93023118-cf50-42a6-9706-69107fa122e1)
++    ]
++    interface ISystemNavigationManager : IInspectable
++    {
++        [eventadd] HRESULT BackRequested([in] Windows.Foundation.EventHandler<Windows.UI.Core.BackRequestedEventArgs *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT BackRequested([in] Windows.Foundation.EventRegistrationToken token);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Core.SystemNavigationManager),
++        uuid(8c510401-67be-49ae-9509-671c1e54a389)
++    ]
++    interface ISystemNavigationManager2 : IInspectable
++    {
++        [propget] HRESULT AppViewBackButtonVisibility([out, retval] Windows.UI.Core.AppViewBackButtonVisibility *value);
++        [propput] HRESULT AppViewBackButtonVisibility([in] Windows.UI.Core.AppViewBackButtonVisibility value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Core.SystemNavigationManager),
++        uuid(dc52b5ce-bee0-4305-8c54-68228ed683b5)
++    ]
++    interface ISystemNavigationManagerStatics : IInspectable
++    {
++        HRESULT GetForCurrentView([out, retval] Windows.UI.Core.SystemNavigationManager * *value);
++    }
++
++}
++
++namespace Windows.UI.Core {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.UI.Core.ISystemNavigationManagerStatics, Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass SystemNavigationManager
++    {
++        [default] interface Windows.UI.Core.ISystemNavigationManager;
++        [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.UI.Core.ISystemNavigationManager2;
++    }
++
++}
++
++namespace Windows.UI.Core {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass BackRequestedEventArgs
++    {
++        [default] interface Windows.UI.Core.IBackRequestedEventArgs;
++    }
++
++}
