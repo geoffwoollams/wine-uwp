@@ -730,3 +730,38 @@ Patch 0050 is the code: `items.c` (ListView and GridView), the new `listview.c` 
   - the GridView's four tiles to a row with the fifth wrapping;
   - `ItemClick` with the Border as `ClickedItem`, Multiple's clicks toggling, the accent frame, and `SelectAll`.
 - Milestones 1 and 2 still pass 34/34.
+
+## 21. Milestone 5, part 5a: ContentDialog and the popup layer (patches 0051-0052)
+
+Patch 0051 is the IDL for all of part 5. `winmd2idl.py` generated `Controls.ContentDialog` with its event arguments and
+deferrals, `CommandBar`, `AppBarButton`, `AppBarToggleButton`, `AppBarSeparator`, `IconElement`, `SymbolIcon` and
+`FontIcon`.
+- `AsyncOperationCompletedHandler<ContentDialogResult>` is declared by hand.
+
+Patch 0052 is the code: the new `dialog.c`, and a popup layer in `window.c`.
+
+**What was built:**
+
+- **The popup layer:** the window keeps a stack of popups, drawn over the content. Each gets the whole window to lay itself out in.
+  - The topmost popup is modal: it gets the pointer, the wheel and the Tab order. Only elements inside it can take the focus (`window_input_root`).
+  - CommandBar's overflow menu and, later, flyouts can use it too.
+- **`ContentDialog`** is a ContentControl, one more kind of the shared Button object. It draws nothing where it is in the tree.
+  - **`ShowAsync`** puts a layer over the window: a translucent smoke over the page (`#99FFFFFF`, or `#99000000` in the dark theme), and Windows 10's dialog box in the middle.
+  - **The box:** 320 to 548 px wide with 24 px padding and an accent border. It holds the `Title` (20 px text, or a UIElement), the `Content` (a UIElement, or wrapped text), and a row of up to three equal buttons for `PrimaryButtonText`, `SecondaryButtonText` and `CloseButtonText`. The `DefaultButton` is accent-coloured.
+  - **Input:** the focus goes to the default (or first) button. Escape is the Close button, Enter the default button. The page gets no input while the dialog shows, and its focus comes back afterwards.
+  - **Closing:** a button raises its Click event (a handler may `Cancel`), then `Closing` (which may `Cancel` too). The dialog then hides, raises `Closed`, and completes `ShowAsync`'s `IAsyncOperation<ContentDialogResult>` last, so the app's await can show another dialog. `Hide()` closes with None, and `IsPrimaryButtonEnabled`/`IsSecondaryButtonEnabled` disable buttons.
+  - **One at a time:** a second `ShowAsync` while one shows fails with `E_ILLEGAL_METHOD_CALL`, as on Windows.
+  - **Not supported:** deferrals complete at once; button `Command`s, `FullSizeDesired`, `TitleTemplate`, placement and button styles are kept but not used; the content doesn't scroll.
+- **Markup:** `<ContentDialog>` with `Title`, the button texts, `DefaultButton` and the `Is…ButtonEnabled` properties.
+
+**Tests:**
+
+- **`xamlmarkup`: 236/236 checks pass**, 15 of them new. A ContentDialog loaded from XAML checks:
+  - `DefaultButton` from markup, and `Opened`;
+  - the operation running while the dialog shows, and a second `ShowAsync` failing;
+  - the smoke's colour over the page, and the 320 px box centred in the window;
+  - no clicks reaching the page;
+  - Enter raising `PrimaryButtonClick`, `Closing` and `Closed`, then completing with Primary, with the smoke gone;
+  - Escape raising `CloseButtonClick` and completing with None;
+  - a click handler's `Cancel` keeping the dialog open, and `Hide()`.
+- With `XAMLHELLO_SCREENSHOT` set, the test also saves `xamlmarkup-dialog.bmp` while the dialog shows.

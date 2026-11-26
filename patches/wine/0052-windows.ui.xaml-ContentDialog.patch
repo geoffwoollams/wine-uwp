@@ -1,0 +1,1872 @@
+Subject: windows.ui.xaml: ContentDialog and a popup layer over the window (milestone 5 part 5)
+
+diff --git a/dlls/windows.ui.xaml/Makefile.in b/dlls/windows.ui.xaml/Makefile.in
+index 8d15bc7..e519a36 100644
+--- a/dlls/windows.ui.xaml/Makefile.in
++++ b/dlls/windows.ui.xaml/Makefile.in
+@@ -13,6 +13,7 @@ SOURCES = \
+ 	color_helper.c \
+ 	content.c \
+ 	definitions.c \
++	dialog.c \
+ 	element.c \
+ 	focus.c \
+ 	image.c \
+diff --git a/dlls/windows.ui.xaml/button.c b/dlls/windows.ui.xaml/button.c
+index 2746392..2d6657d 100644
+--- a/dlls/windows.ui.xaml/button.c
++++ b/dlls/windows.ui.xaml/button.c
+@@ -127,11 +127,12 @@ static HRESULT button_query_interface( struct xaml_element *element, REFIID iid,
+         IInspectable_AddRef( (IInspectable *)*out );
+         return S_OK;
+     }
+-    if (impl->kind == BUTTON_SCROLL || is_item_kind( impl ))
++    if (impl->kind == BUTTON_SCROLL || is_item_kind( impl ) || impl->kind == BUTTON_DIALOG)
+     {
+         if (IsEqualGUID( iid, &IID_IContentControl )) *out = &impl->IContentControl_iface;
+         else if (IsEqualGUID( iid, &IID_IControl )) *out = &impl->IControl_iface;
+         else if (is_item_kind( impl )) return item_query_interface( impl, iid, out );
++        else if (impl->kind == BUTTON_DIALOG) return dialog_query_interface( impl, iid, out );
+         else if (IsEqualGUID( iid, &IID_IControl )) *out = &impl->IControl_iface;
+         else return scroll_query_interface( impl, iid, out );
+         IInspectable_AddRef( (IInspectable *)*out );
+@@ -162,9 +163,18 @@ static void button_measure( struct xaml_element *element, struct layout_context
+     struct button *impl = impl_from_element( element );
+     const Thickness *b = &impl->border_thickness, *p = &impl->padding;
+     float extra_width = b->Left + b->Right + p->Left + p->Right, extra_height = b->Top + b->Bottom + p->Top + p->Bottom;
+-    struct xaml_element *child = button_content_element( impl ), *root = button_template_root( impl );
++    struct xaml_element *child, *root;
+     struct text_format format;
+ 
++    if (impl->kind == BUTTON_DIALOG)
++    {
++        /* it shows over the window, not where it is */
++        *width = *height = 0;
++        return;
++    }
++    child = button_content_element( impl );
++    root = button_template_root( impl );
++
+     if (is_range_kind( impl ))
+     {
+         range_measure( impl, ctx, avail_width, avail_height, width, height );
+@@ -236,7 +246,7 @@ static void button_arrange( struct xaml_element *element, struct layout_context
+     struct layout_rect inner;
+     float x, y, w, h;
+ 
+-    if (is_range_kind( impl ) || is_text_kind( impl )) return;
++    if (is_range_kind( impl ) || is_text_kind( impl ) || impl->kind == BUTTON_DIALOG) return;
+ 
+     if (root)
+     {
+@@ -488,6 +498,7 @@ static void button_render( struct xaml_element *element, struct layout_context *
+         range_render( impl, ctx );
+         return;
+     }
++    if (impl->kind == BUTTON_DIALOG) return;
+     if (root)
+     {
+         element_render( root, ctx );   /* the template draws the button */
+@@ -549,6 +560,8 @@ static UINT32 button_child_count( struct xaml_element *element )
+ {
+     struct button *impl = impl_from_element( element );
+     if (is_range_kind( impl )) return 0;
++    /* a shown ContentDialog's content is in its layer */
++    if (impl->kind == BUTTON_DIALOG) return impl->content_element && impl->content_element->parent == element ? 1 : 0;
+     if (impl->element.template_instance) return template_root( impl->element.template_instance ) ? 1 : 0;
+     return button_content_element( impl ) ? 1 : 0;
+ }
+@@ -738,6 +751,7 @@ static void button_destroy( struct xaml_element *element )
+     range_destroy( impl );
+     scroll_destroy( impl );
+     textbox_destroy( impl );
++    dialog_destroy( impl );
+     event_list_clear( &impl->click );
+     event_list_clear( &impl->checked );
+     event_list_clear( &impl->unchecked );
+@@ -750,7 +764,8 @@ static BOOL button_focusable( struct xaml_element *element )
+ {
+     struct button *impl = impl_from_element( element );
+     /* a ListView takes the focus for its items */
+-    return impl->enabled && impl->kind != BUTTON_PROGRESS && impl->kind != BUTTON_SCROLL && !is_item_kind( impl );
++    return impl->enabled && impl->kind != BUTTON_PROGRESS && impl->kind != BUTTON_SCROLL && !is_item_kind( impl ) &&
++           impl->kind != BUTTON_DIALOG;
+ }
+ 
+ /* Space presses and releases a button (Click on release), Enter clicks a Button at once */
+@@ -761,7 +776,7 @@ static BOOL button_key( struct xaml_element *element, BOOL down, WPARAM vk )
+     if (impl->kind == BUTTON_SCROLL) return scroll_key( impl, down, vk );
+     if (is_text_kind( impl )) return textbox_key( impl, down, vk );
+     if (is_range_kind( impl )) return range_key( impl, down, vk );
+-    if (is_item_kind( impl )) return FALSE;
++    if (is_item_kind( impl ) || impl->kind == BUTTON_DIALOG) return FALSE;
+     if (!impl->enabled || element_focus_state( element ) == FocusState_Unfocused) return FALSE;
+     if (vk == VK_SPACE)
+     {
+@@ -1560,6 +1575,7 @@ static HRESULT button_create( enum button_kind kind, IInspectable *outer, IInspe
+         RuntimeClass_Windows_UI_Xaml_Controls_PasswordBox,
+         RuntimeClass_Windows_UI_Xaml_Controls_ListViewItem,
+         RuntimeClass_Windows_UI_Xaml_Controls_GridViewItem,
++        RuntimeClass_Windows_UI_Xaml_Controls_ContentDialog,
+     };
+     struct button *impl;
+     void *iface;
+@@ -1609,6 +1625,11 @@ static HRESULT button_create( enum button_kind kind, IInspectable *outer, IInspe
+         free( impl );
+         return E_OUTOFMEMORY;
+     }
++    if (kind == BUTTON_DIALOG && FAILED(dialog_init( impl )))
++    {
++        free( impl );
++        return E_OUTOFMEMORY;
++    }
+     if ((kind == BUTTON_TEXTBOX || kind == BUTTON_PASSWORD) && FAILED(textbox_init( impl )))
+     {
+         free( impl );
+@@ -1619,6 +1640,7 @@ static HRESULT button_create( enum button_kind kind, IInspectable *outer, IInspe
+     case BUTTON_TEXTBOX: case BUTTON_PASSWORD: iface = textbox_default_iface( impl ); break;
+     case BUTTON_SCROLL: iface = scroll_default_iface( impl ); break;
+     case BUTTON_LIST_ITEM: case BUTTON_GRID_ITEM: iface = item_default_iface( impl ); break;
++    case BUTTON_DIALOG: iface = dialog_default_iface( impl ); break;
+     case BUTTON_TOGGLE_SWITCH: case BUTTON_SLIDER: case BUTTON_PROGRESS: iface = range_default_iface( impl ); break;
+     case BUTTON_PLAIN: iface = &impl->IButton_iface; break;
+     case BUTTON_CHECK: iface = &impl->ICheckBox_iface; break;
+@@ -1643,6 +1665,7 @@ struct button_statics
+     ITextBoxFactory ITextBoxFactory_iface;
+     IListViewItemFactory IListViewItemFactory_iface;
+     IGridViewItemFactory IGridViewItemFactory_iface;
++    IContentDialogFactory IContentDialogFactory_iface;
+     enum button_kind kind;
+ };
+ 
+@@ -1676,6 +1699,8 @@ static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID
+         *out = &impl->IListViewItemFactory_iface;
+     else if (impl->kind == BUTTON_GRID_ITEM && IsEqualGUID( iid, &IID_IGridViewItemFactory ))
+         *out = &impl->IGridViewItemFactory_iface;
++    else if (impl->kind == BUTTON_DIALOG && IsEqualGUID( iid, &IID_IContentDialogFactory ))
++        *out = &impl->IContentDialogFactory_iface;
+     else
+     {
+         FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
+@@ -1753,12 +1778,13 @@ BUTTON_FACTORY( progress_bar_factory_iface, IProgressBarFactory, IProgressBar, I
+ BUTTON_FACTORY( text_box_factory_iface, ITextBoxFactory, ITextBox, ITextBoxFactory_iface, BUTTON_TEXTBOX )
+ BUTTON_FACTORY( list_view_item_factory_iface, IListViewItemFactory, IListViewItem, IListViewItemFactory_iface, BUTTON_LIST_ITEM )
+ BUTTON_FACTORY( grid_view_item_factory_iface, IGridViewItemFactory, IGridViewItem, IGridViewItemFactory_iface, BUTTON_GRID_ITEM )
++BUTTON_FACTORY( content_dialog_factory_iface, IContentDialogFactory, IContentDialog, IContentDialogFactory_iface, BUTTON_DIALOG )
+ 
+ #define BUTTON_STATICS( kind ) \
+     { {&factory_vtbl}, {&button_factory_iface_vtbl}, {&toggle_button_factory_iface_vtbl}, \
+       {&check_box_factory_iface_vtbl}, {&radio_button_factory_iface_vtbl}, {&slider_factory_iface_vtbl}, \
+       {&progress_bar_factory_iface_vtbl}, {&text_box_factory_iface_vtbl}, {&list_view_item_factory_iface_vtbl}, \
+-      {&grid_view_item_factory_iface_vtbl}, kind }
++      {&grid_view_item_factory_iface_vtbl}, {&content_dialog_factory_iface_vtbl}, kind }
+ 
+ static struct button_statics button_statics = BUTTON_STATICS( BUTTON_PLAIN );
+ static struct button_statics toggle_button_statics = BUTTON_STATICS( BUTTON_TOGGLE );
+@@ -1788,3 +1814,5 @@ static struct button_statics grid_view_item_statics = BUTTON_STATICS( BUTTON_GRI
+ 
+ IActivationFactory *list_view_item_factory = &list_view_item_statics.IActivationFactory_iface;
+ IActivationFactory *grid_view_item_factory = &grid_view_item_statics.IActivationFactory_iface;
++static struct button_statics content_dialog_statics = BUTTON_STATICS( BUTTON_DIALOG );
++IActivationFactory *content_dialog_factory = &content_dialog_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/classes.idl b/dlls/windows.ui.xaml/classes.idl
+index 7e7b02a..1d83af2 100644
+--- a/dlls/windows.ui.xaml/classes.idl
++++ b/dlls/windows.ui.xaml/classes.idl
+@@ -39,6 +39,7 @@ namespace Windows.UI.Xaml.Controls {
+     runtimeclass Button;
+     runtimeclass CheckBox;
+     runtimeclass ColumnDefinition;
++    runtimeclass ContentDialog;
+     runtimeclass ContentPresenter;
+     runtimeclass Frame;
+     runtimeclass Grid;
+diff --git a/dlls/windows.ui.xaml/control.h b/dlls/windows.ui.xaml/control.h
+index e2b081a..f8948b6 100644
+--- a/dlls/windows.ui.xaml/control.h
++++ b/dlls/windows.ui.xaml/control.h
+@@ -35,6 +35,7 @@ enum button_kind
+     BUTTON_PASSWORD,
+     BUTTON_LIST_ITEM,       /* listview.c: ListViewItem and GridViewItem, a ListView's / GridView's containers */
+     BUTTON_GRID_ITEM,
++    BUTTON_DIALOG,          /* dialog.c: ContentDialog, a ContentControl shown over the window */
+ };
+ 
+ enum check_state
+@@ -98,6 +99,8 @@ struct button
+     IGridViewItem IGridViewItem_iface;
+     struct xaml_element *selector;   /* the ListView or GridView showing it (not referenced) */
+     boolean is_selected, is_current;
++    /* dialog.c: ContentDialog */
++    struct dialog_state *dialog;
+ };
+ 
+ static inline struct button *impl_from_element( struct xaml_element *element )
+@@ -171,6 +174,12 @@ void item_render_background( struct button *impl, struct layout_context *ctx );
+ void item_render_overlay( struct button *impl, struct layout_context *ctx );
+ void item_clicked( struct button *impl );
+ 
++/* dialog.c */
++HRESULT dialog_init( struct button *impl );
++void *dialog_default_iface( struct button *impl );
++HRESULT dialog_query_interface( struct button *impl, REFIID iid, void **out );
++void dialog_destroy( struct button *impl );
++
+ 
+ 
+ #endif
+diff --git a/dlls/windows.ui.xaml/dialog.c b/dlls/windows.ui.xaml/dialog.c
+new file mode 100644
+index 0000000..1f85f47
+--- /dev/null
++++ b/dlls/windows.ui.xaml/dialog.c
+@@ -0,0 +1,1416 @@
++/* WinRT Windows.UI.Xaml.Controls.ContentDialog implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <math.h>
++
++#include "private.h"
++#include "control.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* A ContentDialog is a ContentControl (struct button, kind BUTTON_DIALOG) that shows nothing where it is. ShowAsync
++ * puts a layer over the window (window_popup_show): a translucent smoke over the page, and in the middle Windows
++ * 10's dialog box, 320 to 548 px wide with 24 px padding, the Title (20 px text) above the Content and a row of up
++ * to three equal buttons (Primary, Secondary, Close) below. The layer is modal: the page gets no pointer or
++ * keyboard input while it shows. Escape is the Close button, Enter the DefaultButton (drawn in the accent colour).
++ * A button raises its Click event (which may Cancel), then Closing (which may Cancel), then the dialog hides,
++ * raises Closed and completes ShowAsync's operation with the result. Hide closes with None. Deferrals complete at
++ * once; commands, FullSizeDesired, placement and button styles are not supported, and the content doesn't scroll. */
++
++#define DIALOG_MIN_WIDTH 320.0f
++#define DIALOG_MAX_WIDTH 548.0f
++#define DIALOG_PADDING 24.0f
++#define DIALOG_BUTTON_HEIGHT 32.0f
++#define DIALOG_BUTTON_GAP 8.0f
++
++enum dialog_part { PART_PRIMARY, PART_SECONDARY, PART_CLOSE };
++
++struct dialog_click_handler
++{
++    IRoutedEventHandler IRoutedEventHandler_iface;
++    struct dialog_state *dialog;
++    enum dialog_part part;
++};
++
++struct dialog_layer
++{
++    struct xaml_element element;
++    struct dialog_state *dialog;
++    struct layout_rect box;
++};
++
++struct dialog_state
++{
++    IContentDialog IContentDialog_iface;
++    IContentDialog2 IContentDialog2_iface;
++    IContentDialog3 IContentDialog3_iface;
++    struct button *button;
++
++    IInspectable *title;
++    IDataTemplate *title_template;
++    HSTRING texts[3];                     /* PrimaryButtonText, SecondaryButtonText, CloseButtonText */
++    boolean enabled[3];                   /* IsPrimaryButtonEnabled, IsSecondaryButtonEnabled; Close always */
++    IInspectable *commands[3], *parameters[3], *styles[3];
++    ContentDialogButton default_button;
++    boolean full_size;
++    struct event_list closing, closed, opened, clicks[3];
++
++    /* while shown */
++    BOOL open;
++    struct dialog_layer *layer;           /* referenced through layer_object */
++    IInspectable *layer_object;
++    IInspectable *title_object, *text_object;   /* TextBlocks we made for a text Title or Content */
++    struct xaml_element *title_element, *content_element, *buttons[3];
++    IInspectable *button_objects[3];
++    struct dialog_click_handler handlers[3];
++    struct xaml_element *previous_focus;  /* referenced */
++    struct dialog_async *async;
++};
++
++/* ---- ShowAsync's operation ---- */
++
++struct dialog_async
++{
++    IAsyncOperation_ContentDialogResult IAsyncOperation_iface;
++    IAsyncInfo IAsyncInfo_iface;
++    LONG ref;
++    AsyncStatus status;
++    ContentDialogResult result;
++    IAsyncOperationCompletedHandler_ContentDialogResult *handler;
++    BOOL handler_called;
++};
++
++static inline struct dialog_async *async_from_IAsyncOperation( IAsyncOperation_ContentDialogResult *iface )
++{
++    return CONTAINING_RECORD( iface, struct dialog_async, IAsyncOperation_iface );
++}
++
++static HRESULT WINAPI async_QueryInterface( IAsyncOperation_ContentDialogResult *iface, REFIID iid, void **out )
++{
++    struct dialog_async *impl = async_from_IAsyncOperation( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IAsyncOperation_ContentDialogResult ))
++        *out = &impl->IAsyncOperation_iface;
++    else if (IsEqualGUID( iid, &IID_IAsyncInfo ))
++        *out = &impl->IAsyncInfo_iface;
++    else
++    {
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI async_AddRef( IAsyncOperation_ContentDialogResult *iface )
++{
++    return InterlockedIncrement( &async_from_IAsyncOperation( iface )->ref );
++}
++
++static ULONG WINAPI async_Release( IAsyncOperation_ContentDialogResult *iface )
++{
++    struct dialog_async *impl = async_from_IAsyncOperation( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        if (impl->handler) IAsyncOperationCompletedHandler_ContentDialogResult_Release( impl->handler );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI async_GetIids( IAsyncOperation_ContentDialogResult *iface, ULONG *count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI async_GetRuntimeClassName( IAsyncOperation_ContentDialogResult *iface, HSTRING *name )
++{
++    static const WCHAR class_name[] = L"Windows.Foundation.IAsyncOperation`1<Windows.UI.Xaml.Controls.ContentDialogResult>";
++    return WindowsCreateString( class_name, wcslen( class_name ), name );
++}
++
++static HRESULT WINAPI async_GetTrustLevel( IAsyncOperation_ContentDialogResult *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static void async_call_handler( struct dialog_async *impl )
++{
++    IAsyncOperationCompletedHandler_ContentDialogResult *handler = impl->handler;
++    HRESULT hr;
++
++    if (!handler || impl->handler_called || impl->status == Started) return;
++    impl->handler_called = TRUE;
++    IAsyncOperationCompletedHandler_ContentDialogResult_AddRef( handler );
++    hr = IAsyncOperationCompletedHandler_ContentDialogResult_Invoke( handler, &impl->IAsyncOperation_iface, impl->status );
++    if (FAILED(hr)) WARN( "Completed handler %p failed, hr %#lx.\n", handler, hr );
++    IAsyncOperationCompletedHandler_ContentDialogResult_Release( handler );
++}
++
++static HRESULT WINAPI async_put_Completed( IAsyncOperation_ContentDialogResult *iface,
++                                           IAsyncOperationCompletedHandler_ContentDialogResult *handler )
++{
++    struct dialog_async *impl = async_from_IAsyncOperation( iface );
++
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    if (impl->handler) return E_ILLEGAL_DELEGATE_ASSIGNMENT;
++    if (!handler) return E_POINTER;
++    IAsyncOperationCompletedHandler_ContentDialogResult_AddRef( (impl->handler = handler) );
++    async_call_handler( impl );   /* at once if it has finished */
++    return S_OK;
++}
++
++static HRESULT WINAPI async_get_Completed( IAsyncOperation_ContentDialogResult *iface,
++                                           IAsyncOperationCompletedHandler_ContentDialogResult **handler )
++{
++    struct dialog_async *impl = async_from_IAsyncOperation( iface );
++    if ((*handler = impl->handler)) IAsyncOperationCompletedHandler_ContentDialogResult_AddRef( *handler );
++    return S_OK;
++}
++
++static HRESULT WINAPI async_GetResults( IAsyncOperation_ContentDialogResult *iface, ContentDialogResult *result )
++{
++    struct dialog_async *impl = async_from_IAsyncOperation( iface );
++
++    if (impl->status != Completed) return E_ILLEGAL_METHOD_CALL;
++    *result = impl->result;
++    return S_OK;
++}
++
++static const struct IAsyncOperation_ContentDialogResultVtbl async_vtbl =
++{
++    async_QueryInterface,
++    async_AddRef,
++    async_Release,
++    /* IInspectable methods */
++    async_GetIids,
++    async_GetRuntimeClassName,
++    async_GetTrustLevel,
++    /* IAsyncOperation<ContentDialogResult> methods */
++    async_put_Completed,
++    async_get_Completed,
++    async_GetResults,
++};
++
++DEFINE_IINSPECTABLE( async_info, IAsyncInfo, struct dialog_async, IAsyncOperation_iface )
++
++static HRESULT WINAPI async_info_get_Id( IAsyncInfo *iface, UINT32 *id )
++{
++    *id = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI async_info_get_Status( IAsyncInfo *iface, AsyncStatus *status )
++{
++    *status = impl_from_IAsyncInfo( iface )->status;
++    return S_OK;
++}
++
++static HRESULT WINAPI async_info_get_ErrorCode( IAsyncInfo *iface, HRESULT *error )
++{
++    *error = S_OK;
++    return S_OK;
++}
++
++static HRESULT WINAPI async_info_Cancel( IAsyncInfo *iface )
++{
++    FIXME( "iface %p: a shown ContentDialog can't be cancelled; Hide it.\n", iface );
++    return S_OK;
++}
++
++static HRESULT WINAPI async_info_Close( IAsyncInfo *iface )
++{
++    return S_OK;
++}
++
++static const struct IAsyncInfoVtbl async_info_vtbl =
++{
++    async_info_QueryInterface,
++    async_info_AddRef,
++    async_info_Release,
++    /* IInspectable methods */
++    async_info_GetIids,
++    async_info_GetRuntimeClassName,
++    async_info_GetTrustLevel,
++    /* IAsyncInfo methods */
++    async_info_get_Id,
++    async_info_get_Status,
++    async_info_get_ErrorCode,
++    async_info_Cancel,
++    async_info_Close,
++};
++
++static struct dialog_async *async_create(void)
++{
++    struct dialog_async *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return NULL;
++    impl->IAsyncOperation_iface.lpVtbl = &async_vtbl;
++    impl->IAsyncInfo_iface.lpVtbl = &async_info_vtbl;
++    impl->ref = 1;
++    impl->status = Started;
++    return impl;
++}
++
++/* ---- event arguments and deferrals ---- */
++
++struct dialog_args
++{
++    IContentDialogButtonClickEventArgs IButtonClick_iface;
++    IContentDialogClosingEventArgs IClosing_iface;
++    IContentDialogClosedEventArgs IClosed_iface;
++    IContentDialogOpenedEventArgs IOpened_iface;
++    IContentDialogButtonClickDeferral IClickDeferral_iface;
++    IContentDialogClosingDeferral IClosingDeferral_iface;
++    LONG ref;
++    const IID *iid;                       /* which arguments these are */
++    ContentDialogResult result;
++    boolean cancel;
++};
++
++static HRESULT args_query( struct dialog_args *impl, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, impl->iid ))
++    {
++        if (impl->iid == &IID_IContentDialogButtonClickEventArgs) *out = &impl->IButtonClick_iface;
++        else if (impl->iid == &IID_IContentDialogClosingEventArgs) *out = &impl->IClosing_iface;
++        else if (impl->iid == &IID_IContentDialogClosedEventArgs) *out = &impl->IClosed_iface;
++        else if (impl->iid == &IID_IContentDialogOpenedEventArgs) *out = &impl->IOpened_iface;
++        else if (impl->iid == &IID_IContentDialogButtonClickDeferral) *out = &impl->IClickDeferral_iface;
++        else *out = &impl->IClosingDeferral_iface;
++        InterlockedIncrement( &impl->ref );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG args_release( struct dialog_args *impl )
++{
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static struct dialog_args *args_create( const IID *iid, ContentDialogResult result );
++
++#define ARGS_IUNKNOWN( pfx, Iface, field ) \
++static inline struct dialog_args *pfx##_impl( Iface *iface ) { return CONTAINING_RECORD( iface, struct dialog_args, field ); } \
++static HRESULT WINAPI pfx##_QueryInterface( Iface *iface, REFIID iid, void **out ) { return args_query( pfx##_impl( iface ), iid, out ); } \
++static ULONG WINAPI pfx##_AddRef( Iface *iface ) { return InterlockedIncrement( &pfx##_impl( iface )->ref ); } \
++static ULONG WINAPI pfx##_Release( Iface *iface ) { return args_release( pfx##_impl( iface ) ); } \
++static HRESULT WINAPI pfx##_GetIids( Iface *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; } \
++static HRESULT WINAPI pfx##_GetRuntimeClassName( Iface *iface, HSTRING *name ) { return E_NOTIMPL; } \
++static HRESULT WINAPI pfx##_GetTrustLevel( Iface *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++ARGS_IUNKNOWN( click_args, IContentDialogButtonClickEventArgs, IButtonClick_iface )
++
++static HRESULT WINAPI click_args_get_Cancel( IContentDialogButtonClickEventArgs *iface, boolean *value )
++{
++    *value = click_args_impl( iface )->cancel;
++    return S_OK;
++}
++
++static HRESULT WINAPI click_args_put_Cancel( IContentDialogButtonClickEventArgs *iface, boolean value )
++{
++    click_args_impl( iface )->cancel = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI click_args_GetDeferral( IContentDialogButtonClickEventArgs *iface, IContentDialogButtonClickDeferral **value )
++{
++    struct dialog_args *deferral = args_create( &IID_IContentDialogButtonClickDeferral, 0 );
++    TRACE( "iface %p: the deferral completes at once.\n", iface );
++    if (!deferral) return E_OUTOFMEMORY;
++    *value = &deferral->IClickDeferral_iface;
++    return S_OK;
++}
++
++static const struct IContentDialogButtonClickEventArgsVtbl click_args_vtbl =
++{
++    click_args_QueryInterface, click_args_AddRef, click_args_Release,
++    click_args_GetIids, click_args_GetRuntimeClassName, click_args_GetTrustLevel,
++    click_args_get_Cancel, click_args_put_Cancel, click_args_GetDeferral,
++};
++
++ARGS_IUNKNOWN( closing_args, IContentDialogClosingEventArgs, IClosing_iface )
++
++static HRESULT WINAPI closing_args_get_Result( IContentDialogClosingEventArgs *iface, ContentDialogResult *value )
++{
++    *value = closing_args_impl( iface )->result;
++    return S_OK;
++}
++
++static HRESULT WINAPI closing_args_get_Cancel( IContentDialogClosingEventArgs *iface, boolean *value )
++{
++    *value = closing_args_impl( iface )->cancel;
++    return S_OK;
++}
++
++static HRESULT WINAPI closing_args_put_Cancel( IContentDialogClosingEventArgs *iface, boolean value )
++{
++    closing_args_impl( iface )->cancel = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI closing_args_GetDeferral( IContentDialogClosingEventArgs *iface, IContentDialogClosingDeferral **value )
++{
++    struct dialog_args *deferral = args_create( &IID_IContentDialogClosingDeferral, 0 );
++    TRACE( "iface %p: the deferral completes at once.\n", iface );
++    if (!deferral) return E_OUTOFMEMORY;
++    *value = &deferral->IClosingDeferral_iface;
++    return S_OK;
++}
++
++static const struct IContentDialogClosingEventArgsVtbl closing_args_vtbl =
++{
++    closing_args_QueryInterface, closing_args_AddRef, closing_args_Release,
++    closing_args_GetIids, closing_args_GetRuntimeClassName, closing_args_GetTrustLevel,
++    closing_args_get_Result, closing_args_get_Cancel, closing_args_put_Cancel, closing_args_GetDeferral,
++};
++
++ARGS_IUNKNOWN( closed_args, IContentDialogClosedEventArgs, IClosed_iface )
++
++static HRESULT WINAPI closed_args_get_Result( IContentDialogClosedEventArgs *iface, ContentDialogResult *value )
++{
++    *value = closed_args_impl( iface )->result;
++    return S_OK;
++}
++
++static const struct IContentDialogClosedEventArgsVtbl closed_args_vtbl =
++{
++    closed_args_QueryInterface, closed_args_AddRef, closed_args_Release,
++    closed_args_GetIids, closed_args_GetRuntimeClassName, closed_args_GetTrustLevel,
++    closed_args_get_Result,
++};
++
++ARGS_IUNKNOWN( opened_args, IContentDialogOpenedEventArgs, IOpened_iface )
++
++static const struct IContentDialogOpenedEventArgsVtbl opened_args_vtbl =
++{
++    opened_args_QueryInterface, opened_args_AddRef, opened_args_Release,
++    opened_args_GetIids, opened_args_GetRuntimeClassName, opened_args_GetTrustLevel,
++};
++
++ARGS_IUNKNOWN( click_deferral, IContentDialogButtonClickDeferral, IClickDeferral_iface )
++
++static HRESULT WINAPI click_deferral_Complete( IContentDialogButtonClickDeferral *iface )
++{
++    return S_OK;
++}
++
++static const struct IContentDialogButtonClickDeferralVtbl click_deferral_vtbl =
++{
++    click_deferral_QueryInterface, click_deferral_AddRef, click_deferral_Release,
++    click_deferral_GetIids, click_deferral_GetRuntimeClassName, click_deferral_GetTrustLevel,
++    click_deferral_Complete,
++};
++
++ARGS_IUNKNOWN( closing_deferral, IContentDialogClosingDeferral, IClosingDeferral_iface )
++
++static HRESULT WINAPI closing_deferral_Complete( IContentDialogClosingDeferral *iface )
++{
++    return S_OK;
++}
++
++static const struct IContentDialogClosingDeferralVtbl closing_deferral_vtbl =
++{
++    closing_deferral_QueryInterface, closing_deferral_AddRef, closing_deferral_Release,
++    closing_deferral_GetIids, closing_deferral_GetRuntimeClassName, closing_deferral_GetTrustLevel,
++    closing_deferral_Complete,
++};
++
++static struct dialog_args *args_create( const IID *iid, ContentDialogResult result )
++{
++    struct dialog_args *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return NULL;
++    impl->IButtonClick_iface.lpVtbl = &click_args_vtbl;
++    impl->IClosing_iface.lpVtbl = &closing_args_vtbl;
++    impl->IClosed_iface.lpVtbl = &closed_args_vtbl;
++    impl->IOpened_iface.lpVtbl = &opened_args_vtbl;
++    impl->IClickDeferral_iface.lpVtbl = &click_deferral_vtbl;
++    impl->IClosingDeferral_iface.lpVtbl = &closing_deferral_vtbl;
++    impl->ref = 1;
++    impl->iid = iid;
++    impl->result = result;
++    return impl;
++}
++
++/* TypedEventHandler<ContentDialog, args>: the same Invoke for each */
++static BOOL raise_dialog_event( struct dialog_state *dialog, struct event_list *list, struct dialog_args *args,
++                                IInspectable *args_iface, const char *name )
++{
++    IUnknown **handlers;
++    UINT32 i, count = list->count;
++    HRESULT hr;
++
++    TRACE( "%p: %s, %u handler slots.\n", dialog, name, count );
++    if (!count || !(handlers = calloc( count, sizeof(*handlers) ))) return args && args->cancel;
++    for (i = 0; i < count; i++) if ((handlers[i] = list->handlers[i])) IUnknown_AddRef( handlers[i] );
++    for (i = 0; i < count; i++)
++    {
++        if (!handlers[i]) continue;
++        hr = ITypedEventHandler_IInspectable_IInspectable_Invoke( (ITypedEventHandler_IInspectable_IInspectable *)handlers[i],
++                                                                  dialog->button->element.outer, args_iface );
++        if (FAILED(hr)) WARN( "%s handler %p failed, hr %#lx.\n", name, handlers[i], hr );
++    }
++    for (i = 0; i < count; i++) if (handlers[i]) IUnknown_Release( handlers[i] );
++    free( handlers );
++    return args && args->cancel;
++}
++
++/* ---- the layer over the window ---- */
++
++static inline struct dialog_layer *layer_from_element( struct xaml_element *element )
++{
++    return CONTAINING_RECORD( element, struct dialog_layer, element );
++}
++
++static UINT32 layer_parts( struct dialog_state *dialog, struct xaml_element **parts )
++{
++    UINT32 n = 0, i;
++
++    if (dialog->title_element) parts[n++] = dialog->title_element;
++    if (dialog->content_element) parts[n++] = dialog->content_element;
++    for (i = 0; i < 3; i++) if (dialog->buttons[i]) parts[n++] = dialog->buttons[i];
++    return n;
++}
++
++static UINT32 button_count( struct dialog_state *dialog )
++{
++    UINT32 i, n = 0;
++    for (i = 0; i < 3; i++) if (dialog->buttons[i]) n++;
++    return n;
++}
++
++static void layer_measure( struct xaml_element *element, struct layout_context *ctx, float avail_width,
++                           float avail_height, float *width, float *height )
++{
++    struct dialog_state *dialog = layer_from_element( element )->dialog;
++    float inner = DIALOG_MAX_WIDTH - 2 * DIALOG_PADDING;
++    UINT32 i;
++
++    *width = isfinite( avail_width ) ? avail_width : 0;
++    *height = isfinite( avail_height ) ? avail_height : 0;
++    if (!dialog) return;
++    if (dialog->title_element) element_measure( dialog->title_element, ctx, inner, INFINITY );
++    if (dialog->content_element) element_measure( dialog->content_element, ctx, inner, INFINITY );
++    for (i = 0; i < 3; i++) if (dialog->buttons[i]) element_measure( dialog->buttons[i], ctx, inner, DIALOG_BUTTON_HEIGHT );
++}
++
++static void layer_arrange( struct xaml_element *element, struct layout_context *ctx )
++{
++    struct dialog_layer *layer = layer_from_element( element );
++    struct dialog_state *dialog = layer->dialog;
++    const struct layout_rect *b = &element->bounds;
++    float inner_w = 0, title_h = 0, content_h = 0, h, y, x, w;
++    UINT32 i, n;
++
++    if (!dialog) return;
++    n = button_count( dialog );
++    if (dialog->title_element) inner_w = max( inner_w, dialog->title_element->desired_width );
++    if (dialog->content_element) inner_w = max( inner_w, dialog->content_element->desired_width );
++    for (i = 0, w = 0; i < 3; i++) if (dialog->buttons[i]) w += dialog->buttons[i]->desired_width;
++    inner_w = max( inner_w, w + (n ? (n - 1) * DIALOG_BUTTON_GAP : 0) );
++    inner_w = min( max( inner_w, DIALOG_MIN_WIDTH - 2 * DIALOG_PADDING ), DIALOG_MAX_WIDTH - 2 * DIALOG_PADDING );
++    inner_w = min( inner_w, max( 0.0f, b->width - 2 * DIALOG_PADDING ) );
++    if (dialog->title_element) title_h = dialog->title_element->desired_height;
++    if (dialog->content_element) content_h = dialog->content_element->desired_height;
++
++    h = 2 * DIALOG_PADDING + title_h + (title_h && content_h ? 12 : 0) + content_h + (n ? DIALOG_PADDING + DIALOG_BUTTON_HEIGHT : 0);
++    layer->box.width = inner_w + 2 * DIALOG_PADDING;
++    layer->box.height = min( h, b->height );
++    layer->box.x = b->x + (b->width - layer->box.width) / 2;
++    layer->box.y = b->y + (b->height - layer->box.height) / 2;
++
++    x = layer->box.x + DIALOG_PADDING;
++    y = layer->box.y + DIALOG_PADDING;
++    if (dialog->title_element)
++    {
++        element_arrange( dialog->title_element, ctx, x, y, inner_w, title_h );
++        y += title_h + (content_h ? 12 : 0);
++    }
++    if (dialog->content_element)
++    {
++        /* what doesn't fit above the buttons is cut off */
++        float room = layer->box.y + layer->box.height - DIALOG_PADDING - (n ? DIALOG_PADDING + DIALOG_BUTTON_HEIGHT : 0) - y;
++        element_arrange( dialog->content_element, ctx, x, y, inner_w, max( 0.0f, min( content_h, room ) ) );
++    }
++    if (n)
++    {
++        w = (inner_w - (n - 1) * DIALOG_BUTTON_GAP) / n;
++        y = layer->box.y + layer->box.height - DIALOG_PADDING - DIALOG_BUTTON_HEIGHT;
++        for (i = 0; i < 3; i++)
++        {
++            if (!dialog->buttons[i]) continue;
++            element_arrange( dialog->buttons[i], ctx, x, y, w, DIALOG_BUTTON_HEIGHT );
++            x += w + DIALOG_BUTTON_GAP;
++        }
++    }
++}
++
++static void layer_render( struct xaml_element *element, struct layout_context *ctx )
++{
++    struct dialog_layer *layer = layer_from_element( element );
++    struct xaml_element *parts[5];
++    Color smoke = { 0x99, 0xff, 0xff, 0xff }, background = { 0xff, 0xff, 0xff, 0xff }, accent = { 0xff, 0x00, 0x78, 0xd7 };
++    static const Thickness one = { 1, 1, 1, 1 };
++    COLORREF saved = ctx->foreground;
++    UINT32 i, n;
++
++    if (!layer->dialog) return;
++    if (ctx->dark)
++    {
++        smoke.R = smoke.G = smoke.B = 0;
++        background.R = background.G = background.B = 0x2b;
++    }
++    /* SystemControlPageBackgroundMediumAltMediumBrush over the page, then the box with its accent border */
++    element_fill_argb( ctx, &element->bounds, smoke );
++    element_fill_argb( ctx, &layer->box, background );
++    element_frame_color( ctx, &layer->box, &one, RGB( accent.R, accent.G, accent.B ) );
++    ctx->foreground = ctx->dark ? RGB(255, 255, 255) : RGB(0, 0, 0);
++    ctx->foreground_alpha = 255;
++    if (ctx->rt) d2d_push_clip( ctx, &layer->box );
++    n = layer_parts( layer->dialog, parts );
++    for (i = 0; i < n; i++) element_render( parts[i], ctx );
++    if (ctx->rt) d2d_pop_clip( ctx );
++    ctx->foreground = saved;
++}
++
++static UINT32 layer_child_count( struct xaml_element *element )
++{
++    struct xaml_element *parts[5];
++    struct dialog_layer *layer = layer_from_element( element );
++    return layer->dialog ? layer_parts( layer->dialog, parts ) : 0;
++}
++
++static struct xaml_element *layer_child_at( struct xaml_element *element, UINT32 index )
++{
++    struct xaml_element *parts[5];
++    struct dialog_layer *layer = layer_from_element( element );
++    UINT32 n = layer->dialog ? layer_parts( layer->dialog, parts ) : 0;
++    return index < n ? parts[index] : NULL;
++}
++
++/* the whole window: the page underneath gets no input */
++static BOOL layer_hit_self( struct xaml_element *element, float x, float y )
++{
++    return TRUE;
++}
++
++static void dialog_part_clicked( struct dialog_state *dialog, enum dialog_part part );
++
++static BOOL layer_key( struct xaml_element *element, BOOL down, WPARAM vk )
++{
++    struct dialog_state *dialog = layer_from_element( element )->dialog;
++
++    if (!dialog || !down) return FALSE;
++    if (vk == VK_ESCAPE)
++    {
++        dialog_part_clicked( dialog, PART_CLOSE );
++        return TRUE;
++    }
++    if (vk == VK_RETURN && dialog->default_button != ContentDialogButton_None)
++    {
++        enum dialog_part part = dialog->default_button - ContentDialogButton_Primary;
++        if (dialog->buttons[part] && dialog->enabled[part]) dialog_part_clicked( dialog, part );
++        return TRUE;
++    }
++    return FALSE;
++}
++
++static void layer_destroy( struct xaml_element *element )
++{
++    free( layer_from_element( element ) );
++}
++
++static const struct element_ops layer_ops =
++{
++    .measure = layer_measure,
++    .arrange = layer_arrange,
++    .render = layer_render,
++    .child_count = layer_child_count,
++    .child_at = layer_child_at,
++    .hit_self = layer_hit_self,
++    .key = layer_key,
++    .destroy = layer_destroy,
++};
++
++/* ---- showing and closing ---- */
++
++static inline struct dialog_click_handler *handler_from_iface( IRoutedEventHandler *iface )
++{
++    return CONTAINING_RECORD( iface, struct dialog_click_handler, IRoutedEventHandler_iface );
++}
++
++static HRESULT WINAPI part_click_QueryInterface( IRoutedEventHandler *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IRoutedEventHandler ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI part_click_AddRef( IRoutedEventHandler *iface ) { return 2; }
++static ULONG WINAPI part_click_Release( IRoutedEventHandler *iface ) { return 1; }
++
++static HRESULT WINAPI part_click_Invoke( IRoutedEventHandler *iface, IInspectable *sender, IRoutedEventArgs *args )
++{
++    struct dialog_click_handler *handler = handler_from_iface( iface );
++    if (handler->dialog && handler->dialog->open) dialog_part_clicked( handler->dialog, handler->part );
++    return S_OK;
++}
++
++static const struct IRoutedEventHandlerVtbl part_click_vtbl =
++{
++    part_click_QueryInterface,
++    part_click_AddRef,
++    part_click_Release,
++    part_click_Invoke,
++};
++
++static IInspectable *make_text_block( const WCHAR *text, UINT32 len, double size, BOOL wrap )
++{
++    IInspectable *object;
++    ITextBlock *tb;
++    HSTRING str;
++
++    if (FAILED(IActivationFactory_ActivateInstance( text_block_factory, &object ))) return NULL;
++    if (SUCCEEDED(IInspectable_QueryInterface( object, &IID_ITextBlock, (void **)&tb )))
++    {
++        if (SUCCEEDED(WindowsCreateString( text, len, &str )))
++        {
++            ITextBlock_put_Text( tb, str );
++            WindowsDeleteString( str );
++        }
++        if (size) ITextBlock_put_FontSize( tb, size );
++        if (wrap) ITextBlock_put_TextWrapping( tb, TextWrapping_Wrap );
++        ITextBlock_Release( tb );
++    }
++    return object;
++}
++
++static IBrush *solid_brush( Color color )
++{
++    ISolidColorBrushFactory *factory;
++    ISolidColorBrush *brush = NULL;
++    IBrush *out = NULL;
++
++    if (FAILED(IActivationFactory_QueryInterface( solid_color_brush_factory, &IID_ISolidColorBrushFactory, (void **)&factory )))
++        return NULL;
++    ISolidColorBrushFactory_CreateInstanceWithColor( factory, color, &brush );
++    ISolidColorBrushFactory_Release( factory );
++    if (brush)
++    {
++        ISolidColorBrush_QueryInterface( brush, &IID_IBrush, (void **)&out );
++        ISolidColorBrush_Release( brush );
++    }
++    return out;
++}
++
++static void create_button( struct dialog_state *dialog, enum dialog_part part )
++{
++    IInspectable *object, *text;
++    IContentControl *cc;
++    IButtonBase *base;
++    IFrameworkElement *fe;
++    IControl *control;
++    struct xaml_element *element;
++    EventRegistrationToken token;
++    UINT32 len;
++    const WCHAR *str = WindowsGetStringRawBuffer( dialog->texts[part], &len );
++
++    if (!len || FAILED(IActivationFactory_ActivateInstance( button_factory, &object ))) return;
++    if ((text = make_text_block( str, len, 0, FALSE )))
++    {
++        if (SUCCEEDED(IInspectable_QueryInterface( object, &IID_IContentControl, (void **)&cc )))
++        {
++            IContentControl_put_Content( cc, text );
++            IContentControl_Release( cc );
++        }
++        IInspectable_Release( text );
++    }
++    if (SUCCEEDED(IInspectable_QueryInterface( object, &IID_IFrameworkElement, (void **)&fe )))
++    {
++        IFrameworkElement_put_HorizontalAlignment( fe, HorizontalAlignment_Stretch );
++        IFrameworkElement_put_VerticalAlignment( fe, VerticalAlignment_Stretch );
++        IFrameworkElement_Release( fe );
++    }
++    /* set like local values, so that the default Button style doesn't replace them */
++    if ((element = element_from_object( object )))
++    {
++        element_mark_local( element, L"HorizontalAlignment" );
++        element_mark_local( element, L"VerticalAlignment" );
++        if (dialog->default_button == part + ContentDialogButton_Primary)
++        {
++            element_mark_local( element, L"Background" );
++            element_mark_local( element, L"Foreground" );
++        }
++    }
++    if (SUCCEEDED(IInspectable_QueryInterface( object, &IID_IControl, (void **)&control )))
++    {
++        if (part != PART_CLOSE) IControl_put_IsEnabled( control, dialog->enabled[part] );
++        if (dialog->default_button == part + ContentDialogButton_Primary)
++        {
++            /* AccentButtonStyle */
++            Color accent = { 0xff, 0x00, 0x78, 0xd7 }, white = { 0xff, 0xff, 0xff, 0xff };
++            IBrush *brush;
++            if ((brush = solid_brush( accent )))
++            {
++                IControl_put_Background( control, brush );
++                IBrush_Release( brush );
++            }
++            if ((brush = solid_brush( white )))
++            {
++                IControl_put_Foreground( control, brush );
++                IBrush_Release( brush );
++            }
++        }
++        IControl_Release( control );
++    }
++    dialog->handlers[part].IRoutedEventHandler_iface.lpVtbl = &part_click_vtbl;
++    dialog->handlers[part].dialog = dialog;
++    dialog->handlers[part].part = part;
++    if (SUCCEEDED(IInspectable_QueryInterface( object, &IID_IButtonBase, (void **)&base )))
++    {
++        IButtonBase_add_Click( base, &dialog->handlers[part].IRoutedEventHandler_iface, &token );
++        IButtonBase_Release( base );
++    }
++    dialog->button_objects[part] = object;
++    if ((dialog->buttons[part] = element_from_object( object ))) element_set_parent( dialog->buttons[part], &dialog->layer->element );
++}
++
++/* the parts of the dialog box go in the layer */
++static BOOL build_layer( struct dialog_state *dialog )
++{
++    struct button *button = dialog->button;
++    struct dialog_layer *layer;
++    struct xaml_element *element;
++    HSTRING text;
++    UINT32 len;
++    int i;
++
++    if (!(layer = calloc( 1, sizeof(*layer) ))) return FALSE;
++    element_init( &layer->element, &layer_ops, L"Windows.UI.Xaml.Controls.ContentDialog (layer)", NULL );
++    layer->dialog = dialog;
++    if (FAILED(element_compose( &layer->element, NULL, NULL, &layer->element.IInspectable_inner, (void **)&dialog->layer_object )))
++        return FALSE;
++    dialog->layer = layer;
++
++    /* the Title: a UIElement, or text */
++    if (dialog->title && (element = element_from_object( dialog->title )) && !element->parent)
++        dialog->title_element = element;
++    else if (dialog->title && (text = object_to_text( dialog->title )))
++    {
++        const WCHAR *str = WindowsGetStringRawBuffer( text, &len );
++        if ((dialog->title_object = make_text_block( str, len, 20.0, TRUE )))
++            dialog->title_element = element_from_object( dialog->title_object );
++        WindowsDeleteString( text );
++    }
++    /* the Content: the ContentControl's element, or its text */
++    if (button->content_element) dialog->content_element = button->content_element;
++    else if (button->content_text)
++    {
++        const WCHAR *str = WindowsGetStringRawBuffer( button->content_text, &len );
++        if ((dialog->text_object = make_text_block( str, len, 0, TRUE )))
++            dialog->content_element = element_from_object( dialog->text_object );
++    }
++    if (dialog->title_element) element_set_parent( dialog->title_element, &layer->element );
++    if (dialog->content_element) element_set_parent( dialog->content_element, &layer->element );
++    for (i = 0; i < 3; i++) create_button( dialog, i );
++    return TRUE;
++}
++
++static void free_layer( struct dialog_state *dialog )
++{
++    struct button *button = dialog->button;
++    int i;
++
++    for (i = 0; i < 3; i++)
++    {
++        dialog->handlers[i].dialog = NULL;
++        if (dialog->buttons[i]) element_set_parent( dialog->buttons[i], NULL );
++        if (dialog->button_objects[i]) IInspectable_Release( dialog->button_objects[i] );
++        dialog->buttons[i] = NULL;
++        dialog->button_objects[i] = NULL;
++    }
++    /* the app's elements go back */
++    if (dialog->title_element && !dialog->title_object) element_set_parent( dialog->title_element, NULL );
++    if (dialog->content_element && dialog->content_element == button->content_element)
++        element_set_parent( dialog->content_element, &button->element );
++    else if (dialog->content_element) element_set_parent( dialog->content_element, NULL );
++    dialog->title_element = dialog->content_element = NULL;
++    if (dialog->title_object) IInspectable_Release( dialog->title_object );
++    if (dialog->text_object) IInspectable_Release( dialog->text_object );
++    dialog->title_object = dialog->text_object = NULL;
++    if (dialog->layer)
++    {
++        dialog->layer->dialog = NULL;
++        dialog->layer = NULL;
++    }
++    if (dialog->layer_object) IInspectable_Release( dialog->layer_object );
++    dialog->layer_object = NULL;
++}
++
++static struct dialog_state *shown_dialog;   /* one at a time, as on Windows */
++
++static HRESULT dialog_show( struct dialog_state *dialog, IAsyncOperation_ContentDialogResult **value )
++{
++    struct dialog_args *args;
++    struct xaml_element *focus;
++    int i;
++
++    TRACE( "%p.\n", dialog );
++    if (shown_dialog)
++    {
++        WARN( "another ContentDialog is open.\n" );
++        return E_ILLEGAL_METHOD_CALL;
++    }
++    if (!(dialog->async = async_create())) return E_OUTOFMEMORY;
++    if (!build_layer( dialog ) || !window_popup_show( &dialog->layer->element ))
++    {
++        free_layer( dialog );
++        IAsyncOperation_ContentDialogResult_Release( &dialog->async->IAsyncOperation_iface );
++        dialog->async = NULL;
++        return E_FAIL;
++    }
++    dialog->open = TRUE;
++    shown_dialog = dialog;
++    IInspectable_AddRef( dialog->button->element.outer );   /* kept while it shows */
++
++    /* the focus goes to the default button, or the first one */
++    if ((focus = focus_get())) IUIElement_AddRef( &focus->IUIElement_iface );
++    dialog->previous_focus = focus;
++    focus = NULL;
++    if (dialog->default_button != ContentDialogButton_None)
++        focus = dialog->buttons[dialog->default_button - ContentDialogButton_Primary];
++    for (i = 0; !focus && i < 3; i++) focus = dialog->buttons[i];
++    if (focus) focus_set( focus, FocusState_Programmatic );
++    else focus_clear();
++
++    *value = &dialog->async->IAsyncOperation_iface;
++    IAsyncOperation_ContentDialogResult_AddRef( *value );
++    if ((args = args_create( &IID_IContentDialogOpenedEventArgs, 0 )))
++    {
++        raise_dialog_event( dialog, &dialog->opened, args, (IInspectable *)&args->IOpened_iface, "Opened" );
++        args_release( args );
++    }
++    return S_OK;
++}
++
++static void dialog_close( struct dialog_state *dialog, ContentDialogResult result )
++{
++    struct dialog_async *async = dialog->async;
++    struct dialog_args *args;
++    IInspectable *outer = dialog->button->element.outer;
++
++    if (!dialog->open) return;
++    TRACE( "%p, result %d.\n", dialog, result );
++    if ((args = args_create( &IID_IContentDialogClosingEventArgs, result )))
++    {
++        BOOL cancel = raise_dialog_event( dialog, &dialog->closing, args, (IInspectable *)&args->IClosing_iface, "Closing" );
++        args_release( args );
++        if (cancel || !dialog->open) return;
++    }
++    dialog->open = FALSE;
++    shown_dialog = NULL;
++    window_popup_hide( &dialog->layer->element );
++    free_layer( dialog );
++    if (dialog->previous_focus)
++    {
++        if (!focus_set( dialog->previous_focus, FocusState_Programmatic )) focus_clear();
++        IUIElement_Release( &dialog->previous_focus->IUIElement_iface );
++        dialog->previous_focus = NULL;
++    }
++    else focus_clear();
++    window_invalidate();
++
++    if ((args = args_create( &IID_IContentDialogClosedEventArgs, result )))
++    {
++        raise_dialog_event( dialog, &dialog->closed, args, (IInspectable *)&args->IClosed_iface, "Closed" );
++        args_release( args );
++    }
++    /* last: the app's await continues, and may show a dialog again */
++    dialog->async = NULL;
++    if (async)
++    {
++        async->result = result;
++        async->status = Completed;
++        async_call_handler( async );
++        IAsyncOperation_ContentDialogResult_Release( &async->IAsyncOperation_iface );
++    }
++    IInspectable_Release( outer );
++}
++
++static void dialog_part_clicked( struct dialog_state *dialog, enum dialog_part part )
++{
++    static const ContentDialogResult results[] = { ContentDialogResult_Primary, ContentDialogResult_Secondary,
++                                                   ContentDialogResult_None };
++    static const char *names[] = { "PrimaryButtonClick", "SecondaryButtonClick", "CloseButtonClick" };
++    IInspectable *outer = dialog->button->element.outer;
++    struct dialog_args *args;
++    BOOL cancel = FALSE;
++
++    IInspectable_AddRef( outer );
++    if ((args = args_create( &IID_IContentDialogButtonClickEventArgs, 0 )))
++    {
++        cancel = raise_dialog_event( dialog, &dialog->clicks[part], args, (IInspectable *)&args->IButtonClick_iface, names[part] );
++        args_release( args );
++    }
++    if (dialog->commands[part]) FIXME( "%p: the button's Command isn't run.\n", dialog );
++    if (!cancel) dialog_close( dialog, results[part] );
++    IInspectable_Release( outer );
++}
++
++/* ---- IContentDialog ---- */
++
++static inline struct dialog_state *impl_from_IContentDialog( IContentDialog *iface )
++{
++    return CONTAINING_RECORD( iface, struct dialog_state, IContentDialog_iface );
++}
++
++static HRESULT WINAPI dialog_QueryInterface( IContentDialog *iface, REFIID iid, void **out )
++{
++    return IInspectable_QueryInterface( impl_from_IContentDialog( iface )->button->element.outer, iid, out );
++}
++
++static ULONG WINAPI dialog_AddRef( IContentDialog *iface )
++{
++    return IInspectable_AddRef( impl_from_IContentDialog( iface )->button->element.outer );
++}
++
++static ULONG WINAPI dialog_Release( IContentDialog *iface )
++{
++    return IInspectable_Release( impl_from_IContentDialog( iface )->button->element.outer );
++}
++
++static HRESULT WINAPI dialog_GetIids( IContentDialog *iface, ULONG *count, IID **iids )
++{
++    return IInspectable_GetIids( impl_from_IContentDialog( iface )->button->element.outer, count, iids );
++}
++
++static HRESULT WINAPI dialog_GetRuntimeClassName( IContentDialog *iface, HSTRING *name )
++{
++    return IInspectable_GetRuntimeClassName( impl_from_IContentDialog( iface )->button->element.outer, name );
++}
++
++static HRESULT WINAPI dialog_GetTrustLevel( IContentDialog *iface, TrustLevel *level )
++{
++    return IInspectable_GetTrustLevel( impl_from_IContentDialog( iface )->button->element.outer, level );
++}
++
++static void set_object( IInspectable **slot, IInspectable *value )
++{
++    if (value) IInspectable_AddRef( value );
++    if (*slot) IInspectable_Release( *slot );
++    *slot = value;
++}
++
++static HRESULT WINAPI dialog_get_Title( IContentDialog *iface, IInspectable **value )
++{
++    if ((*value = impl_from_IContentDialog( iface )->title)) IInspectable_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI dialog_put_Title( IContentDialog *iface, IInspectable *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    set_object( &impl_from_IContentDialog( iface )->title, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI dialog_get_TitleTemplate( IContentDialog *iface, IDataTemplate **value )
++{
++    if ((*value = impl_from_IContentDialog( iface )->title_template)) IDataTemplate_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI dialog_put_TitleTemplate( IContentDialog *iface, IDataTemplate *value )
++{
++    struct dialog_state *impl = impl_from_IContentDialog( iface );
++    FIXME( "iface %p, value %p: TitleTemplate isn't used.\n", iface, value );
++    if (value) IDataTemplate_AddRef( value );
++    if (impl->title_template) IDataTemplate_Release( impl->title_template );
++    impl->title_template = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI dialog_get_FullSizeDesired( IContentDialog *iface, boolean *value )
++{
++    *value = impl_from_IContentDialog( iface )->full_size;
++    return S_OK;
++}
++
++static HRESULT WINAPI dialog_put_FullSizeDesired( IContentDialog *iface, boolean value )
++{
++    TRACE( "iface %p, value %d: not supported.\n", iface, value );
++    impl_from_IContentDialog( iface )->full_size = value;
++    return S_OK;
++}
++
++#define DIALOG_TEXT( Name, part ) \
++static HRESULT WINAPI dialog_get_##Name##ButtonText( IContentDialog *iface, HSTRING *value ) \
++{ \
++    return WindowsDuplicateString( impl_from_IContentDialog( iface )->texts[part], value ); \
++} \
++static HRESULT WINAPI dialog_put_##Name##ButtonText( IContentDialog *iface, HSTRING value ) \
++{ \
++    struct dialog_state *impl = impl_from_IContentDialog( iface ); \
++    TRACE( "iface %p, value %s.\n", iface, debugstr_hstring(value) ); \
++    WindowsDeleteString( impl->texts[part] ); \
++    return WindowsDuplicateString( value, &impl->texts[part] ); \
++}
++
++DIALOG_TEXT( Primary, PART_PRIMARY )
++DIALOG_TEXT( Secondary, PART_SECONDARY )
++
++#define DIALOG_OBJECT( pfx, Iface, Name, field, part ) \
++static HRESULT WINAPI pfx##_get_##Name( Iface *iface, IInspectable **value ) \
++{ \
++    if ((*value = impl_from_##Iface( iface )->field[part])) IInspectable_AddRef( *value ); \
++    return S_OK; \
++} \
++static HRESULT WINAPI pfx##_put_##Name( Iface *iface, IInspectable *value ) \
++{ \
++    set_object( &impl_from_##Iface( iface )->field[part], value ); \
++    return S_OK; \
++}
++
++DIALOG_OBJECT( dialog, IContentDialog, PrimaryButtonCommand, commands, PART_PRIMARY )
++DIALOG_OBJECT( dialog, IContentDialog, SecondaryButtonCommand, commands, PART_SECONDARY )
++DIALOG_OBJECT( dialog, IContentDialog, PrimaryButtonCommandParameter, parameters, PART_PRIMARY )
++DIALOG_OBJECT( dialog, IContentDialog, SecondaryButtonCommandParameter, parameters, PART_SECONDARY )
++
++#define DIALOG_ENABLED( Name, part ) \
++static HRESULT WINAPI dialog_get_Is##Name##ButtonEnabled( IContentDialog *iface, boolean *value ) \
++{ \
++    *value = impl_from_IContentDialog( iface )->enabled[part]; \
++    return S_OK; \
++} \
++static HRESULT WINAPI dialog_put_Is##Name##ButtonEnabled( IContentDialog *iface, boolean value ) \
++{ \
++    struct dialog_state *impl = impl_from_IContentDialog( iface ); \
++    IControl *control; \
++    impl->enabled[part] = value; \
++    if (impl->button_objects[part] && SUCCEEDED(IInspectable_QueryInterface( impl->button_objects[part], &IID_IControl, (void **)&control ))) \
++    { \
++        IControl_put_IsEnabled( control, value ); \
++        IControl_Release( control ); \
++    } \
++    return S_OK; \
++}
++
++DIALOG_ENABLED( Primary, PART_PRIMARY )
++DIALOG_ENABLED( Secondary, PART_SECONDARY )
++
++#define DIALOG_EVENT( pfx, Iface, Name, field, Handler ) \
++static HRESULT WINAPI pfx##_add_##Name( Iface *iface, Handler *handler, EventRegistrationToken *token ) \
++{ \
++    TRACE( "iface %p, handler %p.\n", iface, handler ); \
++    return event_list_add( &impl_from_##Iface( iface )->field, (IUnknown *)handler, token ); \
++} \
++static HRESULT WINAPI pfx##_remove_##Name( Iface *iface, EventRegistrationToken token ) \
++{ \
++    return event_list_remove( &impl_from_##Iface( iface )->field, token ); \
++}
++
++DIALOG_EVENT( dialog, IContentDialog, Closing, closing, ITypedEventHandler_ContentDialog_ContentDialogClosingEventArgs )
++DIALOG_EVENT( dialog, IContentDialog, Closed, closed, ITypedEventHandler_ContentDialog_ContentDialogClosedEventArgs )
++DIALOG_EVENT( dialog, IContentDialog, Opened, opened, ITypedEventHandler_ContentDialog_ContentDialogOpenedEventArgs )
++DIALOG_EVENT( dialog, IContentDialog, PrimaryButtonClick, clicks[PART_PRIMARY], ITypedEventHandler_ContentDialog_ContentDialogButtonClickEventArgs )
++DIALOG_EVENT( dialog, IContentDialog, SecondaryButtonClick, clicks[PART_SECONDARY], ITypedEventHandler_ContentDialog_ContentDialogButtonClickEventArgs )
++
++static HRESULT WINAPI dialog_Hide( IContentDialog *iface )
++{
++    TRACE( "iface %p.\n", iface );
++    dialog_close( impl_from_IContentDialog( iface ), ContentDialogResult_None );
++    return S_OK;
++}
++
++static HRESULT WINAPI dialog_ShowAsync( IContentDialog *iface, IAsyncOperation_ContentDialogResult **value )
++{
++    return dialog_show( impl_from_IContentDialog( iface ), value );
++}
++
++static const struct IContentDialogVtbl dialog_vtbl =
++{
++    dialog_QueryInterface,
++    dialog_AddRef,
++    dialog_Release,
++    /* IInspectable methods */
++    dialog_GetIids,
++    dialog_GetRuntimeClassName,
++    dialog_GetTrustLevel,
++    /* IContentDialog methods */
++    dialog_get_Title,
++    dialog_put_Title,
++    dialog_get_TitleTemplate,
++    dialog_put_TitleTemplate,
++    dialog_get_FullSizeDesired,
++    dialog_put_FullSizeDesired,
++    dialog_get_PrimaryButtonText,
++    dialog_put_PrimaryButtonText,
++    dialog_get_SecondaryButtonText,
++    dialog_put_SecondaryButtonText,
++    (void *)dialog_get_PrimaryButtonCommand,
++    (void *)dialog_put_PrimaryButtonCommand,
++    (void *)dialog_get_SecondaryButtonCommand,
++    (void *)dialog_put_SecondaryButtonCommand,
++    dialog_get_PrimaryButtonCommandParameter,
++    dialog_put_PrimaryButtonCommandParameter,
++    dialog_get_SecondaryButtonCommandParameter,
++    dialog_put_SecondaryButtonCommandParameter,
++    dialog_get_IsPrimaryButtonEnabled,
++    dialog_put_IsPrimaryButtonEnabled,
++    dialog_get_IsSecondaryButtonEnabled,
++    dialog_put_IsSecondaryButtonEnabled,
++    dialog_add_Closing,
++    dialog_remove_Closing,
++    dialog_add_Closed,
++    dialog_remove_Closed,
++    dialog_add_Opened,
++    dialog_remove_Opened,
++    dialog_add_PrimaryButtonClick,
++    dialog_remove_PrimaryButtonClick,
++    dialog_add_SecondaryButtonClick,
++    dialog_remove_SecondaryButtonClick,
++    dialog_Hide,
++    dialog_ShowAsync,
++};
++
++/* ---- IContentDialog2 ---- */
++
++DEFINE_IINSPECTABLE_( dialog2, IContentDialog2, struct dialog_state, impl_from_IContentDialog2, IContentDialog2_iface,
++                      impl->button->element.outer )
++
++static HRESULT WINAPI dialog2_get_CloseButtonText( IContentDialog2 *iface, HSTRING *value )
++{
++    return WindowsDuplicateString( impl_from_IContentDialog2( iface )->texts[PART_CLOSE], value );
++}
++
++static HRESULT WINAPI dialog2_put_CloseButtonText( IContentDialog2 *iface, HSTRING value )
++{
++    struct dialog_state *impl = impl_from_IContentDialog2( iface );
++    TRACE( "iface %p, value %s.\n", iface, debugstr_hstring(value) );
++    WindowsDeleteString( impl->texts[PART_CLOSE] );
++    return WindowsDuplicateString( value, &impl->texts[PART_CLOSE] );
++}
++
++DIALOG_OBJECT( dialog2, IContentDialog2, CloseButtonCommand, commands, PART_CLOSE )
++DIALOG_OBJECT( dialog2, IContentDialog2, CloseButtonCommandParameter, parameters, PART_CLOSE )
++DIALOG_OBJECT( dialog2, IContentDialog2, PrimaryButtonStyle, styles, PART_PRIMARY )
++DIALOG_OBJECT( dialog2, IContentDialog2, SecondaryButtonStyle, styles, PART_SECONDARY )
++DIALOG_OBJECT( dialog2, IContentDialog2, CloseButtonStyle, styles, PART_CLOSE )
++
++static HRESULT WINAPI dialog2_get_DefaultButton( IContentDialog2 *iface, ContentDialogButton *value )
++{
++    *value = impl_from_IContentDialog2( iface )->default_button;
++    return S_OK;
++}
++
++static HRESULT WINAPI dialog2_put_DefaultButton( IContentDialog2 *iface, ContentDialogButton value )
++{
++    TRACE( "iface %p, value %d.\n", iface, value );
++    if (value < ContentDialogButton_None || value > ContentDialogButton_Close) return E_INVALIDARG;
++    impl_from_IContentDialog2( iface )->default_button = value;
++    return S_OK;
++}
++
++DIALOG_EVENT( dialog2, IContentDialog2, CloseButtonClick, clicks[PART_CLOSE], ITypedEventHandler_ContentDialog_ContentDialogButtonClickEventArgs )
++
++static const struct IContentDialog2Vtbl dialog2_vtbl =
++{
++    dialog2_QueryInterface,
++    dialog2_AddRef,
++    dialog2_Release,
++    /* IInspectable methods */
++    dialog2_GetIids,
++    dialog2_GetRuntimeClassName,
++    dialog2_GetTrustLevel,
++    /* IContentDialog2 methods */
++    dialog2_get_CloseButtonText,
++    dialog2_put_CloseButtonText,
++    (void *)dialog2_get_CloseButtonCommand,
++    (void *)dialog2_put_CloseButtonCommand,
++    dialog2_get_CloseButtonCommandParameter,
++    dialog2_put_CloseButtonCommandParameter,
++    (void *)dialog2_get_PrimaryButtonStyle,
++    (void *)dialog2_put_PrimaryButtonStyle,
++    (void *)dialog2_get_SecondaryButtonStyle,
++    (void *)dialog2_put_SecondaryButtonStyle,
++    (void *)dialog2_get_CloseButtonStyle,
++    (void *)dialog2_put_CloseButtonStyle,
++    dialog2_get_DefaultButton,
++    dialog2_put_DefaultButton,
++    dialog2_add_CloseButtonClick,
++    dialog2_remove_CloseButtonClick,
++};
++
++/* ---- IContentDialog3 ---- */
++
++DEFINE_IINSPECTABLE_( dialog3, IContentDialog3, struct dialog_state, impl_from_IContentDialog3, IContentDialog3_iface,
++                      impl->button->element.outer )
++
++static HRESULT WINAPI dialog3_ShowAsyncWithPlacement( IContentDialog3 *iface, ContentDialogPlacement placement,
++                                                      IAsyncOperation_ContentDialogResult **value )
++{
++    if (placement != ContentDialogPlacement_Popup) FIXME( "iface %p: placement %d, shown as a popup.\n", iface, placement );
++    return dialog_show( impl_from_IContentDialog3( iface ), value );
++}
++
++static const struct IContentDialog3Vtbl dialog3_vtbl =
++{
++    dialog3_QueryInterface,
++    dialog3_AddRef,
++    dialog3_Release,
++    /* IInspectable methods */
++    dialog3_GetIids,
++    dialog3_GetRuntimeClassName,
++    dialog3_GetTrustLevel,
++    /* IContentDialog3 methods */
++    dialog3_ShowAsyncWithPlacement,
++};
++
++/* ---- the button.c side ---- */
++
++HRESULT dialog_init( struct button *impl )
++{
++    struct dialog_state *dialog;
++
++    if (!(dialog = calloc( 1, sizeof(*dialog) ))) return E_OUTOFMEMORY;
++    dialog->IContentDialog_iface.lpVtbl = &dialog_vtbl;
++    dialog->IContentDialog2_iface.lpVtbl = &dialog2_vtbl;
++    dialog->IContentDialog3_iface.lpVtbl = &dialog3_vtbl;
++    dialog->button = impl;
++    dialog->enabled[PART_PRIMARY] = dialog->enabled[PART_SECONDARY] = dialog->enabled[PART_CLOSE] = TRUE;
++    impl->dialog = dialog;
++    impl->element.is_tab_stop = FALSE;
++    return S_OK;
++}
++
++void *dialog_default_iface( struct button *impl )
++{
++    return &impl->dialog->IContentDialog_iface;
++}
++
++HRESULT dialog_query_interface( struct button *impl, REFIID iid, void **out )
++{
++    struct dialog_state *dialog = impl->dialog;
++
++    if (IsEqualGUID( iid, &IID_IContentDialog )) *out = &dialog->IContentDialog_iface;
++    else if (IsEqualGUID( iid, &IID_IContentDialog2 )) *out = &dialog->IContentDialog2_iface;
++    else if (IsEqualGUID( iid, &IID_IContentDialog3 )) *out = &dialog->IContentDialog3_iface;
++    else return E_NOINTERFACE;
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++void dialog_destroy( struct button *impl )
++{
++    struct dialog_state *dialog = impl->dialog;
++    int i;
++
++    if (!dialog) return;
++    if (shown_dialog == dialog) shown_dialog = NULL;
++    free_layer( dialog );
++    if (dialog->previous_focus) IUIElement_Release( &dialog->previous_focus->IUIElement_iface );
++    if (dialog->title) IInspectable_Release( dialog->title );
++    if (dialog->title_template) IDataTemplate_Release( dialog->title_template );
++    for (i = 0; i < 3; i++)
++    {
++        WindowsDeleteString( dialog->texts[i] );
++        if (dialog->commands[i]) IInspectable_Release( dialog->commands[i] );
++        if (dialog->parameters[i]) IInspectable_Release( dialog->parameters[i] );
++        if (dialog->styles[i]) IInspectable_Release( dialog->styles[i] );
++        event_list_clear( &dialog->clicks[i] );
++    }
++    event_list_clear( &dialog->closing );
++    event_list_clear( &dialog->closed );
++    event_list_clear( &dialog->opened );
++    free( dialog );
++    impl->dialog = NULL;
++}
++
++/* ContentDialog properties set from markup; value is the text, or NULL for number */
++BOOL dialog_set_markup( IInspectable *object, const WCHAR *name, const WCHAR *value, double number )
++{
++    struct xaml_element *element = element_from_object( object );
++    struct dialog_state *dialog;
++    struct button *impl;
++    HSTRING str;
++    int part = -1;
++
++    if (!element || !element->class_name || wcscmp( element->class_name, RuntimeClass_Windows_UI_Xaml_Controls_ContentDialog ))
++        return FALSE;
++    impl = CONTAINING_RECORD( element, struct button, element );
++    if (!(dialog = impl->dialog)) return FALSE;
++    if (!wcscmp( name, L"PrimaryButtonText" )) part = PART_PRIMARY;
++    else if (!wcscmp( name, L"SecondaryButtonText" )) part = PART_SECONDARY;
++    else if (!wcscmp( name, L"CloseButtonText" )) part = PART_CLOSE;
++    if (part >= 0)
++    {
++        if (!value || FAILED(WindowsCreateString( value, wcslen( value ), &str ))) return FALSE;
++        WindowsDeleteString( dialog->texts[part] );
++        dialog->texts[part] = str;
++        return TRUE;
++    }
++    if (!wcscmp( name, L"DefaultButton" ))
++    {
++        if (!value) dialog->default_button = number;
++        else if (!wcsicmp( value, L"Primary" )) dialog->default_button = ContentDialogButton_Primary;
++        else if (!wcsicmp( value, L"Secondary" )) dialog->default_button = ContentDialogButton_Secondary;
++        else if (!wcsicmp( value, L"Close" )) dialog->default_button = ContentDialogButton_Close;
++        else dialog->default_button = ContentDialogButton_None;
++        return TRUE;
++    }
++    if (!wcscmp( name, L"IsPrimaryButtonEnabled" ) || !wcscmp( name, L"IsSecondaryButtonEnabled" ))
++    {
++        dialog->enabled[name[2] == 'P' ? PART_PRIMARY : PART_SECONDARY] = value ? !wcsicmp( value, L"True" ) : number != 0;
++        return TRUE;
++    }
++    if (!wcscmp( name, L"FullSizeDesired" ))
++    {
++        dialog->full_size = value ? !wcsicmp( value, L"True" ) : number != 0;
++        return TRUE;
++    }
++    return FALSE;
++}
++
++/* ContentDialog.Title from markup: text or an object */
++BOOL dialog_set_title( IInspectable *object, IInspectable *title )
++{
++    struct xaml_element *element = element_from_object( object );
++    struct button *impl;
++
++    if (!element || !element->class_name || wcscmp( element->class_name, RuntimeClass_Windows_UI_Xaml_Controls_ContentDialog ))
++        return FALSE;
++    impl = CONTAINING_RECORD( element, struct button, element );
++    if (!impl->dialog) return FALSE;
++    set_object( &impl->dialog->title, title );
++    return TRUE;
++}
+diff --git a/dlls/windows.ui.xaml/focus.c b/dlls/windows.ui.xaml/focus.c
+index 213a5a9..c4f40fe 100644
+--- a/dlls/windows.ui.xaml/focus.c
++++ b/dlls/windows.ui.xaml/focus.c
+@@ -45,7 +45,7 @@ FocusState element_focus_state( struct xaml_element *element )
+ /* visible all the way up, and in the window */
+ static BOOL element_shown( struct xaml_element *element )
+ {
+-    struct xaml_element *root = window_content_element();
++    struct xaml_element *root = window_input_root();
+ 
+     for (; element; element = element->parent)
+     {
+@@ -219,7 +219,7 @@ static struct xaml_element *find_tab_target( struct xaml_element *scope, BOOL ba
+ 
+ BOOL focus_move( BOOL backwards, FocusState state )
+ {
+-    struct xaml_element *target = find_tab_target( window_content_element(), backwards );
++    struct xaml_element *target = find_tab_target( window_input_root(), backwards );
+ 
+     return target && focus_set( target, state );
+ }
+@@ -393,7 +393,7 @@ static BOOL raise_key_event( struct xaml_element *start, BOOL down, WPARAM vk, L
+ /* WM_KEYDOWN / WM_KEYUP for the XAML window; TRUE if XAML used the key */
+ BOOL focus_key( BOOL down, WPARAM vk, LPARAM lparam )
+ {
+-    struct xaml_element *start = focused ? focused : window_content_element(), *element;
++    struct xaml_element *start = focused ? focused : window_input_root(), *element;
+     BOOL handled;
+ 
+     if (!start) return FALSE;
+@@ -487,7 +487,7 @@ static struct xaml_element *find_direction( FocusNavigationDirection direction )
+     BOOL backwards = direction == FocusNavigationDirection_Previous || direction == FocusNavigationDirection_Up ||
+                      direction == FocusNavigationDirection_Left;
+     if (direction == FocusNavigationDirection_None) return NULL;
+-    return find_tab_target( window_content_element(), backwards );
++    return find_tab_target( window_input_root(), backwards );
+ }
+ 
+ DEFINE_IINSPECTABLE( manager2, IFocusManagerStatics2, struct focus_manager, IActivationFactory_iface )
+diff --git a/dlls/windows.ui.xaml/main.c b/dlls/windows.ui.xaml/main.c
+index ea96995..f847ecb 100644
+--- a/dlls/windows.ui.xaml/main.c
++++ b/dlls/windows.ui.xaml/main.c
+@@ -78,6 +78,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( property_changed_event_args_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ItemsControl ))
+         IActivationFactory_QueryInterface( items_control_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ContentDialog ))
++        IActivationFactory_QueryInterface( content_dialog_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ListView ))
+         IActivationFactory_QueryInterface( list_view_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_GridView ))
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index d4122a9..dd81bb6 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -88,6 +88,10 @@ extern IActivationFactory *list_view_item_factory;
+ extern IActivationFactory *grid_view_item_factory;
+ extern IActivationFactory *items_stack_panel_factory;
+ extern IActivationFactory *items_wrap_grid_factory;
++extern IActivationFactory *content_dialog_factory;
++/* dialog.c: ContentDialog properties from markup */
++BOOL dialog_set_markup( IInspectable *object, const WCHAR *name, const WCHAR *value, double number );
++BOOL dialog_set_title( IInspectable *object, IInspectable *title );
+ /* items.c: ListView and GridView */
+ struct xaml_element;
+ void list_view_item_clicked( struct xaml_element *owner, struct xaml_element *container );
+@@ -201,6 +205,9 @@ IInspectable *create_builtin( const WCHAR *name );
+ HRESULT window_create_for_core_window( ICoreWindow *core_window );
+ void window_destroy_current(void);
+ struct xaml_element *window_content_element(void);   /* Window.Current.Content, not referenced, or NULL */
++struct xaml_element *window_input_root(void);        /* the topmost popup, or the content */
++BOOL window_popup_show( struct xaml_element *popup ); /* drawn over the content, getting the input, until hidden */
++void window_popup_hide( struct xaml_element *popup );
+ 
+ /* focus.c */
+ extern IActivationFactory *focus_manager_factory;
+diff --git a/dlls/windows.ui.xaml/window.c b/dlls/windows.ui.xaml/window.c
+index c629012..535e5f3 100644
+--- a/dlls/windows.ui.xaml/window.c
++++ b/dlls/windows.ui.xaml/window.c
+@@ -37,6 +37,9 @@ struct xaml_window
+     struct xaml_element *captured;  /* element that got the button press (referenced) */
+     BOOL tracking;
+     struct event_list activated, closed, size_changed, visibility_changed;
++    /* popups over the content, the topmost last (referenced): a ContentDialog's layer, a menu */
++    struct xaml_element *popups[8];
++    UINT32 popup_count;
+ };
+ 
+ static struct xaml_window *current_window;
+@@ -63,6 +66,43 @@ struct xaml_element *window_content_element(void)
+     return element_from_iinspectable( (IInspectable *)current_window->content );
+ }
+ 
++/* where input goes: the topmost popup, which is modal, or the content */
++struct xaml_element *window_input_root(void)
++{
++    if (current_window && current_window->popup_count) return current_window->popups[current_window->popup_count - 1];
++    return window_content_element();
++}
++
++BOOL window_popup_show( struct xaml_element *popup )
++{
++    struct xaml_window *window = current_window;
++
++    if (!window || window->popup_count == ARRAY_SIZE(window->popups)) return FALSE;
++    IUIElement_AddRef( &popup->IUIElement_iface );
++    window->popups[window->popup_count++] = popup;
++    window_invalidate();
++    return TRUE;
++}
++
++static void set_element_ref( struct xaml_element **slot, struct xaml_element *element );
++
++void window_popup_hide( struct xaml_element *popup )
++{
++    struct xaml_window *window = current_window;
++    UINT32 i;
++
++    if (!window) return;
++    for (i = 0; i < window->popup_count; i++) if (window->popups[i] == popup) break;
++    if (i == window->popup_count) return;
++    memmove( window->popups + i, window->popups + i + 1, (window->popup_count - i - 1) * sizeof(*window->popups) );
++    window->popup_count--;
++    /* the pointer's elements may have been in it */
++    set_element_ref( &window->hover, NULL );
++    set_element_ref( &window->captured, NULL );
++    IUIElement_Release( &popup->IUIElement_iface );
++    window_invalidate();
++}
++
+ void window_invalidate(void)
+ {
+     if (current_window && current_window->hwnd) InvalidateRect( current_window->hwnd, NULL, FALSE );
+@@ -83,18 +123,27 @@ static void window_layout( struct xaml_window *window, struct layout_context *ct
+     RECT client;
+     float width, height;
+ 
++    UINT32 i;
++
+     GetClientRect( window->hwnd, &client );
+     ctx->hdc = hdc;
+     ctx->scale = view_scale();
+     ctx->dark = application_theme() == ApplicationTheme_Dark;
+     ctx->foreground = ctx->dark ? RGB(255, 255, 255) : RGB(0, 0, 0);
+     ctx->foreground_alpha = 255;
+-    if (!window->content || !(element = element_from_iinspectable( (IInspectable *)window->content ))) return;
+-
+     width = client.right / ctx->scale;
+     height = client.bottom / ctx->scale;
+-    element_measure( element, ctx, width, height );
+-    element_arrange( element, ctx, 0, 0, width, height );
++    if (window->content && (element = element_from_iinspectable( (IInspectable *)window->content )))
++    {
++        element_measure( element, ctx, width, height );
++        element_arrange( element, ctx, 0, 0, width, height );
++    }
++    /* popups get the whole window and place themselves */
++    for (i = 0; i < window->popup_count; i++)
++    {
++        element_measure( window->popups[i], ctx, width, height );
++        element_arrange( window->popups[i], ctx, 0, 0, width, height );
++    }
+ }
+ 
+ static void window_paint( struct xaml_window *window )
+@@ -106,6 +155,7 @@ static void window_paint( struct xaml_window *window )
+     HBRUSH background;
+     RECT client;
+     HDC hdc, mem;
++    UINT32 i;
+ 
+     ULONGLONG start = GetTickCount64();
+ 
+@@ -125,6 +175,7 @@ static void window_paint( struct xaml_window *window )
+         /* Direct2D draws the frame into the back buffer; without it, GDI does */
+         render_begin( &ctx, mem, &client );
+         element_render( element, &ctx );
++        for (i = 0; i < window->popup_count; i++) element_render( window->popups[i], &ctx );
+         render_end( &ctx );
+     }
+ 
+@@ -148,7 +199,7 @@ static struct xaml_element *pointer_target( struct xaml_window *window, float x,
+ {
+     struct xaml_element *element;
+ 
+-    if (!window->content || !(element = element_from_iinspectable( (IInspectable *)window->content ))) return NULL;
++    if (!(element = window_input_root())) return NULL;
+     for (element = element_hit_test( element, x, y ); element; element = element->parent)
+         if (element->ops->pointer) return element;
+     return NULL;
+@@ -208,7 +259,7 @@ static void window_pointer( struct xaml_window *window, UINT msg, LPARAM lparam
+ static void window_wheel( struct xaml_window *window, WPARAM wparam, LPARAM lparam, BOOL horizontal )
+ {
+     POINT pt = { (short)LOWORD( lparam ), (short)HIWORD( lparam ) };
+-    struct xaml_element *element, *root = window_content_element();
++    struct xaml_element *element, *root = window_input_root();
+     float scale = view_scale();
+ 
+     if (!root) return;
+diff --git a/dlls/windows.ui.xaml/xbf.c b/dlls/windows.ui.xaml/xbf.c
+index 668a0ba..dcde8ce 100644
+--- a/dlls/windows.ui.xaml/xbf.c
++++ b/dlls/windows.ui.xaml/xbf.c
+@@ -2199,9 +2199,17 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+         else if (value->kind == XV_SIGNED || value->kind == XV_FLOAT) to_double( value, &d );
+         else if (str && to_double( value, &d ) && wcsicmp( str, L"Auto" )) str = NULL;
+         else if (!str) have = FALSE;
+-        if (have && (list_view_set_markup( target, prop->name, str, d ) || wrap_grid_set_markup( target, prop->name, str, d )))
++        if (have && (list_view_set_markup( target, prop->name, str, d ) || wrap_grid_set_markup( target, prop->name, str, d ) ||
++                     dialog_set_markup( target, prop->name, value->kind == XV_STRING ? value->s : str, d )))
+             return S_OK;
+     }
++    if (prop_is( prop, L"Title" ))
++    {
++        IInspectable *title = to_content( value );
++        BOOL done = dialog_set_title( target, title );
++        if (title) IInspectable_Release( title );
++        if (done) return S_OK;
++    }
+     if (prop_is( prop, L"IsSelected" ))
+     {
+         ISelectorItem *selector_item;
+@@ -2927,6 +2935,7 @@ IInspectable *create_builtin( const WCHAR *name )
+         { L"BitmapImage", &bitmap_image_factory },
+         { L"ItemsControl", &items_control_factory },
+         { L"ListView", &list_view_factory },
++        { L"ContentDialog", &content_dialog_factory },
+         { L"GridView", &grid_view_factory },
+         { L"ListViewItem", &list_view_item_factory },
+         { L"GridViewItem", &grid_view_item_factory },

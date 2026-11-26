@@ -2722,6 +2722,178 @@ done:
     IInspectable_Release(root);
 }
 
+/* one handler type for the ContentDialog events: TypedEventHandler<ContentDialog, args> all look alike */
+struct dialog_handler
+{
+    ITypedEventHandler_IInspectable_IInspectable iface;
+    int kind;   /* 0 PrimaryButtonClick, 1 CloseButtonClick, 2 Closing, 3 Closed, 4 Opened */
+};
+static int dialog_counts[5], cancel_primary;
+static ContentDialogResult closed_result = -1;
+static HRESULT WINAPI dialog_handler_QueryInterface(ITypedEventHandler_IInspectable_IInspectable *iface, REFIID iid, void **out)
+{
+    *out = iface;
+    return S_OK;
+}
+static ULONG WINAPI dialog_handler_AddRef(ITypedEventHandler_IInspectable_IInspectable *iface) { return 2; }
+static ULONG WINAPI dialog_handler_Release(ITypedEventHandler_IInspectable_IInspectable *iface) { return 1; }
+static HRESULT WINAPI dialog_handler_Invoke(ITypedEventHandler_IInspectable_IInspectable *iface, IInspectable *sender, IInspectable *args)
+{
+    struct dialog_handler *handler = CONTAINING_RECORD(iface, struct dialog_handler, iface);
+    IContentDialogButtonClickEventArgs *click;
+    IContentDialogClosedEventArgs *closed;
+
+    dialog_counts[handler->kind]++;
+    if (handler->kind == 0 && cancel_primary &&
+        SUCCEEDED(IInspectable_QueryInterface(args, &IID_IContentDialogButtonClickEventArgs, (void **)&click)))
+    {
+        IContentDialogButtonClickEventArgs_put_Cancel(click, TRUE);
+        IContentDialogButtonClickEventArgs_Release(click);
+    }
+    if (handler->kind == 3 && SUCCEEDED(IInspectable_QueryInterface(args, &IID_IContentDialogClosedEventArgs, (void **)&closed)))
+    {
+        IContentDialogClosedEventArgs_get_Result(closed, &closed_result);
+        IContentDialogClosedEventArgs_Release(closed);
+    }
+    return S_OK;
+}
+static ITypedEventHandler_IInspectable_IInspectableVtbl dialog_handler_vtbl =
+    { dialog_handler_QueryInterface, dialog_handler_AddRef, dialog_handler_Release, dialog_handler_Invoke };
+static struct dialog_handler on_dialog[5] =
+    { {{&dialog_handler_vtbl}, 0}, {{&dialog_handler_vtbl}, 1}, {{&dialog_handler_vtbl}, 2}, {{&dialog_handler_vtbl}, 3},
+      {{&dialog_handler_vtbl}, 4} };
+
+static int dialog_completed;
+static ContentDialogResult completed_result = -1;
+static HRESULT WINAPI dialog_done_QueryInterface(IAsyncOperationCompletedHandler_ContentDialogResult *iface, REFIID iid, void **out)
+{
+    *out = iface;
+    return S_OK;
+}
+static ULONG WINAPI dialog_done_AddRef(IAsyncOperationCompletedHandler_ContentDialogResult *iface) { return 2; }
+static ULONG WINAPI dialog_done_Release(IAsyncOperationCompletedHandler_ContentDialogResult *iface) { return 1; }
+static HRESULT WINAPI dialog_done_Invoke(IAsyncOperationCompletedHandler_ContentDialogResult *iface,
+                                         IAsyncOperation_ContentDialogResult *op, AsyncStatus status)
+{
+    dialog_completed++;
+    if (status == Completed) IAsyncOperation_ContentDialogResult_GetResults(op, &completed_result);
+    return S_OK;
+}
+static IAsyncOperationCompletedHandler_ContentDialogResultVtbl dialog_done_vtbl =
+    { dialog_done_QueryInterface, dialog_done_AddRef, dialog_done_Release, dialog_done_Invoke };
+static IAsyncOperationCompletedHandler_ContentDialogResult on_dialog_done = { &dialog_done_vtbl };
+
+static const WCHAR dialog_xaml[] =
+    L"<ContentDialog xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\"\n"
+    L"      Title=\"Delete it?\" PrimaryButtonText=\"Delete\" CloseButtonText=\"Cancel\" DefaultButton=\"Primary\">\n"
+    L"  <TextBlock Text=\"This can't be undone.\" TextWrapping=\"Wrap\"/>\n"
+    L"</ContentDialog>\n";
+
+static IAsyncOperation_ContentDialogResult *show_dialog(IContentDialog *dialog)
+{
+    IAsyncOperation_ContentDialogResult *op = NULL;
+    HRESULT hr = IContentDialog_ShowAsync(dialog, &op);
+    if (FAILED(hr)) printf("ShowAsync failed, hr %#lx\n", hr);
+    if (op) IAsyncOperation_ContentDialogResult_put_Completed(op, &on_dialog_done);
+    pump(30);
+    return op;
+}
+
+static void check_dialog(struct main_page *page)
+{
+    IInspectable *root;
+    IContentDialog *dialog = NULL;
+    IContentDialog2 *dialog2 = NULL;
+    IAsyncOperation_ContentDialogResult *op, *second = NULL;
+    IAsyncInfo *info;
+    EventRegistrationToken token;
+    AsyncStatus status = -1;
+    ContentDialogButton button = -1;
+    RECT box;
+    HRESULT hr;
+    DWORD c;
+    int n, clicks;
+
+    root = xaml_load(dialog_xaml, &hr);
+    check(hr == S_OK && root, "XamlReader.Load of a ContentDialog, hr %#lx", hr);
+    if (!root) return;
+    IInspectable_QueryInterface(root, &IID_IContentDialog, (void **)&dialog);
+    IInspectable_QueryInterface(root, &IID_IContentDialog2, (void **)&dialog2);
+    check(dialog && dialog2, "ContentDialog is an IContentDialog and IContentDialog2");
+    if (!dialog || !dialog2) goto done;
+    IContentDialog2_get_DefaultButton(dialog2, &button);
+    check(button == ContentDialogButton_Primary, "DefaultButton=\"Primary\" from markup (%d)", button);
+    IContentDialog_add_PrimaryButtonClick(dialog, (void *)&on_dialog[0].iface, &token);
+    IContentDialog2_add_CloseButtonClick(dialog2, (void *)&on_dialog[1].iface, &token);
+    IContentDialog_add_Closing(dialog, (void *)&on_dialog[2].iface, &token);
+    IContentDialog_add_Closed(dialog, (void *)&on_dialog[3].iface, &token);
+    IContentDialog_add_Opened(dialog, (void *)&on_dialog[4].iface, &token);
+
+    op = show_dialog(dialog);
+    check(op != NULL && dialog_counts[4] == 1, "ShowAsync returns an operation and raises Opened (%d)", dialog_counts[4]);
+    if (!op) goto done;
+    IAsyncOperation_ContentDialogResult_QueryInterface(op, &IID_IAsyncInfo, (void **)&info);
+    IAsyncInfo_get_Status(info, &status);
+    check(status == Started && dialog_completed == 0, "the operation runs while the dialog shows (%d)", status);
+    hr = IContentDialog_ShowAsync(dialog, &second);
+    check(hr == E_ILLEGAL_METHOD_CALL && !second, "one dialog at a time: a second ShowAsync fails, hr %#lx", hr);
+
+    snapshot();
+    if (GetEnvironmentVariableA("XAMLHELLO_SCREENSHOT", NULL, 0)) CopyFileA("xamlmarkup.bmp", "xamlmarkup-dialog.bmp", FALSE);
+    c = px(25, 600);
+    check(close_rgb(c, 153, 193, 224, 10), "a translucent smoke covers the page (%06lx)", c);
+    n = find_color(0x0078d7, &box);
+    check(n > 1000 && box.right - box.left + 1 == 320 && abs((box.left + box.right) / 2 - 640) <= 1,
+          "a 320 px dialog box with an accent border and default button, centred (%d px, %ld..%ld)", n, box.left, box.right);
+
+    /* modal: the page's button doesn't get the click */
+    clicks = page->clicks;
+    SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(75, 91));
+    SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(75, 91));
+    check(page->clicks == clicks, "the page gets no clicks while the dialog shows (%d)", page->clicks - clicks);
+
+    /* Enter is the default button */
+    key(VK_RETURN);
+    pump(20);
+    IAsyncInfo_get_Status(info, &status);
+    check(dialog_counts[0] == 1 && dialog_counts[2] == 1 && dialog_counts[3] == 1 && closed_result == ContentDialogResult_Primary,
+          "Enter clicks Delete: PrimaryButtonClick, Closing, Closed with Primary (%d %d %d, %d)",
+          dialog_counts[0], dialog_counts[2], dialog_counts[3], closed_result);
+    check(status == Completed && dialog_completed == 1 && completed_result == ContentDialogResult_Primary,
+          "and ShowAsync completes with Primary (%d, %d, %d)", status, dialog_completed, completed_result);
+    snapshot();
+    c = px(25, 600);
+    check(close_rgb(c, 0x00, 0x63, 0xb1, 6), "the smoke is gone (%06lx)", c);
+    IAsyncInfo_Release(info);
+    IAsyncOperation_ContentDialogResult_Release(op);
+
+    /* Escape is the Close button */
+    op = show_dialog(dialog);
+    key(VK_ESCAPE);
+    pump(20);
+    check(dialog_counts[1] == 1 && completed_result == ContentDialogResult_None && dialog_completed == 2,
+          "Escape clicks Cancel: CloseButtonClick, result None (%d, %d)", dialog_counts[1], completed_result);
+    if (op) IAsyncOperation_ContentDialogResult_Release(op);
+
+    /* a click handler can Cancel; Hide closes with None */
+    op = show_dialog(dialog);
+    cancel_primary = 1;
+    key(VK_RETURN);
+    pump(20);
+    check(dialog_counts[0] == 2 && dialog_counts[2] == 2 && dialog_completed == 2,
+          "a PrimaryButtonClick handler's Cancel keeps it open (%d, %d)", dialog_counts[2], dialog_completed);
+    IContentDialog_Hide(dialog);
+    pump(20);
+    check(dialog_completed == 3 && completed_result == ContentDialogResult_None && closed_result == ContentDialogResult_None,
+          "Hide closes it with None (%d, %d)", dialog_completed, completed_result);
+    if (op) IAsyncOperation_ContentDialogResult_Release(op);
+
+done:
+    if (dialog) IContentDialog_Release(dialog);
+    if (dialog2) IContentDialog2_Release(dialog2);
+    IInspectable_Release(root);
+}
+
 static void check_microsoft_xbf(const WCHAR *file, const WCHAR *component_class)
 {
     IActivationFactory *factory;
@@ -2838,6 +3010,7 @@ static void CALLBACK verify(HWND unused, UINT msg, UINT_PTR id, DWORD time)
     check_textbox(the_page);
     check_images(the_page);
     check_lists(the_page);
+    check_dialog(the_page);
     check(!wcscmp(text_of(the_page->title, buf, ARRAYSIZE(buf)), L"Clicked!"), "OnClick changed Title (%ls)", buf);
     snapshot();
 
