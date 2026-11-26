@@ -1,0 +1,90 @@
+Subject: ntdll, kernelbase: delay-load failure hooks get the procedure name and a failing stub; SetProcessValidCallTargets
+
+diff --git a/dlls/kernelbase/kernelbase.spec b/dlls/kernelbase/kernelbase.spec
+index 791fe00..6768169 100644
+--- a/dlls/kernelbase/kernelbase.spec
++++ b/dlls/kernelbase/kernelbase.spec
+@@ -1514,7 +1514,7 @@
+ @ stdcall SetProcessPreferredUILanguages(long ptr ptr)
+ @ stdcall SetProcessPriorityBoost(long long)
+ @ stdcall SetProcessShutdownParameters(long long)
+-# @ stub SetProcessValidCallTargets
++@ stdcall SetProcessValidCallTargets(long ptr long long ptr)
+ @ stdcall SetProcessWorkingSetSizeEx(long long long long)
+ # @ stub SetProtectedPolicy
+ # @ stub SetRoamingLastObservedChangeTime
+diff --git a/dlls/kernelbase/memory.c b/dlls/kernelbase/memory.c
+index 2ce2dca..1cce666 100644
+--- a/dlls/kernelbase/memory.c
++++ b/dlls/kernelbase/memory.c
+@@ -551,6 +551,23 @@ BOOL WINAPI DECLSPEC_HOTPATCH  VirtualLock( void *addr, SIZE_T size )
+ /***********************************************************************
+  *             VirtualProtect   (kernelbase.@)
+  */
++/***********************************************************************
++ *             SetProcessValidCallTargets   (kernelbase.@)
++ *
++ * Control Flow Guard's call target list: Wine doesn't enforce CFG, so every target is valid and this only marks them
++ * processed (CFG_CALL_TARGET_PROCESSED is 0x2 in each entry's Flags).
++ */
++BOOL WINAPI SetProcessValidCallTargets( HANDLE process, void *base, SIZE_T size, ULONG count, void *infos )
++{
++    struct { ULONG_PTR Offset; ULONG_PTR Flags; } *info = infos;
++    ULONG i;
++
++    TRACE( "process %p, base %p, size %#Ix, count %lu, infos %p.\n", process, base, size, count, infos );
++    for (i = 0; i < count; i++) info[i].Flags |= 0x2;
++    return TRUE;
++}
++
++
+ BOOL WINAPI DECLSPEC_HOTPATCH VirtualProtect( void *addr, SIZE_T size, DWORD new_prot, DWORD *old_prot )
+ {
+     return VirtualProtectEx( GetCurrentProcess(), addr, size, new_prot, old_prot );
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+index d0c2145..bebdb49 100644
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -3828,6 +3828,13 @@ BOOLEAN WINAPI RtlDllShutdownInProgress(void)
+     return process_detaching;
+ }
+ 
++/* what an unresolved delay-loaded function becomes when the module's failure hook declines it */
++static ULONG_PTR WINAPI delayload_failure_stub(void)
++{
++    RtlSetLastWin32Error( ERROR_PROC_NOT_FOUND );
++    return E_NOTIMPL;
++}
++
+ /****************************************************************************
+  *              LdrResolveDelayLoadedAPI   (NTDLL.@)
+  */
+@@ -3887,13 +3894,26 @@ fail:
+     delayinfo.ThunkAddress = addr;
+     delayinfo.TargetDllName = name;
+     delayinfo.TargetApiDescriptor.ImportDescribedByName = !IMAGE_SNAP_BY_ORDINAL(pINT[id].u1.Ordinal);
+-    delayinfo.TargetApiDescriptor.Description.Ordinal = LOWORD(pINT[id].u1.Ordinal);
++    if (delayinfo.TargetApiDescriptor.ImportDescribedByName)
++    {
++        /* the hook gets the name, as on Windows (.NET Native's runtime looks it up by name) */
++        const IMAGE_IMPORT_BY_NAME* iibn = get_rva(base, pINT[id].u1.AddressOfData);
++        delayinfo.TargetApiDescriptor.Description.Name = (const char *)iibn->Name;
++    }
++    else
++        delayinfo.TargetApiDescriptor.Description.Ordinal = LOWORD(pINT[id].u1.Ordinal);
+     delayinfo.TargetModuleBase = *phmod;
+     delayinfo.Unused = NULL;
+     delayinfo.LastError = nts;
+ 
+     if (dllhook)
+-        return dllhook(4, &delayinfo);
++    {
++        /* when the module's own hook doesn't supply a replacement, the call fails instead of jumping to NULL:
++         * .NET Native's mrt100_app.dll delay-loads the desktop runtime's GetManagedRuntimeService and expects that */
++        if ((fp = dllhook(4, &delayinfo))) return fp;
++        WARN( "%s: the failure hook gave no replacement, using a failing stub\n", debugstr_a(name) );
++        return (void *)delayload_failure_stub;
++    }
+ 
+     if (IMAGE_SNAP_BY_ORDINAL(pINT[id].u1.Ordinal))
+     {

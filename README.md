@@ -266,7 +266,8 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 and app pages from C++/CX TypeNames, 0055-0060 for Microsoft Minesweeper (a Unity XAML game):
                 PointerVisualizationSettings, PnpObject, SystemNavigationManager, input capabilities,
                 ICoreApplication2, MediaDevice selectors, the thread pool's IAsyncAction, SwapChainPanel,
-                CompositionTarget, Loaded/SizeChanged
+                CompositionTarget, Loaded/SizeChanged, 0061 delay-load failure handling and
+                SetProcessValidCallTargets (.NET Native's runtime)
 patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings
