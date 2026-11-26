@@ -606,3 +606,47 @@ is added, which the generator missed.
   - Space clicking on release, Enter clicking;
   - Tab skipping `IsTabStop=False`.
 - Milestones 1 and 2 still pass 34/34.
+
+## 18. Milestone 5, part 2: TextBox and PasswordBox (patches 0045-0046)
+
+Patch 0045 is the IDL, generated with `winmd2idl.py` for `Controls.TextBox`, `PasswordBox` and `TextChangedEventArgs`
+(all their interface versions, `InputScope` and the text control event args). It needs
+`AsyncOperationCompletedHandler<IVectorView<HSTRING>>` declared, which the generator missed. Patch 0046 is the code
+(`textbox.c`).
+
+**What was built:**
+
+- **`TextBox` and `PasswordBox`** are Control kinds of `struct button`, so `IControl` (fonts, brushes, focus) is shared with the other controls.
+  - **Interfaces:** `ITextBox` and `ITextBox2`; `IPasswordBox` and `IPasswordBox2`. TextBox also has `ITextBoxFactory`, so apps can subclass it.
+  - **Look:** Windows 10's, with a 2 px border that turns the accent colour while focused, `Header` above as text, and `PlaceholderText` in grey while the box is empty. A PasswordBox shows `PasswordChar` (● by default) for each character.
+- **Layout and drawing:**
+  - Text is laid out with DirectWrite, which also places the caret and maps a click to a character. `render.c` gains `dwrite_caret` and `dwrite_hit`.
+  - A single-line box scrolls sideways to keep the caret in view. With `AcceptsReturn` it has lines and grows with them, and wraps if `TextWrapping` says so.
+  - **Wine bug worked round:** Wine's `IDWriteTextLayout::HitTestTextPosition` faults on a layout without characters, so an empty text is measured as a space.
+- **Editing:**
+  - **Typing:** characters (`WM_CHAR`, through a new element operation and `focus_char`) replace the selection.
+  - **Keys:** Backspace and Delete, the arrow keys with Shift to select and Ctrl to move by word, Home and End, Up and Down between lines, and Enter for a new line with `AcceptsReturn`.
+  - **Clipboard:** Ctrl+A, and Ctrl+C / X / V for TextBox only.
+  - **Mouse:** a press places the caret, a drag selects, and Shift+press extends the selection.
+  - **Limits:** `MaxLength` and `IsReadOnly` hold.
+- **API:**
+  - **Text:** `Text`, `SelectedText`, `SelectionStart`/`SelectionLength`, `Select`, `SelectAll` and `GetRectFromCharacterIndex`; `Password` and `PasswordChar`.
+  - **Events:** `TextChanged` (with `TextChangedEventArgs`), `SelectionChanged` and `PasswordChanged` are raised at once, not queued as on Windows. Bindings to `Text` and `Password` hear of changes.
+- **Markup:** `Text`, `Password`, `PlaceholderText`, `Header` (as text), `PasswordChar`, `AcceptsReturn`, `IsReadOnly`, `MaxLength` and `TextWrapping`.
+- **Not supported:**
+  - IME composition, undo, spell checking, the touch keyboard, the password reveal button and the context menu;
+  - `HeaderTemplate`, the selection highlight brush, and the interface versions above 2;
+  - the selection is drawn as a translucent accent band over the text, where Windows draws white text on the accent colour.
+
+**Tests:**
+
+- **`xamlmarkup`: 185/185 checks pass**, 24 of them new:
+  - the placeholder from markup and drawn in grey, and the 32 px height;
+  - typing with `TextChanged`, and the caret after the text;
+  - Left, replacing a selection, Backspace, Delete, `SelectAll`;
+  - `MaxLength` and `IsReadOnly`;
+  - Ctrl+C and Ctrl+V twice through the clipboard;
+  - clicks at the text's start and end placing the caret;
+  - typing a password with `PasswordChanged`;
+  - Enter adding a line to an `AcceptsReturn` box, which then grows.
+- Milestones 1 and 2 still pass 34/34.

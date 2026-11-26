@@ -1943,8 +1943,9 @@ static void check_scroll_focus(struct main_page *page)
     IButtonBase *bb = NULL;
     IUIElement *ui, *keys_ui = NULL;
     EventRegistrationToken token;
-    int got_focus = 0, clicks = 0;
-    struct counter_handler on_got_focus = { { &counter_vtbl }, &got_focus }, on_second_click = { { &counter_vtbl }, &clicks };
+    /* static: the elements keep their handlers until the process ends */
+    static int got_focus, clicks;
+    static struct counter_handler on_got_focus = { { &counter_vtbl }, &got_focus }, on_second_click = { { &counter_vtbl }, &clicks };
     Visibility visibility;
     FocusState state;
     boolean result;
@@ -2084,6 +2085,225 @@ done:
     IInspectable_Release(root);
 }
 
+/* milestone 5 part 2: TextBox and PasswordBox (an overlay at 950,510) */
+
+static int text_changed_count;
+static HRESULT WINAPI text_changed_QueryInterface(ITextChangedEventHandler *iface, REFIID iid, void **out)
+{
+    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_ITextChangedEventHandler))
+    { *out = iface; return S_OK; }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI text_changed_AddRef(ITextChangedEventHandler *iface) { return 2; }
+static ULONG WINAPI text_changed_Release(ITextChangedEventHandler *iface) { return 1; }
+static HRESULT WINAPI text_changed_Invoke(ITextChangedEventHandler *iface, IInspectable *sender, ITextChangedEventArgs *args)
+{
+    text_changed_count++;
+    return S_OK;
+}
+static ITextChangedEventHandlerVtbl text_changed_vtbl =
+    { text_changed_QueryInterface, text_changed_AddRef, text_changed_Release, text_changed_Invoke };
+static ITextChangedEventHandler on_text_changed = { &text_changed_vtbl };
+
+static const WCHAR textbox_xaml[] =
+    L"<StackPanel xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\"\n"
+    L"      xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\" Grid.RowSpan=\"2\" Margin=\"950,510,0,0\"\n"
+    L"      HorizontalAlignment=\"Left\" VerticalAlignment=\"Top\" Width=\"300\" Background=\"White\">\n"
+    L"  <TextBox x:Name=\"Edit\" Width=\"200\" HorizontalAlignment=\"Left\" PlaceholderText=\"Type here\"/>\n"
+    L"  <PasswordBox x:Name=\"Secret\" Width=\"200\" HorizontalAlignment=\"Left\"/>\n"
+    L"  <TextBox x:Name=\"Multi\" Width=\"200\" HorizontalAlignment=\"Left\" AcceptsReturn=\"True\" Text=\"one\"/>\n"
+    L"</StackPanel>\n";
+
+static void type_text(const WCHAR *text)
+{
+    for (; *text; text++) SendMessageW(hwnd, WM_CHAR, *text, 1);
+}
+
+static void key(UINT vk)
+{
+    SendMessageW(hwnd, WM_KEYDOWN, vk, 1);
+    SendMessageW(hwnd, WM_KEYUP, vk, 0xc0000001);
+}
+
+/* a key with Ctrl held, through the thread's keyboard state (what GetKeyState reads) */
+static void ctrl_key(UINT vk)
+{
+    BYTE state[256];
+    GetKeyboardState(state);
+    state[VK_CONTROL] = 0x80;
+    SetKeyboardState(state);
+    key(vk);
+    state[VK_CONTROL] = 0;
+    SetKeyboardState(state);
+}
+
+static const WCHAR *box_text(ITextBox *box, WCHAR *buf, int len)
+{
+    HSTRING str = NULL;
+    ITextBox_get_Text(box, &str);
+    lstrcpynW(buf, WindowsGetStringRawBuffer(str, NULL), len);
+    WindowsDeleteString(str);
+    return buf;
+}
+
+static void check_textbox(struct main_page *page)
+{
+    IFrameworkElement2 *page_grid = page_root(page);
+    IInspectable *root, *edit_obj, *secret_obj, *multi_obj;
+    ITextBox *edit = NULL, *multi = NULL;
+    IPasswordBox *secret = NULL;
+    IControl *control;
+    IVector_UIElement *children;
+    IUIElement *ui;
+    IPanel *panel;
+    EventRegistrationToken token;
+    static int pw_changed;
+    static struct counter_handler on_pw_changed = { { &counter_vtbl }, &pw_changed };
+    WCHAR buf[64];
+    INT32 start, length;
+    HSTRING str;
+    boolean result;
+    double edit_h, multi_h;
+    int x = 950, y = 510, gray;
+    HRESULT hr;
+
+    root = xaml_load(textbox_xaml, &hr);
+    check(hr == S_OK && root, "XamlReader.Load of a TextBox, a PasswordBox and a multi-line TextBox, hr %#lx", hr);
+    if (!root || !page_grid) return;
+    IFrameworkElement2_QueryInterface(page_grid, &IID_IPanel, (void **)&panel);
+    IPanel_get_Children(panel, &children);
+    IInspectable_QueryInterface(root, &IID_IUIElement, (void **)&ui);
+    IVector_UIElement_Append(children, ui);
+    IUIElement_Release(ui);
+    edit_obj = find_in(root, L"Edit");
+    secret_obj = find_in(root, L"Secret");
+    multi_obj = find_in(root, L"Multi");
+    if (edit_obj) IInspectable_QueryInterface(edit_obj, &IID_ITextBox, (void **)&edit);
+    if (secret_obj) IInspectable_QueryInterface(secret_obj, &IID_IPasswordBox, (void **)&secret);
+    if (multi_obj) IInspectable_QueryInterface(multi_obj, &IID_ITextBox, (void **)&multi);
+    check(edit && secret && multi, "they are ITextBox and IPasswordBox");
+    if (!edit || !secret || !multi) goto done;
+    snapshot();
+
+    check(!*box_text(edit, buf, ARRAYSIZE(buf)), "a new TextBox is empty (%ls)", buf);
+    {
+        ITextBox2 *edit2 = NULL;
+        str = NULL;
+        IInspectable_QueryInterface(edit_obj, &IID_ITextBox2, (void **)&edit2);
+        if (edit2) ITextBox2_get_PlaceholderText(edit2, &str);
+        check(!wcscmp(WindowsGetStringRawBuffer(str, NULL), L"Type here"), "PlaceholderText from markup (%ls)",
+              WindowsGetStringRawBuffer(str, NULL));
+        WindowsDeleteString(str);
+        if (edit2) ITextBox2_Release(edit2);
+    }
+    gray = 0;
+    /* grey text, anti-aliased: pixels darker than the white background but never as dark as black text */
+    {
+        int darkest = 255;
+        for (int py = y + 4; py < y + 28; py++)
+            for (int px_ = x + 10; px_ < x + 120; px_++)
+            {
+                DWORD c = px(px_, py);
+                int lum = ((c >> 16) + ((c >> 8) & 0xff) + (c & 0xff)) / 3;
+                if (lum < 230) gray++;
+                if (lum < darkest) darkest = lum;
+            }
+        check(gray > 20 && darkest >= 80, "and shows its PlaceholderText in grey (%d px, darkest %d)", gray, darkest);
+    }
+    edit_h = actual(edit, TRUE);
+    check(edit_h == 32, "a single-line TextBox is 32 px high (%g)", edit_h);
+
+    ITextBox_add_TextChanged(edit, &on_text_changed, &token);
+    IInspectable_QueryInterface(edit_obj, &IID_IControl, (void **)&control);
+    IControl_Focus(control, FocusState_Keyboard, &result);
+    IControl_Release(control);
+    type_text(L"Hi");
+    check(!wcscmp(box_text(edit, buf, ARRAYSIZE(buf)), L"Hi"), "typing into the focused TextBox (%ls)", buf);
+    check(text_changed_count == 2, "raises TextChanged for each character (%d)", text_changed_count);
+    ITextBox_get_SelectionStart(edit, &start);
+    check(start == 2, "and leaves the caret after the text (%d)", start);
+    key(VK_LEFT);
+    type_text(L"!");
+    check(!wcscmp(box_text(edit, buf, ARRAYSIZE(buf)), L"H!i"), "Left moves the caret back one (%ls)", buf);
+    ITextBox_Select(edit, 0, 1);
+    type_text(L"X");
+    check(!wcscmp(box_text(edit, buf, ARRAYSIZE(buf)), L"X!i"), "a typed character replaces the selection (%ls)", buf);
+    key(VK_BACK);
+    check(!wcscmp(box_text(edit, buf, ARRAYSIZE(buf)), L"!i"), "Backspace deletes before the caret (%ls)", buf);
+    key(VK_DELETE);
+    check(!wcscmp(box_text(edit, buf, ARRAYSIZE(buf)), L"i"), "Delete deletes after it (%ls)", buf);
+    ITextBox_SelectAll(edit);
+    ITextBox_get_SelectionLength(edit, &length);
+    check(length == 1, "SelectAll selects the text (%d)", length);
+    key(VK_BACK);
+    check(!*box_text(edit, buf, ARRAYSIZE(buf)), "and Backspace then empties it (%ls)", buf);
+
+    ITextBox_put_MaxLength(edit, 3);
+    type_text(L"abcd");
+    check(!wcscmp(box_text(edit, buf, ARRAYSIZE(buf)), L"abc"), "MaxLength 3 stops the fourth character (%ls)", buf);
+    ITextBox_put_IsReadOnly(edit, TRUE);
+    type_text(L"z");
+    check(!wcscmp(box_text(edit, buf, ARRAYSIZE(buf)), L"abc"), "IsReadOnly keeps typing out (%ls)", buf);
+    ITextBox_put_IsReadOnly(edit, FALSE);
+    ITextBox_put_MaxLength(edit, 0);
+
+    ITextBox_SelectAll(edit);
+    ctrl_key('C');
+    str = NULL;
+    WindowsCreateString(L"", 0, &str);
+    ITextBox_put_Text(edit, str);
+    WindowsDeleteString(str);
+    ctrl_key('V');
+    ctrl_key('V');
+    check(!wcscmp(box_text(edit, buf, ARRAYSIZE(buf)), L"abcabc"), "Ctrl+C then Ctrl+V twice pastes it twice (%ls)", buf);
+
+    snapshot();
+    SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(x + 12, y + 16));
+    SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(x + 12, y + 16));
+    ITextBox_get_SelectionStart(edit, &start);
+    check(start == 0, "a click at the text's start puts the caret there (%d)", start);
+    SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(x + 190, y + 16));
+    SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(x + 190, y + 16));
+    ITextBox_get_SelectionStart(edit, &start);
+    check(start == 6, "and one past its end at the end (%d)", start);
+
+    IPasswordBox_add_PasswordChanged(secret, &on_pw_changed.IRoutedEventHandler_iface, &token);
+    IInspectable_QueryInterface(secret_obj, &IID_IControl, (void **)&control);
+    IControl_Focus(control, FocusState_Keyboard, &result);
+    IControl_Release(control);
+    type_text(L"pw");
+    str = NULL;
+    IPasswordBox_get_Password(secret, &str);
+    check(!wcscmp(WindowsGetStringRawBuffer(str, NULL), L"pw"), "typing into a PasswordBox sets Password (%ls)",
+          WindowsGetStringRawBuffer(str, NULL));
+    WindowsDeleteString(str);
+    check(pw_changed == 2, "and raises PasswordChanged (%d)", pw_changed);
+
+    IInspectable_QueryInterface(multi_obj, &IID_IControl, (void **)&control);
+    IControl_Focus(control, FocusState_Keyboard, &result);
+    IControl_Release(control);
+    key(VK_END);
+    key(VK_RETURN);
+    type_text(L"two");
+    check(!wcscmp(box_text(multi, buf, ARRAYSIZE(buf)), L"one\ntwo"), "Enter starts a new line with AcceptsReturn (%ls)", buf);
+    snapshot();
+    multi_h = actual(multi, TRUE);
+    check(multi_h > edit_h + 10, "and the TextBox grows for the second line (%g > %g)", multi_h, edit_h);
+
+done:
+    if (edit) ITextBox_Release(edit);
+    if (secret) IPasswordBox_Release(secret);
+    if (multi) ITextBox_Release(multi);
+    if (edit_obj) IInspectable_Release(edit_obj);
+    if (secret_obj) IInspectable_Release(secret_obj);
+    if (multi_obj) IInspectable_Release(multi_obj);
+    IVector_UIElement_Release(children);
+    IPanel_Release(panel);
+    IFrameworkElement2_Release(page_grid);
+    IInspectable_Release(root);
+}
+
 static void check_microsoft_xbf(const WCHAR *file, const WCHAR *component_class)
 {
     IActivationFactory *factory;
@@ -2197,6 +2417,7 @@ static void CALLBACK verify(HWND unused, UINT msg, UINT_PTR id, DWORD time)
     check_part6(the_page);
     check_d2d(the_page);
     check_scroll_focus(the_page);
+    check_textbox(the_page);
     check(!wcscmp(text_of(the_page->title, buf, ARRAYSIZE(buf)), L"Clicked!"), "OnClick changed Title (%ls)", buf);
     snapshot();
 

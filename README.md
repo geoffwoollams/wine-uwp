@@ -120,7 +120,9 @@ Wine has no `Windows.UI.Xaml`, the UI framework most non-game UWP apps are built
 
 **Milestone 5, part 1 (done): scrolling and the keyboard.** `ScrollViewer` with the mouse wheel, keys, Windows 10 scroll bars, `ChangeView` and `ViewChanged`. Keyboard focus with `Focus`, `IsTabStop`, `TabIndex`, a focus visual and Tab / Shift+Tab, routed `KeyDown`/`KeyUp`/`GotFocus`/`LostFocus`, Space and Enter on buttons, keys on sliders and toggle switches, and `FocusManager`.
 
-**Not yet:** ListView/GridView and other item controls, `x:Bind` beyond what its generated code calls, `TextBox`, localized `x:Uid` strings and navigation history. Real Store apps will still often stop or look wrong where they need these; see [docs/xaml-plan.md](docs/xaml-plan.md).
+**Milestone 5, part 2 (done): text entry.** `TextBox` and `PasswordBox` with typing, selection, the caret, the clipboard, multi-line text with `AcceptsReturn`, `MaxLength`, `IsReadOnly`, `Header`, `PlaceholderText`, `TextChanged` and `PasswordChanged`. No IME or undo yet.
+
+**Not yet:** ListView/GridView and other item controls, `x:Bind` beyond what its generated code calls, localized `x:Uid` strings and navigation history. Real Store apps will still often stop or look wrong where they need these; see [docs/xaml-plan.md](docs/xaml-plan.md).
 
 To try it, build the test clients and run them in a throwaway prefix (each opens a window for a few seconds and checks what was drawn):
 
@@ -244,7 +246,8 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 MouseDevice, MessageDialog, Xbox Live device address, msxml6 HTTP class registration,
                 pointer devices and cursor; COM ContextCallback is Wine's own since 11.x), 0040 the app's icon
                 on its window, 0041-0042 Forza Motorsport 7 and automatic dialog answers, 0043-0044 XAML
-                milestone 5 part 1 (ScrollViewer, keyboard focus, key events)
+                milestone 5 part 1 (ScrollViewer, keyboard focus, key events), 0045-0046 part 2 (TextBox,
+                PasswordBox)
 patches/dxvk/   patch against DXVK f90f1bf1 (v3.1.1-235)
 docker/         build containers
 apps/           optional per-app settings
