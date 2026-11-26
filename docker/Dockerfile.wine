@@ -2,7 +2,7 @@
 FROM debian:trixie
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 flex bison gettext pkg-config ca-certificates git \
+    build-essential gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 g++-mingw-w64-x86-64 g++-mingw-w64-i686 flex bison gettext pkg-config ca-certificates git \
     libx11-dev libxext-dev libfreetype-dev libfontconfig-dev libvulkan-dev libgnutls28-dev \
     libpulse-dev libasound2-dev libwayland-dev libxkbcommon-dev libxrandr-dev libxi-dev libxcursor-dev \
     libxrender-dev libxfixes-dev libxcomposite-dev libxinerama-dev libxxf86vm-dev libdbus-1-dev libudev-dev \
