@@ -56,6 +56,7 @@ If you installed a game with **Lutris**, its game folder works too. Lutris puts 
 
 Apps also need the **framework packages** their `AppxManifest.xml` lists as dependencies: the VC++ runtime (`Microsoft.VCLibs.140.00`) for C++/CX apps, and for some apps .NET Native (`Microsoft.NET.Native.Framework.2.2` and `Microsoft.NET.Native.Runtime.2.2`) or WinUI 2 (`Microsoft.UI.Xaml.2.8`). They are Microsoft's, so releases don't include them: you import your own copies once, and every app set up afterwards uses them.
 - **Where to get them:** a Windows 10/11 install has them in `C:\Program Files\WindowsApps` (folders such as `Microsoft.VCLibs.140.00_14.0.33519.0_x64__8wekyb3d8bbwe`). Copy the x64 ones you need into one folder and pass it with `--frameworks`; `.appx`/`.msix` files work too. Many games carry their VC++ package in a `redist/` folder (Halo Wars 2, Gears of War 4, Forza Motorsport 7), and those are imported automatically. Microsoft's own VCLibs download page only has the `UWPDesktop` package, which doesn't replace the UWP one; the UWP one also comes with the Windows 10 SDK (`ExtensionSDKs\Microsoft.VCLibs\14.0\Appx\Retail\x64`).
+- **.NET Native apps** also need `mrt100.dll` from `C:\Windows\System32` of a Windows install: put it in the `--frameworks` folder too.
 - **Where they go:** one copy of each, in `~/.local/share/wine-uwp/frameworks`. Each app gets the newest stored version of every framework it depends on, linked into its folder; nothing is copied per app. Setup names any framework an app needs that isn't there yet.
 
 ```bash
@@ -267,7 +268,8 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 PointerVisualizationSettings, PnpObject, SystemNavigationManager, input capabilities,
                 ICoreApplication2, MediaDevice selectors, the thread pool's IAsyncAction, SwapChainPanel,
                 CompositionTarget, Loaded/SizeChanged, 0061 delay-load failure handling and
-                SetProcessValidCallTargets (.NET Native's runtime)
+                SetProcessValidCallTargets (.NET Native's runtime), 0062 ExtendedExecution's
+                async operation interfaces
 patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings

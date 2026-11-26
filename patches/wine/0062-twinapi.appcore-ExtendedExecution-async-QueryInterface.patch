@@ -1,0 +1,35 @@
+Subject: twinapi.appcore: ExtendedExecution's async operation answers only its own interfaces
+
+diff --git a/dlls/twinapi.appcore/extended_execution.c b/dlls/twinapi.appcore/extended_execution.c
+index 3906e1c..c7bf09f 100644
+--- a/dlls/twinapi.appcore/extended_execution.c
++++ b/dlls/twinapi.appcore/extended_execution.c
+@@ -143,6 +143,10 @@ struct completed_handler_vtbl
+ static inline struct async_op *impl_from_asyncinfo(IAsyncInfo *iface)
+ { return CONTAINING_RECORD(iface, struct async_op, IAsyncInfo_iface); }
+ 
++/* IAsyncOperation<ExtendedExecutionResult>: the pinterface IID of
++ * pinterface({9fc2b0bb-e446-44e2-aa61-9cab8f636af2};enum(Windows.ApplicationModel.ExtendedExecution.ExtendedExecutionResult;i4)) */
++static const GUID iid_async_operation_result = { 0x1dbb1bc9, 0x6cd7, 0x5947, { 0x8c, 0xd1, 0x29, 0x63, 0x2b, 0x5a, 0xa9, 0x50 } };
++
+ static HRESULT WINAPI op_QueryInterface(async_op *iface, REFIID iid, void **out)
+ {
+     TRACE("iface %p, iid %s.\n", iface, debugstr_guid(iid));
+@@ -150,11 +154,14 @@ static HRESULT WINAPI op_QueryInterface(async_op *iface, REFIID iid, void **out)
+         *out = iface;
+     else if (IsEqualGUID(iid, &IID_IAsyncInfo))
+         *out = &iface->IAsyncInfo_iface;
++    else if (IsEqualGUID(iid, &iid_async_operation_result))
++        *out = iface;
+     else
+     {
+-        /* IAsyncOperation<ExtendedExecutionResult> itself: its pinterface IID is not computed here. */
+-        FIXME("%s, assuming it is IAsyncOperation<ExtendedExecutionResult>.\n", debugstr_guid(iid));
+-        *out = iface;
++        /* other interfaces (IL2CPP probes several) must fail: answering them with this vtable crashes the caller */
++        TRACE("%s not supported.\n", debugstr_guid(iid));
++        *out = NULL;
++        return E_NOINTERFACE;
+     }
+     InterlockedIncrement(&iface->ref);
+     return S_OK;

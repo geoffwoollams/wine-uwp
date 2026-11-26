@@ -158,10 +158,19 @@ def import_frameworks(source, store):
             folder = import_one(path, store)
             if folder:
                 imported.append(folder)
+        elif path.lower().endswith(".dll") and os.path.basename(path).lower() in SYSTEM_DLLS:
+            # Windows system DLLs a framework needs but doesn't carry (mrt100.dll, .NET Native's runtime service)
+            os.makedirs(os.path.join(store, "system"), exist_ok=True)
+            shutil.copyfile(path, os.path.join(store, "system", os.path.basename(path).lower()))
+            imported.append("system/" + os.path.basename(path).lower())
     for folder in imported:
         print("framework %s" % folder)
     if not imported and os.path.exists(source):
         print("no x64 framework packages found in %s" % source, file=sys.stderr)
+
+
+# from C:\Windows\System32, needed by framework packages: .NET Native's mrt100_app.dll calls mrt100.dll at start
+SYSTEM_DLLS = {"mrt100.dll": "Microsoft.NET.Native.Runtime."}
 
 
 def matched_frameworks(package_dir, store):
@@ -203,6 +212,16 @@ def link_frameworks(package_dir, store, app_dir):
                 os.unlink(target)
             os.symlink(os.path.join(src, entry), target)
         linked.append(folder)
+        # the system DLLs this framework needs
+        for dll, prefix in SYSTEM_DLLS.items():
+            path = os.path.join(store, "system", dll)
+            target = os.path.join(app_dir, dll)
+            if name.startswith(prefix):
+                if os.path.exists(path):
+                    if not os.path.lexists(target):
+                        os.symlink(path, target)
+                else:
+                    print("MISSING\t%s (C:\\Windows\\System32 on Windows, for %s)\t-" % (dll, name))
     for folder in linked:
         print("LINKED\t%s" % folder)
 
