@@ -32,8 +32,12 @@ rm -f "$PREFIX/drive_c/crash.txt"
 LOG="$LOGS/run-$NAME-$(date +%Y%m%d-%H%M%S).log"
 ln -sf "$LOG" "$LOGS/latest.log"
 echo "Logging to $LOG"
-if [ -n "${1:-}" ]; then timeout "$1" wine "$EXE" > "$LOG" 2>&1; else wine "$EXE" > "$LOG" 2>&1; fi
+# Everything appends: wineserver inherits this handle and keeps writing after the app exits (a development build of
+# Wine lists its remaining objects when it shuts down), which would otherwise overwrite the lines after its position.
+: > "$LOG"
+if [ -n "${1:-}" ]; then timeout "$1" wine "$EXE" >> "$LOG" 2>&1; else wine "$EXE" >> "$LOG" 2>&1; fi
 RC=$?
+wineserver -w   # let the prefix shut down first, so the exit line is the log's last
 echo "=== process exited with status $RC at $(date +%T) ===" >> "$LOG"
 [ -f "$PREFIX/drive_c/crash.txt" ] && cp "$PREFIX/drive_c/crash.txt" "${LOG%.log}.crash.txt"
 ls -1t "$LOGS"/run-*.log 2>/dev/null | tail -n +9 | xargs -r rm -f
