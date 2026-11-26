@@ -1,0 +1,243 @@
+Subject: windows.networking.connectivity: GetProxyConfigurationAsync reports a direct connection
+
+diff --git a/dlls/windows.networking.connectivity/Makefile.in b/dlls/windows.networking.connectivity/Makefile.in
+index 32fe5bf..9cd5de6 100644
+--- a/dlls/windows.networking.connectivity/Makefile.in
++++ b/dlls/windows.networking.connectivity/Makefile.in
+@@ -6,4 +6,5 @@ SOURCES = \
+ 	classes.idl \
+ 	hostnames.c \
+ 	main.c \
+-	network_information.c
++	network_information.c \
++	proxy.c
+diff --git a/dlls/windows.networking.connectivity/network_information.c b/dlls/windows.networking.connectivity/network_information.c
+index 27f78a2..d34fbfd 100644
+--- a/dlls/windows.networking.connectivity/network_information.c
++++ b/dlls/windows.networking.connectivity/network_information.c
+@@ -473,10 +473,13 @@ static HRESULT WINAPI network_information_statics_GetHostNames( INetworkInformat
+     return local_hostnames_create( value );
+ }
+ 
++extern HRESULT proxy_configuration_operation( IAsyncOperation_ProxyConfiguration **out );
++
+ static HRESULT WINAPI network_information_statics_GetProxyConfigurationAsync( INetworkInformationStatics *iface, IUriRuntimeClass *uri, IAsyncOperation_ProxyConfiguration **value )
+ {
+-    FIXME( "iface %p, uri %p, value %p stub!\n", iface, uri, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, uri %p, value %p: no proxy.\n", iface, uri, value );
++    if (!uri || !value) return E_POINTER;
++    return proxy_configuration_operation( value );
+ }
+ 
+ static HRESULT WINAPI network_information_statics_GetSortedEndpointPairs( INetworkInformationStatics *iface, IIterable_EndpointPair *endpoint,
+diff --git a/dlls/windows.networking.connectivity/proxy.c b/dlls/windows.networking.connectivity/proxy.c
+new file mode 100644
+index 0000000..eb6057a
+--- /dev/null
++++ b/dlls/windows.networking.connectivity/proxy.c
+@@ -0,0 +1,204 @@
++/* WinRT Windows.Networking.Connectivity.ProxyConfiguration: every address is reached directly
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++/* ---- IVectorView<Uri>: no proxies ---- */
++
++static HRESULT WINAPI uris_QueryInterface( IVectorView_Uri *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IVectorView_Uri ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI uris_AddRef( IVectorView_Uri *iface ) { return 2; }
++static ULONG WINAPI uris_Release( IVectorView_Uri *iface ) { return 1; }
++static HRESULT WINAPI uris_GetIids( IVectorView_Uri *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI uris_GetRuntimeClassName( IVectorView_Uri *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI uris_GetTrustLevel( IVectorView_Uri *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI uris_GetAt( IVectorView_Uri *iface, UINT32 index, IUriRuntimeClass **value ) { *value = NULL; return E_BOUNDS; }
++static HRESULT WINAPI uris_get_Size( IVectorView_Uri *iface, UINT32 *value ) { *value = 0; return S_OK; }
++static HRESULT WINAPI uris_IndexOf( IVectorView_Uri *iface, IUriRuntimeClass *element, UINT32 *index, BOOLEAN *found )
++{
++    *index = 0;
++    *found = FALSE;
++    return S_OK;
++}
++static HRESULT WINAPI uris_GetMany( IVectorView_Uri *iface, UINT32 start, UINT32 size, IUriRuntimeClass **items, UINT32 *count )
++{
++    *count = 0;
++    return S_OK;
++}
++static const IVectorView_UriVtbl uris_vtbl =
++{
++    uris_QueryInterface, uris_AddRef, uris_Release,
++    uris_GetIids, uris_GetRuntimeClassName, uris_GetTrustLevel,
++    uris_GetAt, uris_get_Size, uris_IndexOf, uris_GetMany,
++};
++static IVectorView_Uri no_uris = { &uris_vtbl };
++
++/* ---- ProxyConfiguration ---- */
++
++static HRESULT WINAPI proxy_QueryInterface( IProxyConfiguration *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IProxyConfiguration ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI proxy_AddRef( IProxyConfiguration *iface ) { return 2; }
++static ULONG WINAPI proxy_Release( IProxyConfiguration *iface ) { return 1; }
++static HRESULT WINAPI proxy_GetIids( IProxyConfiguration *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI proxy_GetRuntimeClassName( IProxyConfiguration *iface, HSTRING *name )
++{
++    return WindowsCreateString( L"Windows.Networking.Connectivity.ProxyConfiguration", 50, name );
++}
++static HRESULT WINAPI proxy_GetTrustLevel( IProxyConfiguration *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI proxy_get_ProxyUris( IProxyConfiguration *iface, IVectorView_Uri **value )
++{
++    *value = &no_uris;
++    return S_OK;
++}
++static HRESULT WINAPI proxy_get_CanConnectDirectly( IProxyConfiguration *iface, boolean *value )
++{
++    *value = TRUE;
++    return S_OK;
++}
++static const IProxyConfigurationVtbl proxy_vtbl =
++{
++    proxy_QueryInterface, proxy_AddRef, proxy_Release,
++    proxy_GetIids, proxy_GetRuntimeClassName, proxy_GetTrustLevel,
++    proxy_get_ProxyUris, proxy_get_CanConnectDirectly,
++};
++static IProxyConfiguration direct = { &proxy_vtbl };
++
++/* ---- IAsyncOperation<ProxyConfiguration>, complete when returned ---- */
++
++struct proxy_op
++{
++    IAsyncOperation_ProxyConfiguration IAsyncOperation_ProxyConfiguration_iface;
++    IAsyncInfo IAsyncInfo_iface;
++    LONG ref;
++    IAsyncOperationCompletedHandler_ProxyConfiguration *handler;
++};
++
++static inline struct proxy_op *impl_from_op( IAsyncOperation_ProxyConfiguration *iface )
++{
++    return CONTAINING_RECORD( iface, struct proxy_op, IAsyncOperation_ProxyConfiguration_iface );
++}
++
++static HRESULT WINAPI op_QueryInterface( IAsyncOperation_ProxyConfiguration *iface, REFIID iid, void **out )
++{
++    struct proxy_op *impl = impl_from_op( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IAsyncOperation_ProxyConfiguration ))
++        *out = &impl->IAsyncOperation_ProxyConfiguration_iface;
++    else if (IsEqualGUID( iid, &IID_IAsyncInfo ))
++        *out = &impl->IAsyncInfo_iface;
++    else
++    {
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    InterlockedIncrement( &impl->ref );
++    return S_OK;
++}
++static ULONG WINAPI op_AddRef( IAsyncOperation_ProxyConfiguration *iface ) { return InterlockedIncrement( &impl_from_op( iface )->ref ); }
++static ULONG WINAPI op_Release( IAsyncOperation_ProxyConfiguration *iface )
++{
++    struct proxy_op *impl = impl_from_op( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        if (impl->handler) IAsyncOperationCompletedHandler_ProxyConfiguration_Release( impl->handler );
++        free( impl );
++    }
++    return ref;
++}
++static HRESULT WINAPI op_GetIids( IAsyncOperation_ProxyConfiguration *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI op_GetRuntimeClassName( IAsyncOperation_ProxyConfiguration *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI op_GetTrustLevel( IAsyncOperation_ProxyConfiguration *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI op_put_Completed( IAsyncOperation_ProxyConfiguration *iface, IAsyncOperationCompletedHandler_ProxyConfiguration *handler )
++{
++    struct proxy_op *impl = impl_from_op( iface );
++
++    if (!handler) return E_POINTER;
++    if (impl->handler) return E_ILLEGAL_DELEGATE_ASSIGNMENT;
++    impl->handler = handler;
++    IAsyncOperationCompletedHandler_ProxyConfiguration_AddRef( handler );
++    IAsyncOperationCompletedHandler_ProxyConfiguration_Invoke( handler, iface, Completed );
++    return S_OK;
++}
++static HRESULT WINAPI op_get_Completed( IAsyncOperation_ProxyConfiguration *iface, IAsyncOperationCompletedHandler_ProxyConfiguration **handler )
++{
++    struct proxy_op *impl = impl_from_op( iface );
++    if ((*handler = impl->handler)) IAsyncOperationCompletedHandler_ProxyConfiguration_AddRef( *handler );
++    return S_OK;
++}
++static HRESULT WINAPI op_GetResults( IAsyncOperation_ProxyConfiguration *iface, IProxyConfiguration **results )
++{
++    *results = &direct;
++    return S_OK;
++}
++static const IAsyncOperation_ProxyConfigurationVtbl op_vtbl =
++{
++    op_QueryInterface, op_AddRef, op_Release,
++    op_GetIids, op_GetRuntimeClassName, op_GetTrustLevel,
++    op_put_Completed, op_get_Completed, op_GetResults,
++};
++
++static inline struct proxy_op *impl_from_info( IAsyncInfo *iface ) { return CONTAINING_RECORD( iface, struct proxy_op, IAsyncInfo_iface ); }
++static HRESULT WINAPI info_QueryInterface( IAsyncInfo *iface, REFIID iid, void **out )
++{ return op_QueryInterface( &impl_from_info( iface )->IAsyncOperation_ProxyConfiguration_iface, iid, out ); }
++static ULONG WINAPI info_AddRef( IAsyncInfo *iface ) { return op_AddRef( &impl_from_info( iface )->IAsyncOperation_ProxyConfiguration_iface ); }
++static ULONG WINAPI info_Release( IAsyncInfo *iface ) { return op_Release( &impl_from_info( iface )->IAsyncOperation_ProxyConfiguration_iface ); }
++static HRESULT WINAPI info_GetIids( IAsyncInfo *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI info_GetRuntimeClassName( IAsyncInfo *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI info_GetTrustLevel( IAsyncInfo *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI info_get_Id( IAsyncInfo *iface, UINT32 *id ) { *id = 1; return S_OK; }
++static HRESULT WINAPI info_get_Status( IAsyncInfo *iface, AsyncStatus *status ) { *status = Completed; return S_OK; }
++static HRESULT WINAPI info_get_ErrorCode( IAsyncInfo *iface, HRESULT *error ) { *error = S_OK; return S_OK; }
++static HRESULT WINAPI info_Cancel( IAsyncInfo *iface ) { return S_OK; }
++static HRESULT WINAPI info_Close( IAsyncInfo *iface ) { return S_OK; }
++static const IAsyncInfoVtbl info_vtbl =
++{
++    info_QueryInterface, info_AddRef, info_Release,
++    info_GetIids, info_GetRuntimeClassName, info_GetTrustLevel,
++    info_get_Id, info_get_Status, info_get_ErrorCode, info_Cancel, info_Close,
++};
++
++HRESULT proxy_configuration_operation( IAsyncOperation_ProxyConfiguration **out )
++{
++    struct proxy_op *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IAsyncOperation_ProxyConfiguration_iface.lpVtbl = &op_vtbl;
++    impl->IAsyncInfo_iface.lpVtbl = &info_vtbl;
++    impl->ref = 1;
++    *out = &impl->IAsyncOperation_ProxyConfiguration_iface;
++    return S_OK;
++}

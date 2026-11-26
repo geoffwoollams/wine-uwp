@@ -150,7 +150,6 @@ tests/xaml/run.sh
 | Variable | Effect |
 |---|---|
 | `WINE_CORE_WINDOWED=1` | Run in a normal 1280x720 window instead of borderless fullscreen |
-| `WINE_UWP_ONLINE=1` | Report the host's internet connection to apps (by default they are told they are offline, matching their web requests, which always fail) |
 | `WINE_CORE_SCALE=1.5` | Report a display scale (like Windows' 150% setting); leave unset for 100% |
 | `WINE_APP_STORE_ID=...` | The Store ID reported for the app (it is not in the package manifest); apps that care need it set in [`apps/<package name>.conf`](apps/README.md) |
 | `WINE_MESSAGEDIALOG_AUTO=Continue` | Answer an app's pop-up dialogs without showing them: the first button whose label starts with this text (or a button number). Set for Gears of War 4 and Forza Motorsport 7 in their `apps/` files, to get past their hardware warnings; `WINE_MESSAGEDIALOG_AUTO=` (empty) shows them again |
@@ -275,7 +274,8 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 CreateFolderAsync/GetFolderAsync, 0066 PlatformDiagnosticsAndUsageDataSettings, 0067
                 twinapi shims answering only their own interfaces and CoreDispatcher.RunIdleAsync, 0068
                 ApiInformation answers and HighContrastChanged, 0069 StorageFile and file streams,
-                0070 Clipboard text, 0071 apps told they have no internet connection
+                0070 Clipboard text, 0071 GetProxyConfigurationAsync, 0072 ApiInformation from
+                twinapi.appcore (GE-Proton's wintypes fails its checks) and signed Xbox Live tokens
 patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings

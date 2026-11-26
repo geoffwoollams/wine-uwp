@@ -1,0 +1,434 @@
+Subject: twinapi.appcore: ApiInformation (GE-Proton's wintypes fails it); Xbox Live token responses carry a signature
+
+diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
+index 576dcb9..ccedfd0 100644
+--- a/dlls/twinapi.appcore/Makefile.in
++++ b/dlls/twinapi.appcore/Makefile.in
+@@ -4,6 +4,7 @@ IMPORTS   = combase advapi32 user32 gdi32
+ 
+ SOURCES = \
+ 	advertising_manager.c \
++	api_information.c \
+ 	analytics_info.c \
+ 	app_icon.c \
+ 	application_view.c \
+diff --git a/dlls/twinapi.appcore/api_information.c b/dlls/twinapi.appcore/api_information.c
+new file mode 100644
+index 0000000..febbdf2
+--- /dev/null
++++ b/dlls/twinapi.appcore/api_information.c
+@@ -0,0 +1,336 @@
++/* WinRT Windows.Foundation.Metadata.ApiInformation
++ *
++ * Wine's wintypes implementation, served from twinapi.appcore: the wintypes.dll the prefix
++ * loads comes from GE-Proton, whose ApiInformation fails these checks (a failed check
++ * becomes an exception the app does not catch).
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#include "winreg.h"
++#include "initguid.h"
++#define WIDL_using_Windows_Foundation_Metadata
++#include "windows.foundation.metadata.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
++
++static const struct
++{
++    const WCHAR *name;
++    unsigned int max_major;
++}
++present_contracts[] =
++{
++    { L"Windows.Foundation.UniversalApiContract", 10, },
++};
++
++static BOOLEAN is_api_contract_present( const HSTRING hname, unsigned int version )
++{
++    const WCHAR *name = WindowsGetStringRawBuffer( hname, NULL );
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(present_contracts); ++i)
++        if (!wcsicmp( name, present_contracts[i].name )) return version <= present_contracts[i].max_major;
++
++    return FALSE;
++}
++
++/* A runtime class is present when it is registered; other kinds of type (interfaces,
++ * enums, structs) are not registered, so they are reported missing. */
++static BOOLEAN is_type_present( HSTRING hname )
++{
++    const WCHAR *name = WindowsGetStringRawBuffer( hname, NULL );
++    WCHAR path[512];
++    HKEY key;
++
++    if (!name || !*name || wcslen( name ) > 400) return FALSE;
++    swprintf( path, ARRAY_SIZE(path), L"Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\%s", name );
++    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, path, 0, KEY_READ, &key )) return FALSE;
++    RegCloseKey( key );
++    return TRUE;
++}
++
++struct api_information_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IApiInformationStatics IApiInformationStatics_iface;
++    LONG ref;
++};
++
++static inline struct api_information_statics *impl_ais_from_IActivationFactory(IActivationFactory *iface)
++{
++    return CONTAINING_RECORD(iface, struct api_information_statics, IActivationFactory_iface);
++}
++
++static HRESULT STDMETHODCALLTYPE api_information_statics_factory_QueryInterface(IActivationFactory *iface, REFIID iid,
++        void **out)
++{
++    struct api_information_statics *impl = impl_ais_from_IActivationFactory(iface);
++
++    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
++
++    if (IsEqualGUID(iid, &IID_IUnknown)
++            || IsEqualGUID(iid, &IID_IInspectable)
++            || IsEqualGUID(iid, &IID_IAgileObject)
++            || IsEqualGUID(iid, &IID_IActivationFactory))
++    {
++        IUnknown_AddRef(iface);
++        *out = iface;
++        return S_OK;
++    }
++
++    if (IsEqualGUID(iid, &IID_IApiInformationStatics))
++    {
++        IUnknown_AddRef(iface);
++        *out = &impl->IApiInformationStatics_iface;
++        return S_OK;
++    }
++
++    WARN("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG STDMETHODCALLTYPE api_information_statics_factory_AddRef(IActivationFactory *iface)
++{
++    struct api_information_statics *impl = impl_ais_from_IActivationFactory(iface);
++    ULONG ref = InterlockedIncrement(&impl->ref);
++    TRACE("iface %p, ref %lu.\n", iface, ref);
++    return ref;
++}
++
++static ULONG STDMETHODCALLTYPE api_information_statics_factory_Release(IActivationFactory *iface)
++{
++    struct api_information_statics *impl = impl_ais_from_IActivationFactory(iface);
++    ULONG ref = InterlockedDecrement(&impl->ref);
++    TRACE("iface %p, ref %lu.\n", iface, ref);
++    return ref;
++}
++
++static HRESULT STDMETHODCALLTYPE api_information_statics_factory_GetIids(IActivationFactory *iface, ULONG *iid_count,
++        IID **iids)
++{
++    FIXME("iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids);
++    return E_NOTIMPL;
++}
++
++static HRESULT STDMETHODCALLTYPE api_information_statics_factory_GetRuntimeClassName(IActivationFactory *iface,
++        HSTRING *class_name)
++{
++    FIXME("iface %p, class_name %p stub!\n", iface, class_name);
++    return E_NOTIMPL;
++}
++
++static HRESULT STDMETHODCALLTYPE api_information_statics_factory_GetTrustLevel(IActivationFactory *iface,
++        TrustLevel *trust_level)
++{
++    FIXME("iface %p, trust_level %p stub!\n", iface, trust_level);
++    return E_NOTIMPL;
++}
++
++static HRESULT STDMETHODCALLTYPE api_information_statics_factory_ActivateInstance(IActivationFactory *iface,
++        IInspectable **instance)
++{
++    FIXME("iface %p, instance %p stub!\n", iface, instance);
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl api_information_statics_factory_vtbl =
++{
++    api_information_statics_factory_QueryInterface,
++    api_information_statics_factory_AddRef,
++    api_information_statics_factory_Release,
++    /* IInspectable methods */
++    api_information_statics_factory_GetIids,
++    api_information_statics_factory_GetRuntimeClassName,
++    api_information_statics_factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    api_information_statics_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE(api_information_statics, IApiInformationStatics, struct api_information_statics, IActivationFactory_iface)
++
++static HRESULT STDMETHODCALLTYPE api_information_statics_IsTypePresent(
++        IApiInformationStatics *iface, HSTRING type_name, BOOLEAN *value)
++{
++    TRACE("iface %p, type_name %s, value %p.\n", iface, debugstr_hstring(type_name), value);
++
++    if (!type_name)
++        return E_INVALIDARG;
++
++    *value = is_type_present( type_name );
++    TRACE("-> %d\n", *value);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE api_information_statics_IsMethodPresent(
++        IApiInformationStatics *iface, HSTRING type_name, HSTRING method_name, BOOLEAN *value)
++{
++    FIXME("iface %p, type_name %s, method_name %s, value %p stub!\n", iface,
++            debugstr_hstring(type_name), debugstr_hstring(method_name), value);
++
++    if (!type_name)
++        return E_INVALIDARG;
++
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE api_information_statics_IsMethodPresentWithArity(
++        IApiInformationStatics *iface, HSTRING type_name, HSTRING method_name,
++        UINT32 input_parameter_count, BOOLEAN *value)
++{
++    FIXME("iface %p, type_name %s, method_name %s, input_parameter_count %u, value %p stub!\n",
++            iface, debugstr_hstring(type_name), debugstr_hstring(method_name),
++            input_parameter_count, value);
++
++    if (!type_name)
++        return E_INVALIDARG;
++
++    /* members are reported missing: callers check for optional APIs and fall back */
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE api_information_statics_IsEventPresent(
++        IApiInformationStatics *iface, HSTRING type_name, HSTRING event_name, BOOLEAN *value)
++{
++    FIXME("iface %p, type_name %s, event_name %s, value %p stub!\n", iface,
++            debugstr_hstring(type_name), debugstr_hstring(event_name), value);
++
++    if (!type_name)
++        return E_INVALIDARG;
++
++    /* members are reported missing: callers check for optional APIs and fall back */
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE api_information_statics_IsPropertyPresent(
++        IApiInformationStatics *iface, HSTRING type_name, HSTRING property_name, BOOLEAN *value)
++{
++    FIXME("iface %p, type_name %s, property_name %s, value %p stub!\n", iface,
++            debugstr_hstring(type_name), debugstr_hstring(property_name), value);
++
++    if (!type_name)
++        return E_INVALIDARG;
++
++    /* members are reported missing: callers check for optional APIs and fall back */
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE api_information_statics_IsReadOnlyPropertyPresent(
++        IApiInformationStatics *iface, HSTRING type_name, HSTRING property_name,
++        BOOLEAN *value)
++{
++    FIXME("iface %p, type_name %s, property_name %s, value %p stub!\n", iface,
++            debugstr_hstring(type_name), debugstr_hstring(property_name), value);
++
++    if (!type_name)
++        return E_INVALIDARG;
++
++    /* members are reported missing: callers check for optional APIs and fall back */
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE api_information_statics_IsWriteablePropertyPresent(
++        IApiInformationStatics *iface, HSTRING type_name, HSTRING property_name, BOOLEAN *value)
++{
++    FIXME("iface %p, type_name %s, property_name %s, value %p stub!\n", iface,
++            debugstr_hstring(type_name), debugstr_hstring(property_name), value);
++
++    if (!type_name)
++        return E_INVALIDARG;
++
++    /* members are reported missing: callers check for optional APIs and fall back */
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE api_information_statics_IsEnumNamedValuePresent(
++        IApiInformationStatics *iface, HSTRING enum_type_name, HSTRING value_name, BOOLEAN *value)
++{
++    FIXME("iface %p, enum_type_name %s, value_name %s, value %p stub!\n", iface,
++            debugstr_hstring(enum_type_name), debugstr_hstring(value_name), value);
++
++    if (!enum_type_name)
++        return E_INVALIDARG;
++
++    /* members are reported missing: callers check for optional APIs and fall back */
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE api_information_statics_IsApiContractPresentByMajor(
++        IApiInformationStatics *iface, HSTRING contract_name, UINT16 major_version, BOOLEAN *value)
++{
++    FIXME("iface %p, contract_name %s, major_version %u, value %p semi-stub.\n", iface,
++            debugstr_hstring(contract_name), major_version, value);
++
++    if (!contract_name)
++        return E_INVALIDARG;
++
++    *value = is_api_contract_present( contract_name, major_version );
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE api_information_statics_IsApiContractPresentByMajorAndMinor(
++        IApiInformationStatics *iface, HSTRING contract_name, UINT16 major_version,
++        UINT16 minor_version, BOOLEAN *value)
++{
++    FIXME("iface %p, contract_name %s, major_version %u, minor_version %u, value %p semi-stub.\n", iface,
++            debugstr_hstring(contract_name), major_version, minor_version, value);
++
++    if (!contract_name)
++        return E_INVALIDARG;
++
++    /* every minor version of a present major version is treated as present */
++    *value = is_api_contract_present( contract_name, major_version );
++    return S_OK;
++}
++
++static const struct IApiInformationStaticsVtbl api_information_statics_vtbl =
++{
++    api_information_statics_QueryInterface,
++    api_information_statics_AddRef,
++    api_information_statics_Release,
++    /* IInspectable methods */
++    api_information_statics_GetIids,
++    api_information_statics_GetRuntimeClassName,
++    api_information_statics_GetTrustLevel,
++    /* IApiInformationStatics methods */
++    api_information_statics_IsTypePresent,
++    api_information_statics_IsMethodPresent,
++    api_information_statics_IsMethodPresentWithArity,
++    api_information_statics_IsEventPresent,
++    api_information_statics_IsPropertyPresent,
++    api_information_statics_IsReadOnlyPropertyPresent,
++    api_information_statics_IsWriteablePropertyPresent,
++    api_information_statics_IsEnumNamedValuePresent,
++    api_information_statics_IsApiContractPresentByMajor,
++    api_information_statics_IsApiContractPresentByMajorAndMinor
++};
++
++static struct api_information_statics api_information_statics =
++{
++    {&api_information_statics_factory_vtbl},
++    {&api_information_statics_vtbl},
++    1
++};
++
++IActivationFactory *api_information_factory = &api_information_statics.IActivationFactory_iface;
+diff --git a/dlls/twinapi.appcore/auth_probe.c b/dlls/twinapi.appcore/auth_probe.c
+index 90531ba..6fbeb3a 100644
+--- a/dlls/twinapi.appcore/auth_probe.c
++++ b/dlls/twinapi.appcore/auth_probe.c
+@@ -207,7 +207,11 @@ static HRESULT create_success_result(struct treq *request, void **out)
+         map_put(props, L"Sandbox", L"RETAIL");
+         map_put(props, L"AgeGroup", L"Adult");
+         map_put(props, L"ModernGamertagSuffix", L"");
+-        map_put(props, L"Signature", L"");
++        /* Xbox Live services ask for a token and signature for each request; an empty
++         * signature reads as "could not get token and signature" and is retried for ever.
++         * A placeholder lets the request itself go ahead and fail as offline, which apps
++         * handle the way they would on a PC without a connection. */
++        map_put(props, L"Signature", L"AAAAAQHZ4ozDAAAAb2ZmbGluZS1zaWduYXR1cmU=");
+     }
+     if (FAILED(hr = single_vector_create(response, &vec))) return hr;
+     if (!(res = calloc(1, sizeof(*res)))) return E_OUTOFMEMORY;
+diff --git a/dlls/twinapi.appcore/classes.idl b/dlls/twinapi.appcore/classes.idl
+index ca3aa66..9b32867 100644
+--- a/dlls/twinapi.appcore/classes.idl
++++ b/dlls/twinapi.appcore/classes.idl
+@@ -22,6 +22,7 @@
+ import "inspectable.idl";
+ import "asyncinfo.idl";
+ import "eventtoken.idl";
++import "windows.foundation.metadata.idl";
+ import "windowscontracts.idl";
+ import "windows.foundation.idl";
+ import "windows.globalization.idl";
+@@ -38,6 +39,9 @@ import "windows.ui.core.idl";
+ namespace Windows.Security.ExchangeActiveSyncProvisioning {
+     runtimeclass EasClientDeviceInformation;
+ }
++namespace Windows.Foundation.Metadata {
++    runtimeclass ApiInformation;
++}
+ namespace Windows.System.Profile {
+     runtimeclass AnalyticsInfo;
+     runtimeclass PlatformDiagnosticsAndUsageDataSettings;
+diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
+index fa4c42d..ced5320 100644
+--- a/dlls/twinapi.appcore/main.c
++++ b/dlls/twinapi.appcore/main.c
+@@ -73,6 +73,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( client_device_information_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, RuntimeClass_Windows_System_Profile_AnalyticsInfo ))
+         IActivationFactory_QueryInterface( analytics_info_factory, &IID_IActivationFactory, (void **)factory );
++    else if (!wcscmp( buffer, L"Windows.Foundation.Metadata.ApiInformation" ))
++        IActivationFactory_QueryInterface( api_information_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, RuntimeClass_Windows_System_Profile_PlatformDiagnosticsAndUsageDataSettings ))
+         IActivationFactory_QueryInterface( diagnostics_settings_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, RuntimeClass_Windows_System_UserProfile_AdvertisingManager ))
+diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
+index b48aece..15a702e 100644
+--- a/dlls/twinapi.appcore/private.h
++++ b/dlls/twinapi.appcore/private.h
+@@ -76,6 +76,7 @@ extern void message_dialog_init(void);
+ extern IActivationFactory *hardware_identification_factory;
+ extern IActivationFactory *diagnostics_settings_factory;
+ extern IActivationFactory *clipboard_factory;
++extern IActivationFactory *api_information_factory;
+ extern IActivationFactory *web_token_manager_factory, *web_token_request_factory, *web_account_provider_factory, *user_picker_factory, *system_user_factory, *launcher_factory, *web_account_factory, *web_token_response_factory, *thread_pool_timer_factory, *user_statics_factory, *store_context_real_factory, *message_websocket_factory, *store_context_factory, *logging_options_factory, *logging_fields_factory, *push_manager_factory, *logging_channel_factory, *loggingchanneloptions_factory, *loggingactivity_factory, *loggingsession_factory;
+ extern IActivationFactory *async_causality_tracer_factory;   /* causality.c */
+ extern IActivationFactory *mouse_device_factory;   /* mouse.c */
+diff --git a/dlls/wintypes/classes.idl b/dlls/wintypes/classes.idl
+index 139b25b..66485fc 100644
+--- a/dlls/wintypes/classes.idl
++++ b/dlls/wintypes/classes.idl
+@@ -31,9 +31,6 @@ namespace Windows.Foundation {
+ namespace Windows.Foundation.Collections {
+     runtimeclass PropertySet;
+ }
+-namespace Windows.Foundation.Metadata {
+-    runtimeclass ApiInformation;
+-}
+ namespace Windows.Storage.Streams {
+     runtimeclass Buffer;
+     runtimeclass DataWriter;
