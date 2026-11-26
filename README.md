@@ -20,7 +20,7 @@ UWP apps don't create a normal Win32 window. They ask Windows for a `CoreApplica
 | ✅ | Gears of War 4 (`Microsoft.SpartaUWP`, Unreal Engine 4, D3D12) | Campaign playable offline in fullscreen: menus, videos, mouse look and aiming, keyboard; the built-in benchmark runs. No multiplayer or co-op. See [the example](#example-gears-of-war-4). |
 | ✅ | Microsoft Minesweeper (`Microsoft.MicrosoftMinesweeper`, Unity, XAML, .NET Native) | Playable offline: menus and Classic games with mouse clicks, flags and local saves. Needs `mrt100.dll` (see [framework packages](#set-up-an-app)). After the tutorial, each start waits about 30 seconds on "Downloading Game Data" while its Xbox cloud saves fail as offline. No ads, achievements or cloud saves. |
 | ❌ | Forza Motorsport 7 (`Microsoft.ApolloBaseGame`, D3D12) | Not working: it starts and its hardware warning is answered, but it isn't playable yet. |
-| ❓ | Crackdown 3 (`Microsoft.48248D2C77101`, Unreal Engine 4) | In progress: reaches the main menu and keeps running offline (its online services fail as offline); gameplay not tested yet. |
+| ✅ | Crackdown 3 (`Microsoft.48248D2C77101`, Unreal Engine 4) | Campaign playable offline: menus with the mouse, keyboard movement, mouse look; saves kept locally. Holding the mouse button doesn't skip the intro video; let it play. Its online services fail as offline. |
 | ❌ | Windows Calculator (`Microsoft.WindowsCalculator`, XAML, WinUI 2.8) | Not working: stops at startup. It needs XAML's dependency-property system and the WinUI 2 control library, which the partial XAML doesn't support yet. |
 | ❌ | Windows Notepad, Paint (`Microsoft.WindowsNotepad`, `Microsoft.Paint`) | Not supported: Windows App SDK (WinUI 3) desktop apps, not UWP; nothing here supports them. |
 
@@ -283,7 +283,8 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 twinapi.appcore (GE-Proton's wintypes fails its checks) and signed Xbox Live tokens, 0073-0078
                 for Crackdown 3: CPU set queries, DisplayInformation 3 and 4, the add-on licence map,
                 GameChatOverlay, CryptographicBuffer, gaming privilege checks, IMediaPlayer3 and
-                MediaPlaybackSession
+                MediaPlaybackSession, 0079 AcceleratorKeyActivated (Unreal Engine's game keys) and CoreWindow key
+                state from any thread
 patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings

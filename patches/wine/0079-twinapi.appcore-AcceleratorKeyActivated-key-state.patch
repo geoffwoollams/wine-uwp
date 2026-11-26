@@ -1,0 +1,229 @@
+Subject: twinapi.appcore: CoreDispatcher.AcceleratorKeyActivated; CoreWindow key state from any thread
+
+diff --git a/dlls/twinapi.appcore/core_gen.c b/dlls/twinapi.appcore/core_gen.c
+index 11d03d6..2bd250e 100644
+--- a/dlls/twinapi.appcore/core_gen.c
++++ b/dlls/twinapi.appcore/core_gen.c
+@@ -715,9 +715,8 @@ static HRESULT WINAPI core_accel_GetTrustLevel(ICoreAcceleratorKeys *iface, Trus
+ 
+ static HRESULT WINAPI core_accel_add_AcceleratorKeyActivated(ICoreAcceleratorKeys *iface, __FITypedEventHandler_2_Windows__CUI__CCore__CCoreDispatcher_Windows__CUI__CCore__CAcceleratorKeyEventArgs *handler, EventRegistrationToken *cookie)
+ {
+-    TRACE("iface %p, add_AcceleratorKeyActivated (event ignored).\n", iface);
+-    cookie->value = InterlockedIncrement(&event_token_counter);
+-    return S_OK;
++    TRACE("iface %p, handler %p, cookie %p.\n", iface, handler, cookie);
++    return core_input_add_handler(10 /* EV_ACCELERATOR */, (IUnknown *)handler, cookie);
+ }
+ 
+ static HRESULT WINAPI core_accel_remove_AcceleratorKeyActivated(ICoreAcceleratorKeys *iface, EventRegistrationToken cookie)
+@@ -858,6 +857,7 @@ static HRESULT WINAPI core_window_get_PointerPosition(ICoreWindow *iface, __x_AB
+     POINT pt = { 0, 0 };
+     GetCursorPos(&pt);
+     value->X = pt.x / core_view_scale(); value->Y = pt.y / core_view_scale();
++    TRACE("iface %p -> %.1fx%.1f.\n", iface, value->X, value->Y);
+     return S_OK;
+ }
+ 
+@@ -891,17 +891,38 @@ static HRESULT WINAPI core_window_Close(ICoreWindow *iface)
+     return E_NOTIMPL;
+ }
+ 
++/* Down from the high bit, Locked (toggle keys such as Caps Lock) from the low bit of the
++ * window thread's key state */
++static __x_ABI_CWindows_CUI_CCore_CCoreVirtualKeyStates key_states(SHORT value)
++{
++    __x_ABI_CWindows_CUI_CCore_CCoreVirtualKeyStates state = CoreVirtualKeyStates_None;
++    if (value & 0x8000) state |= CoreVirtualKeyStates_Down;
++    if (value & 1) state |= CoreVirtualKeyStates_Locked;
++    return state;
++}
++
+ static HRESULT WINAPI core_window_GetAsyncKeyState(ICoreWindow *iface, __x_ABI_CWindows_CSystem_CVirtualKey key, __x_ABI_CWindows_CUI_CCore_CCoreVirtualKeyStates *state)
+ {
+-    struct core_window *impl __attribute__((unused)) = impl_from_core_window(iface);
++    if (!state) return E_POINTER;
+     *state = (GetAsyncKeyState(key) & 0x8000) ? CoreVirtualKeyStates_Down : CoreVirtualKeyStates_None;
++    TRACE("iface %p, key %#x -> %#x.\n", iface, key, *state);
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI core_window_GetKeyState(ICoreWindow *iface, __x_ABI_CWindows_CSystem_CVirtualKey key, __x_ABI_CWindows_CUI_CCore_CCoreVirtualKeyStates *state)
+ {
+-    struct core_window *impl __attribute__((unused)) = impl_from_core_window(iface);
+-    *state = (GetKeyState(key) & 0x8000) ? CoreVirtualKeyStates_Down : CoreVirtualKeyStates_None;
++    struct core_window *impl = impl_from_core_window(iface);
++
++    if (!state) return E_POINTER;
++    /* Win32 key state belongs to each thread's input queue, but CoreWindow's is the window's,
++     * read from any thread: games poll it from their own threads (Unreal Engine's game thread,
++     * for a held mouse button). Elsewhere than the window's thread, the live state stands in
++     * for it, with the toggles from the window's thread. */
++    if (impl->dispatcher && GetCurrentThreadId() != impl->dispatcher->thread_id)
++        *state = key_states((GetAsyncKeyState(key) & 0x8000) | (GetKeyState(key) & 1));
++    else
++        *state = key_states(GetKeyState(key));
++    TRACE("iface %p, key %#x -> %#x.\n", iface, key, *state);
+     return S_OK;
+ }
+ 
+diff --git a/dlls/twinapi.appcore/core_input_gen.c b/dlls/twinapi.appcore/core_input_gen.c
+index e71eaf1..5371b5b 100644
+--- a/dlls/twinapi.appcore/core_input_gen.c
++++ b/dlls/twinapi.appcore/core_input_gen.c
+@@ -8,7 +8,7 @@
+ WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
+ 
+ enum input_event { EV_KEYDOWN, EV_KEYUP, EV_CHAR, EV_PMOVED, EV_PPRESSED, EV_PRELEASED, EV_PWHEEL,
+-                   EV_ACTIVATED, EV_VISIBILITY, EV_SIZE, EV_COUNT };
++                   EV_ACTIVATED, EV_VISIBILITY, EV_SIZE, EV_ACCELERATOR, EV_COUNT };
+ 
+ static struct { IUnknown *h[8]; UINT32 n; } handlers[EV_COUNT];
+ static LONG input_token_counter;
+@@ -1273,6 +1273,113 @@ void core_input_raise_size(ICoreWindow *sender, float w, float h)
+ }
+ 
+ 
++/* ---- AcceleratorKeyEventArgs: CoreDispatcher.AcceleratorKeyActivated, raised for every key and
++ * character message before the CoreWindow's own key events (Unreal Engine takes game keys from it) ---- */
++struct accel_args
++{
++    IAcceleratorKeyEventArgs IAcceleratorKeyEventArgs_iface;
++    ICoreWindowEventArgs ICoreWindowEventArgs_iface;
++    LONG ref;
++    boolean handled;
++    CoreAcceleratorKeyEventType type;
++    __x_ABI_CWindows_CSystem_CVirtualKey vkey;
++    CorePhysicalKeyStatus status;
++};
++static inline struct accel_args *impl_from_accel(IAcceleratorKeyEventArgs *iface)
++{ return CONTAINING_RECORD(iface, struct accel_args, IAcceleratorKeyEventArgs_iface); }
++static inline struct accel_args *impl_from_accel_cw(ICoreWindowEventArgs *iface)
++{ return CONTAINING_RECORD(iface, struct accel_args, ICoreWindowEventArgs_iface); }
++
++static HRESULT accel_args_qi(struct accel_args *impl, REFIID iid, void **out)
++{
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IAcceleratorKeyEventArgs))
++        *out = &impl->IAcceleratorKeyEventArgs_iface;
++    else if (IsEqualGUID(iid, &IID_ICoreWindowEventArgs))
++        *out = &impl->ICoreWindowEventArgs_iface;
++    else
++    {
++        FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    InterlockedIncrement(&impl->ref);
++    return S_OK;
++}
++static ULONG accel_args_release(struct accel_args *impl)
++{ ULONG r = InterlockedDecrement(&impl->ref); if (!r) free(impl); return r; }
++
++static HRESULT WINAPI accel_QueryInterface(IAcceleratorKeyEventArgs *iface, REFIID iid, void **out)
++{ return accel_args_qi(impl_from_accel(iface), iid, out); }
++static ULONG WINAPI accel_AddRef(IAcceleratorKeyEventArgs *iface) { return InterlockedIncrement(&impl_from_accel(iface)->ref); }
++static ULONG WINAPI accel_Release(IAcceleratorKeyEventArgs *iface) { return accel_args_release(impl_from_accel(iface)); }
++static HRESULT WINAPI accel_GetIids(IAcceleratorKeyEventArgs *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI accel_GetRuntimeClassName(IAcceleratorKeyEventArgs *iface, HSTRING *name)
++{ return WindowsCreateString(L"Windows.UI.Core.AcceleratorKeyEventArgs", 39, name); }
++static HRESULT WINAPI accel_GetTrustLevel(IAcceleratorKeyEventArgs *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI accel_get_EventType(IAcceleratorKeyEventArgs *iface, CoreAcceleratorKeyEventType *value)
++{ *value = impl_from_accel(iface)->type; return S_OK; }
++static HRESULT WINAPI accel_get_VirtualKey(IAcceleratorKeyEventArgs *iface, __x_ABI_CWindows_CSystem_CVirtualKey *value)
++{ *value = impl_from_accel(iface)->vkey; return S_OK; }
++static HRESULT WINAPI accel_get_KeyStatus(IAcceleratorKeyEventArgs *iface, CorePhysicalKeyStatus *value)
++{ *value = impl_from_accel(iface)->status; return S_OK; }
++static const IAcceleratorKeyEventArgsVtbl accel_vtbl =
++{
++    accel_QueryInterface, accel_AddRef, accel_Release,
++    accel_GetIids, accel_GetRuntimeClassName, accel_GetTrustLevel,
++    accel_get_EventType, accel_get_VirtualKey, accel_get_KeyStatus,
++};
++
++static HRESULT WINAPI accel_cw_QueryInterface(ICoreWindowEventArgs *iface, REFIID iid, void **out)
++{ return accel_args_qi(impl_from_accel_cw(iface), iid, out); }
++static ULONG WINAPI accel_cw_AddRef(ICoreWindowEventArgs *iface) { return InterlockedIncrement(&impl_from_accel_cw(iface)->ref); }
++static ULONG WINAPI accel_cw_Release(ICoreWindowEventArgs *iface) { return accel_args_release(impl_from_accel_cw(iface)); }
++static HRESULT WINAPI accel_cw_GetIids(ICoreWindowEventArgs *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI accel_cw_GetRuntimeClassName(ICoreWindowEventArgs *iface, HSTRING *name)
++{ return accel_GetRuntimeClassName(&impl_from_accel_cw(iface)->IAcceleratorKeyEventArgs_iface, name); }
++static HRESULT WINAPI accel_cw_GetTrustLevel(ICoreWindowEventArgs *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI accel_cw_get_Handled(ICoreWindowEventArgs *iface, boolean *value)
++{ *value = impl_from_accel_cw(iface)->handled; return S_OK; }
++static HRESULT WINAPI accel_cw_put_Handled(ICoreWindowEventArgs *iface, boolean value)
++{ impl_from_accel_cw(iface)->handled = value; return S_OK; }
++static const ICoreWindowEventArgsVtbl accel_cw_vtbl =
++{
++    accel_cw_QueryInterface, accel_cw_AddRef, accel_cw_Release,
++    accel_cw_GetIids, accel_cw_GetRuntimeClassName, accel_cw_GetTrustLevel,
++    accel_cw_get_Handled, accel_cw_put_Handled,
++};
++
++static CorePhysicalKeyStatus key_status(LPARAM lparam);
++
++/* raises AcceleratorKeyActivated on the window's dispatcher; TRUE when a handler marked it handled */
++static BOOL raise_accelerator(ICoreWindow *sender, CoreAcceleratorKeyEventType type, WPARAM wparam, LPARAM lparam)
++{
++    ICoreDispatcher *dispatcher;
++    BOOL handled = FALSE;
++    UINT32 i;
++
++    if (!handlers[EV_ACCELERATOR].n || FAILED(ICoreWindow_get_Dispatcher(sender, &dispatcher))) return FALSE;
++    for (i = 0; i < handlers[EV_ACCELERATOR].n && !handled; i++)
++    {
++        struct accel_args *args = calloc(1, sizeof(*args));
++        if (!args) break;
++        args->IAcceleratorKeyEventArgs_iface.lpVtbl = &accel_vtbl;
++        args->ICoreWindowEventArgs_iface.lpVtbl = &accel_cw_vtbl;
++        args->ref = 1;
++        args->type = type;
++        args->vkey = wparam;
++        args->status = key_status(lparam);
++        ITypedEventHandler_CoreDispatcher_AcceleratorKeyEventArgs_Invoke(
++                (ITypedEventHandler_CoreDispatcher_AcceleratorKeyEventArgs *)handlers[EV_ACCELERATOR].h[i], dispatcher,
++                &args->IAcceleratorKeyEventArgs_iface);
++        handled = args->handled;
++        IAcceleratorKeyEventArgs_Release(&args->IAcceleratorKeyEventArgs_iface);
++    }
++    ICoreDispatcher_Release(dispatcher);
++    TRACE("type %d, vkey %#Ix, handled %d.\n", type, wparam, handled);
++    return handled;
++}
++
+ static CorePhysicalKeyStatus key_status(LPARAM lparam)
+ {
+     CorePhysicalKeyStatus s;
+@@ -1304,6 +1411,8 @@ static void raise_pointer(ICoreWindow *sender, int ev, struct pointer_data *d)
+ 
+     if (ev == EV_PPRESSED || ev == EV_PRELEASED)
+         TRACE("pointer %s at %.0f,%.0f, %u handlers.\n", ev == EV_PPRESSED ? "pressed" : "released", d->x, d->y, handlers[ev].n);
++    else if (ev == EV_PMOVED)
++        TRACE("pointer moved to %.0f,%.0f, %u handlers.\n", d->x, d->y, handlers[ev].n);
+ 
+     for (i = 0; i < handlers[ev].n; i++)
+     {
+@@ -1340,6 +1449,12 @@ BOOL core_input_message(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, ICore
+     case WM_KEYDOWN: case WM_SYSKEYDOWN: case WM_KEYUP: case WM_SYSKEYUP:
+     {
+         int ev = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) ? EV_KEYDOWN : EV_KEYUP;
++        CoreAcceleratorKeyEventType type = msg == WM_KEYDOWN ? CoreAcceleratorKeyEventType_KeyDown :
++                                           msg == WM_KEYUP ? CoreAcceleratorKeyEventType_KeyUp :
++                                           msg == WM_SYSKEYDOWN ? CoreAcceleratorKeyEventType_SystemKeyDown :
++                                           CoreAcceleratorKeyEventType_SystemKeyUp;
++
++        if (raise_accelerator(sender, type, wparam, lparam)) return TRUE;
+         for (i = 0; i < handlers[ev].n; i++)
+         {
+             struct key_args *args = calloc(1, sizeof(*args));
+@@ -1356,7 +1471,11 @@ BOOL core_input_message(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, ICore
+         }
+         return TRUE;
+     }
++    case WM_SYSCHAR:
++        raise_accelerator(sender, CoreAcceleratorKeyEventType_SystemCharacter, wparam, lparam);
++        return FALSE;
+     case WM_CHAR:
++        if (raise_accelerator(sender, CoreAcceleratorKeyEventType_Character, wparam, lparam)) return TRUE;
+         for (i = 0; i < handlers[EV_CHAR].n; i++)
+         {
+             struct char_args *args = calloc(1, sizeof(*args));
