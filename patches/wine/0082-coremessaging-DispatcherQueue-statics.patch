@@ -1,0 +1,115 @@
+Subject: coremessaging: DispatcherQueue.GetForCurrentThread (no thread has a queue)
+
+diff --git a/dlls/coremessaging/classes.idl b/dlls/coremessaging/classes.idl
+index af84f0a..5491a6c 100644
+--- a/dlls/coremessaging/classes.idl
++++ b/dlls/coremessaging/classes.idl
+@@ -24,5 +24,6 @@
+ import "windows.system.idl";
+ 
+ namespace Windows.System {
++    runtimeclass DispatcherQueue;
+     runtimeclass DispatcherQueueController;
+ }
+diff --git a/dlls/coremessaging/main.c b/dlls/coremessaging/main.c
+index 6fa2e28..cec2860 100644
+--- a/dlls/coremessaging/main.c
++++ b/dlls/coremessaging/main.c
+@@ -251,6 +251,88 @@ static struct dispatcher_queue_controller_statics dispatcher_queue_controller_st
+ 
+ static IActivationFactory *dispatcher_queue_controller_factory = &dispatcher_queue_controller_statics.IActivationFactory_iface;
+ 
++/* ---- Windows.System.DispatcherQueue statics: no thread here has a dispatcher queue of its own, so
++ * GetForCurrentThread finds none (the answer Windows gives on a thread without one) ---- */
++struct dispatcher_queue_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IDispatcherQueueStatics IDispatcherQueueStatics_iface;
++    LONG ref;
++};
++
++static inline struct dispatcher_queue_statics *queue_statics_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct dispatcher_queue_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI queue_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct dispatcher_queue_statics *impl = queue_statics_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IDispatcherQueueStatics ))
++        *out = &impl->IDispatcherQueueStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++static ULONG WINAPI queue_factory_AddRef( IActivationFactory *iface )
++{ return InterlockedIncrement( &queue_statics_from_IActivationFactory( iface )->ref ); }
++static ULONG WINAPI queue_factory_Release( IActivationFactory *iface )
++{ return InterlockedDecrement( &queue_statics_from_IActivationFactory( iface )->ref ); }
++
++static const struct IActivationFactoryVtbl queue_factory_vtbl =
++{
++    queue_factory_QueryInterface,
++    queue_factory_AddRef,
++    queue_factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( queue_statics, IDispatcherQueueStatics, struct dispatcher_queue_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI queue_statics_GetForCurrentThread( IDispatcherQueueStatics *iface, IDispatcherQueue **result )
++{
++    TRACE( "iface %p, result %p: no queue on thread %#lx.\n", iface, result, GetCurrentThreadId() );
++    if (!result) return E_POINTER;
++    *result = NULL;
++    return S_OK;
++}
++
++static const struct IDispatcherQueueStaticsVtbl queue_statics_vtbl =
++{
++    queue_statics_QueryInterface,
++    queue_statics_AddRef,
++    queue_statics_Release,
++    /* IInspectable methods */
++    queue_statics_GetIids,
++    queue_statics_GetRuntimeClassName,
++    queue_statics_GetTrustLevel,
++    /* IDispatcherQueueStatics methods */
++    queue_statics_GetForCurrentThread,
++};
++
++static struct dispatcher_queue_statics dispatcher_queue_statics =
++{
++    {&queue_factory_vtbl},
++    {&queue_statics_vtbl},
++    1,
++};
++
+ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **factory )
+ {
+     const WCHAR *name = WindowsGetStringRawBuffer( classid, NULL );
+@@ -261,6 +343,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+ 
+     if (!wcscmp( name, RuntimeClass_Windows_System_DispatcherQueueController ))
+         IActivationFactory_QueryInterface( dispatcher_queue_controller_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( name, RuntimeClass_Windows_System_DispatcherQueue ))
++        IActivationFactory_QueryInterface( &dispatcher_queue_statics.IActivationFactory_iface, &IID_IActivationFactory, (void **)factory );
+ 
+     if (*factory) return S_OK;
+     return CLASS_E_CLASSNOTAVAILABLE;

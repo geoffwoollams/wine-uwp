@@ -1,0 +1,451 @@
+Subject: twinapi.appcore: ResourceContext for the current view (language and qualifier values)
+
+diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
+index ccedfd0..ed91354 100644
+--- a/dlls/twinapi.appcore/Makefile.in
++++ b/dlls/twinapi.appcore/Makefile.in
+@@ -36,6 +36,7 @@ SOURCES = \
+ 	message_dialog.c \
+ 	mouse.c \
+ 	pointer_visualization.c \
++	resource_context.c \
+ 	hardware_identification.c \
+ 	input_capabilities.c \
+ 	main.c \
+diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
+index ced5320..15077b1 100644
+--- a/dlls/twinapi.appcore/main.c
++++ b/dlls/twinapi.appcore/main.c
+@@ -152,6 +152,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( message_dialog_factory, &IID_IActivationFactory, (void **)factory );
+     }
+ 
++    else if (!wcscmp( buffer, L"Windows.ApplicationModel.Resources.Core.ResourceContext" ))
++        IActivationFactory_QueryInterface( resource_context_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, L"Windows.System.Profile.HardwareIdentification" ))
+         IActivationFactory_QueryInterface( hardware_identification_factory, &IID_IActivationFactory, (void **)factory );
+ 
+diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
+index 15a702e..8c6aa4c 100644
+--- a/dlls/twinapi.appcore/private.h
++++ b/dlls/twinapi.appcore/private.h
+@@ -77,6 +77,7 @@ extern IActivationFactory *hardware_identification_factory;
+ extern IActivationFactory *diagnostics_settings_factory;
+ extern IActivationFactory *clipboard_factory;
+ extern IActivationFactory *api_information_factory;
++extern IActivationFactory *resource_context_factory;
+ extern IActivationFactory *web_token_manager_factory, *web_token_request_factory, *web_account_provider_factory, *user_picker_factory, *system_user_factory, *launcher_factory, *web_account_factory, *web_token_response_factory, *thread_pool_timer_factory, *user_statics_factory, *store_context_real_factory, *message_websocket_factory, *store_context_factory, *logging_options_factory, *logging_fields_factory, *push_manager_factory, *logging_channel_factory, *loggingchanneloptions_factory, *loggingactivity_factory, *loggingsession_factory;
+ extern IActivationFactory *async_causality_tracer_factory;   /* causality.c */
+ extern IActivationFactory *mouse_device_factory;   /* mouse.c */
+diff --git a/dlls/twinapi.appcore/resource_context.c b/dlls/twinapi.appcore/resource_context.c
+new file mode 100644
+index 0000000..bf7726a
+--- /dev/null
++++ b/dlls/twinapi.appcore/resource_context.c
+@@ -0,0 +1,391 @@
++/* WinRT Windows.ApplicationModel.Resources.Core.ResourceContext (hand-declared interfaces)
++ *
++ * The context for the current view: the user's language, a scale of 100, standard contrast,
++ * left-to-right layout. Nothing resolves resources against it yet (there is no ResourceManager);
++ * apps read it for the language they should show (Unity 6 asks for it when it starts).
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#include "winnls.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
++
++extern HRESULT string_map_create( void **out );
++
++static const GUID IID_IResourceContext_local = { 0x2fa22f4b, 0x707e, 0x4b27, { 0xad, 0x0d, 0xd0, 0xd8, 0xcd, 0x46, 0x8f, 0xd2 } };
++static const GUID IID_IResourceContextStatics2_local = { 0x41f752ef, 0x12af, 0x41b9, { 0xab, 0x36, 0xb1, 0xeb, 0x4b, 0x51, 0x24, 0x60 } };
++/* IObservableMap<String, String>, IVectorView<String>, IIterable<String> (pinterface IIDs) */
++static const GUID IID_IObservableMap_HSTRING_HSTRING_local = { 0x1e036276, 0x2f60, 0x55f6, { 0xb7, 0xf3, 0xf8, 0x60, 0x79, 0xe6, 0x90, 0x0b } };
++static const GUID IID_IVectorView_HSTRING_local = { 0x2f13c006, 0xa03a, 0x5f69, { 0xb0, 0x90, 0x75, 0xa4, 0x3e, 0x33, 0x42, 0x3e } };
++
++static void user_language( WCHAR *name, int size )
++{
++    if (!GetUserDefaultLocaleName( name, size )) lstrcpynW( name, L"en-US", size );
++}
++
++/* ---- IVectorView<String>: the context's languages ---- */
++struct languages
++{
++    const void *const *lpVtbl;
++    LONG ref;
++    HSTRING language;
++};
++
++static HRESULT WINAPI languages_QueryInterface( struct languages *impl, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IVectorView_HSTRING_local ))
++    {
++        InterlockedIncrement( &impl->ref );
++        *out = impl;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI languages_AddRef( struct languages *impl ) { return InterlockedIncrement( &impl->ref ); }
++static ULONG WINAPI languages_Release( struct languages *impl )
++{
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        WindowsDeleteString( impl->language );
++        free( impl );
++    }
++    return ref;
++}
++static HRESULT WINAPI languages_GetIids( struct languages *impl, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI languages_GetRuntimeClassName( struct languages *impl, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI languages_GetTrustLevel( struct languages *impl, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI languages_GetAt( struct languages *impl, UINT32 index, HSTRING *value )
++{
++    *value = NULL;
++    if (index) return E_BOUNDS;
++    return WindowsDuplicateString( impl->language, value );
++}
++static HRESULT WINAPI languages_get_Size( struct languages *impl, UINT32 *value ) { *value = 1; return S_OK; }
++static HRESULT WINAPI languages_IndexOf( struct languages *impl, HSTRING element, UINT32 *index, BOOLEAN *found )
++{
++    INT32 order = 1;
++    *index = 0;
++    WindowsCompareStringOrdinal( element, impl->language, &order );
++    *found = !order;
++    return S_OK;
++}
++static HRESULT WINAPI languages_GetMany( struct languages *impl, UINT32 start, UINT32 size, HSTRING *items, UINT32 *count )
++{
++    *count = 0;
++    if (start || !size) return S_OK;
++    *count = 1;
++    return WindowsDuplicateString( impl->language, items );
++}
++static const void *const languages_vtbl[] =
++{
++    languages_QueryInterface, languages_AddRef, languages_Release,
++    languages_GetIids, languages_GetRuntimeClassName, languages_GetTrustLevel,
++    languages_GetAt, languages_get_Size, languages_IndexOf, languages_GetMany,
++};
++
++static HRESULT languages_create( void **out )
++{
++    struct languages *impl;
++    WCHAR name[LOCALE_NAME_MAX_LENGTH];
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->lpVtbl = languages_vtbl;
++    impl->ref = 1;
++    user_language( name, ARRAY_SIZE(name) );
++    WindowsCreateString( name, wcslen( name ), &impl->language );
++    *out = impl;
++    return S_OK;
++}
++
++/* ---- IObservableMap<String, String> over a StringMap: the qualifier values. They change only when
++ * the app sets them, so MapChanged is never raised; IMap and IIterable are the StringMap's own. ---- */
++struct qualifiers
++{
++    const void *const *lpVtbl;
++    LONG ref;
++    IUnknown *map;
++};
++
++static HRESULT WINAPI qualifiers_QueryInterface( struct qualifiers *impl, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IObservableMap_HSTRING_HSTRING_local ))
++    {
++        InterlockedIncrement( &impl->ref );
++        *out = impl;
++        return S_OK;
++    }
++    return IUnknown_QueryInterface( impl->map, iid, out );
++}
++static ULONG WINAPI qualifiers_AddRef( struct qualifiers *impl ) { return InterlockedIncrement( &impl->ref ); }
++static ULONG WINAPI qualifiers_Release( struct qualifiers *impl )
++{
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        IUnknown_Release( impl->map );
++        free( impl );
++    }
++    return ref;
++}
++static HRESULT WINAPI qualifiers_GetIids( struct qualifiers *impl, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI qualifiers_GetRuntimeClassName( struct qualifiers *impl, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI qualifiers_GetTrustLevel( struct qualifiers *impl, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI qualifiers_add_MapChanged( struct qualifiers *impl, IUnknown *handler, EventRegistrationToken *token )
++{
++    if (!handler || !token) return E_POINTER;
++    token->value = 0x7263;
++    return S_OK;
++}
++static HRESULT WINAPI qualifiers_remove_MapChanged( struct qualifiers *impl, EventRegistrationToken token ) { return S_OK; }
++static const void *const qualifiers_vtbl[] =
++{
++    qualifiers_QueryInterface, qualifiers_AddRef, qualifiers_Release,
++    qualifiers_GetIids, qualifiers_GetRuntimeClassName, qualifiers_GetTrustLevel,
++    qualifiers_add_MapChanged, qualifiers_remove_MapChanged,
++};
++
++static void map_set( IMap_HSTRING_HSTRING *map, const WCHAR *key, const WCHAR *value )
++{
++    HSTRING k, v;
++    boolean replaced;
++
++    WindowsCreateString( key, wcslen( key ), &k );
++    WindowsCreateString( value, wcslen( value ), &v );
++    IMap_HSTRING_HSTRING_Insert( map, k, v, &replaced );
++    WindowsDeleteString( k );
++    WindowsDeleteString( v );
++}
++
++static HRESULT qualifiers_create( void **out )
++{
++    struct qualifiers *impl;
++    IMap_HSTRING_HSTRING *map;
++    WCHAR language[LOCALE_NAME_MAX_LENGTH], region[16];
++    HRESULT hr;
++
++    if (FAILED(hr = string_map_create( (void **)&map ))) return hr;
++    user_language( language, ARRAY_SIZE(language) );
++    if (!GetUserDefaultGeoName( region, ARRAY_SIZE(region) )) lstrcpyW( region, L"US" );
++    map_set( map, L"Language", language );
++    map_set( map, L"HomeRegion", region );
++    map_set( map, L"Scale", L"100" );
++    map_set( map, L"Contrast", L"standard" );
++    map_set( map, L"LayoutDirection", L"LTR" );
++    map_set( map, L"Theme", L"dark" );
++    map_set( map, L"DeviceFamily", L"Desktop" );
++    map_set( map, L"AlternateForm", L"" );
++    map_set( map, L"Configuration", L"" );
++    map_set( map, L"DXFeatureLevel", L"DX11" );
++    map_set( map, L"TargetSize", L"0" );
++
++    if (!(impl = calloc( 1, sizeof(*impl) )))
++    {
++        IMap_HSTRING_HSTRING_Release( map );
++        return E_OUTOFMEMORY;
++    }
++    impl->lpVtbl = qualifiers_vtbl;
++    impl->ref = 1;
++    impl->map = (IUnknown *)map;
++    *out = impl;
++    return S_OK;
++}
++
++/* ---- ResourceContext (IResourceContext) ---- */
++struct resource_context
++{
++    const void *const *lpVtbl;
++    LONG ref;
++    void *qualifiers;    /* struct qualifiers */
++    IUnknown *languages; /* IVectorView<String> */
++};
++
++static HRESULT resource_context_create( void **out );
++
++static HRESULT WINAPI context_QueryInterface( struct resource_context *impl, REFIID iid, void **out )
++{
++    TRACE( "context %p, iid %s.\n", impl, debugstr_guid( iid ) );
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IResourceContext_local ))
++    {
++        InterlockedIncrement( &impl->ref );
++        *out = impl;
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI context_AddRef( struct resource_context *impl ) { return InterlockedIncrement( &impl->ref ); }
++static ULONG WINAPI context_Release( struct resource_context *impl )
++{
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        qualifiers_Release( impl->qualifiers );
++        IUnknown_Release( impl->languages );
++        free( impl );
++    }
++    return ref;
++}
++static HRESULT WINAPI context_GetIids( struct resource_context *impl, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI context_GetRuntimeClassName( struct resource_context *impl, HSTRING *name )
++{
++    return WindowsCreateString( L"Windows.ApplicationModel.Resources.Core.ResourceContext", 55, name );
++}
++static HRESULT WINAPI context_GetTrustLevel( struct resource_context *impl, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI context_get_QualifierValues( struct resource_context *impl, void **value )
++{
++    TRACE( "context %p, value %p.\n", impl, value );
++    qualifiers_AddRef( impl->qualifiers );
++    *value = impl->qualifiers;
++    return S_OK;
++}
++static HRESULT WINAPI context_Reset( struct resource_context *impl ) { return S_OK; }
++static HRESULT WINAPI context_ResetQualifierValues( struct resource_context *impl, void *names ) { return S_OK; }
++static HRESULT WINAPI context_OverrideToMatch( struct resource_context *impl, void *result )
++{
++    FIXME( "context %p, result %p: ignored.\n", impl, result );
++    return S_OK;
++}
++static HRESULT WINAPI context_Clone( struct resource_context *impl, void **value )
++{
++    return resource_context_create( value );
++}
++static HRESULT WINAPI context_get_Languages( struct resource_context *impl, void **value )
++{
++    TRACE( "context %p, value %p.\n", impl, value );
++    IUnknown_AddRef( impl->languages );
++    *value = impl->languages;
++    return S_OK;
++}
++static HRESULT WINAPI context_put_Languages( struct resource_context *impl, IUnknown *value )
++{
++    TRACE( "context %p, value %p.\n", impl, value );
++    if (!value) return E_POINTER;
++    IUnknown_AddRef( value );
++    IUnknown_Release( impl->languages );
++    impl->languages = value;
++    return S_OK;
++}
++static const void *const context_vtbl[] =
++{
++    context_QueryInterface, context_AddRef, context_Release,
++    context_GetIids, context_GetRuntimeClassName, context_GetTrustLevel,
++    context_get_QualifierValues, context_Reset, context_ResetQualifierValues, context_OverrideToMatch,
++    context_Clone, context_get_Languages, context_put_Languages,
++};
++
++static HRESULT resource_context_create( void **out )
++{
++    struct resource_context *impl;
++    HRESULT hr;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->lpVtbl = context_vtbl;
++    impl->ref = 1;
++    if (FAILED(hr = qualifiers_create( &impl->qualifiers )) || FAILED(hr = languages_create( (void **)&impl->languages )))
++    {
++        if (impl->qualifiers) qualifiers_Release( impl->qualifiers );
++        free( impl );
++        return hr;
++    }
++    *out = impl;
++    return S_OK;
++}
++
++/* ---- the factory, with IResourceContextStatics2 ---- */
++struct context_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    struct { const void *const *lpVtbl; } statics2;
++};
++
++static struct context_statics context_statics;
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s.\n", iface, debugstr_guid( iid ) );
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        *out = &context_statics.IActivationFactory_iface;
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_IResourceContextStatics2_local ))
++    {
++        *out = &context_statics.statics2;
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    /* new ResourceContext() is the default context */
++    return resource_context_create( (void **)instance );
++}
++static const IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface, factory_AddRef, factory_Release,
++    factory_GetIids, factory_GetRuntimeClassName, factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++static HRESULT WINAPI statics2_QueryInterface( void *iface, REFIID iid, void **out )
++{
++    return factory_QueryInterface( &context_statics.IActivationFactory_iface, iid, out );
++}
++static ULONG WINAPI statics2_AddRef( void *iface ) { return 2; }
++static ULONG WINAPI statics2_Release( void *iface ) { return 1; }
++static HRESULT WINAPI statics2_GetIids( void *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI statics2_GetRuntimeClassName( void *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI statics2_GetTrustLevel( void *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI statics2_GetForCurrentView( void *iface, void **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    return resource_context_create( value );
++}
++static HRESULT WINAPI statics2_SetGlobalQualifierValue( void *iface, HSTRING key, HSTRING value )
++{
++    FIXME( "iface %p, key %s, value %s: ignored.\n", iface, debugstr_hstring( key ), debugstr_hstring( value ) );
++    return S_OK;
++}
++static HRESULT WINAPI statics2_ResetGlobalQualifierValues( void *iface ) { return S_OK; }
++static HRESULT WINAPI statics2_ResetGlobalQualifierValuesForSpecifiedQualifiers( void *iface, void *names ) { return S_OK; }
++static const void *const statics2_vtbl[] =
++{
++    statics2_QueryInterface, statics2_AddRef, statics2_Release,
++    statics2_GetIids, statics2_GetRuntimeClassName, statics2_GetTrustLevel,
++    statics2_GetForCurrentView, statics2_SetGlobalQualifierValue, statics2_ResetGlobalQualifierValues,
++    statics2_ResetGlobalQualifierValuesForSpecifiedQualifiers,
++    statics2_GetForCurrentView,                         /* GetForViewIndependentUse */
++};
++
++static struct context_statics context_statics = { {&factory_vtbl}, {statics2_vtbl} };
++
++IActivationFactory *resource_context_factory = &context_statics.IActivationFactory_iface;
+diff --git a/dlls/twinapi.appcore/twinapi.appcore.rgs b/dlls/twinapi.appcore/twinapi.appcore.rgs
+index d6346d5..bbcd3dc 100644
+--- a/dlls/twinapi.appcore/twinapi.appcore.rgs
++++ b/dlls/twinapi.appcore/twinapi.appcore.rgs
+@@ -92,6 +92,10 @@ HKLM
+                     {
+                         val 'DllPath' = s '%MODULE%'
+                     }
++                    ForceRemove Windows.ApplicationModel.Resources.Core.ResourceContext
++                    {
++                        val 'DllPath' = s '%MODULE%'
++                    }
+                     ForceRemove Windows.System.Profile.HardwareIdentification
+                     {
+                         val 'DllPath' = s '%MODULE%'

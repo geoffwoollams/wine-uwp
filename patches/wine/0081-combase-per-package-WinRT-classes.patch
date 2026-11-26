@@ -1,0 +1,60 @@
+Subject: combase: a package's own WinRT classes are looked up for that package first
+
+diff --git a/dlls/combase/roapi.c b/dlls/combase/roapi.c
+index 774f969..ad39ec8 100644
+--- a/dlls/combase/roapi.c
++++ b/dlls/combase/roapi.c
+@@ -26,6 +26,7 @@
+ #include "roerrorapi.h"
+ #include "winstring.h"
+ #include "errhandlingapi.h"
++#include "appmodel.h"
+ 
+ #include "combase_private.h"
+ 
+@@ -42,6 +43,35 @@ struct activatable_class_data
+     DWORD threading_model;
+ };
+ 
++/* Classes an app brings in its own package are registered for that package only, in
++ * HKLM\Software\Wine\WindowsRuntime\Packages\<package name>\ActivatableClassId\<class>, with
++ * DllPath relative to the package folder: apps that ship the same classes (every Unity game
++ * has UnityPlayer's) each load their own copy, as on Windows. */
++static WCHAR *get_package_library_for_classid(const WCHAR *classid)
++{
++    WCHAR family[PACKAGE_FAMILY_NAME_MAX_LENGTH + 1], root[MAX_PATH], key[MAX_PATH + 160], dll[MAX_PATH], *p, *out;
++    UINT32 len = ARRAY_SIZE(family), root_len = ARRAY_SIZE(root);
++    DWORD size = sizeof(dll), type;
++    HKEY hkey;
++    LSTATUS ret;
++
++    if (GetCurrentPackageFamilyName(&len, family) || GetCurrentPackagePath(&root_len, root)) return NULL;
++    if ((p = wcschr(family, '_'))) *p = 0;   /* the package name */
++    if (wcslen(classid) > MAX_PATH) return NULL;
++    swprintf(key, ARRAY_SIZE(key), L"Software\\Wine\\WindowsRuntime\\Packages\\%s\\ActivatableClassId\\%s", family, classid);
++    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, key, 0, KEY_READ, &hkey)) return NULL;
++    ret = RegQueryValueExW(hkey, L"DllPath", NULL, &type, (BYTE *)dll, &size);
++    RegCloseKey(hkey);
++    if (ret || type != REG_SZ) return NULL;
++    dll[ARRAY_SIZE(dll) - 1] = 0;
++
++    if (dll[0] && dll[1] == ':') return wcsdup(dll);   /* already absolute */
++    if (!(out = malloc((wcslen(root) + wcslen(dll) + 2) * sizeof(WCHAR)))) return NULL;
++    swprintf(out, wcslen(root) + wcslen(dll) + 2, L"%s\\%s", root, dll);
++    TRACE("%s from the package: %s.\n", debugstr_w(classid), debugstr_w(out));
++    return out;
++}
++
+ static HRESULT get_library_for_classid(const WCHAR *classid, WCHAR **out)
+ {
+     ACTCTX_SECTION_KEYED_DATA data;
+@@ -63,6 +93,9 @@ static HRESULT get_library_for_classid(const WCHAR *classid, WCHAR **out)
+         return S_OK;
+     }
+ 
++    /* then the running package's own classes */
++    if ((*out = get_package_library_for_classid(classid))) return S_OK;
++
+     /* load class registry key */
+     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\WindowsRuntime\\ActivatableClassId",
+                       0, KEY_READ, &hkey_root))

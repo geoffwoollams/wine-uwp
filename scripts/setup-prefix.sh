@@ -137,6 +137,11 @@ printf '%s\n%s\n%s\n' "$PKG_DIR" "" "$OWN_PREFIX" > "$SOURCES/$PKG_NAME.source"
 info "Registering WinRT classes"
 python3 -I "$REPO/scripts/uwptool.py" registry "$PKG_DIR" "C:\\$APPS_DIR_NAME\\$PKG_NAME" "$FRAMEWORKS" > "$PREFIX/drive_c/uwp-$PKG_NAME.reg"
 wine regedit /S "C:\\uwp-$PKG_NAME.reg"
+# time zones without their MUI names: IL2CPP apps' DateTime.Now fails on them (see uwptool.py timezone-mui)
+wine regedit /E "C:\\uwp-timezones.reg" "HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Time Zones"
+python3 -I "$REPO/scripts/uwptool.py" timezone-mui "$PREFIX/drive_c/uwp-timezones.reg" > "$PREFIX/drive_c/uwp-timezones-mui.reg"
+wine regedit /S "C:\\uwp-timezones-mui.reg"
+rm -f "$PREFIX/drive_c/uwp-timezones.reg" "$PREFIX/drive_c/uwp-timezones-mui.reg"
 wineserver -w
 
 # A launcher: ~/.local/share/applications/wine-uwp-<package>.desktop (the menu) and a copy on the desktop, with the app's

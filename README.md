@@ -18,9 +18,9 @@ UWP apps don't create a normal Win32 window. They ask Windows for a `CoreApplica
 |---|---|---|
 | ✅ | Halo Wars 2 (`Microsoft.HoganThreshold`, D3D12) | Playable offline: videos, menus, skirmish, native-resolution fullscreen, mouse and keyboard, settings and local saves. See [the example](#example-halo-wars-2). |
 | ✅ | Gears of War 4 (`Microsoft.SpartaUWP`, Unreal Engine 4, D3D12) | Campaign playable offline in fullscreen: menus, videos, mouse look and aiming, keyboard; the built-in benchmark runs. No multiplayer or co-op. See [the example](#example-gears-of-war-4). |
+| ✅ | Crackdown 3 (`Microsoft.48248D2C77101`, Unreal Engine 4) | Campaign playable offline: menus with the mouse, keyboard movement, mouse look; saves kept locally. Holding the mouse button doesn't skip the intro video; let it play. Its online services fail as offline. |
 | ✅ | Microsoft Minesweeper (`Microsoft.MicrosoftMinesweeper`, Unity, XAML, .NET Native) | Playable offline: menus and Classic games with mouse clicks, flags and local saves. Needs `mrt100.dll` (see [framework packages](#set-up-an-app)). After the tutorial, each start waits about 30 seconds on "Downloading Game Data" while its Xbox cloud saves fail as offline. No ads, achievements or cloud saves. |
 | ❌ | Forza Motorsport 7 (`Microsoft.ApolloBaseGame`, D3D12) | Not working: it starts and its hardware warning is answered, but it isn't playable yet. |
-| ✅ | Crackdown 3 (`Microsoft.48248D2C77101`, Unreal Engine 4) | Campaign playable offline: menus with the mouse, keyboard movement, mouse look; saves kept locally. Holding the mouse button doesn't skip the intro video; let it play. Its online services fail as offline. |
 | ❌ | Windows Calculator (`Microsoft.WindowsCalculator`, XAML, WinUI 2.8) | Not working: stops at startup. It needs XAML's dependency-property system and the WinUI 2 control library, which the partial XAML doesn't support yet. |
 | ❌ | Windows Notepad, Paint (`Microsoft.WindowsNotepad`, `Microsoft.Paint`) | Not supported: Windows App SDK (WinUI 3) desktop apps, not UWP; nothing here supports them. |
 
@@ -284,7 +284,9 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 for Crackdown 3: CPU set queries, DisplayInformation 3 and 4, the add-on licence map,
                 GameChatOverlay, CryptographicBuffer, gaming privilege checks, IMediaPlayer3 and
                 MediaPlaybackSession, 0079 AcceleratorKeyActivated (Unreal Engine's game keys) and CoreWindow key
-                state from any thread, 0080 the *FromApp file functions (Microsoft Sudoku)
+                state from any thread, 0080 the *FromApp file functions, 0081-0083 for Microsoft Sudoku
+                (Unity 6): a package's own WinRT classes first (Unity games no longer load each other's),
+                DispatcherQueue.GetForCurrentThread, ResourceContext
 patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings
