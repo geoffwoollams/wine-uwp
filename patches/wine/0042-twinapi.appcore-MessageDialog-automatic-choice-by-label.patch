@@ -1,0 +1,44 @@
+Subject: twinapi.appcore: WINE_MESSAGEDIALOG_AUTO chooses a MessageDialog command by its label
+
+diff --git a/dlls/twinapi.appcore/message_dialog.c b/dlls/twinapi.appcore/message_dialog.c
+index b2c92d6..59591b0 100644
+--- a/dlls/twinapi.appcore/message_dialog.c
++++ b/dlls/twinapi.appcore/message_dialog.c
+@@ -929,7 +929,7 @@ static DWORD WINAPI dialog_thread( void *arg )
+     AsyncStatus status;
+     HSTRING close = NULL;
+     UINT32 count = op->count, chosen, i;
+-    WCHAR auto_choice[16];
++    WCHAR auto_choice[64];
+ 
+     SetThreadDescription( GetCurrentThread(), L"wine_uwp_message_dialog" );
+ 
+@@ -948,14 +948,22 @@ static DWORD WINAPI dialog_thread( void *arg )
+         WindowsDeleteString( label );
+     }
+ 
+-    /* for unattended test runs: WINE_MESSAGEDIALOG_AUTO=<n> picks command n without showing the dialog */
+-    if (GetEnvironmentVariableW( L"WINE_MESSAGEDIALOG_AUTO", auto_choice, ARRAY_SIZE(auto_choice) ))
++    /* WINE_MESSAGEDIALOG_AUTO picks a command without showing the dialog: a label to match the start of, ignoring
++     * case ("Continue" picks "Continue Anyway"), or a command number. Games' hardware warnings set it in their
++     * apps/<package>.conf; a dialog without a matching command is shown as usual. */
++    chosen = ~0u;
++    if (GetEnvironmentVariableW( L"WINE_MESSAGEDIALOG_AUTO", auto_choice, ARRAY_SIZE(auto_choice) ) && *auto_choice)
+     {
+-        chosen = wcstoul( auto_choice, NULL, 10 );
+-        if (chosen >= count) chosen = count - 1;
+-        FIXME( "WINE_MESSAGEDIALOG_AUTO: choosing command %u (%s).\n", chosen, debugstr_w(labels[chosen]) );
++        WCHAR *end;
++        UINT32 n = wcstoul( auto_choice, &end, 10 );
++
++        if (!*end) chosen = n < count ? n : ~0u;
++        else for (i = 0; i < count && chosen == ~0u; i++)
++            if (!wcsnicmp( labels[i], auto_choice, wcslen( auto_choice ) )) chosen = i;
++        if (chosen != ~0u)
++            FIXME( "WINE_MESSAGEDIALOG_AUTO=%s: choosing %s.\n", debugstr_w(auto_choice), debugstr_w(labels[chosen]) );
+     }
+-    else chosen = run_dialog( op, labels, count );
++    if (chosen == ~0u) chosen = run_dialog( op, labels, count );
+     for (i = 0; i < count; i++) free( (void *)labels[i] );
+ 
+     if (chosen < count)

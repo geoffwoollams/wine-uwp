@@ -135,6 +135,7 @@ tests/xaml/run.sh
 | `WINE_CORE_WINDOWED=1` | Run in a normal 1280x720 window instead of borderless fullscreen |
 | `WINE_CORE_SCALE=1.5` | Report a display scale (like Windows' 150% setting); leave unset for 100% |
 | `WINE_APP_STORE_ID=...` | The Store ID reported for the app (it is not in the package manifest); apps that care need it set in [`apps/<package name>.conf`](apps/README.md) |
+| `WINE_MESSAGEDIALOG_AUTO=Continue` | Answer an app's pop-up dialogs without showing them: the first button whose label starts with this text (or a button number). Set for Gears of War 4 and Forza Motorsport 7 in their `apps/` files, to get past their hardware warnings; `WINE_MESSAGEDIALOG_AUTO=` (empty) shows them again |
 | `WINE_REPORT_HOSTNAMES=1` | Report the PC's real IP addresses to the app (off by default) |
 | `WINEDEBUG=-all` | Turn off logging (default logs errors, fixmes and the WinRT channel) |
 | `UWP_PREFIX`, `UWP_DATA_DIR`, `UWP_LOGS`, `UWP_BUILD_DIR` | Move the shared prefix, data, logs or build folders |
@@ -184,7 +185,7 @@ scripts/run-app.sh Microsoft.SpartaUWP
 Things specific to this game:
 
 - **Run it fullscreen** (the default, without `WINE_CORE_WINDOWED=1`): in a window the mouse may not reach the game; see [Limitations](#limitations).
-- At start it shows a **"Thank you for installing Gears of War 4"** dialog saying the graphics driver has known compatibility problems. It reads the driver version the way Windows reports it, which Wine doesn't match. Choose Continue.
+- At start it warns, in a **"Thank you for installing Gears of War 4"** dialog, that the graphics driver has known compatibility problems. It reads the driver version the way Windows reports it, which Wine doesn't match. [`apps/Microsoft.SpartaUWP.conf`](apps/Microsoft.SpartaUWP.conf) answers it with Continue, so you won't see it.
 - It then says the **Xbox user and the Store user don't match**, because both are offline stand-ins here. It carries on.
 - The campaign and the benchmark work. Everything online (multiplayer, Horde, co-op, cards, profile stats) fails as offline. The game keeps retrying Xbox Live in the background, which shows in the log but does no harm.
 - The first launch compiles a lot of shaders, so expect long loads and some stutter the first time through a level.
