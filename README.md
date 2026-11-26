@@ -232,7 +232,7 @@ This repository is licensed under the **GNU LGPL 2.1 or later**, the same as Win
 |---|---|
 | Wine and the patches in `patches/wine/` | LGPL 2.1 or later |
 | The scripts, tests, docker files and app settings in this repository | LGPL 2.1 or later |
-| DXVK `dxgi.dll` and the patch in `patches/dxvk/` | zlib |
+| DXVK `dxgi.dll`, `d3d11.dll`, `d3d10core.dll` and the patches in `patches/dxvk/` | zlib |
 | vkd3d-proton `d3d12.dll`, `d3d12core.dll` and Wine's `wintypes.dll`, `windows.storage.dll` (from GE-Proton) | LGPL 2.1 or later |
 
 This is not legal advice. The LGPL requires that anyone who gets the binaries can get the matching source; the release's `SOURCE.txt` and bundled `source/` folder do that.
@@ -265,7 +265,7 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 PointerVisualizationSettings, PnpObject, SystemNavigationManager, input capabilities,
                 ICoreApplication2, MediaDevice selectors, the thread pool's IAsyncAction, SwapChainPanel,
                 CompositionTarget, Loaded/SizeChanged
-patches/dxvk/   patch against DXVK f90f1bf1 (v3.1.1-235)
+patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings
 scripts/        fetch-release.sh, build-wine.sh, build-dxvk.sh, setup-prefix.sh, run-app.sh,
