@@ -1,10 +1,10 @@
 Subject: twinapi.appcore, windows.web: register the implemented WinRT classes at wineboot
 
 diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
-index b812e50..2c1d20c 100644
+index b3261bd..469612c 100644
 --- a/dlls/twinapi.appcore/Makefile.in
 +++ b/dlls/twinapi.appcore/Makefile.in
-@@ -19,6 +19,7 @@ SOURCES = \
+@@ -20,6 +20,7 @@ SOURCES = \
  	user_statics.c \
  	strmap_gen.c \
  	thread_pool_timer.c \
@@ -13,20 +13,20 @@ index b812e50..2c1d20c 100644
  	display_request.c \
  	extended_execution.c \
 diff --git a/dlls/twinapi.appcore/classes.idl b/dlls/twinapi.appcore/classes.idl
-index 83aba1c..178b51b 100644
+index 48c0762..f4a26fe 100644
 --- a/dlls/twinapi.appcore/classes.idl
 +++ b/dlls/twinapi.appcore/classes.idl
-@@ -32,6 +32,7 @@ import "windows.system.profile.idl";
- import "windows.system.userprofile.idl";
+@@ -33,6 +33,7 @@ import "windows.system.userprofile.idl";
  import "windows.ui.viewmanagement.idl";
  import "windows.applicationmodel.core.idl";
+ import "windows.applicationmodel.datatransfer.idl";
 +import "windows.ui.core.idl";
  
  namespace Windows.Security.ExchangeActiveSyncProvisioning {
      runtimeclass EasClientDeviceInformation;
-@@ -48,3 +49,7 @@ namespace Windows.UI.ViewManagement {
- namespace Windows.ApplicationModel.Core {
-     runtimeclass CoreApplication;
+@@ -52,3 +53,7 @@ namespace Windows.ApplicationModel.Core {
+ namespace Windows.ApplicationModel.DataTransfer {
+     runtimeclass DataTransferManager;
  }
 +namespace Windows.UI.Core {
 +    runtimeclass CoreCursor;
@@ -185,17 +185,44 @@ index 0000000..84a4773
 +        }
 +    }
 +}
+diff --git a/dlls/windows.graphics/classes.idl b/dlls/windows.graphics/classes.idl
+index 82ab26f..cc62a79 100644
+--- a/dlls/windows.graphics/classes.idl
++++ b/dlls/windows.graphics/classes.idl
+@@ -25,5 +25,5 @@ import "windows.graphics.display.idl";
+ 
+ namespace Windows.Graphics.Display {
+     runtimeclass AdvancedColorInfo;
+-    runtimeclass DisplayInformation;
++    /* DisplayInformation is registered by twinapi.appcore, which implements it (as on Windows) */
+ }
+diff --git a/dlls/windows.ui/classes.idl b/dlls/windows.ui/classes.idl
+index 0f79fdc..41dca72 100644
+--- a/dlls/windows.ui/classes.idl
++++ b/dlls/windows.ui/classes.idl
+@@ -35,9 +35,7 @@ import "windows.ui.input.idl";
+ import "windows.ui.windowmanagement.idl";
+ import "windows.ui.viewmanagement.idl";
+ 
+-namespace Windows.UI.Core {
+-    runtimeclass CoreWindow;
+-}
++/* Windows.UI.Core.CoreWindow is registered by twinapi.appcore, which implements it (as on Windows) */
+ 
+ namespace Windows.UI.ViewManagement {
+     runtimeclass AccessibilitySettings;
 diff --git a/dlls/windows.web/classes.idl b/dlls/windows.web/classes.idl
-index 37537cf..0616e18 100644
+index 266f560..43f376d 100644
 --- a/dlls/windows.web/classes.idl
 +++ b/dlls/windows.web/classes.idl
-@@ -22,8 +22,13 @@
+@@ -22,9 +22,14 @@
  #pragma winrt ns_prefix
  
  import "windows.data.json.idl";
 +import "windows.data.xml.dom.idl";
  
  namespace Windows.Data.Json {
+     runtimeclass JsonArray;
      runtimeclass JsonObject;
      runtimeclass JsonValue;
  }

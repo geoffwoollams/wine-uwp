@@ -1,10 +1,10 @@
 Subject: twinapi.appcore: CoreApplication/CoreWindow host, input, display, lifecycle, offline Xbox/Store services
 
 diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
-index a68379f..0db52f0 100644
+index 9e42248..d9b10cf 100644
 --- a/dlls/twinapi.appcore/Makefile.in
 +++ b/dlls/twinapi.appcore/Makefile.in
-@@ -1,11 +1,26 @@
+@@ -1,13 +1,27 @@
  EXTRADEFS = -D_CONTRACT_GEN
  MODULE    = twinapi.appcore.dll
 -IMPORTS   = combase advapi32
@@ -17,8 +17,10 @@ index a68379f..0db52f0 100644
  	classes.idl \
 +	auth_probe.c \
  	client_device_information.c \
--	main.c
+-	core_application.c \
 +	core_gen.c \
+ 	data_transfer.c \
+-	main.c
 +	core_input_gen.c \
 +	sink.c \
 +	store.c \
@@ -34,7 +36,7 @@ index a68379f..0db52f0 100644
 +	main.c \
 +	manifest.c
 diff --git a/dlls/twinapi.appcore/application_view.c b/dlls/twinapi.appcore/application_view.c
-index 334f0dc..6e3c37d 100644
+index 07519f9..6e3c37d 100644
 --- a/dlls/twinapi.appcore/application_view.c
 +++ b/dlls/twinapi.appcore/application_view.c
 @@ -26,6 +26,7 @@ struct factory
@@ -420,7 +422,7 @@ index 334f0dc..6e3c37d 100644
  static HRESULT WINAPI statics2_GetForCurrentView(IApplicationViewStatics2 *iface, IApplicationView **current)
  {
 -    FIXME("iface %p, current %p stub!\n", iface, current);
--    return E_NOTIMPL;
+-    return 0x80070490;
 +    TRACE("iface %p, current %p.\n", iface, current);
 +    return get_current_view(current);
  }
@@ -902,25 +904,127 @@ index 0000000..0981881
 +PFACTORY(store_context_factory, L"StoreContext")
 +PFACTORY(game_save_factory, L"GameSaveProvider")
 +PFACTORY(message_websocket_factory, L"MessageWebSocket")
-diff --git a/dlls/twinapi.appcore/classes.idl b/dlls/twinapi.appcore/classes.idl
-index 3ad10af..83aba1c 100644
---- a/dlls/twinapi.appcore/classes.idl
-+++ b/dlls/twinapi.appcore/classes.idl
-@@ -31,6 +31,7 @@ import "windows.security.exchangeactivesyncprovisioning.idl";
- import "windows.system.profile.idl";
- import "windows.system.userprofile.idl";
- import "windows.ui.viewmanagement.idl";
-+import "windows.applicationmodel.core.idl";
- 
- namespace Windows.Security.ExchangeActiveSyncProvisioning {
-     runtimeclass EasClientDeviceInformation;
-@@ -44,3 +45,6 @@ namespace Windows.System.UserProfile {
- namespace Windows.UI.ViewManagement {
-     runtimeclass ApplicationView;
- }
-+namespace Windows.ApplicationModel.Core {
-+    runtimeclass CoreApplication;
-+}
+diff --git a/dlls/twinapi.appcore/core_application.c b/dlls/twinapi.appcore/core_application.c
+deleted file mode 100644
+index c332558..0000000
+--- a/dlls/twinapi.appcore/core_application.c
++++ /dev/null
+@@ -1,115 +0,0 @@
+-/* WinRT Windows.ApplicationModel.Core.CoreApplication implementation
+- *
+- * Copyright 2025 Zhiyi Zhang for CodeWeavers
+- *
+- * This library is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU Lesser General Public
+- * License as published by the Free Software Foundation; either
+- * version 2.1 of the License, or (at your option) any later version.
+- *
+- * This library is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+- * Lesser General Public License for more details.
+- *
+- * You should have received a copy of the GNU Lesser General Public
+- * License along with this library; if not, write to the Free Software
+- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+- */
+-
+-#include "private.h"
+-
+-WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
+-
+-struct factory
+-{
+-    IActivationFactory IActivationFactory_iface;
+-    LONG ref;
+-};
+-
+-static inline struct factory *impl_from_IActivationFactory( IActivationFactory *iface )
+-{
+-    return CONTAINING_RECORD( iface, struct factory, IActivationFactory_iface );
+-}
+-
+-static HRESULT WINAPI activation_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
+-{
+-    struct factory *impl = impl_from_IActivationFactory( iface );
+-
+-    TRACE( "iface %p, iid %s, out %p stub!\n", iface, debugstr_guid( iid ), out );
+-
+-    if (IsEqualGUID( iid, &IID_IUnknown ) ||
+-        IsEqualGUID( iid, &IID_IInspectable ) ||
+-        IsEqualGUID( iid, &IID_IAgileObject ) ||
+-        IsEqualGUID( iid, &IID_IActivationFactory ))
+-    {
+-        IActivationFactory_AddRef( &impl->IActivationFactory_iface );
+-        *out = &impl->IActivationFactory_iface;
+-        return S_OK;
+-    }
+-
+-    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+-    *out = NULL;
+-    return E_NOINTERFACE;
+-}
+-
+-static ULONG WINAPI activation_factory_AddRef( IActivationFactory *iface )
+-{
+-    struct factory *impl = impl_from_IActivationFactory( iface );
+-    ULONG ref = InterlockedIncrement( &impl->ref );
+-    TRACE( "iface %p, ref %lu.\n", iface, ref );
+-    return ref;
+-}
+-
+-static ULONG WINAPI activation_factory_Release( IActivationFactory *iface )
+-{
+-    struct factory *impl = impl_from_IActivationFactory( iface );
+-    ULONG ref = InterlockedDecrement( &impl->ref );
+-    TRACE( "iface %p, ref %lu.\n", iface, ref );
+-    return ref;
+-}
+-
+-static HRESULT WINAPI activation_factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
+-{
+-    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI activation_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
+-{
+-    FIXME( "iface %p, class_name %p stub!\n", iface, class_name );
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI activation_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
+-{
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI activation_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+-{
+-    FIXME( "iface %p, instance %p stub!\n", iface, instance );
+-    return E_NOTIMPL;
+-}
+-
+-static const struct IActivationFactoryVtbl activation_factory_vtbl =
+-{
+-    activation_factory_QueryInterface,
+-    activation_factory_AddRef,
+-    activation_factory_Release,
+-    /* IInspectable methods */
+-    activation_factory_GetIids,
+-    activation_factory_GetRuntimeClassName,
+-    activation_factory_GetTrustLevel,
+-    /* IActivationFactory methods */
+-    activation_factory_ActivateInstance,
+-};
+-
+-static struct factory factory =
+-{
+-    {&activation_factory_vtbl},
+-    1,
+-};
+-
+-IActivationFactory *core_application_factory = &factory.IActivationFactory_iface;
 diff --git a/dlls/twinapi.appcore/core_gen.c b/dlls/twinapi.appcore/core_gen.c
 new file mode 100644
 index 0000000..0f59a15
@@ -4778,12 +4882,17 @@ index 0000000..1279bbe
 +static IActivationFactory hwf_obj = { &hwf_vtbl };
 +IActivationFactory *hardware_identification_factory = &hwf_obj;
 diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
-index eab55d3..9f3db77 100644
+index bc82361..b57bb40 100644
 --- a/dlls/twinapi.appcore/main.c
 +++ b/dlls/twinapi.appcore/main.c
-@@ -78,6 +78,83 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+@@ -77,11 +77,86 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( advertising_manager_factory, &IID_IActivationFactory, (void **)factory );
      else if (!wcscmp( buffer, RuntimeClass_Windows_UI_ViewManagement_ApplicationView ))
          IActivationFactory_QueryInterface( application_view_factory, &IID_IActivationFactory, (void **)factory );
+-    else if (!wcscmp( buffer, RuntimeClass_Windows_ApplicationModel_Core_CoreApplication ))
+-        IActivationFactory_QueryInterface( core_application_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, RuntimeClass_Windows_ApplicationModel_DataTransfer_DataTransferManager ))
+         IActivationFactory_QueryInterface( data_transfer_manager_statics_factory, &IID_IActivationFactory, (void **)factory );
  
 +    else if (!wcscmp( buffer, RuntimeClass_Windows_ApplicationModel_Core_CoreApplication ))
 +    {
@@ -5112,7 +5221,7 @@ index 0000000..a626ab9
 +    md_factory_obj.factory_iface = md_factory_probe_vtbl;
 +}
 diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
-index bb62d7f..250a597 100644
+index bcc1593..1855dc1 100644
 --- a/dlls/twinapi.appcore/private.h
 +++ b/dlls/twinapi.appcore/private.h
 @@ -21,6 +21,7 @@
@@ -5123,19 +5232,22 @@ index bb62d7f..250a597 100644
  
  #define COBJMACROS
  #include "winstring.h"
-@@ -37,11 +38,31 @@
+@@ -38,8 +39,13 @@
  #define WIDL_using_Windows_System_UserProfile
  #include "windows.system.userprofile.h"
  #define WIDL_using_Windows_UI_ViewManagement
-+#define WIDL_using_Windows_ApplicationModel_Core
+-#include "windows.ui.viewmanagement.h"
+ #define WIDL_using_Windows_ApplicationModel_Core
 +#define WIDL_using_Windows_ApplicationModel_Activation
 +#define WIDL_using_Windows_UI_Core
 +#define WIDL_using_Windows_UI_Input
 +#define WIDL_using_Windows_System
- #include "windows.ui.viewmanagement.h"
++#include "windows.ui.viewmanagement.h"
 +#include "windows.ui.core.h"
-+#include "windows.applicationmodel.core.h"
- 
+ #include "windows.applicationmodel.core.h"
+ #define WIDL_using_Windows_ApplicationModel_DataTransfer
+ #include "windows.applicationmodel.datatransfer.h"
+@@ -47,10 +53,22 @@
  #include "wine/debug.h"
  
  extern IActivationFactory *application_view_factory;
@@ -5155,7 +5267,11 @@ index bb62d7f..250a597 100644
  extern IActivationFactory *client_device_information_factory;
  extern IActivationFactory *analytics_info_factory;
  extern IActivationFactory *advertising_manager_factory;
-@@ -83,3 +104,8 @@ extern IActivationFactory *advertising_manager_factory;
+-extern IActivationFactory *core_application_factory;
+ extern IActivationFactory *data_transfer_manager_statics_factory;
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+@@ -90,3 +108,8 @@ extern IActivationFactory *data_transfer_manager_statics_factory;
      }
  #define DEFINE_IINSPECTABLE( pfx, iface_type, impl_type, base_iface )                              \
      DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from_##iface_type, iface_type##_iface, &impl->base_iface )

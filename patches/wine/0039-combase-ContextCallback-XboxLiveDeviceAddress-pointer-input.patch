@@ -1,145 +1,12 @@
-Subject: combase, msxml6, twinapi.appcore: IContextCallback::ContextCallback, FreeThreadedXMLHTTP60 registration,
+Subject: msxml6, twinapi.appcore: FreeThreadedXMLHTTP60 registration,
  XboxLiveDeviceAddress, PointerDevice, GetIntermediatePoints and PointerCursor (Gears of War 4 campaign and mouse)
 
-diff --git a/dlls/combase/apartment.c b/dlls/combase/apartment.c
-index 85e06a6..cc10374 100644
---- a/dlls/combase/apartment.c
-+++ b/dlls/combase/apartment.c
-@@ -1116,6 +1116,9 @@ static LRESULT CALLBACK apartment_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LP
-         return 0;
-     case DM_HOSTOBJECT:
-         return apartment_hostobject(com_get_current_apt(), (const struct host_object_params *)lParam);
-+    case DM_CONTEXTCALL:
-+        context_call_execute((struct context_call *)lParam);
-+        return 0;
-     default:
-         return DefWindowProcW(hWnd, msg, wParam, lParam);
-     }
-diff --git a/dlls/combase/combase.c b/dlls/combase/combase.c
-index 34a9a42..b91bfa2 100644
---- a/dlls/combase/combase.c
-+++ b/dlls/combase/combase.c
-@@ -2443,6 +2443,7 @@ struct thread_context
-     IContextCallback IContextCallback_iface;
-     IObjContext IObjContext_iface;
-     LONG refcount;
-+    DWORD tid;   /* the thread whose context this is */
- };
- 
- static inline struct thread_context *impl_from_IComThreadingInfo(IComThreadingInfo *iface)
-@@ -2588,12 +2589,81 @@ static ULONG WINAPI thread_context_callback_Release(IContextCallback *iface)
-     return IComThreadingInfo_Release(&context->IComThreadingInfo_iface);
- }
- 
-+/* A callback to run in another thread's context: an STA runs it from its apartment window, as it does incoming
-+ * calls; the MTA runs it on a thread-pool thread. The caller waits, pumping messages when it is in an STA itself. */
-+struct context_call
-+{
-+    PFNCONTEXTCALL callback;
-+    ComCallData *param;
-+    HRESULT hr;
-+    HANDLE done;
-+};
-+
-+void context_call_execute(struct context_call *call)
-+{
-+    call->hr = call->callback(call->param);
-+    SetEvent(call->done);
-+}
-+
-+static void CALLBACK context_call_mta(TP_CALLBACK_INSTANCE *instance, void *arg)
-+{
-+    context_call_execute(arg);
-+}
-+
- static HRESULT WINAPI thread_context_callback_ContextCallback(IContextCallback *iface,
-         PFNCONTEXTCALL callback, ComCallData *param, REFIID riid, int method, IUnknown *punk)
- {
--    FIXME("%p, %p, %p, %s, %d, %p\n", iface, callback, param, debugstr_guid(riid), method, punk);
-+    struct thread_context *context = impl_from_IContextCallback(iface);
-+    struct apartment *target, *current = com_get_current_apt();
-+    struct context_call call = { callback, param, E_FAIL };
-+    DWORD index;
-+    HWND hwnd;
-+    HRESULT hr;
- 
--    return E_NOTIMPL;
-+    TRACE("%p, %p, %p, %s, %d, %p\n", iface, callback, param, debugstr_guid(riid), method, punk);
-+
-+    if (!callback) return E_INVALIDARG;
-+    if (context->tid == GetCurrentThreadId())
-+        return callback(param);
-+
-+    /* no apartment, or a multi-threaded one, means the MTA (apartment_findfromtid() can return an MTA other
-+     * than the current one, such as one that thread created after the first was released) */
-+    if ((target = apartment_findfromtid(context->tid)) && target->multi_threaded)
-+    {
-+        apartment_release(target);
-+        target = NULL;
-+    }
-+    if (!target && (!current || current->multi_threaded))
-+        return callback(param);
-+
-+    if (!(call.done = CreateEventW(NULL, TRUE, FALSE, NULL)))
-+    {
-+        if (target) apartment_release(target);
-+        return HRESULT_FROM_WIN32(GetLastError());
-+    }
-+    if (target)
-+    {
-+        hwnd = apartment_getwindow(target);
-+        apartment_release(target);
-+        if (!hwnd || !PostMessageW(hwnd, DM_CONTEXTCALL, 0, (LPARAM)&call))
-+        {
-+            WARN("no window for the apartment of thread %04lx.\n", context->tid);
-+            CloseHandle(call.done);
-+            return RPC_E_DISCONNECTED;
-+        }
-+    }
-+    else if (!TrySubmitThreadpoolCallback(context_call_mta, &call, NULL))
-+    {
-+        CloseHandle(call.done);
-+        return HRESULT_FROM_WIN32(GetLastError());
-+    }
-+
-+    if (current && !current->multi_threaded)
-+        hr = CoWaitForMultipleHandles(0, INFINITE, 1, &call.done, &index);
-+    else
-+        hr = WaitForSingleObject(call.done, INFINITE) == WAIT_OBJECT_0 ? S_OK : HRESULT_FROM_WIN32(GetLastError());
-+    CloseHandle(call.done);
-+    return FAILED(hr) ? hr : call.hr;
- }
- 
- static const IContextCallbackVtbl thread_context_callback_vtbl =
-@@ -2739,6 +2809,7 @@ HRESULT WINAPI CoGetContextToken(ULONG_PTR *token)
-         /* Context token does not take a reference, it's always zero until the
-            interface is explicitly requested with CoGetObjectContext(). */
-         context->refcount = 0;
-+        context->tid = GetCurrentThreadId();
- 
-         tlsdata->context_token = &context->IObjContext_iface;
-     }
-diff --git a/dlls/combase/combase_private.h b/dlls/combase/combase_private.h
-index ca79356..7c30edc 100644
---- a/dlls/combase/combase_private.h
-+++ b/dlls/combase/combase_private.h
-@@ -59,6 +59,10 @@ HRESULT open_appidkey_from_clsid(REFCLSID clsid, REGSAM access, HKEY *subkey);
- /* DCOM messages used by the apartment window (not compatible with native) */
- #define DM_EXECUTERPC   (WM_USER + 0) /* WPARAM = 0, LPARAM = (struct dispatch_params *) */
- #define DM_HOSTOBJECT   (WM_USER + 1) /* WPARAM = 0, LPARAM = (struct host_object_params *) */
-+#define DM_CONTEXTCALL  (WM_USER + 2) /* WPARAM = 0, LPARAM = (struct context_call *) */
-+
-+struct context_call;
-+void context_call_execute(struct context_call *call);
- 
- #define CHARS_IN_GUID 39
- 
 diff --git a/dlls/msxml6/Makefile.in b/dlls/msxml6/Makefile.in
-index d3b7ccc..4fde38c 100644
+index 04ff713..203424b 100644
 --- a/dlls/msxml6/Makefile.in
 +++ b/dlls/msxml6/Makefile.in
-@@ -2,5 +2,6 @@ MODULE    = msxml6.dll
- IMPORTS   = oleaut32 ole32 advapi32
+@@ -6,5 +6,6 @@ VER_PRODUCTVERSION      = 6,30,7601,24498
+ VER_OLESELFREGISTER     = 1
  
  SOURCES = \
 +	msxml6_classes.idl \
@@ -187,10 +54,10 @@ index 0000000..e77a51a
 +]
 +coclass FreeThreadedXMLHTTP60 { interface IUnknown; }
 diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
-index 868841e..5ab2083 100644
+index deaba9c..8b677a0 100644
 --- a/dlls/twinapi.appcore/Makefile.in
 +++ b/dlls/twinapi.appcore/Makefile.in
-@@ -16,6 +16,7 @@ SOURCES = \
+@@ -17,6 +17,7 @@ SOURCES = \
  	sink.c \
  	store.c \
  	xbox_identity.c \
@@ -535,10 +402,10 @@ index fcce577..e71eaf1 100644
      }
  }
 diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
-index 5d2d8d6..2b4f62d 100644
+index e699b80..8b460fa 100644
 --- a/dlls/twinapi.appcore/main.c
 +++ b/dlls/twinapi.appcore/main.c
-@@ -108,9 +108,15 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+@@ -110,9 +110,15 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
          IActivationFactory_QueryInterface( core_window_factory, &IID_IActivationFactory, (void **)factory );
      }
  
@@ -740,10 +607,10 @@ index c2cfdc0..34ea5a3 100644
 +    return &pointer_device.IPointerDevice_iface;
 +}
 diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
-index f6afca3..2bf980e 100644
+index b99810a..d1da712 100644
 --- a/dlls/twinapi.appcore/private.h
 +++ b/dlls/twinapi.appcore/private.h
-@@ -44,10 +44,13 @@
+@@ -45,10 +45,13 @@
  #define WIDL_using_Windows_UI_Input
  #define WIDL_using_Windows_Devices_Input
  #define WIDL_using_Windows_UI_Popups
@@ -755,9 +622,9 @@ index f6afca3..2bf980e 100644
 +#include "windows.devices.input.h"
 +#include "windows.networking.xboxlive.h"
  #include "windows.applicationmodel.core.h"
- 
- #include "wine/debug.h"
-@@ -66,7 +69,10 @@ extern IActivationFactory *web_token_manager_factory, *web_token_request_factory
+ #define WIDL_using_Windows_ApplicationModel_DataTransfer
+ #include "windows.applicationmodel.datatransfer.h"
+@@ -69,7 +72,10 @@ extern IActivationFactory *web_token_manager_factory, *web_token_request_factory
  extern IActivationFactory *async_causality_tracer_factory;   /* causality.c */
  extern IActivationFactory *mouse_device_factory;   /* mouse.c */
  extern IActivationFactory *ui_command_factory;   /* message_dialog.c */
@@ -1132,10 +999,10 @@ index 0000000..e433604
 +
 +IActivationFactory *xboxlive_device_address_factory = &address_statics.IActivationFactory_iface;
 diff --git a/include/Makefile.in b/include/Makefile.in
-index 6f56227..84311c0 100644
+index df03a67..b12cf54 100644
 --- a/include/Makefile.in
 +++ b/include/Makefile.in
-@@ -922,6 +922,7 @@ SOURCES = \
+@@ -1075,6 +1075,7 @@ SOURCES = \
  	windows.networking.connectivity.idl \
  	windows.networking.idl \
  	windows.networking.sockets.idl \

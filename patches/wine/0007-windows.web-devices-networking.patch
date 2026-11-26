@@ -1,7 +1,7 @@
 Subject: windows.web, windows.devices.enumeration, windows.networking.*: JSON/XML, device watcher and host name support
 
 diff --git a/dlls/windows.devices.enumeration/main.c b/dlls/windows.devices.enumeration/main.c
-index 081260d..5f82a08 100644
+index 552af14..602f464 100644
 --- a/dlls/windows.devices.enumeration/main.c
 +++ b/dlls/windows.devices.enumeration/main.c
 @@ -225,27 +225,29 @@ static HRESULT WINAPI device_watcher_remove_Added( IDeviceWatcher *iface, EventR
@@ -438,25 +438,48 @@ index b77186a..5423ee8 100644
  }
  
 diff --git a/dlls/windows.web/Makefile.in b/dlls/windows.web/Makefile.in
-index ebcf7bb..e1cfff4 100644
+index aaaacd6..e646778 100644
 --- a/dlls/windows.web/Makefile.in
 +++ b/dlls/windows.web/Makefile.in
-@@ -3,6 +3,8 @@ IMPORTS = combase
- 
+@@ -4,6 +4,8 @@ IMPORTS = combase
  SOURCES = \
  	classes.idl \
+ 	json_array.c \
 +	json_gen.c \
  	json_object.c \
  	json_value.c \
 -	main.c
 +	main.c \
 +	xml_probe.c
+diff --git a/dlls/windows.web/json_array.c b/dlls/windows.web/json_array.c
+index 1e3890d..b5f7a7a 100644
+--- a/dlls/windows.web/json_array.c
++++ b/dlls/windows.web/json_array.c
+@@ -56,6 +56,18 @@ HRESULT json_array_push( IJsonArray *iface, IJsonValue *value )
+     return S_OK;
+ }
+ 
++/* S_FALSE past the end. */
++HRESULT json_array_get_at( IJsonArray *iface, UINT32 index, IJsonValue **value )
++{
++    struct json_array *impl = impl_from_IJsonArray( iface );
++
++    *value = NULL;
++    if (index >= impl->length) return S_FALSE;
++    *value = impl->elements[index];
++    IJsonValue_AddRef( *value );
++    return S_OK;
++}
++
+ static HRESULT WINAPI json_array_QueryInterface( IJsonArray *iface, REFIID iid, void **out )
+ {
+     struct json_array *impl = impl_from_IJsonArray( iface );
 diff --git a/dlls/windows.web/json_gen.c b/dlls/windows.web/json_gen.c
 new file mode 100644
-index 0000000..21baff5
+index 0000000..7a219f3
 --- /dev/null
 +++ b/dlls/windows.web/json_gen.c
-@@ -0,0 +1,644 @@
+@@ -0,0 +1,717 @@
 +/* in-memory Windows.Data.Json implementation. */
 +#include "private.h"
 +#include "wine/debug.h"
@@ -522,6 +545,7 @@ index 0000000..21baff5
 +
 +static HRESULT jnode_add(struct jnode *parent, HSTRING key, struct jnode *child);
 +static HRESULT jnode_stringify(struct jnode *n, HSTRING *out);
++static HRESULT jnode_import(IJsonValue *value, struct jnode **out);
 +
 +/* ---- IJsonValue on jnode ---- */
 +static inline struct jnode *impl_from_jvalue(IJsonValue *iface)
@@ -669,16 +693,19 @@ index 0000000..21baff5
 +{
 +    struct jnode *impl __attribute__((unused)) = impl_from_jobject(iface);
 +    int idx = find_key(impl, name);
-+    struct jnode *node = CONTAINING_RECORD(value, struct jnode, IJsonValue_iface);
++    struct jnode *node;
++    HRESULT hr;
 +    TRACE("name %s, value %p.\n", debugstr_hstring(name), value);
++    if (FAILED(hr = jnode_import(value, &node))) return hr;
 +    if (idx >= 0)
 +    {
 +        jnode_release(impl->items[idx]);
 +        impl->items[idx] = node;
-+        jnode_addref(node);
 +        return S_OK;
 +    }
-+    return jnode_add(impl, name, node);
++    hr = jnode_add(impl, name, node);
++    jnode_release(node);
++    return hr;
 +}
 +
 +static HRESULT WINAPI jobject_GetNamedObject(IJsonObject *iface, HSTRING name, __x_ABI_CWindows_CData_CJson_CIJsonObject **value)
@@ -872,6 +899,75 @@ index 0000000..21baff5
 +    }
 +    parent->items[parent->count++] = child;
 +    jnode_addref(child);
++    return S_OK;
++}
++
++/* Values made by the builtin JsonValue/JsonArray classes (JsonValue.Parse, JsonValue.CreateStringValue, ...)
++ * are not jnodes; copy them into one. */
++static HRESULT jnode_import(IJsonValue *value, struct jnode **out)
++{
++    IJsonObject *object;
++    JsonValueType type;
++    struct jnode *n, *child;
++    UINT32 i;
++    HRESULT hr;
++
++    *out = NULL;
++    if (!value) return E_POINTER;
++    if (value->lpVtbl == &jvalue_vtbl)
++    {
++        *out = impl_from_jvalue(value);
++        jnode_addref(*out);
++        return S_OK;
++    }
++    if (FAILED(hr = IJsonValue_get_ValueType(value, &type))) return hr;
++    if (type == JsonValueType_Object)
++    {
++        if (FAILED(hr = IJsonValue_GetObject(value, &object))) return hr;
++        if (object->lpVtbl != &jobject_vtbl)
++        {
++            FIXME("foreign JsonObject %p not supported.\n", object);
++            IJsonObject_Release(object);
++            return E_NOTIMPL;
++        }
++        *out = impl_from_jobject(object); /* keeps the reference from GetObject */
++        return S_OK;
++    }
++    if (!(n = jnode_create(type))) return E_OUTOFMEMORY;
++    switch (type)
++    {
++    case JsonValueType_String: hr = IJsonValue_GetString(value, &n->str); break;
++    case JsonValueType_Number: hr = IJsonValue_GetNumber(value, &n->num); break;
++    case JsonValueType_Boolean: hr = IJsonValue_GetBoolean(value, &n->boolean_value); break;
++    case JsonValueType_Array:
++    {
++        IJsonArray *array;
++        IJsonValue *item;
++
++        if (FAILED(hr = IJsonValue_GetArray(value, &array))) break;
++        if (array->lpVtbl == &jarray_vtbl)
++        {
++            jnode_release(n);
++            *out = impl_from_jarray(array); /* keeps the reference from GetArray */
++            return S_OK;
++        }
++        for (i = 0; SUCCEEDED(hr) && (hr = json_array_get_at(array, i, &item)) == S_OK; i++)
++        {
++            if (SUCCEEDED(hr = jnode_import(item, &child)))
++            {
++                hr = jnode_add(n, NULL, child);
++                jnode_release(child);
++            }
++            IJsonValue_Release(item);
++        }
++        if (hr == S_FALSE) hr = S_OK;
++        IJsonArray_Release(array);
++        break;
++    }
++    default: hr = S_OK; break;
++    }
++    if (FAILED(hr)) { jnode_release(n); return hr; }
++    *out = n;
 +    return S_OK;
 +}
 +
@@ -1102,10 +1198,10 @@ index 0000000..21baff5
 +    return S_OK;
 +}
 diff --git a/dlls/windows.web/json_object.c b/dlls/windows.web/json_object.c
-index 38c8992..bc8f222 100644
+index a765d5c..63fc6b8 100644
 --- a/dlls/windows.web/json_object.c
 +++ b/dlls/windows.web/json_object.c
-@@ -163,6 +163,22 @@ static inline struct json_object_statics *impl_from_IActivationFactory( IActivat
+@@ -248,6 +248,22 @@ static inline struct json_object_statics *impl_from_IActivationFactory( IActivat
      return CONTAINING_RECORD( iface, struct json_object_statics, IActivationFactory_iface );
  }
  
@@ -1128,7 +1224,7 @@ index 38c8992..bc8f222 100644
  static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
  {
      struct json_object_statics *impl = impl_from_IActivationFactory( iface );
-@@ -179,6 +195,12 @@ static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID
+@@ -264,6 +280,12 @@ static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID
          return S_OK;
      }
  
@@ -1141,31 +1237,47 @@ index 38c8992..bc8f222 100644
      FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
      *out = NULL;
      return E_NOINTERFACE;
-@@ -220,18 +242,10 @@ static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLev
+@@ -305,34 +327,10 @@ static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLev
  
  static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
  {
+-    IPropertySet *property_set;
+-    HSTRING property_set_class;
 -    struct json_object *impl;
+-    HSTRING_HEADER header;
+-    HRESULT hr;
 -
      TRACE( "iface %p, instance %p.\n", iface, instance );
  
      *instance = NULL;
 -    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
 -
--    impl->IJsonObject_iface.lpVtbl = &json_object_statics_vtbl;
+-    impl->IJsonObject_iface.lpVtbl = &json_object_vtbl;
 -    impl->ref = 1;
+-
+-    WindowsCreateStringReference( RuntimeClass_Windows_Foundation_Collections_PropertySet, wcslen( RuntimeClass_Windows_Foundation_Collections_PropertySet ),
+-                                  &header, &property_set_class );
+-    if (FAILED(hr = RoActivateInstance( property_set_class, (IInspectable **)&property_set ))) goto failed;
+-
+-    hr = IPropertySet_QueryInterface( property_set, &IID_IMap_HSTRING_IInspectable, (void **)&impl->members );
+-    IPropertySet_Release( property_set );
+-    if (FAILED(hr)) goto failed;
 -
 -    *instance = (IInspectable *)&impl->IJsonObject_iface;
 -    return S_OK;
+-
+-failed:
+-    free( impl );
+-    return hr;
 +    return json_object_create( (IJsonObject **)instance );
  }
  
  static const struct IActivationFactoryVtbl factory_vtbl =
 diff --git a/dlls/windows.web/main.c b/dlls/windows.web/main.c
-index 60e95fd..74aecd6 100644
+index bec92a8..cae71a2 100644
 --- a/dlls/windows.web/main.c
 +++ b/dlls/windows.web/main.c
-@@ -43,6 +43,9 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+@@ -45,6 +45,9 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
      if (!wcscmp( buffer, RuntimeClass_Windows_Data_Json_JsonValue ))
          IActivationFactory_QueryInterface( json_value_factory, &IID_IActivationFactory, (void **)factory );
  
@@ -1176,19 +1288,23 @@ index 60e95fd..74aecd6 100644
      return CLASS_E_CLASSNOTAVAILABLE;
  }
 diff --git a/dlls/windows.web/private.h b/dlls/windows.web/private.h
-index d5f0e76..c71f028 100644
+index 6722d69..a743013 100644
 --- a/dlls/windows.web/private.h
 +++ b/dlls/windows.web/private.h
-@@ -37,6 +37,9 @@
- #include "windows.data.json.h"
+@@ -39,9 +39,13 @@
  
+ extern IActivationFactory *json_array_factory;
  extern IActivationFactory *json_object_factory;
 +extern HRESULT json_parse_object( HSTRING input, IJsonObject **out, boolean *ok );
 +extern HRESULT json_object_create( IJsonObject **out );
 +extern IActivationFactory *xml_document_factory;
  extern IActivationFactory *json_value_factory;
  
+ HRESULT json_array_push( IJsonArray *iface, IJsonValue *value );
++HRESULT json_array_get_at( IJsonArray *iface, UINT32 index, IJsonValue **value );
+ 
  #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \
 diff --git a/dlls/windows.web/xml_probe.c b/dlls/windows.web/xml_probe.c
 new file mode 100644
 index 0000000..4f64e1f

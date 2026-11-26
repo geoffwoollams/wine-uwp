@@ -1,10 +1,10 @@
 Subject: twinapi.appcore: Windows.Gaming.XboxLive.Storage.GameSaveProvider kept in the package's LocalState
 
 diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
-index 20e95a7..b812e50 100644
+index 37a4469..b3261bd 100644
 --- a/dlls/twinapi.appcore/Makefile.in
 +++ b/dlls/twinapi.appcore/Makefile.in
-@@ -22,6 +22,7 @@ SOURCES = \
+@@ -23,6 +23,7 @@ SOURCES = \
  	display_information.c \
  	display_request.c \
  	extended_execution.c \
@@ -1598,10 +1598,10 @@ index 0000000..d1815c2
 +static IActivationFactory factory = { &factory_vtbl };
 +IActivationFactory *game_save_provider_factory = &factory;
 diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
-index 34a20c6..838f41e 100644
+index d0e32a8..cb3e381 100644
 --- a/dlls/twinapi.appcore/main.c
 +++ b/dlls/twinapi.appcore/main.c
-@@ -156,7 +156,7 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+@@ -158,7 +158,7 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
      else if (!wcscmp( buffer, L"Windows.ApplicationModel.Store.CurrentApp" ))
          IActivationFactory_QueryInterface( current_app_factory, &IID_IActivationFactory, (void **)factory );
      else if (!wcscmp( buffer, L"Windows.Gaming.XboxLive.Storage.GameSaveProvider" ))
@@ -1611,10 +1611,10 @@ index 34a20c6..838f41e 100644
          IActivationFactory_QueryInterface( message_websocket_factory, &IID_IActivationFactory, (void **)factory );
  
 diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
-index 0bc7cdc..f7ccfb4 100644
+index d49bc9a..08e2934 100644
 --- a/dlls/twinapi.appcore/private.h
 +++ b/dlls/twinapi.appcore/private.h
-@@ -59,10 +59,11 @@ extern void core_cursor_init(void);
+@@ -62,10 +62,11 @@ extern void core_cursor_init(void);
  extern IActivationFactory *message_dialog_factory;
  extern void message_dialog_init(void);
  extern IActivationFactory *hardware_identification_factory;

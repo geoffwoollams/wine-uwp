@@ -2,10 +2,10 @@ Subject: twinapi.appcore, kernelbase: ICoreApplicationView3 and a CoreApplicatio
  subfolder executable, quieter per-frame traces (Gears of War 4)
 
 diff --git a/dlls/combase/roapi.c b/dlls/combase/roapi.c
-index e55913a..66ec3d3 100644
+index 7d685bd..774f969 100644
 --- a/dlls/combase/roapi.c
 +++ b/dlls/combase/roapi.c
-@@ -460,7 +460,9 @@ HRESULT WINAPI RoUnregisterForApartmentShutdown(APARTMENT_SHUTDOWN_REGISTRATION_
+@@ -493,7 +493,9 @@ HRESULT WINAPI RoUnregisterForApartmentShutdown(APARTMENT_SHUTDOWN_REGISTRATION_
   */
  HRESULT WINAPI RoGetApartmentIdentifier(UINT64 *identifier)
  {
@@ -17,10 +17,10 @@ index e55913a..66ec3d3 100644
      if (!identifier)
          return E_INVALIDARG;
 diff --git a/dlls/kernelbase/version.c b/dlls/kernelbase/version.c
-index 8951268..ee19b01 100644
+index 3dcb616..d73b033 100644
 --- a/dlls/kernelbase/version.c
 +++ b/dlls/kernelbase/version.c
-@@ -1606,15 +1606,20 @@ static BOOL CALLBACK init_current_package( INIT_ONCE *once, void *param, void **
+@@ -1605,15 +1605,20 @@ static BOOL CALLBACK init_current_package( INIT_ONCE *once, void *param, void **
  
      len = GetModuleFileNameW( NULL, manifest_path, MAX_PATH );
      if (!len || len >= MAX_PATH) return TRUE;

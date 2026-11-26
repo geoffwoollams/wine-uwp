@@ -1,10 +1,10 @@
 Subject: dxgi: implement CreateSwapChainForCoreWindow via the CoreWindow's HWND
 
 diff --git a/dlls/dxgi/factory.c b/dlls/dxgi/factory.c
-index ebdb42a..9ec72c2 100644
+index c6bb47f..b2ddfc7 100644
 --- a/dlls/dxgi/factory.c
 +++ b/dlls/dxgi/factory.c
-@@ -316,14 +316,48 @@ static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForHwnd(IWineDXGIFa
+@@ -325,14 +325,48 @@ static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForHwnd(IWineDXGIFa
      return DXGI_ERROR_UNSUPPORTED;
  }
  

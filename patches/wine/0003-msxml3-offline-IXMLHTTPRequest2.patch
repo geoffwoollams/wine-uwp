@@ -1,17 +1,17 @@
 Subject: msxml3: offline IXMLHTTPRequest2 (FreeThreadedXMLHTTP60) that reports network errors
 
 diff --git a/dlls/msxml3/Makefile.in b/dlls/msxml3/Makefile.in
-index 78cf5b2..21132d2 100644
+index 0c9404a..fd0d68a 100644
 --- a/dlls/msxml3/Makefile.in
 +++ b/dlls/msxml3/Makefile.in
-@@ -16,6 +16,7 @@ SOURCES = \
+@@ -21,6 +21,7 @@ SOURCES = \
  	entityref.c \
  	factory.c \
  	httprequest.c \
 +	httprequest2.c \
  	main.c \
+ 	msxml.mc \
  	msxml3_v1.idl \
- 	mxnamespace.c \
 diff --git a/dlls/msxml3/factory.c b/dlls/msxml3/factory.c
 index 5847752..d3ba32b 100644
 --- a/dlls/msxml3/factory.c

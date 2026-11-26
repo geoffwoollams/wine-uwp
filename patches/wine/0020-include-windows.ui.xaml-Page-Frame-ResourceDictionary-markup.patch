@@ -1,7 +1,7 @@
 Subject: include: declare Windows.UI.Xaml Page, UserControl, Frame, ResourceDictionary and the markup interfaces (generated from Windows metadata)
 
 diff --git a/include/windows.ui.xaml.idl b/include/windows.ui.xaml.idl
-index 39827d2..badbdb2 100644
+index 39827d2..bd262be 100644
 --- a/include/windows.ui.xaml.idl
 +++ b/include/windows.ui.xaml.idl
 @@ -37,6 +37,7 @@ import "windows.ui.core.idl";

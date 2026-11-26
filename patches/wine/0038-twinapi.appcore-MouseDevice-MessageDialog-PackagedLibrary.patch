@@ -2,10 +2,10 @@ Subject: twinapi.appcore, kernelbase, windows.applicationmodel: MouseDevice, a r
  AsyncCausalityTracer, LoadPackagedLibrary, the package root as InstalledLocation (Gears of War 4)
 
 diff --git a/dlls/kernelbase/loader.c b/dlls/kernelbase/loader.c
-index f6347c1..72809c1 100644
+index 6c6f1f3..63ccea1 100644
 --- a/dlls/kernelbase/loader.c
 +++ b/dlls/kernelbase/loader.c
-@@ -30,6 +30,7 @@
+@@ -29,6 +29,7 @@
  #include "winternl.h"
  #include "ddk/ntddk.h"
  #include "kernelbase.h"
@@ -13,7 +13,7 @@ index f6347c1..72809c1 100644
  #include "wine/list.h"
  #include "wine/asm.h"
  #include "wine/debug.h"
-@@ -579,8 +580,41 @@ HMODULE WINAPI DECLSPEC_HOTPATCH LoadLibraryExW( LPCWSTR name, HANDLE file, DWOR
+@@ -589,8 +590,41 @@ HMODULE WINAPI DECLSPEC_HOTPATCH LoadLibraryExW( LPCWSTR name, HANDLE file, DWOR
   */
  HMODULE WINAPI /* DECLSPEC_HOTPATCH */ LoadPackagedLibrary( LPCWSTR name, DWORD reserved )
  {
@@ -58,7 +58,7 @@ index f6347c1..72809c1 100644
  }
  
 diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
-index 2c1d20c..868841e 100644
+index 469612c..deaba9c 100644
 --- a/dlls/twinapi.appcore/Makefile.in
 +++ b/dlls/twinapi.appcore/Makefile.in
 @@ -10,6 +10,7 @@ SOURCES = \
@@ -67,9 +67,9 @@ index 2c1d20c..868841e 100644
  	current_app.c \
 +	causality.c \
  	core_gen.c \
+ 	data_transfer.c \
  	core_input_gen.c \
- 	sink.c \
-@@ -25,6 +26,7 @@ SOURCES = \
+@@ -26,6 +27,7 @@ SOURCES = \
  	extended_execution.c \
  	game_save.c \
  	message_dialog.c \
@@ -275,10 +275,10 @@ index d012692..fbf8b46 100644
          FIXME("WM_CLOSE: posting quit.\n");
          PostQuitMessage(0);
 diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
-index 838f41e..5d2d8d6 100644
+index cb3e381..e699b80 100644
 --- a/dlls/twinapi.appcore/main.c
 +++ b/dlls/twinapi.appcore/main.c
-@@ -108,6 +108,12 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+@@ -110,6 +110,12 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
          IActivationFactory_QueryInterface( core_window_factory, &IID_IActivationFactory, (void **)factory );
      }
  
@@ -291,7 +291,7 @@ index 838f41e..5d2d8d6 100644
      else if (!wcscmp( buffer, L"Windows.UI.Popups.MessageDialog" ))
      {
          message_dialog_init();
-@@ -148,7 +154,7 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+@@ -150,7 +156,7 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
      else if (!wcscmp( buffer, L"Windows.Foundation.Diagnostics.LoggingSession" ))
          IActivationFactory_QueryInterface( loggingsession_factory, &IID_IActivationFactory, (void **)factory );
      else if (!wcscmp( buffer, L"Windows.Foundation.Diagnostics.AsyncCausalityTracer" ))
@@ -1785,10 +1785,10 @@ index 0000000..c2cfdc0
 +
 +IActivationFactory *mouse_device_factory = &mouse.IActivationFactory_iface;
 diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
-index f7ccfb4..f6afca3 100644
+index 08e2934..b99810a 100644
 --- a/dlls/twinapi.appcore/private.h
 +++ b/dlls/twinapi.appcore/private.h
-@@ -42,9 +42,12 @@
+@@ -43,9 +43,12 @@
  #define WIDL_using_Windows_ApplicationModel_Activation
  #define WIDL_using_Windows_UI_Core
  #define WIDL_using_Windows_UI_Input
@@ -1799,9 +1799,9 @@ index f7ccfb4..f6afca3 100644
  #include "windows.ui.core.h"
 +#include "windows.ui.popups.h"
  #include "windows.applicationmodel.core.h"
- 
- #include "wine/debug.h"
-@@ -59,7 +62,11 @@ extern void core_cursor_init(void);
+ #define WIDL_using_Windows_ApplicationModel_DataTransfer
+ #include "windows.applicationmodel.datatransfer.h"
+@@ -62,7 +65,11 @@ extern void core_cursor_init(void);
  extern IActivationFactory *message_dialog_factory;
  extern void message_dialog_init(void);
  extern IActivationFactory *hardware_identification_factory;
@@ -1867,17 +1867,17 @@ index 51b66df..3cfa294 100644
      if (FAILED( hr = PathCchRemoveFileSpec( buffer, ARRAY_SIZE(buffer) ) )) return hr;
  
 diff --git a/include/Makefile.in b/include/Makefile.in
-index e0987ce..6f56227 100644
+index 3f23c63..df03a67 100644
 --- a/include/Makefile.in
 +++ b/include/Makefile.in
-@@ -949,6 +949,7 @@ SOURCES = \
+@@ -1102,6 +1102,7 @@ SOURCES = \
  	windows.ui.core.idl \
  	windows.ui.idl \
  	windows.ui.input.idl \
 +	windows.ui.popups.idl \
  	windows.ui.notifications.idl \
- 	windows.ui.viewmanagement.core.idl \
- 	windows.ui.viewmanagement.idl \
+ 	windows.ui.text.core.idl \
+ 	windows.ui.text.idl \
 diff --git a/include/windows.devices.input.idl b/include/windows.devices.input.idl
 index db390e5..ff7ebb6 100644
 --- a/include/windows.devices.input.idl

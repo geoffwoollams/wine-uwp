@@ -1,7 +1,7 @@
 Subject: twinapi.appcore: the CoreWindow takes the app's icon from the manifest's Square44x44Logo
 
 diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
-index 5ab2083..34349b6 100644
+index 8b677a0..37c50a3 100644
 --- a/dlls/twinapi.appcore/Makefile.in
 +++ b/dlls/twinapi.appcore/Makefile.in
 @@ -5,6 +5,7 @@ IMPORTS   = combase advapi32 user32 gdi32
@@ -174,10 +174,10 @@ index 8dd2cb7..4c34b0d 100644
  }
  
 diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
-index 2bf980e..6cbf0d7 100644
+index d1da712..de1ebd7 100644
 --- a/dlls/twinapi.appcore/private.h
 +++ b/dlls/twinapi.appcore/private.h
-@@ -125,3 +125,4 @@ extern float core_view_scale(void);
+@@ -129,3 +129,4 @@ extern float core_view_scale(void);
  extern BOOL manifest_property(const char *element, WCHAR *out, UINT32 out_len);
  extern BOOL manifest_app_visual(const char *attribute, WCHAR *out, UINT32 out_len);
  extern void app_display_name(WCHAR *out, UINT32 out_len);

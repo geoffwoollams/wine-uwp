@@ -1,10 +1,10 @@
 Subject: twinapi.appcore: Windows.System.Display.DisplayRequest via SetThreadExecutionState
 
 diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
-index e6a3e2b..20e95a7 100644
+index 55a7328..37a4469 100644
 --- a/dlls/twinapi.appcore/Makefile.in
 +++ b/dlls/twinapi.appcore/Makefile.in
-@@ -20,6 +20,7 @@ SOURCES = \
+@@ -21,6 +21,7 @@ SOURCES = \
  	strmap_gen.c \
  	thread_pool_timer.c \
  	display_information.c \
@@ -199,10 +199,10 @@ index 0000000..116b52f
 +static IActivationFactory factory = { &factory_vtbl };
 +IActivationFactory *display_request_factory = &factory;
 diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
-index 0e0f620..34a20c6 100644
+index a6365b9..d0e32a8 100644
 --- a/dlls/twinapi.appcore/main.c
 +++ b/dlls/twinapi.appcore/main.c
-@@ -90,6 +90,9 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+@@ -92,6 +92,9 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
          IActivationFactory_QueryInterface( display_information_factory, &IID_IActivationFactory, (void **)factory );
      }
  
@@ -213,10 +213,10 @@ index 0e0f620..34a20c6 100644
          IActivationFactory_QueryInterface( extended_execution_factory, &IID_IActivationFactory, (void **)factory );
  
 diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
-index 5df5a0d..0bc7cdc 100644
+index e229754..d49bc9a 100644
 --- a/dlls/twinapi.appcore/private.h
 +++ b/dlls/twinapi.appcore/private.h
-@@ -62,6 +62,7 @@ extern IActivationFactory *hardware_identification_factory;
+@@ -65,6 +65,7 @@ extern IActivationFactory *hardware_identification_factory;
  extern IActivationFactory *web_token_manager_factory, *web_token_request_factory, *web_account_provider_factory, *user_picker_factory, *system_user_factory, *launcher_factory, *web_account_factory, *web_token_response_factory, *thread_pool_timer_factory, *user_statics_factory, *store_context_real_factory, *game_save_factory, *message_websocket_factory, *store_context_factory, *logging_options_factory, *logging_fields_factory, *push_manager_factory, *logging_channel_factory, *loggingchanneloptions_factory, *loggingactivity_factory, *loggingsession_factory, *asynccausalitytracer_factory;
  extern IActivationFactory *core_window_factory;
  extern IActivationFactory *current_app_factory;

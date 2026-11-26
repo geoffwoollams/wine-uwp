@@ -9,7 +9,7 @@ PREFIX="${UWP_PREFIX:-$DATA/prefix}"                         # the Wine prefix t
 LOGS="${UWP_LOGS:-$DATA/logs}"
 APPS_DIR_NAME="UWP"                                          # apps are linked into C:\UWP\<package name> inside the prefix
 
-WINE_TAG="wine-11.0"
+WINE_TAG="wine-11.22"
 WINE_GIT="https://gitlab.winehq.org/wine/wine.git"
 DXVK_COMMIT="f90f1bf180f41356695ddf3df6af62119fb64a3e"     # DXVK master the patch was made against (v3.1.1-235)
 DXVK_GIT="https://github.com/doitsujin/dxvk.git"

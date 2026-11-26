@@ -1,7 +1,7 @@
 Subject: twinapi.appcore: Windows.ApplicationModel.Store.CurrentApp (licensed base app, no add-on licences)
 
 diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
-index 0db52f0..e6a3e2b 100644
+index d9b10cf..55a7328 100644
 --- a/dlls/twinapi.appcore/Makefile.in
 +++ b/dlls/twinapi.appcore/Makefile.in
 @@ -9,6 +9,7 @@ SOURCES = \
@@ -10,8 +10,8 @@ index 0db52f0..e6a3e2b 100644
  	client_device_information.c \
 +	current_app.c \
  	core_gen.c \
+ 	data_transfer.c \
  	core_input_gen.c \
- 	sink.c \
 diff --git a/dlls/twinapi.appcore/current_app.c b/dlls/twinapi.appcore/current_app.c
 new file mode 100644
 index 0000000..84cfb6d
@@ -314,10 +314,10 @@ index 0000000..84cfb6d
 +};
 +IActivationFactory *current_app_factory = &current_app.IActivationFactory_iface;
 diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
-index 9f3db77..0e0f620 100644
+index b57bb40..a6365b9 100644
 --- a/dlls/twinapi.appcore/main.c
 +++ b/dlls/twinapi.appcore/main.c
-@@ -150,6 +150,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+@@ -152,6 +152,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
          IActivationFactory_QueryInterface( push_manager_factory, &IID_IActivationFactory, (void **)factory );
      else if (!wcscmp( buffer, L"Windows.Services.Store.StoreContext" ))
          IActivationFactory_QueryInterface( store_context_real_factory, &IID_IActivationFactory, (void **)factory );
@@ -327,10 +327,10 @@ index 9f3db77..0e0f620 100644
          IActivationFactory_QueryInterface( game_save_factory, &IID_IActivationFactory, (void **)factory );
      else if (!wcscmp( buffer, L"Windows.Networking.Sockets.MessageWebSocket" ))
 diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
-index 250a597..5df5a0d 100644
+index 1855dc1..e229754 100644
 --- a/dlls/twinapi.appcore/private.h
 +++ b/dlls/twinapi.appcore/private.h
-@@ -61,6 +61,7 @@ extern void message_dialog_init(void);
+@@ -64,6 +64,7 @@ extern void message_dialog_init(void);
  extern IActivationFactory *hardware_identification_factory;
  extern IActivationFactory *web_token_manager_factory, *web_token_request_factory, *web_account_provider_factory, *user_picker_factory, *system_user_factory, *launcher_factory, *web_account_factory, *web_token_response_factory, *thread_pool_timer_factory, *user_statics_factory, *store_context_real_factory, *game_save_factory, *message_websocket_factory, *store_context_factory, *logging_options_factory, *logging_fields_factory, *push_manager_factory, *logging_channel_factory, *loggingchanneloptions_factory, *loggingactivity_factory, *loggingsession_factory, *asynccausalitytracer_factory;
  extern IActivationFactory *core_window_factory;

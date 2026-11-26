@@ -1,5 +1,5 @@
 #!/bin/bash
-# Builds Wine 11.0 with the patches in patches/wine/ inside a Debian container and installs it to build/wine-root.
+# Builds Wine 11.22 with the patches in patches/wine/ inside a Debian container and installs it to build/wine-root.
 # Usage: scripts/build-wine.sh [-j jobs]
 set -euo pipefail
 source "$(dirname "$0")/common.sh"

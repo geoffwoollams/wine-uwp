@@ -1,18 +1,9 @@
 Subject: combase, kernelbase: package identity from AppxManifest.xml and missing RoFailFast/RoUnregister entry points
 
 diff --git a/dlls/combase/combase.spec b/dlls/combase/combase.spec
-index 9018b01..0651251 100644
+index 19249e1..07469a4 100644
 --- a/dlls/combase/combase.spec
 +++ b/dlls/combase/combase.spec
-@@ -290,7 +290,7 @@
- @ stdcall RoActivateInstance(ptr ptr)
- @ stub RoCaptureErrorContext
- @ stub RoClearError
--@ stub RoFailFastWithErrorContext
-+@ stdcall RoFailFastWithErrorContext(long)
- @ stub RoFreeParameterizedTypeExtra
- @ stub RoGetActivatableClassRegistration
- @ stdcall RoGetActivationFactory(ptr ptr ptr)
 @@ -318,7 +318,7 @@
  @ stub RoTransformError
  @ stub RoTransformErrorW
@@ -23,22 +14,13 @@ index 9018b01..0651251 100644
  @ stdcall SetErrorInfo(long ptr)
  @ stdcall SetRestrictedErrorInfo(ptr)
 diff --git a/dlls/combase/roapi.c b/dlls/combase/roapi.c
-index a88181a..e55913a 100644
+index e5c18c0..7d685bd 100644
 --- a/dlls/combase/roapi.c
 +++ b/dlls/combase/roapi.c
-@@ -437,6 +437,24 @@ void WINAPI RoFailFastWithErrorContextInternal2(HRESULT error, ULONG exception_c
+@@ -479,6 +479,15 @@ void WINAPI RoFailFastWithErrorContextInternal2(HRESULT error, ULONG exception_c
      RaiseFailFastException(NULL, NULL, 0);
  }
  
-+/***********************************************************************
-+ *      RoFailFastWithErrorContext (combase.@)
-+ */
-+void WINAPI RoFailFastWithErrorContext(HRESULT error)
-+{
-+    ERR("fail fast requested, error %#lx.\n", error);
-+    RaiseFailFastException(NULL, NULL, 0);
-+}
-+
 +/***********************************************************************
 + *      RoUnregisterForApartmentShutdown (combase.@)
 + */
@@ -52,10 +34,10 @@ index a88181a..e55913a 100644
   *      RoGetApartmentIdentifier (combase.@)
   */
 diff --git a/dlls/kernelbase/version.c b/dlls/kernelbase/version.c
-index d3399bc..8951268 100644
+index 809577a..3dcb616 100644
 --- a/dlls/kernelbase/version.c
 +++ b/dlls/kernelbase/version.c
-@@ -1547,13 +1547,183 @@ BOOL WINAPI GetVersionExW( OSVERSIONINFOW *info )
+@@ -1546,13 +1546,183 @@ BOOL WINAPI GetVersionExW( OSVERSIONINFOW *info )
      return TRUE;
  }
  
@@ -241,7 +223,7 @@ index d3399bc..8951268 100644
  }
  
  /***********************************************************************
-@@ -1561,8 +1731,9 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentApplicationUserModelId( UINT32 *le
+@@ -1560,8 +1730,9 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentApplicationUserModelId( UINT32 *le
   */
  LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageFamilyName( UINT32 *length, WCHAR *name )
  {
@@ -253,7 +235,7 @@ index d3399bc..8951268 100644
  }
  
  
-@@ -1571,8 +1742,9 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageFamilyName( UINT32 *length,
+@@ -1570,8 +1741,9 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageFamilyName( UINT32 *length,
   */
  LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageFullName( UINT32 *length, WCHAR *name )
  {
@@ -265,7 +247,7 @@ index d3399bc..8951268 100644
  }
  
  
-@@ -1581,8 +1753,20 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageFullName( UINT32 *length, W
+@@ -1580,8 +1752,20 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageFullName( UINT32 *length, W
   */
  LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageId( UINT32 *len, BYTE *buffer )
  {
@@ -288,7 +270,7 @@ index d3399bc..8951268 100644
  }
  
  /***********************************************************************
-@@ -1590,8 +1774,38 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageId( UINT32 *len, BYTE *buff
+@@ -1589,8 +1773,38 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageId( UINT32 *len, BYTE *buff
   */
  LONG WINAPI GetCurrentPackageInfo( const UINT32 flags, UINT32 *buffer_size, BYTE *buffer, UINT32 *count )
  {
@@ -329,7 +311,7 @@ index d3399bc..8951268 100644
  }
  
  /***********************************************************************
-@@ -1599,8 +1813,9 @@ LONG WINAPI GetCurrentPackageInfo( const UINT32 flags, UINT32 *buffer_size, BYTE
+@@ -1598,8 +1812,9 @@ LONG WINAPI GetCurrentPackageInfo( const UINT32 flags, UINT32 *buffer_size, BYTE
   */
  LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackagePath( UINT32 *length, WCHAR *path )
  {
@@ -342,20 +324,17 @@ index d3399bc..8951268 100644
  
  
 diff --git a/include/appmodel.h b/include/appmodel.h
-index 8c219e8..5bc734d 100644
+index d9744c2..860afce 100644
 --- a/include/appmodel.h
 +++ b/include/appmodel.h
-@@ -90,6 +90,13 @@ LONG WINAPI AppPolicyGetShowDeveloperDiagnostic(HANDLE token, AppPolicyShowDevel
- LONG WINAPI AppPolicyGetThreadInitializationType(HANDLE token, AppPolicyThreadInitializationType *policy);
+@@ -131,6 +131,10 @@ LONG WINAPI AppPolicyGetThreadInitializationType(HANDLE token, AppPolicyThreadIn
  LONG WINAPI AppPolicyGetWindowingModel(HANDLE processToken, AppPolicyWindowingModel *policy);
+ LONG WINAPI PackageFullNameFromId(const PACKAGE_ID *id, UINT32 *name_length, WCHAR *name);
  LONG WINAPI PackageIdFromFullName(const WCHAR *full_name, UINT32 flags, UINT32 *buffer_length, BYTE *buffer);
 +LONG WINAPI GetCurrentPackageId(UINT32 *buffer_length, BYTE *buffer);
 +LONG WINAPI GetCurrentPackageFullName(UINT32 *length, WCHAR *name);
 +LONG WINAPI GetCurrentPackageFamilyName(UINT32 *length, WCHAR *name);
 +LONG WINAPI GetCurrentPackagePath(UINT32 *length, WCHAR *path);
-+
-+#define PACKAGE_FULL_NAME_MAX_LENGTH    127
-+#define PACKAGE_FAMILY_NAME_MAX_LENGTH  64
  
  #if defined(__cplusplus)
  }
