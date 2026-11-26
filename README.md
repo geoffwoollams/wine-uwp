@@ -52,7 +52,7 @@ Both put their output in `build/`, where `fetch-release.sh` would also unpack. M
 
 You need the app as an **unpacked package folder**: the folder with `AppxManifest.xml`, `AppxBlockMap.xml` and the executable, for example copied from `C:\Program Files\WindowsApps\<package>` or extracted from the `.appx`/`.msix`. This project does not provide apps and does not bypass licensing: the app is treated as licensed because Wine has no Store client to ask, so you need to own it.
 
-Apps built with C++/CX also need the **x64 `Microsoft.VCLibs.140.00`** framework package (the UWP one, not the `UWPDesktop` one), either as a `.appx` file or as the installed folder, for example `C:\Program Files\WindowsApps\Microsoft.VCLibs.140.00_14.0.33519.0_x64__8wekyb3d8bbwe` from a Windows install. If the package has a `redist/` folder containing that `.appx`, it is found automatically.
+Apps built with C++/CX also need the **x64 `Microsoft.VCLibs.140.00`** framework package (the UWP one, not the `UWPDesktop` one), either as a `.appx` file or as the installed folder, for example `C:\Program Files\WindowsApps\Microsoft.VCLibs.140.00_14.0.33519.0_x64__8wekyb3d8bbwe` from a Windows install. If the package has a `redist/` folder containing that `.appx`, it is found automatically. Most games ship one there: Halo Wars 2 and Gears of War 4 both do. If an app has none, the package found for an app you set up earlier is used. Microsoft doesn't offer the UWP `Microsoft.VCLibs.140.00` as a download of its own: its download page has only the `UWPDesktop` package, which doesn't work here. The UWP package comes with the Windows 10 SDK and Visual Studio (`ExtensionSDKs\Microsoft.VCLibs\14.0\Appx\Retail\x64`), or is already installed on any Windows PC that has Store apps.
 
 ```bash
 scripts/setup-prefix.sh "/path/to/package-folder"
@@ -74,6 +74,23 @@ scripts/run-app.sh Microsoft.HoganThreshold
 The game window shows the app's icon in the taskbar, in Alt-Tab and in its title bar, and the desktop groups it under the launcher's icon. This works under X11 and under Wayland through XWayland, which is how Wine runs on a Wayland desktop by default. With Wine's own Wayland driver it needs a compositor that supports the `xdg-toplevel-icon` protocol (KDE Plasma 6.1 or later, for example). Elsewhere the launcher's icon still shows.
 
 Everything lives under `~/.local/share/wine-uwp/` (the prefix, logs and launcher icons) and the repo's `build/` folder, plus any launchers you added. Delete those to uninstall.
+
+## Upgrading
+
+To move to a newer release, run:
+
+```bash
+git pull
+scripts/fetch-release.sh
+```
+
+After unpacking the new build, `fetch-release.sh` sets up every app already in the prefix again, with `setup-prefix.sh --update-all`. That copies in the new `dxgi.dll` and D3D12 DLLs, registers the WinRT classes the new build adds, and relinks each package from the folder it was set up from. It skips the file check and the launcher question; your saves, settings and launchers are kept. If you build from source instead, run it yourself after `build-wine.sh`:
+
+```bash
+scripts/setup-prefix.sh --update-all
+```
+
+An app whose package folder has moved or is gone is skipped with a warning. Set it up again with `scripts/setup-prefix.sh /new/path/to/it`.
 
 ## XAML apps
 

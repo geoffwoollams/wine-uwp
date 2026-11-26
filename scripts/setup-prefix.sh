@@ -2,23 +2,53 @@
 # Creates the shared Wine prefix (once) and links one unpacked UWP package into it. The package folder is never modified.
 # Usage: scripts/setup-prefix.sh /path/to/package-folder [--vclibs /path/to/Microsoft.VCLibs.140.00_..._x64.appx|folder] [--skip-verify]
 #        [--shortcut | --no-shortcut]
+#        scripts/setup-prefix.sh --update-all
 # Run it again for each app; they share the prefix. It offers to add a launcher (a .desktop file with the app's icon) to
 # the applications menu and the desktop; --shortcut adds it without asking, --no-shortcut skips it.
+# --update-all sets up every app already in the prefix again, from the folders they were set up from (without the file
+# check or the launcher question): what an upgraded Wine build needs, and what fetch-release.sh runs.
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
 
-PKG_DIR="" VCLIBS="" VERIFY=1 SHORTCUT=ask
+PKG_DIR="" VCLIBS="" VERIFY=1 SHORTCUT=ask UPDATE_ALL=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --vclibs) VCLIBS="$2"; shift 2 ;;
         --skip-verify) VERIFY=0; shift ;;
         --shortcut) SHORTCUT=yes; shift ;;
         --no-shortcut) SHORTCUT=no; shift ;;
+        --update-all) UPDATE_ALL=1; shift ;;
         -*) die "unknown option $1" ;;
         *) PKG_DIR="$(cd "$1" && pwd)"; shift ;;
     esac
 done
-[ -n "$PKG_DIR" ] || die "usage: $0 /path/to/package-folder [--vclibs path] [--skip-verify] [--shortcut | --no-shortcut]"
+SOURCES="$DATA/apps"   # <package name>.source: the package folder (line 1) and the VCLibs package (line 2) it was set up with
+
+if [ "$UPDATE_ALL" = 1 ]; then
+    shopt -s nullglob
+    apps=("$PREFIX/drive_c/$APPS_DIR_NAME"/*/)
+    [ ${#apps[@]} -gt 0 ] || { info "No apps set up in $PREFIX yet"; exit 0; }
+    failed=0
+    for app in "${apps[@]}"; do
+        name="$(basename "$app")" src="" vcl=""
+        if [ -f "$SOURCES/$name.source" ]; then
+            { read -r src; read -r vcl || true; } < "$SOURCES/$name.source"
+        elif [ -L "$app/AppxManifest.xml" ]; then
+            src="$(dirname "$(readlink "$app/AppxManifest.xml")")"   # set up before the folder was recorded
+        fi
+        if [ -z "$src" ] || [ ! -f "$src/AppxManifest.xml" ]; then
+            echo "warning: can't find the package folder $name was set up from${src:+ ($src)}; run scripts/setup-prefix.sh /path/to/it" >&2
+            failed=1
+            continue
+        fi
+        info "Updating $name from $src"
+        args=("$src" --skip-verify --no-shortcut)
+        [ -n "$vcl" ] && [ -e "$vcl" ] && args+=(--vclibs "$vcl")
+        "$0" "${args[@]}" || { echo "warning: updating $name failed" >&2; failed=1; }
+    done
+    exit $failed
+fi
+[ -n "$PKG_DIR" ] || die "usage: $0 /path/to/package-folder [--vclibs path] [--skip-verify] [--shortcut | --no-shortcut], or $0 --update-all"
 [ -x "$WINE_ROOT/bin/wine" ] || die "patched Wine not found in $WINE_ROOT: run scripts/fetch-release.sh or scripts/build-wine.sh first"
 [ -f "$DXVK_DXGI" ] || die "patched dxgi.dll not found at $DXVK_DXGI: run scripts/fetch-release.sh or scripts/build-dxvk.sh first"
 IFS=$'\t' read -r PKG_NAME PKG_EXE < <(python3 -I "$REPO/scripts/uwptool.py" info "$PKG_DIR")
@@ -29,7 +59,15 @@ info "Package $PKG_NAME ($PKG_EXE); components from $VKD3D_DIR"
 
 if [ -z "$VCLIBS" ]; then
     VCLIBS="$(ls -1 "$PKG_DIR"/redist/Microsoft.VCLibs.140.00_*_x64_*.appx "$PKG_DIR"/redist/Microsoft.VCLibs.140.00_*_x64_*.Appx 2>/dev/null | head -1 || true)"
-    [ -n "$VCLIBS" ] || echo "warning: no x64 Microsoft.VCLibs.140.00 package found in $PKG_DIR/redist; C++/CX apps need one: pass it with --vclibs (see README)" >&2
+    # none in this package: reuse the one another app here was set up with (Microsoft offers no download of the UWP one)
+    if [ -z "$VCLIBS" ]; then
+        for f in "$SOURCES"/*.source; do
+            [ -f "$f" ] || continue
+            vcl="$(sed -n 2p "$f")"
+            if [ -n "$vcl" ] && [ -e "$vcl" ]; then VCLIBS="$vcl"; info "Using the VC++ runtime package from another app: $VCLIBS"; break; fi
+        done
+    fi
+    [ -n "$VCLIBS" ] || echo "warning: no x64 Microsoft.VCLibs.140.00 package found in $PKG_DIR/redist or with the apps already set up; C++/CX apps need one: pass it with --vclibs (see README)" >&2
 fi
 
 if [ "$VERIFY" = 1 ]; then
@@ -66,6 +104,8 @@ for f in "$PKG_DIR"/*; do
     ln -s "$f" "$APP/$name"
 done
 [ -n "$VCLIBS" ] && python3 -I "$REPO/scripts/uwptool.py" vclibs "$VCLIBS" "$APP"
+mkdir -p "$SOURCES"
+printf '%s\n%s\n' "$PKG_DIR" "${VCLIBS:+$(cd "$(dirname "$VCLIBS")" && pwd)/$(basename "$VCLIBS")}" > "$SOURCES/$PKG_NAME.source"
 
 info "Registering WinRT classes"
 python3 -I "$REPO/scripts/uwptool.py" registry "$PKG_DIR" "C:\\$APPS_DIR_NAME\\$PKG_NAME" > "$PREFIX/drive_c/uwp-$PKG_NAME.reg"
