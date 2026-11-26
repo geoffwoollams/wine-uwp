@@ -1,0 +1,61 @@
+Subject: twinapi.appcore: store objects refuse interfaces they don't implement
+
+diff --git a/dlls/twinapi.appcore/store.c b/dlls/twinapi.appcore/store.c
+index b964ef7..a4071e3 100644
+--- a/dlls/twinapi.appcore/store.c
++++ b/dlls/twinapi.appcore/store.c
+@@ -54,7 +54,28 @@ static const WCHAR *store_app_id(void)
+ }
+ 
+ /* ---------------- common slot helpers ---------------- */
+-static HRESULT WINAPI o_QI(void *o, REFIID iid, void **out) { TRACE("obj %p iid %s\n", o, debugstr_guid(iid)); *out = o; return S_OK; }
++/* Interfaces callers probe any object for, which these never implement: answering them with the object's own vtable
++ * makes the caller call the wrong methods (IL2CPP games then crash on an E_NOTIMPL read as a pointer). */
++static const GUID probed_iids[] =
++{
++    { 0xd4bbc1c8, 0xf5bf, 0x4647, { 0x94, 0x95, 0x2e, 0x5c, 0x0f, 0x20, 0xf7, 0x5d } },   /* asked for by IL2CPP */
++    { 0x96369f54, 0x8eb6, 0x48f0, { 0xab, 0xce, 0xc1, 0xb2, 0x11, 0xe6, 0x27, 0xc3 } },   /* IStringable */
++    { 0x00000003, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } },   /* IMarshal */
++    { 0x00000018, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } },   /* IStdMarshalInfo */
++    { 0x00000019, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } },   /* IExternalConnection */
++    { 0x00000038, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } },   /* IWeakReferenceSource */
++};
++
++static HRESULT WINAPI o_QI(void *o, REFIID iid, void **out)
++{
++    UINT i;
++
++    TRACE("obj %p iid %s\n", o, debugstr_guid(iid));
++    for (i = 0; i < ARRAY_SIZE(probed_iids); i++)
++        if (IsEqualGUID(iid, &probed_iids[i])) { *out = NULL; return E_NOINTERFACE; }
++    *out = o;
++    return S_OK;
++}
+ static ULONG WINAPI o_AddRef(void *o) { return 2; }
+ static ULONG WINAPI o_Release(void *o) { return 1; }
+ static HRESULT WINAPI o_GetIids(void *o, ULONG *c, IID **i) { return E_NOTIMPL; }
+@@ -119,14 +140,20 @@ static HRESULT WINAPI pm_First(struct pmap *m, void **iter)
+     *iter = it;
+     return S_OK;
+ }
++static const GUID iid_product_map_view = { 0xdbaac6e5, 0x61a4, 0x5c88, { 0xb5, 0xd8, 0x3a, 0x3e, 0x16, 0x1c, 0x3e, 0x4a } };
++static const GUID iid_product_map_iterable = { 0x78a33722, 0xabfb, 0x57c0, { 0x85, 0x3f, 0x56, 0x16, 0xa3, 0xab, 0x8d, 0x57 } };
++
+ static HRESULT WINAPI pm_QI(struct pmap *m, REFIID iid, void **out)
+ {
+     struct pmap_pair *pair = CONTAINING_RECORD(m->twin ? m->twin : m, struct pmap_pair, view);
+     if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) || IsEqualGUID(iid, &IID_IAgileObject)) { *out = m; return S_OK; }
+-    /* The game's range-for asks for IIterable first, then IMapView for lookups. */
+-    *out = pair->view.qi++ ? (void *)&pair->view : (void *)&pair->iterable;
+-    FIXME("map view QI %s -> %s\n", debugstr_guid(iid), pair->view.qi > 1 ? "view" : "iterable");
+-    return S_OK;
++    /* IMapView<String, StoreProduct> and IIterable<IKeyValuePair<String, StoreProduct>>, by their pinterface IIDs;
++     * anything else (IL2CPP probes several interfaces) must fail rather than get one of these vtables */
++    if (IsEqualGUID(iid, &iid_product_map_view)) { *out = &pair->view; return S_OK; }
++    if (IsEqualGUID(iid, &iid_product_map_iterable)) { *out = &pair->iterable; return S_OK; }
++    TRACE("map view QI %s not supported\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
+ }
+ const void *const pmap_view_vtbl[] = { pm_QI, o_AddRef, o_Release, o_GetIids, o_GetRuntimeClassName, o_GetTrustLevel,
+     pm_Lookup, pm_Size, pm_HasKey, pm_Split };

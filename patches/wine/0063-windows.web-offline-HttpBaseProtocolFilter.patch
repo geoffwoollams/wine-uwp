@@ -1,0 +1,1928 @@
+Subject: include, windows.web: an offline Windows.Web.Http.Filters.HttpBaseProtocolFilter
+
+diff --git a/dlls/windows.web/Makefile.in b/dlls/windows.web/Makefile.in
+index e646778..b50ff08 100644
+--- a/dlls/windows.web/Makefile.in
++++ b/dlls/windows.web/Makefile.in
+@@ -3,6 +3,7 @@ IMPORTS = combase
+ 
+ SOURCES = \
+ 	classes.idl \
++	http_filter.c \
+ 	json_array.c \
+ 	json_gen.c \
+ 	json_object.c \
+diff --git a/dlls/windows.web/classes.idl b/dlls/windows.web/classes.idl
+index 43f376d..c4cb491 100644
+--- a/dlls/windows.web/classes.idl
++++ b/dlls/windows.web/classes.idl
+@@ -23,6 +23,7 @@
+ 
+ import "windows.data.json.idl";
+ import "windows.data.xml.dom.idl";
++import "windows.web.http.idl";
+ 
+ namespace Windows.Data.Json {
+     runtimeclass JsonArray;
+@@ -33,3 +34,7 @@ namespace Windows.Data.Json {
+ namespace Windows.Data.Xml.Dom {
+     runtimeclass XmlDocument;
+ }
++
++namespace Windows.Web.Http.Filters {
++    runtimeclass HttpBaseProtocolFilter;
++}
+diff --git a/dlls/windows.web/http_filter.c b/dlls/windows.web/http_filter.c
+new file mode 100644
+index 0000000..4e3eaec
+--- /dev/null
++++ b/dlls/windows.web/http_filter.c
+@@ -0,0 +1,649 @@
++/* WinRT Windows.Web.Http.Filters.HttpBaseProtocolFilter implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#define WIDL_using_Windows_Web_Http
++#define WIDL_using_Windows_Web_Http_Filters
++#define WIDL_using_Windows_Security_Credentials
++#define WIDL_using_Windows_Security_Cryptography_Certificates
++#define WIDL_using_Windows_System
++#include "initguid.h"   /* this file defines the Windows.Web.Http IIDs */
++#include "windows.web.http.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(web);
++
++/* The WinRT HTTP stack is offline: an HttpBaseProtocolFilter keeps its settings, and every request it is given
++ * fails at once as if the host's name couldn't be resolved (WININET_E_NAME_NOT_RESOLVED), which is what Windows
++ * reports without a network. .NET's HttpClient turns that into an HttpRequestException, which apps and their ad and
++ * telemetry libraries expect and handle. */
++
++
++/* ---- SendRequestAsync's operation: already failed ---- */
++
++struct failed_op
++{
++    IAsyncOperationWithProgress_HttpResponseMessage_HttpProgress IAsyncOperationWithProgress_iface;
++    IAsyncInfo IAsyncInfo_iface;
++    LONG ref;
++    IAsyncOperationWithProgressCompletedHandler_HttpResponseMessage_HttpProgress *completed;
++    IAsyncOperationProgressHandler_HttpResponseMessage_HttpProgress *progress;
++};
++
++static inline struct failed_op *impl_from_IAsyncOperationWithProgress( IAsyncOperationWithProgress_HttpResponseMessage_HttpProgress *iface )
++{
++    return CONTAINING_RECORD( iface, struct failed_op, IAsyncOperationWithProgress_iface );
++}
++
++static HRESULT WINAPI op_QueryInterface( IAsyncOperationWithProgress_HttpResponseMessage_HttpProgress *iface, REFIID iid, void **out )
++{
++    struct failed_op *impl = impl_from_IAsyncOperationWithProgress( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IAsyncOperationWithProgress_HttpResponseMessage_HttpProgress ))
++        *out = &impl->IAsyncOperationWithProgress_iface;
++    else if (IsEqualGUID( iid, &IID_IAsyncInfo ))
++        *out = &impl->IAsyncInfo_iface;
++    else
++    {
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    InterlockedIncrement( &impl->ref );
++    return S_OK;
++}
++
++static ULONG WINAPI op_AddRef( IAsyncOperationWithProgress_HttpResponseMessage_HttpProgress *iface )
++{
++    return InterlockedIncrement( &impl_from_IAsyncOperationWithProgress( iface )->ref );
++}
++
++static ULONG WINAPI op_Release( IAsyncOperationWithProgress_HttpResponseMessage_HttpProgress *iface )
++{
++    struct failed_op *impl = impl_from_IAsyncOperationWithProgress( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        if (impl->completed) IAsyncOperationWithProgressCompletedHandler_HttpResponseMessage_HttpProgress_Release( impl->completed );
++        if (impl->progress) IAsyncOperationProgressHandler_HttpResponseMessage_HttpProgress_Release( impl->progress );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI op_GetIids( IAsyncOperationWithProgress_HttpResponseMessage_HttpProgress *iface, ULONG *count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI op_GetRuntimeClassName( IAsyncOperationWithProgress_HttpResponseMessage_HttpProgress *iface, HSTRING *name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI op_GetTrustLevel( IAsyncOperationWithProgress_HttpResponseMessage_HttpProgress *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI op_put_Progress( IAsyncOperationWithProgress_HttpResponseMessage_HttpProgress *iface,
++                                       IAsyncOperationProgressHandler_HttpResponseMessage_HttpProgress *handler )
++{
++    struct failed_op *impl = impl_from_IAsyncOperationWithProgress( iface );
++    if (handler) IAsyncOperationProgressHandler_HttpResponseMessage_HttpProgress_AddRef( handler );
++    if (impl->progress) IAsyncOperationProgressHandler_HttpResponseMessage_HttpProgress_Release( impl->progress );
++    impl->progress = handler;
++    return S_OK;
++}
++
++static HRESULT WINAPI op_get_Progress( IAsyncOperationWithProgress_HttpResponseMessage_HttpProgress *iface,
++                                       IAsyncOperationProgressHandler_HttpResponseMessage_HttpProgress **handler )
++{
++    struct failed_op *impl = impl_from_IAsyncOperationWithProgress( iface );
++    if ((*handler = impl->progress)) IAsyncOperationProgressHandler_HttpResponseMessage_HttpProgress_AddRef( *handler );
++    return S_OK;
++}
++
++static HRESULT WINAPI op_put_Completed( IAsyncOperationWithProgress_HttpResponseMessage_HttpProgress *iface,
++                                        IAsyncOperationWithProgressCompletedHandler_HttpResponseMessage_HttpProgress *handler )
++{
++    struct failed_op *impl = impl_from_IAsyncOperationWithProgress( iface );
++
++    if (impl->completed) return E_ILLEGAL_DELEGATE_ASSIGNMENT;
++    if (!handler) return E_POINTER;
++    IAsyncOperationWithProgressCompletedHandler_HttpResponseMessage_HttpProgress_AddRef( (impl->completed = handler) );
++    /* it has finished: the handler runs at once */
++    IAsyncOperationWithProgressCompletedHandler_HttpResponseMessage_HttpProgress_Invoke( handler, iface, Error );
++    return S_OK;
++}
++
++static HRESULT WINAPI op_get_Completed( IAsyncOperationWithProgress_HttpResponseMessage_HttpProgress *iface,
++                                        IAsyncOperationWithProgressCompletedHandler_HttpResponseMessage_HttpProgress **handler )
++{
++    struct failed_op *impl = impl_from_IAsyncOperationWithProgress( iface );
++    if ((*handler = impl->completed)) IAsyncOperationWithProgressCompletedHandler_HttpResponseMessage_HttpProgress_AddRef( *handler );
++    return S_OK;
++}
++
++static HRESULT WINAPI op_GetResults( IAsyncOperationWithProgress_HttpResponseMessage_HttpProgress *iface, IHttpResponseMessage **results )
++{
++    *results = NULL;
++    return WININET_E_NAME_NOT_RESOLVED;
++}
++
++static const struct IAsyncOperationWithProgress_HttpResponseMessage_HttpProgressVtbl op_vtbl =
++{
++    op_QueryInterface,
++    op_AddRef,
++    op_Release,
++    /* IInspectable methods */
++    op_GetIids,
++    op_GetRuntimeClassName,
++    op_GetTrustLevel,
++    /* IAsyncOperationWithProgress<HttpResponseMessage *, HttpProgress> methods */
++    op_put_Progress,
++    op_get_Progress,
++    op_put_Completed,
++    op_get_Completed,
++    op_GetResults,
++};
++
++DEFINE_IINSPECTABLE( op_info, IAsyncInfo, struct failed_op, IAsyncOperationWithProgress_iface )
++
++static HRESULT WINAPI op_info_get_Id( IAsyncInfo *iface, UINT32 *id )
++{
++    *id = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI op_info_get_Status( IAsyncInfo *iface, AsyncStatus *status )
++{
++    *status = Error;
++    return S_OK;
++}
++
++static HRESULT WINAPI op_info_get_ErrorCode( IAsyncInfo *iface, HRESULT *error )
++{
++    *error = WININET_E_NAME_NOT_RESOLVED;
++    return S_OK;
++}
++
++static HRESULT WINAPI op_info_Cancel( IAsyncInfo *iface ) { return S_OK; }
++static HRESULT WINAPI op_info_Close( IAsyncInfo *iface ) { return S_OK; }
++
++static const struct IAsyncInfoVtbl op_info_vtbl =
++{
++    op_info_QueryInterface,
++    op_info_AddRef,
++    op_info_Release,
++    /* IInspectable methods */
++    op_info_GetIids,
++    op_info_GetRuntimeClassName,
++    op_info_GetTrustLevel,
++    /* IAsyncInfo methods */
++    op_info_get_Id,
++    op_info_get_Status,
++    op_info_get_ErrorCode,
++    op_info_Cancel,
++    op_info_Close,
++};
++
++/* ---- HttpCacheControl ---- */
++
++struct cache_control
++{
++    IHttpCacheControl IHttpCacheControl_iface;
++    HttpCacheReadBehavior read;
++    HttpCacheWriteBehavior write;
++};
++
++/* ---- the filter ---- */
++
++struct filter
++{
++    IHttpBaseProtocolFilter IHttpBaseProtocolFilter_iface;
++    IHttpBaseProtocolFilter2 IHttpBaseProtocolFilter2_iface;
++    IHttpBaseProtocolFilter3 IHttpBaseProtocolFilter3_iface;
++    IHttpBaseProtocolFilter4 IHttpBaseProtocolFilter4_iface;
++    IHttpFilter IHttpFilter_iface;
++    IClosable IClosable_iface;
++    LONG ref;
++    boolean auto_redirect, allow_ui, decompression, use_proxy;
++    UINT32 max_connections;
++    ICertificate *certificate;
++    IPasswordCredential *proxy_credential, *server_credential;
++    HttpVersion max_version;
++    HttpCookieUsageBehavior cookie_usage;
++    struct cache_control cache;
++};
++
++static inline struct filter *impl_from_IHttpBaseProtocolFilter( IHttpBaseProtocolFilter *iface )
++{
++    return CONTAINING_RECORD( iface, struct filter, IHttpBaseProtocolFilter_iface );
++}
++
++static HRESULT WINAPI filter_QueryInterface( IHttpBaseProtocolFilter *iface, REFIID iid, void **out )
++{
++    struct filter *impl = impl_from_IHttpBaseProtocolFilter( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IHttpBaseProtocolFilter ))
++        *out = &impl->IHttpBaseProtocolFilter_iface;
++    else if (IsEqualGUID( iid, &IID_IHttpBaseProtocolFilter2 )) *out = &impl->IHttpBaseProtocolFilter2_iface;
++    else if (IsEqualGUID( iid, &IID_IHttpBaseProtocolFilter3 )) *out = &impl->IHttpBaseProtocolFilter3_iface;
++    else if (IsEqualGUID( iid, &IID_IHttpBaseProtocolFilter4 )) *out = &impl->IHttpBaseProtocolFilter4_iface;
++    else if (IsEqualGUID( iid, &IID_IHttpFilter )) *out = &impl->IHttpFilter_iface;
++    else if (IsEqualGUID( iid, &IID_IClosable )) *out = &impl->IClosable_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    InterlockedIncrement( &impl->ref );
++    return S_OK;
++}
++
++static ULONG WINAPI filter_AddRef( IHttpBaseProtocolFilter *iface )
++{
++    return InterlockedIncrement( &impl_from_IHttpBaseProtocolFilter( iface )->ref );
++}
++
++static ULONG WINAPI filter_Release( IHttpBaseProtocolFilter *iface )
++{
++    struct filter *impl = impl_from_IHttpBaseProtocolFilter( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        if (impl->certificate) ICertificate_Release( impl->certificate );
++        if (impl->proxy_credential) IPasswordCredential_Release( impl->proxy_credential );
++        if (impl->server_credential) IPasswordCredential_Release( impl->server_credential );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI filter_GetIids( IHttpBaseProtocolFilter *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI filter_GetRuntimeClassName( IHttpBaseProtocolFilter *iface, HSTRING *name )
++{
++    static const WCHAR class_name[] = L"Windows.Web.Http.Filters.HttpBaseProtocolFilter";
++    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
++}
++
++static HRESULT WINAPI filter_GetTrustLevel( IHttpBaseProtocolFilter *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++#define FILTER_BOOL( Name, field ) \
++static HRESULT WINAPI filter_get_##Name( IHttpBaseProtocolFilter *iface, boolean *value ) \
++{ \
++    *value = impl_from_IHttpBaseProtocolFilter( iface )->field; \
++    return S_OK; \
++} \
++static HRESULT WINAPI filter_put_##Name( IHttpBaseProtocolFilter *iface, boolean value ) \
++{ \
++    impl_from_IHttpBaseProtocolFilter( iface )->field = value; \
++    return S_OK; \
++}
++
++FILTER_BOOL( AllowAutoRedirect, auto_redirect )
++FILTER_BOOL( AllowUI, allow_ui )
++FILTER_BOOL( AutomaticDecompression, decompression )
++FILTER_BOOL( UseProxy, use_proxy )
++
++static HRESULT WINAPI filter_get_CacheControl( IHttpBaseProtocolFilter *iface, IHttpCacheControl **value )
++{
++    struct filter *impl = impl_from_IHttpBaseProtocolFilter( iface );
++    *value = &impl->cache.IHttpCacheControl_iface;
++    IHttpCacheControl_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI filter_get_CookieManager( IHttpBaseProtocolFilter *iface, IHttpCookieManager **value )
++{
++    FIXME( "iface %p: no cookie manager (offline).\n", iface );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI filter_get_ClientCertificate( IHttpBaseProtocolFilter *iface, ICertificate **value )
++{
++    if ((*value = impl_from_IHttpBaseProtocolFilter( iface )->certificate)) ICertificate_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI filter_put_ClientCertificate( IHttpBaseProtocolFilter *iface, ICertificate *value )
++{
++    struct filter *impl = impl_from_IHttpBaseProtocolFilter( iface );
++    if (value) ICertificate_AddRef( value );
++    if (impl->certificate) ICertificate_Release( impl->certificate );
++    impl->certificate = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI filter_get_IgnorableServerCertificateErrors( IHttpBaseProtocolFilter *iface, IVector_ChainValidationResult **value )
++{
++    FIXME( "iface %p: no certificate error list (offline).\n", iface );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI filter_get_MaxConnectionsPerServer( IHttpBaseProtocolFilter *iface, UINT32 *value )
++{
++    *value = impl_from_IHttpBaseProtocolFilter( iface )->max_connections;
++    return S_OK;
++}
++
++static HRESULT WINAPI filter_put_MaxConnectionsPerServer( IHttpBaseProtocolFilter *iface, UINT32 value )
++{
++    impl_from_IHttpBaseProtocolFilter( iface )->max_connections = value;
++    return S_OK;
++}
++
++#define FILTER_CREDENTIAL( Name, field ) \
++static HRESULT WINAPI filter_get_##Name( IHttpBaseProtocolFilter *iface, IPasswordCredential **value ) \
++{ \
++    if ((*value = impl_from_IHttpBaseProtocolFilter( iface )->field)) IPasswordCredential_AddRef( *value ); \
++    return S_OK; \
++} \
++static HRESULT WINAPI filter_put_##Name( IHttpBaseProtocolFilter *iface, IPasswordCredential *value ) \
++{ \
++    struct filter *impl = impl_from_IHttpBaseProtocolFilter( iface ); \
++    if (value) IPasswordCredential_AddRef( value ); \
++    if (impl->field) IPasswordCredential_Release( impl->field ); \
++    impl->field = value; \
++    return S_OK; \
++}
++
++FILTER_CREDENTIAL( ProxyCredential, proxy_credential )
++FILTER_CREDENTIAL( ServerCredential, server_credential )
++
++static const struct IHttpBaseProtocolFilterVtbl filter_vtbl =
++{
++    filter_QueryInterface,
++    filter_AddRef,
++    filter_Release,
++    /* IInspectable methods */
++    filter_GetIids,
++    filter_GetRuntimeClassName,
++    filter_GetTrustLevel,
++    /* IHttpBaseProtocolFilter methods */
++    filter_get_AllowAutoRedirect,
++    filter_put_AllowAutoRedirect,
++    filter_get_AllowUI,
++    filter_put_AllowUI,
++    filter_get_AutomaticDecompression,
++    filter_put_AutomaticDecompression,
++    filter_get_CacheControl,
++    filter_get_CookieManager,
++    filter_get_ClientCertificate,
++    filter_put_ClientCertificate,
++    filter_get_IgnorableServerCertificateErrors,
++    filter_get_MaxConnectionsPerServer,
++    filter_put_MaxConnectionsPerServer,
++    filter_get_ProxyCredential,
++    filter_put_ProxyCredential,
++    filter_get_ServerCredential,
++    filter_put_ServerCredential,
++    filter_get_UseProxy,
++    filter_put_UseProxy,
++};
++
++DEFINE_IINSPECTABLE( filter2, IHttpBaseProtocolFilter2, struct filter, IHttpBaseProtocolFilter_iface )
++
++static HRESULT WINAPI filter2_get_MaxVersion( IHttpBaseProtocolFilter2 *iface, HttpVersion *value )
++{
++    *value = impl_from_IHttpBaseProtocolFilter2( iface )->max_version;
++    return S_OK;
++}
++
++static HRESULT WINAPI filter2_put_MaxVersion( IHttpBaseProtocolFilter2 *iface, HttpVersion value )
++{
++    impl_from_IHttpBaseProtocolFilter2( iface )->max_version = value;
++    return S_OK;
++}
++
++static const struct IHttpBaseProtocolFilter2Vtbl filter2_vtbl =
++{
++    filter2_QueryInterface, filter2_AddRef, filter2_Release,
++    filter2_GetIids, filter2_GetRuntimeClassName, filter2_GetTrustLevel,
++    filter2_get_MaxVersion, filter2_put_MaxVersion,
++};
++
++DEFINE_IINSPECTABLE( filter3, IHttpBaseProtocolFilter3, struct filter, IHttpBaseProtocolFilter_iface )
++
++static HRESULT WINAPI filter3_get_CookieUsageBehavior( IHttpBaseProtocolFilter3 *iface, HttpCookieUsageBehavior *value )
++{
++    *value = impl_from_IHttpBaseProtocolFilter3( iface )->cookie_usage;
++    return S_OK;
++}
++
++static HRESULT WINAPI filter3_put_CookieUsageBehavior( IHttpBaseProtocolFilter3 *iface, HttpCookieUsageBehavior value )
++{
++    impl_from_IHttpBaseProtocolFilter3( iface )->cookie_usage = value;
++    return S_OK;
++}
++
++static const struct IHttpBaseProtocolFilter3Vtbl filter3_vtbl =
++{
++    filter3_QueryInterface, filter3_AddRef, filter3_Release,
++    filter3_GetIids, filter3_GetRuntimeClassName, filter3_GetTrustLevel,
++    filter3_get_CookieUsageBehavior, filter3_put_CookieUsageBehavior,
++};
++
++DEFINE_IINSPECTABLE( filter4, IHttpBaseProtocolFilter4, struct filter, IHttpBaseProtocolFilter_iface )
++
++static HRESULT WINAPI filter4_add_ServerCustomValidationRequested( IHttpBaseProtocolFilter4 *iface,
++        ITypedEventHandler_HttpBaseProtocolFilter_HttpServerCustomValidationRequestedEventArgs *handler, EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p: no server is ever reached.\n", iface, handler );
++    token->value = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI filter4_remove_ServerCustomValidationRequested( IHttpBaseProtocolFilter4 *iface, EventRegistrationToken token )
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI filter4_ClearAuthenticationCache( IHttpBaseProtocolFilter4 *iface )
++{
++    return S_OK;
++}
++
++static const struct IHttpBaseProtocolFilter4Vtbl filter4_vtbl =
++{
++    filter4_QueryInterface, filter4_AddRef, filter4_Release,
++    filter4_GetIids, filter4_GetRuntimeClassName, filter4_GetTrustLevel,
++    filter4_add_ServerCustomValidationRequested, filter4_remove_ServerCustomValidationRequested,
++    filter4_ClearAuthenticationCache,
++};
++
++DEFINE_IINSPECTABLE( http_filter, IHttpFilter, struct filter, IHttpBaseProtocolFilter_iface )
++
++static HRESULT WINAPI http_filter_SendRequestAsync( IHttpFilter *iface, IHttpRequestMessage *request,
++                                                    IAsyncOperationWithProgress_HttpResponseMessage_HttpProgress **value )
++{
++    struct failed_op *op;
++
++    TRACE( "iface %p, request %p: offline.\n", iface, request );
++    if (!(op = calloc( 1, sizeof(*op) ))) return E_OUTOFMEMORY;
++    op->IAsyncOperationWithProgress_iface.lpVtbl = &op_vtbl;
++    op->IAsyncInfo_iface.lpVtbl = &op_info_vtbl;
++    op->ref = 1;
++    *value = &op->IAsyncOperationWithProgress_iface;
++    return S_OK;
++}
++
++static const struct IHttpFilterVtbl http_filter_vtbl =
++{
++    http_filter_QueryInterface, http_filter_AddRef, http_filter_Release,
++    http_filter_GetIids, http_filter_GetRuntimeClassName, http_filter_GetTrustLevel,
++    http_filter_SendRequestAsync,
++};
++
++DEFINE_IINSPECTABLE( closable, IClosable, struct filter, IHttpBaseProtocolFilter_iface )
++
++static HRESULT WINAPI closable_Close( IClosable *iface )
++{
++    return S_OK;
++}
++
++static const struct IClosableVtbl closable_vtbl =
++{
++    closable_QueryInterface, closable_AddRef, closable_Release,
++    closable_GetIids, closable_GetRuntimeClassName, closable_GetTrustLevel,
++    closable_Close,
++};
++
++/* the filter's CacheControl, part of the filter's object */
++
++static inline struct filter *impl_from_IHttpCacheControl( IHttpCacheControl *iface )
++{
++    return CONTAINING_RECORD( iface, struct filter, cache.IHttpCacheControl_iface );
++}
++
++static HRESULT WINAPI cache_QueryInterface( IHttpCacheControl *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IHttpCacheControl ))
++    {
++        *out = iface;
++        IHttpCacheControl_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI cache_AddRef( IHttpCacheControl *iface )
++{
++    return filter_AddRef( &impl_from_IHttpCacheControl( iface )->IHttpBaseProtocolFilter_iface );
++}
++
++static ULONG WINAPI cache_Release( IHttpCacheControl *iface )
++{
++    return filter_Release( &impl_from_IHttpCacheControl( iface )->IHttpBaseProtocolFilter_iface );
++}
++
++static HRESULT WINAPI cache_GetIids( IHttpCacheControl *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI cache_GetRuntimeClassName( IHttpCacheControl *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI cache_GetTrustLevel( IHttpCacheControl *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI cache_get_ReadBehavior( IHttpCacheControl *iface, HttpCacheReadBehavior *value )
++{
++    *value = impl_from_IHttpCacheControl( iface )->cache.read;
++    return S_OK;
++}
++
++static HRESULT WINAPI cache_put_ReadBehavior( IHttpCacheControl *iface, HttpCacheReadBehavior value )
++{
++    impl_from_IHttpCacheControl( iface )->cache.read = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI cache_get_WriteBehavior( IHttpCacheControl *iface, HttpCacheWriteBehavior *value )
++{
++    *value = impl_from_IHttpCacheControl( iface )->cache.write;
++    return S_OK;
++}
++
++static HRESULT WINAPI cache_put_WriteBehavior( IHttpCacheControl *iface, HttpCacheWriteBehavior value )
++{
++    impl_from_IHttpCacheControl( iface )->cache.write = value;
++    return S_OK;
++}
++
++static const struct IHttpCacheControlVtbl cache_vtbl =
++{
++    cache_QueryInterface, cache_AddRef, cache_Release,
++    cache_GetIids, cache_GetRuntimeClassName, cache_GetTrustLevel,
++    cache_get_ReadBehavior, cache_put_ReadBehavior,
++    cache_get_WriteBehavior, cache_put_WriteBehavior,
++};
++
++/* ---- the factory ---- */
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    struct filter *impl;
++
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IHttpBaseProtocolFilter_iface.lpVtbl = &filter_vtbl;
++    impl->IHttpBaseProtocolFilter2_iface.lpVtbl = &filter2_vtbl;
++    impl->IHttpBaseProtocolFilter3_iface.lpVtbl = &filter3_vtbl;
++    impl->IHttpBaseProtocolFilter4_iface.lpVtbl = &filter4_vtbl;
++    impl->IHttpFilter_iface.lpVtbl = &http_filter_vtbl;
++    impl->IClosable_iface.lpVtbl = &closable_vtbl;
++    impl->cache.IHttpCacheControl_iface.lpVtbl = &cache_vtbl;
++    impl->ref = 1;
++    impl->auto_redirect = impl->allow_ui = impl->decompression = impl->use_proxy = TRUE;
++    impl->max_connections = 6;
++    impl->max_version = HttpVersion_Http20;
++    *instance = (IInspectable *)&impl->IHttpBaseProtocolFilter_iface;
++    return S_OK;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++static IActivationFactory factory = { &factory_vtbl };
++IActivationFactory *http_base_protocol_filter_factory = &factory;
+diff --git a/dlls/windows.web/main.c b/dlls/windows.web/main.c
+index cae71a2..ed506bb 100644
+--- a/dlls/windows.web/main.c
++++ b/dlls/windows.web/main.c
+@@ -45,6 +45,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+     if (!wcscmp( buffer, RuntimeClass_Windows_Data_Json_JsonValue ))
+         IActivationFactory_QueryInterface( json_value_factory, &IID_IActivationFactory, (void **)factory );
+ 
++    if (!wcscmp( buffer, L"Windows.Web.Http.Filters.HttpBaseProtocolFilter" ))
++        IActivationFactory_QueryInterface( http_base_protocol_filter_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, L"Windows.Data.Xml.Dom.XmlDocument" ))
+         IActivationFactory_QueryInterface( xml_document_factory, &IID_IActivationFactory, (void **)factory );
+ 
+diff --git a/dlls/windows.web/private.h b/dlls/windows.web/private.h
+index a743013..8cea195 100644
+--- a/dlls/windows.web/private.h
++++ b/dlls/windows.web/private.h
+@@ -42,6 +42,7 @@ extern IActivationFactory *json_object_factory;
+ extern HRESULT json_parse_object( HSTRING input, IJsonObject **out, boolean *ok );
+ extern HRESULT json_object_create( IJsonObject **out );
+ extern IActivationFactory *xml_document_factory;
++extern IActivationFactory *http_base_protocol_filter_factory;
+ extern IActivationFactory *json_value_factory;
+ 
+ HRESULT json_array_push( IJsonArray *iface, IJsonValue *value );
+diff --git a/include/Makefile.in b/include/Makefile.in
+index b12cf54..2b09bf0 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -1112,6 +1112,7 @@ SOURCES = \
+ 	windows.ui.windowmanagement.idl \
+ 	windows.ui.xaml.hosting.desktopwindowxamlsource.idl \
+ 	windows.ui.xaml.idl \
++	windows.web.http.idl \
+ 	windows.ui.xaml.interop.idl \
+ 	windowscontracts.idl \
+ 	windowsx.h \
+diff --git a/include/windows.web.http.idl b/include/windows.web.http.idl
+new file mode 100644
+index 0000000..f426a53
+--- /dev/null
++++ b/include/windows.web.http.idl
+@@ -0,0 +1,1196 @@
++/*
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/* generated by scripts/winmd2idl.py: Windows.Web.Http.Filters.HttpBaseProtocolFilter and what it uses */
++
++#ifdef __WIDL__
++#pragma winrt ns_prefix
++#endif
++
++import "inspectable.idl";
++import "asyncinfo.idl";
++import "eventtoken.idl";
++import "windowscontracts.idl";
++import "windows.foundation.idl";
++import "windows.networking.idl";
++import "windows.storage.streams.idl";
++import "windows.system.idl";
++
++
++namespace Windows.Networking.Sockets {
++    typedef enum SocketSslErrorSeverity SocketSslErrorSeverity;
++}
++
++namespace Windows.Security.Credentials {
++    interface IPasswordCredential;
++    runtimeclass PasswordCredential;
++}
++
++namespace Windows.Security.Cryptography.Certificates {
++    runtimeclass Certificate;
++    runtimeclass CertificateChain;
++    typedef enum CertificateChainPolicy CertificateChainPolicy;
++    runtimeclass ChainBuildingParameters;
++    runtimeclass ChainValidationParameters;
++    typedef enum ChainValidationResult ChainValidationResult;
++    interface ICertificate;
++    interface ICertificateChain;
++    interface IChainBuildingParameters;
++    interface IChainValidationParameters;
++}
++
++namespace Windows.Web.Http {
++    runtimeclass HttpCookie;
++    runtimeclass HttpCookieCollection;
++    runtimeclass HttpCookieManager;
++    runtimeclass HttpMethod;
++    typedef struct HttpProgress HttpProgress;
++    typedef enum HttpProgressStage HttpProgressStage;
++    runtimeclass HttpRequestMessage;
++    runtimeclass HttpResponseMessage;
++    typedef enum HttpResponseMessageSource HttpResponseMessageSource;
++    typedef enum HttpStatusCode HttpStatusCode;
++    runtimeclass HttpTransportInformation;
++    typedef enum HttpVersion HttpVersion;
++    interface IHttpContent;
++    interface IHttpCookie;
++    interface IHttpCookieManager;
++    interface IHttpMethod;
++    interface IHttpRequestMessage;
++    interface IHttpResponseMessage;
++    interface IHttpTransportInformation;
++}
++
++namespace Windows.Web.Http.Filters {
++    runtimeclass HttpBaseProtocolFilter;
++    runtimeclass HttpCacheControl;
++    typedef enum HttpCacheReadBehavior HttpCacheReadBehavior;
++    typedef enum HttpCacheWriteBehavior HttpCacheWriteBehavior;
++    typedef enum HttpCookieUsageBehavior HttpCookieUsageBehavior;
++    runtimeclass HttpServerCustomValidationRequestedEventArgs;
++    interface IHttpBaseProtocolFilter;
++    interface IHttpBaseProtocolFilter2;
++    interface IHttpBaseProtocolFilter3;
++    interface IHttpBaseProtocolFilter4;
++    interface IHttpBaseProtocolFilter5;
++    interface IHttpBaseProtocolFilterStatics;
++    interface IHttpCacheControl;
++    interface IHttpFilter;
++    interface IHttpServerCustomValidationRequestedEventArgs;
++}
++
++namespace Windows.Web.Http.Headers {
++    runtimeclass HttpCacheDirectiveHeaderValueCollection;
++    runtimeclass HttpChallengeHeaderValueCollection;
++    runtimeclass HttpConnectionOptionHeaderValueCollection;
++    runtimeclass HttpContentCodingWithQualityHeaderValueCollection;
++    runtimeclass HttpCookiePairHeaderValueCollection;
++    runtimeclass HttpCredentialsHeaderValue;
++    runtimeclass HttpDateOrDeltaHeaderValue;
++    runtimeclass HttpExpectationHeaderValueCollection;
++    runtimeclass HttpLanguageRangeWithQualityHeaderValueCollection;
++    runtimeclass HttpMediaTypeWithQualityHeaderValueCollection;
++    runtimeclass HttpMethodHeaderValueCollection;
++    runtimeclass HttpNameValueHeaderValue;
++    runtimeclass HttpProductInfoHeaderValueCollection;
++    runtimeclass HttpRequestHeaderCollection;
++    runtimeclass HttpResponseHeaderCollection;
++    runtimeclass HttpTransferCodingHeaderValueCollection;
++    interface IHttpCacheDirectiveHeaderValueCollection;
++    interface IHttpChallengeHeaderValueCollection;
++    interface IHttpConnectionOptionHeaderValueCollection;
++    interface IHttpContentCodingWithQualityHeaderValueCollection;
++    interface IHttpCookiePairHeaderValueCollection;
++    interface IHttpCredentialsHeaderValue;
++    interface IHttpDateOrDeltaHeaderValue;
++    interface IHttpExpectationHeaderValueCollection;
++    interface IHttpLanguageRangeWithQualityHeaderValueCollection;
++    interface IHttpMediaTypeWithQualityHeaderValueCollection;
++    interface IHttpMethodHeaderValueCollection;
++    interface IHttpNameValueHeaderValue;
++    interface IHttpProductInfoHeaderValueCollection;
++    interface IHttpRequestHeaderCollection;
++    interface IHttpResponseHeaderCollection;
++    interface IHttpTransferCodingHeaderValueCollection;
++}
++
++namespace Windows.Web.Http {
++    declare {
++        interface Windows.Foundation.IReference<Windows.Foundation.DateTime>;
++        interface Windows.Foundation.Collections.IIterator<Windows.Web.Http.HttpCookie *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.Web.Http.HttpCookie *>;
++        interface Windows.Foundation.Collections.IVectorView<Windows.Web.Http.HttpCookie *>;
++        interface Windows.Foundation.Collections.IIterator<Windows.Security.Cryptography.Certificates.Certificate *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.Security.Cryptography.Certificates.Certificate *>;
++        interface Windows.Foundation.Collections.IVectorView<Windows.Security.Cryptography.Certificates.Certificate *>;
++        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.Security.Cryptography.Certificates.CertificateChain *>;
++        interface Windows.Foundation.IAsyncOperation<Windows.Security.Cryptography.Certificates.CertificateChain *>;
++        interface Windows.Foundation.Collections.IIterator<HSTRING>;
++        interface Windows.Foundation.Collections.IIterable<HSTRING>;
++        interface Windows.Foundation.Collections.IVectorView<HSTRING>;
++        interface Windows.Foundation.Collections.IVector<HSTRING>;
++        interface Windows.Foundation.Collections.IVector<Windows.Security.Cryptography.Certificates.Certificate *>;
++        interface Windows.Foundation.Collections.IIterator<Windows.Security.Cryptography.Certificates.ChainValidationResult>;
++        interface Windows.Foundation.Collections.IIterable<Windows.Security.Cryptography.Certificates.ChainValidationResult>;
++        interface Windows.Foundation.Collections.IVectorView<Windows.Security.Cryptography.Certificates.ChainValidationResult>;
++        interface Windows.Foundation.Collections.IVector<Windows.Security.Cryptography.Certificates.ChainValidationResult>;
++        interface Windows.Foundation.Collections.IIterator<Windows.Web.Http.Headers.HttpNameValueHeaderValue *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.Web.Http.Headers.HttpNameValueHeaderValue *>;
++        interface Windows.Foundation.Collections.IVectorView<Windows.Web.Http.Headers.HttpNameValueHeaderValue *>;
++        interface Windows.Foundation.Collections.IVector<Windows.Web.Http.Headers.HttpNameValueHeaderValue *>;
++        interface Windows.Foundation.IReference<Windows.Foundation.TimeSpan>;
++        interface Windows.Foundation.IReference<UINT32>;
++        interface Windows.Foundation.Collections.IKeyValuePair<HSTRING, IInspectable *>;
++        interface Windows.Foundation.Collections.IIterator<Windows.Foundation.Collections.IKeyValuePair<HSTRING, IInspectable *> *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.Foundation.Collections.IKeyValuePair<HSTRING, IInspectable *> *>;
++        interface Windows.Foundation.Collections.IMapView<HSTRING, IInspectable *>;
++        interface Windows.Foundation.Collections.IMap<HSTRING, IInspectable *>;
++        interface Windows.Foundation.TypedEventHandler<Windows.Web.Http.Filters.HttpBaseProtocolFilter *, Windows.Web.Http.Filters.HttpServerCustomValidationRequestedEventArgs *>;
++        interface Windows.Foundation.IReference<UINT64>;
++        interface Windows.Foundation.AsyncOperationProgressHandler<Windows.Web.Http.HttpResponseMessage *, Windows.Web.Http.HttpProgress>;
++        interface Windows.Foundation.AsyncOperationWithProgressCompletedHandler<Windows.Web.Http.HttpResponseMessage *, Windows.Web.Http.HttpProgress>;
++        interface Windows.Foundation.IAsyncOperationWithProgress<Windows.Web.Http.HttpResponseMessage *, Windows.Web.Http.HttpProgress>;
++    }
++}
++
++namespace Windows.Networking.Sockets {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum SocketSslErrorSeverity
++    {
++        None = 0,
++        Ignorable = 1,
++        Fatal = 2
++    };
++
++}
++
++namespace Windows.Security.Cryptography.Certificates {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum CertificateChainPolicy
++    {
++        Base = 0,
++        Ssl = 1,
++        NTAuthentication = 2,
++        MicrosoftRoot = 3
++    };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum ChainValidationResult
++    {
++        Success = 0,
++        Untrusted = 1,
++        Revoked = 2,
++        Expired = 3,
++        IncompleteChain = 4,
++        InvalidSignature = 5,
++        WrongUsage = 6,
++        InvalidName = 7,
++        InvalidCertificateAuthorityPolicy = 8,
++        BasicConstraintsError = 9,
++        UnknownCriticalExtension = 10,
++        RevocationInformationMissing = 11,
++        RevocationFailure = 12,
++        OtherErrors = 13
++    };
++
++}
++
++namespace Windows.Web.Http {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum HttpProgressStage
++    {
++        None = 0,
++        DetectingProxy = 10,
++        ResolvingName = 20,
++        ConnectingToServer = 30,
++        NegotiatingSsl = 40,
++        SendingHeaders = 50,
++        SendingContent = 60,
++        WaitingForResponse = 70,
++        ReceivingHeaders = 80,
++        ReceivingContent = 90
++    };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum HttpResponseMessageSource
++    {
++        None = 0,
++        Cache = 1,
++        Network = 2
++    };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum HttpStatusCode
++    {
++        None = 0,
++        Continue = 100,
++        SwitchingProtocols = 101,
++        Processing = 102,
++        Ok = 200,
++        Created = 201,
++        Accepted = 202,
++        NonAuthoritativeInformation = 203,
++        NoContent = 204,
++        ResetContent = 205,
++        PartialContent = 206,
++        MultiStatus = 207,
++        AlreadyReported = 208,
++        IMUsed = 226,
++        MultipleChoices = 300,
++        MovedPermanently = 301,
++        Found = 302,
++        SeeOther = 303,
++        NotModified = 304,
++        UseProxy = 305,
++        TemporaryRedirect = 307,
++        PermanentRedirect = 308,
++        BadRequest = 400,
++        Unauthorized = 401,
++        PaymentRequired = 402,
++        Forbidden = 403,
++        NotFound = 404,
++        MethodNotAllowed = 405,
++        NotAcceptable = 406,
++        ProxyAuthenticationRequired = 407,
++        RequestTimeout = 408,
++        Conflict = 409,
++        Gone = 410,
++        LengthRequired = 411,
++        PreconditionFailed = 412,
++        RequestEntityTooLarge = 413,
++        RequestUriTooLong = 414,
++        UnsupportedMediaType = 415,
++        RequestedRangeNotSatisfiable = 416,
++        ExpectationFailed = 417,
++        UnprocessableEntity = 422,
++        Locked = 423,
++        FailedDependency = 424,
++        UpgradeRequired = 426,
++        PreconditionRequired = 428,
++        TooManyRequests = 429,
++        RequestHeaderFieldsTooLarge = 431,
++        InternalServerError = 500,
++        NotImplemented = 501,
++        BadGateway = 502,
++        ServiceUnavailable = 503,
++        GatewayTimeout = 504,
++        HttpVersionNotSupported = 505,
++        VariantAlsoNegotiates = 506,
++        InsufficientStorage = 507,
++        LoopDetected = 508,
++        NotExtended = 510,
++        NetworkAuthenticationRequired = 511
++    };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum HttpVersion
++    {
++        None = 0,
++        Http10 = 1,
++        Http11 = 2,
++        Http20 = 3
++    };
++
++}
++
++namespace Windows.Web.Http.Filters {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum HttpCacheReadBehavior
++    {
++        Default = 0,
++        MostRecent = 1,
++        OnlyFromCache = 2,
++        NoCache = 3
++    };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum HttpCacheWriteBehavior
++    {
++        Default = 0,
++        NoCache = 1
++    };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 2.0)
++    ]
++    enum HttpCookieUsageBehavior
++    {
++        Default = 0,
++        NoCookies = 1
++    };
++
++}
++
++namespace Windows.Web.Http {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    struct HttpProgress
++    {
++        Windows.Web.Http.HttpProgressStage Stage;
++        UINT64 BytesSent;
++        Windows.Foundation.IReference<UINT64> * TotalBytesToSend;
++        UINT64 BytesReceived;
++        Windows.Foundation.IReference<UINT64> * TotalBytesToReceive;
++        UINT32 Retries;
++    };
++
++}
++
++namespace Windows.Security.Credentials {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Security.Credentials.PasswordCredential),
++        uuid(6ab18989-c720-41a7-a6c1-feadb36329a0)
++    ]
++    interface IPasswordCredential : IInspectable
++    {
++        [propget] HRESULT Resource([out, retval] HSTRING *value);
++        [propput] HRESULT Resource([in] HSTRING value);
++        [propget] HRESULT UserName([out, retval] HSTRING *value);
++        [propput] HRESULT UserName([in] HSTRING value);
++        [propget] HRESULT Password([out, retval] HSTRING *value);
++        [propput] HRESULT Password([in] HSTRING value);
++        HRESULT RetrievePassword();
++        [propget] HRESULT Properties([out, retval] Windows.Foundation.Collections.IPropertySet * *value);
++    }
++
++}
++
++namespace Windows.Security.Cryptography.Certificates {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Security.Cryptography.Certificates.Certificate),
++        uuid(333f740c-04d8-43b3-b278-8c5fcc9be5a0)
++    ]
++    interface ICertificate : IInspectable
++    {
++        [overload("BuildChainAsync")] HRESULT BuildChainAsync([in] Windows.Foundation.Collections.IIterable<Windows.Security.Cryptography.Certificates.Certificate *> * certificates, [out, retval] Windows.Foundation.IAsyncOperation<Windows.Security.Cryptography.Certificates.CertificateChain *> * *value);
++        [overload("BuildChainAsync")] HRESULT BuildChainWithParametersAsync([in] Windows.Foundation.Collections.IIterable<Windows.Security.Cryptography.Certificates.Certificate *> * certificates, [in] Windows.Security.Cryptography.Certificates.ChainBuildingParameters * parameters, [out, retval] Windows.Foundation.IAsyncOperation<Windows.Security.Cryptography.Certificates.CertificateChain *> * *value);
++        [propget] HRESULT SerialNumber([out] UINT32 *__valueSize, [out, retval, size_is(, *__valueSize)] BYTE **value);
++        [overload("GetHashValue")] HRESULT GetHashValue([out] UINT32 *__valueSize, [out, retval, size_is(, *__valueSize)] BYTE **value);
++        [overload("GetHashValue")] HRESULT GetHashValueWithAlgorithm([in] HSTRING hashAlgorithmName, [out] UINT32 *__valueSize, [out, retval, size_is(, *__valueSize)] BYTE **value);
++        HRESULT GetCertificateBlob([out, retval] Windows.Storage.Streams.IBuffer * *value);
++        [propget] HRESULT Subject([out, retval] HSTRING *value);
++        [propget] HRESULT Issuer([out, retval] HSTRING *value);
++        [propget] HRESULT HasPrivateKey([out, retval] boolean *value);
++        [propget] HRESULT IsStronglyProtected([out, retval] boolean *value);
++        [propget] HRESULT ValidFrom([out, retval] Windows.Foundation.DateTime *value);
++        [propget] HRESULT ValidTo([out, retval] Windows.Foundation.DateTime *value);
++        [propget] HRESULT EnhancedKeyUsages([out, retval] Windows.Foundation.Collections.IVectorView<HSTRING> * *value);
++        [propput] HRESULT FriendlyName([in] HSTRING value);
++        [propget] HRESULT FriendlyName([out, retval] HSTRING *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Security.Cryptography.Certificates.CertificateChain),
++        uuid(20bf5385-3691-4501-a62c-fd97278b31ee)
++    ]
++    interface ICertificateChain : IInspectable
++    {
++        [overload("Validate")] HRESULT Validate([out, retval] Windows.Security.Cryptography.Certificates.ChainValidationResult *value);
++        [overload("Validate")] HRESULT ValidateWithParameters([in] Windows.Security.Cryptography.Certificates.ChainValidationParameters * parameter, [out, retval] Windows.Security.Cryptography.Certificates.ChainValidationResult *value);
++        HRESULT GetCertificates([in] boolean includeRoot, [out, retval] Windows.Foundation.Collections.IVectorView<Windows.Security.Cryptography.Certificates.Certificate *> * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Security.Cryptography.Certificates.ChainBuildingParameters),
++        uuid(422ba922-7c8d-47b7-b59b-b12703733ac3)
++    ]
++    interface IChainBuildingParameters : IInspectable
++    {
++        [propget] HRESULT EnhancedKeyUsages([out, retval] Windows.Foundation.Collections.IVector<HSTRING> * *value);
++        [propget] HRESULT ValidationTimestamp([out, retval] Windows.Foundation.DateTime *value);
++        [propput] HRESULT ValidationTimestamp([in] Windows.Foundation.DateTime value);
++        [propget] HRESULT RevocationCheckEnabled([out, retval] boolean *value);
++        [propput] HRESULT RevocationCheckEnabled([in] boolean value);
++        [propget] HRESULT NetworkRetrievalEnabled([out, retval] boolean *value);
++        [propput] HRESULT NetworkRetrievalEnabled([in] boolean value);
++        [propget] HRESULT AuthorityInformationAccessEnabled([out, retval] boolean *value);
++        [propput] HRESULT AuthorityInformationAccessEnabled([in] boolean value);
++        [propget] HRESULT CurrentTimeValidationEnabled([out, retval] boolean *value);
++        [propput] HRESULT CurrentTimeValidationEnabled([in] boolean value);
++        [propget] HRESULT ExclusiveTrustRoots([out, retval] Windows.Foundation.Collections.IVector<Windows.Security.Cryptography.Certificates.Certificate *> * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Security.Cryptography.Certificates.ChainValidationParameters),
++        uuid(c4743b4a-7eb0-4b56-a040-b9c8e655ddf3)
++    ]
++    interface IChainValidationParameters : IInspectable
++    {
++        [propget] HRESULT CertificateChainPolicy([out, retval] Windows.Security.Cryptography.Certificates.CertificateChainPolicy *value);
++        [propput] HRESULT CertificateChainPolicy([in] Windows.Security.Cryptography.Certificates.CertificateChainPolicy value);
++        [propget] HRESULT ServerDnsName([out, retval] Windows.Networking.HostName * *value);
++        [propput] HRESULT ServerDnsName([in] Windows.Networking.HostName * value);
++    }
++
++}
++
++namespace Windows.Web.Http {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.HttpCookie),
++        uuid(1f5488e2-cc2d-4779-86a7-88f10687d249)
++    ]
++    interface IHttpCookie : IInspectable
++    {
++        [propget] HRESULT Name([out, retval] HSTRING *value);
++        [propget] HRESULT Domain([out, retval] HSTRING *value);
++        [propget] HRESULT Path([out, retval] HSTRING *value);
++        [propget] HRESULT Expires([out, retval] Windows.Foundation.IReference<Windows.Foundation.DateTime> * *value);
++        [propput] HRESULT Expires([in] Windows.Foundation.IReference<Windows.Foundation.DateTime> * value);
++        [propget] HRESULT HttpOnly([out, retval] boolean *value);
++        [propput] HRESULT HttpOnly([in] boolean value);
++        [propget] HRESULT Secure([out, retval] boolean *value);
++        [propput] HRESULT Secure([in] boolean value);
++        [propget] HRESULT Value([out, retval] HSTRING *value);
++        [propput] HRESULT Value([in] HSTRING value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.HttpCookieManager),
++        uuid(7a431780-cd4f-4e57-a84a-5b0a53d6bb96)
++    ]
++    interface IHttpCookieManager : IInspectable
++    {
++        [overload("SetCookie")] HRESULT SetCookie([in] Windows.Web.Http.HttpCookie * cookie, [out, retval] boolean *value);
++        [overload("SetCookie")] HRESULT SetCookieWithThirdParty([in] Windows.Web.Http.HttpCookie * cookie, [in] boolean thirdParty, [out, retval] boolean *value);
++        HRESULT DeleteCookie([in] Windows.Web.Http.HttpCookie * cookie);
++        HRESULT GetCookies([in] Windows.Foundation.Uri * uri, [out, retval] Windows.Web.Http.HttpCookieCollection * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.HttpMethod),
++        uuid(728d4022-700d-4fe0-afa5-40299c58dbfd)
++    ]
++    interface IHttpMethod : IInspectable
++    {
++        [propget] HRESULT Method([out, retval] HSTRING *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.HttpRequestMessage),
++        uuid(f5762b3c-74d4-4811-b5dc-9f8b4e2f9abf)
++    ]
++    interface IHttpRequestMessage : IInspectable
++    {
++        [propget] HRESULT Content([out, retval] Windows.Web.Http.IHttpContent * *value);
++        [propput] HRESULT Content([in] Windows.Web.Http.IHttpContent * value);
++        [propget] HRESULT Headers([out, retval] Windows.Web.Http.Headers.HttpRequestHeaderCollection * *value);
++        [propget] HRESULT Method([out, retval] Windows.Web.Http.HttpMethod * *value);
++        [propput] HRESULT Method([in] Windows.Web.Http.HttpMethod * value);
++        [propget] HRESULT Properties([out, retval] Windows.Foundation.Collections.IMap<HSTRING, IInspectable *> * *value);
++        [propget] HRESULT RequestUri([out, retval] Windows.Foundation.Uri * *value);
++        [propput] HRESULT RequestUri([in] Windows.Foundation.Uri * value);
++        [propget] HRESULT TransportInformation([out, retval] Windows.Web.Http.HttpTransportInformation * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.HttpResponseMessage),
++        uuid(fee200fb-8664-44e0-95d9-42696199bffc)
++    ]
++    interface IHttpResponseMessage : IInspectable
++    {
++        [propget] HRESULT Content([out, retval] Windows.Web.Http.IHttpContent * *value);
++        [propput] HRESULT Content([in] Windows.Web.Http.IHttpContent * value);
++        [propget] HRESULT Headers([out, retval] Windows.Web.Http.Headers.HttpResponseHeaderCollection * *value);
++        [propget] HRESULT IsSuccessStatusCode([out, retval] boolean *value);
++        [propget] HRESULT ReasonPhrase([out, retval] HSTRING *value);
++        [propput] HRESULT ReasonPhrase([in] HSTRING value);
++        [propget] HRESULT RequestMessage([out, retval] Windows.Web.Http.HttpRequestMessage * *value);
++        [propput] HRESULT RequestMessage([in] Windows.Web.Http.HttpRequestMessage * value);
++        [propget] HRESULT Source([out, retval] Windows.Web.Http.HttpResponseMessageSource *value);
++        [propput] HRESULT Source([in] Windows.Web.Http.HttpResponseMessageSource value);
++        [propget] HRESULT StatusCode([out, retval] Windows.Web.Http.HttpStatusCode *value);
++        [propput] HRESULT StatusCode([in] Windows.Web.Http.HttpStatusCode value);
++        [propget] HRESULT Version([out, retval] Windows.Web.Http.HttpVersion *value);
++        [propput] HRESULT Version([in] Windows.Web.Http.HttpVersion value);
++        HRESULT EnsureSuccessStatusCode([out, retval] Windows.Web.Http.HttpResponseMessage * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.HttpTransportInformation),
++        uuid(70127198-c6a7-4ed0-833a-83fd8b8f178d)
++    ]
++    interface IHttpTransportInformation : IInspectable
++    {
++        [propget] HRESULT ServerCertificate([out, retval] Windows.Security.Cryptography.Certificates.Certificate * *value);
++        [propget] HRESULT ServerCertificateErrorSeverity([out, retval] Windows.Networking.Sockets.SocketSslErrorSeverity *value);
++        [propget] HRESULT ServerCertificateErrors([out, retval] Windows.Foundation.Collections.IVectorView<Windows.Security.Cryptography.Certificates.ChainValidationResult> * *value);
++        [propget] HRESULT ServerIntermediateCertificates([out, retval] Windows.Foundation.Collections.IVectorView<Windows.Security.Cryptography.Certificates.Certificate *> * *value);
++    }
++
++}
++
++namespace Windows.Web.Http.Filters {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.Filters.HttpBaseProtocolFilter),
++        uuid(71c89b09-e131-4b54-a53c-eb43ff37e9bb)
++    ]
++    interface IHttpBaseProtocolFilter : IInspectable
++    {
++        [propget] HRESULT AllowAutoRedirect([out, retval] boolean *value);
++        [propput] HRESULT AllowAutoRedirect([in] boolean value);
++        [propget] HRESULT AllowUI([out, retval] boolean *value);
++        [propput] HRESULT AllowUI([in] boolean value);
++        [propget] HRESULT AutomaticDecompression([out, retval] boolean *value);
++        [propput] HRESULT AutomaticDecompression([in] boolean value);
++        [propget] HRESULT CacheControl([out, retval] Windows.Web.Http.Filters.HttpCacheControl * *value);
++        [propget] HRESULT CookieManager([out, retval] Windows.Web.Http.HttpCookieManager * *value);
++        [propget] HRESULT ClientCertificate([out, retval] Windows.Security.Cryptography.Certificates.Certificate * *value);
++        [propput] HRESULT ClientCertificate([in] Windows.Security.Cryptography.Certificates.Certificate * value);
++        [propget] HRESULT IgnorableServerCertificateErrors([out, retval] Windows.Foundation.Collections.IVector<Windows.Security.Cryptography.Certificates.ChainValidationResult> * *value);
++        [propget] HRESULT MaxConnectionsPerServer([out, retval] UINT32 *value);
++        [propput] HRESULT MaxConnectionsPerServer([in] UINT32 value);
++        [propget] HRESULT ProxyCredential([out, retval] Windows.Security.Credentials.PasswordCredential * *value);
++        [propput] HRESULT ProxyCredential([in] Windows.Security.Credentials.PasswordCredential * value);
++        [propget] HRESULT ServerCredential([out, retval] Windows.Security.Credentials.PasswordCredential * *value);
++        [propput] HRESULT ServerCredential([in] Windows.Security.Credentials.PasswordCredential * value);
++        [propget] HRESULT UseProxy([out, retval] boolean *value);
++        [propput] HRESULT UseProxy([in] boolean value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.Filters.HttpBaseProtocolFilter),
++        uuid(2ec30013-9427-4900-a017-fa7da3b5c9ae)
++    ]
++    interface IHttpBaseProtocolFilter2 : IInspectable
++    {
++        [propget] HRESULT MaxVersion([out, retval] Windows.Web.Http.HttpVersion *value);
++        [propput] HRESULT MaxVersion([in] Windows.Web.Http.HttpVersion value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 2.0),
++        exclusiveto(Windows.Web.Http.Filters.HttpBaseProtocolFilter),
++        uuid(d43f4d4c-bd42-43ae-8717-ad2c8f4b2937)
++    ]
++    interface IHttpBaseProtocolFilter3 : IInspectable
++    {
++        [propget] HRESULT CookieUsageBehavior([out, retval] Windows.Web.Http.Filters.HttpCookieUsageBehavior *value);
++        [propput] HRESULT CookieUsageBehavior([in] Windows.Web.Http.Filters.HttpCookieUsageBehavior value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 3.0),
++        exclusiveto(Windows.Web.Http.Filters.HttpBaseProtocolFilter),
++        uuid(9fe36ccf-2983-4893-941f-eb518ca8cef9)
++    ]
++    interface IHttpBaseProtocolFilter4 : IInspectable
++    {
++        [eventadd] HRESULT ServerCustomValidationRequested([in] Windows.Foundation.TypedEventHandler<Windows.Web.Http.Filters.HttpBaseProtocolFilter *, Windows.Web.Http.Filters.HttpServerCustomValidationRequestedEventArgs *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT ServerCustomValidationRequested([in] Windows.Foundation.EventRegistrationToken token);
++        HRESULT ClearAuthenticationCache();
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 8.0),
++        exclusiveto(Windows.Web.Http.Filters.HttpBaseProtocolFilter),
++        uuid(416e4993-31e3-4816-bf09-e018ee8dc1f5)
++    ]
++    interface IHttpBaseProtocolFilter5 : IInspectable
++    {
++        [propget] HRESULT User([out, retval] Windows.System.User * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 8.0),
++        exclusiveto(Windows.Web.Http.Filters.HttpBaseProtocolFilter),
++        uuid(6d4dee0c-e908-494e-b5a3-1263c9b8242a)
++    ]
++    interface IHttpBaseProtocolFilterStatics : IInspectable
++    {
++        HRESULT CreateForUser([in] Windows.System.User * user, [out, retval] Windows.Web.Http.Filters.HttpBaseProtocolFilter * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.Filters.HttpCacheControl),
++        uuid(c77e1cb4-3cea-4eb5-ac85-04e186e63ab7)
++    ]
++    interface IHttpCacheControl : IInspectable
++    {
++        [propget] HRESULT ReadBehavior([out, retval] Windows.Web.Http.Filters.HttpCacheReadBehavior *value);
++        [propput] HRESULT ReadBehavior([in] Windows.Web.Http.Filters.HttpCacheReadBehavior value);
++        [propget] HRESULT WriteBehavior([out, retval] Windows.Web.Http.Filters.HttpCacheWriteBehavior *value);
++        [propput] HRESULT WriteBehavior([in] Windows.Web.Http.Filters.HttpCacheWriteBehavior value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        uuid(a4cb6dd5-0902-439e-bfd7-e12552b165ce)
++    ]
++    interface IHttpFilter : IInspectable
++        requires Windows.Foundation.IClosable
++    {
++        HRESULT SendRequestAsync([in] Windows.Web.Http.HttpRequestMessage * request, [out, retval] Windows.Foundation.IAsyncOperationWithProgress<Windows.Web.Http.HttpResponseMessage *, Windows.Web.Http.HttpProgress> * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 3.0),
++        exclusiveto(Windows.Web.Http.Filters.HttpServerCustomValidationRequestedEventArgs),
++        uuid(3165fe32-e7dd-48b7-a361-939c750e63cc)
++    ]
++    interface IHttpServerCustomValidationRequestedEventArgs : IInspectable
++    {
++        [propget] HRESULT RequestMessage([out, retval] Windows.Web.Http.HttpRequestMessage * *value);
++        [propget] HRESULT ServerCertificate([out, retval] Windows.Security.Cryptography.Certificates.Certificate * *value);
++        [propget] HRESULT ServerCertificateErrorSeverity([out, retval] Windows.Networking.Sockets.SocketSslErrorSeverity *value);
++        [propget] HRESULT ServerCertificateErrors([out, retval] Windows.Foundation.Collections.IVectorView<Windows.Security.Cryptography.Certificates.ChainValidationResult> * *value);
++        [propget] HRESULT ServerIntermediateCertificates([out, retval] Windows.Foundation.Collections.IVectorView<Windows.Security.Cryptography.Certificates.Certificate *> * *value);
++        HRESULT Reject();
++        HRESULT GetDeferral([out, retval] Windows.Foundation.Deferral * *value);
++    }
++
++}
++
++namespace Windows.Web.Http.Headers {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.Headers.HttpCacheDirectiveHeaderValueCollection),
++        uuid(9a586b89-d5d0-4fbe-bd9d-b5b3636811b4)
++    ]
++    interface IHttpCacheDirectiveHeaderValueCollection : IInspectable
++    {
++        [propget] HRESULT MaxAge([out, retval] Windows.Foundation.IReference<Windows.Foundation.TimeSpan> * *value);
++        [propput] HRESULT MaxAge([in] Windows.Foundation.IReference<Windows.Foundation.TimeSpan> * value);
++        [propget] HRESULT MaxStale([out, retval] Windows.Foundation.IReference<Windows.Foundation.TimeSpan> * *value);
++        [propput] HRESULT MaxStale([in] Windows.Foundation.IReference<Windows.Foundation.TimeSpan> * value);
++        [propget] HRESULT MinFresh([out, retval] Windows.Foundation.IReference<Windows.Foundation.TimeSpan> * *value);
++        [propput] HRESULT MinFresh([in] Windows.Foundation.IReference<Windows.Foundation.TimeSpan> * value);
++        [propget] HRESULT SharedMaxAge([out, retval] Windows.Foundation.IReference<Windows.Foundation.TimeSpan> * *value);
++        [propput] HRESULT SharedMaxAge([in] Windows.Foundation.IReference<Windows.Foundation.TimeSpan> * value);
++        HRESULT ParseAdd([in] HSTRING input);
++        HRESULT TryParseAdd([in] HSTRING input, [out, retval] boolean *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.Headers.HttpChallengeHeaderValueCollection),
++        uuid(ca9e5f81-aee0-4353-a10b-e625babd64c2)
++    ]
++    interface IHttpChallengeHeaderValueCollection : IInspectable
++    {
++        HRESULT ParseAdd([in] HSTRING input);
++        HRESULT TryParseAdd([in] HSTRING input, [out, retval] boolean *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.Headers.HttpConnectionOptionHeaderValueCollection),
++        uuid(e4f56c1d-5142-4e00-8e0f-019509337629)
++    ]
++    interface IHttpConnectionOptionHeaderValueCollection : IInspectable
++    {
++        HRESULT ParseAdd([in] HSTRING input);
++        HRESULT TryParseAdd([in] HSTRING input, [out, retval] boolean *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.Headers.HttpContentCodingWithQualityHeaderValueCollection),
++        uuid(7c0d753e-e899-4378-b5c8-412d820711cc)
++    ]
++    interface IHttpContentCodingWithQualityHeaderValueCollection : IInspectable
++    {
++        HRESULT ParseAdd([in] HSTRING input);
++        HRESULT TryParseAdd([in] HSTRING input, [out, retval] boolean *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.Headers.HttpCookiePairHeaderValueCollection),
++        uuid(f3f44350-581e-4ecc-9f59-e507d04f06e6)
++    ]
++    interface IHttpCookiePairHeaderValueCollection : IInspectable
++    {
++        HRESULT ParseAdd([in] HSTRING input);
++        HRESULT TryParseAdd([in] HSTRING input, [out, retval] boolean *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.Headers.HttpCredentialsHeaderValue),
++        uuid(c34cc3cb-542e-4177-a6c7-b674ce193fbf)
++    ]
++    interface IHttpCredentialsHeaderValue : IInspectable
++    {
++        [propget] HRESULT Parameters([out, retval] Windows.Foundation.Collections.IVector<Windows.Web.Http.Headers.HttpNameValueHeaderValue *> * *value);
++        [propget] HRESULT Scheme([out, retval] HSTRING *value);
++        [propget] HRESULT Token([out, retval] HSTRING *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.Headers.HttpDateOrDeltaHeaderValue),
++        uuid(eafcaa6a-c4dc-49e2-a27d-043adf5867a3)
++    ]
++    interface IHttpDateOrDeltaHeaderValue : IInspectable
++    {
++        [propget] HRESULT Date([out, retval] Windows.Foundation.IReference<Windows.Foundation.DateTime> * *value);
++        [propget] HRESULT Delta([out, retval] Windows.Foundation.IReference<Windows.Foundation.TimeSpan> * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.Headers.HttpExpectationHeaderValueCollection),
++        uuid(e78521b3-a0e2-4ac4-9e66-79706cb9fd58)
++    ]
++    interface IHttpExpectationHeaderValueCollection : IInspectable
++    {
++        HRESULT ParseAdd([in] HSTRING input);
++        HRESULT TryParseAdd([in] HSTRING input, [out, retval] boolean *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.Headers.HttpLanguageRangeWithQualityHeaderValueCollection),
++        uuid(885d5abd-4b4f-480a-89ce-8aedcee6e3a0)
++    ]
++    interface IHttpLanguageRangeWithQualityHeaderValueCollection : IInspectable
++    {
++        HRESULT ParseAdd([in] HSTRING input);
++        HRESULT TryParseAdd([in] HSTRING input, [out, retval] boolean *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.Headers.HttpMediaTypeWithQualityHeaderValueCollection),
++        uuid(3c0c6b73-1342-4587-a056-18d02ff67165)
++    ]
++    interface IHttpMediaTypeWithQualityHeaderValueCollection : IInspectable
++    {
++        HRESULT ParseAdd([in] HSTRING input);
++        HRESULT TryParseAdd([in] HSTRING input, [out, retval] boolean *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.Headers.HttpMethodHeaderValueCollection),
++        uuid(43bc3ff4-6119-4adf-938c-34bfffcf92ed)
++    ]
++    interface IHttpMethodHeaderValueCollection : IInspectable
++    {
++        HRESULT ParseAdd([in] HSTRING input);
++        HRESULT TryParseAdd([in] HSTRING input, [out, retval] boolean *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.Headers.HttpNameValueHeaderValue),
++        uuid(d8ba7463-5b9a-4d1b-93f9-aa5b44ecfddf)
++    ]
++    interface IHttpNameValueHeaderValue : IInspectable
++    {
++        [propget] HRESULT Name([out, retval] HSTRING *value);
++        [propget] HRESULT Value([out, retval] HSTRING *value);
++        [propput] HRESULT Value([in] HSTRING value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.Headers.HttpProductInfoHeaderValueCollection),
++        uuid(877df74a-d69b-44f8-ad4f-453af9c42ed0)
++    ]
++    interface IHttpProductInfoHeaderValueCollection : IInspectable
++    {
++        HRESULT ParseAdd([in] HSTRING input);
++        HRESULT TryParseAdd([in] HSTRING input, [out, retval] boolean *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.Headers.HttpRequestHeaderCollection),
++        uuid(af40329b-b544-469b-86b9-ac3d466fea36)
++    ]
++    interface IHttpRequestHeaderCollection : IInspectable
++    {
++        [propget] HRESULT Accept([out, retval] Windows.Web.Http.Headers.HttpMediaTypeWithQualityHeaderValueCollection * *value);
++        [propget] HRESULT AcceptEncoding([out, retval] Windows.Web.Http.Headers.HttpContentCodingWithQualityHeaderValueCollection * *value);
++        [propget] HRESULT AcceptLanguage([out, retval] Windows.Web.Http.Headers.HttpLanguageRangeWithQualityHeaderValueCollection * *value);
++        [propget] HRESULT Authorization([out, retval] Windows.Web.Http.Headers.HttpCredentialsHeaderValue * *value);
++        [propput] HRESULT Authorization([in] Windows.Web.Http.Headers.HttpCredentialsHeaderValue * value);
++        [propget] HRESULT CacheControl([out, retval] Windows.Web.Http.Headers.HttpCacheDirectiveHeaderValueCollection * *value);
++        [propget] HRESULT Connection([out, retval] Windows.Web.Http.Headers.HttpConnectionOptionHeaderValueCollection * *value);
++        [propget] HRESULT Cookie([out, retval] Windows.Web.Http.Headers.HttpCookiePairHeaderValueCollection * *value);
++        [propget] HRESULT Date([out, retval] Windows.Foundation.IReference<Windows.Foundation.DateTime> * *value);
++        [propput] HRESULT Date([in] Windows.Foundation.IReference<Windows.Foundation.DateTime> * value);
++        [propget] HRESULT Expect([out, retval] Windows.Web.Http.Headers.HttpExpectationHeaderValueCollection * *value);
++        [propget] HRESULT From([out, retval] HSTRING *value);
++        [propput] HRESULT From([in] HSTRING value);
++        [propget] HRESULT Host([out, retval] Windows.Networking.HostName * *value);
++        [propput] HRESULT Host([in] Windows.Networking.HostName * value);
++        [propget] HRESULT IfModifiedSince([out, retval] Windows.Foundation.IReference<Windows.Foundation.DateTime> * *value);
++        [propput] HRESULT IfModifiedSince([in] Windows.Foundation.IReference<Windows.Foundation.DateTime> * value);
++        [propget] HRESULT IfUnmodifiedSince([out, retval] Windows.Foundation.IReference<Windows.Foundation.DateTime> * *value);
++        [propput] HRESULT IfUnmodifiedSince([in] Windows.Foundation.IReference<Windows.Foundation.DateTime> * value);
++        [propget] HRESULT MaxForwards([out, retval] Windows.Foundation.IReference<UINT32> * *value);
++        [propput] HRESULT MaxForwards([in] Windows.Foundation.IReference<UINT32> * value);
++        [propget] HRESULT ProxyAuthorization([out, retval] Windows.Web.Http.Headers.HttpCredentialsHeaderValue * *value);
++        [propput] HRESULT ProxyAuthorization([in] Windows.Web.Http.Headers.HttpCredentialsHeaderValue * value);
++        [propget] HRESULT Referer([out, retval] Windows.Foundation.Uri * *value);
++        [propput] HRESULT Referer([in] Windows.Foundation.Uri * value);
++        [propget] HRESULT TransferEncoding([out, retval] Windows.Web.Http.Headers.HttpTransferCodingHeaderValueCollection * *value);
++        [propget] HRESULT UserAgent([out, retval] Windows.Web.Http.Headers.HttpProductInfoHeaderValueCollection * *value);
++        HRESULT Append([in] HSTRING name, [in] HSTRING value);
++        HRESULT TryAppendWithoutValidation([in] HSTRING name, [in] HSTRING value, [out, retval] boolean *result);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.Headers.HttpResponseHeaderCollection),
++        uuid(7a990969-fa3f-41ed-aac6-bf957975c16b)
++    ]
++    interface IHttpResponseHeaderCollection : IInspectable
++    {
++        [propget] HRESULT Age([out, retval] Windows.Foundation.IReference<Windows.Foundation.TimeSpan> * *value);
++        [propput] HRESULT Age([in] Windows.Foundation.IReference<Windows.Foundation.TimeSpan> * value);
++        [propget] HRESULT Allow([out, retval] Windows.Web.Http.Headers.HttpMethodHeaderValueCollection * *value);
++        [propget] HRESULT CacheControl([out, retval] Windows.Web.Http.Headers.HttpCacheDirectiveHeaderValueCollection * *value);
++        [propget] HRESULT Connection([out, retval] Windows.Web.Http.Headers.HttpConnectionOptionHeaderValueCollection * *value);
++        [propget] HRESULT Date([out, retval] Windows.Foundation.IReference<Windows.Foundation.DateTime> * *value);
++        [propput] HRESULT Date([in] Windows.Foundation.IReference<Windows.Foundation.DateTime> * value);
++        [propget] HRESULT Location([out, retval] Windows.Foundation.Uri * *value);
++        [propput] HRESULT Location([in] Windows.Foundation.Uri * value);
++        [propget] HRESULT ProxyAuthenticate([out, retval] Windows.Web.Http.Headers.HttpChallengeHeaderValueCollection * *value);
++        [propget] HRESULT RetryAfter([out, retval] Windows.Web.Http.Headers.HttpDateOrDeltaHeaderValue * *value);
++        [propput] HRESULT RetryAfter([in] Windows.Web.Http.Headers.HttpDateOrDeltaHeaderValue * value);
++        [propget] HRESULT TransferEncoding([out, retval] Windows.Web.Http.Headers.HttpTransferCodingHeaderValueCollection * *value);
++        [propget] HRESULT WwwAuthenticate([out, retval] Windows.Web.Http.Headers.HttpChallengeHeaderValueCollection * *value);
++        HRESULT Append([in] HSTRING name, [in] HSTRING value);
++        HRESULT TryAppendWithoutValidation([in] HSTRING name, [in] HSTRING value, [out, retval] boolean *result);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Web.Http.Headers.HttpTransferCodingHeaderValueCollection),
++        uuid(202c8c34-2c03-49b8-9665-73e27cb2fc79)
++    ]
++    interface IHttpTransferCodingHeaderValueCollection : IInspectable
++    {
++        HRESULT ParseAdd([in] HSTRING input);
++        HRESULT TryParseAdd([in] HSTRING input, [out, retval] boolean *value);
++    }
++
++}
++
++namespace Windows.Web.Http.Filters {
++    [
++        activatable(Windows.Foundation.UniversalApiContract, 1.0),
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.Web.Http.Filters.IHttpBaseProtocolFilterStatics, Windows.Foundation.UniversalApiContract, 8.0),
++        threading(both)
++    ]
++    runtimeclass HttpBaseProtocolFilter
++    {
++        [default] interface Windows.Web.Http.Filters.IHttpBaseProtocolFilter;
++        [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Web.Http.Filters.IHttpBaseProtocolFilter2;
++        [contract(Windows.Foundation.UniversalApiContract, 2.0)] interface Windows.Web.Http.Filters.IHttpBaseProtocolFilter3;
++        [contract(Windows.Foundation.UniversalApiContract, 3.0)] interface Windows.Web.Http.Filters.IHttpBaseProtocolFilter4;
++        [contract(Windows.Foundation.UniversalApiContract, 8.0)] interface Windows.Web.Http.Filters.IHttpBaseProtocolFilter5;
++        interface Windows.Web.Http.Filters.IHttpFilter;
++        interface Windows.Foundation.IClosable;
++    }
++
++}
++
++namespace Windows.Security.Credentials {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass PasswordCredential
++    {
++        [default] interface Windows.Security.Credentials.IPasswordCredential;
++    }
++
++}
++
++namespace Windows.Security.Cryptography.Certificates {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass Certificate
++    {
++        [default] interface Windows.Security.Cryptography.Certificates.ICertificate;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass CertificateChain
++    {
++        [default] interface Windows.Security.Cryptography.Certificates.ICertificateChain;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass ChainBuildingParameters
++    {
++        [default] interface Windows.Security.Cryptography.Certificates.IChainBuildingParameters;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass ChainValidationParameters
++    {
++        [default] interface Windows.Security.Cryptography.Certificates.IChainValidationParameters;
++    }
++
++}
++
++namespace Windows.Web.Http {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpCookie
++    {
++        [default] interface Windows.Web.Http.IHttpCookie;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpCookieCollection
++    {
++        [default] [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Foundation.Collections.IVectorView<Windows.Web.Http.HttpCookie *>;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpCookieManager
++    {
++        [default] interface Windows.Web.Http.IHttpCookieManager;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpMethod
++    {
++        [default] interface Windows.Web.Http.IHttpMethod;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpRequestMessage
++    {
++        [default] interface Windows.Web.Http.IHttpRequestMessage;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpResponseMessage
++    {
++        [default] interface Windows.Web.Http.IHttpResponseMessage;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpTransportInformation
++    {
++        [default] interface Windows.Web.Http.IHttpTransportInformation;
++    }
++
++}
++
++namespace Windows.Web.Http.Filters {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpCacheControl
++    {
++        [default] interface Windows.Web.Http.Filters.IHttpCacheControl;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 3.0)
++    ]
++    runtimeclass HttpServerCustomValidationRequestedEventArgs
++    {
++        [default] interface Windows.Web.Http.Filters.IHttpServerCustomValidationRequestedEventArgs;
++    }
++
++}
++
++namespace Windows.Web.Http.Headers {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpCacheDirectiveHeaderValueCollection
++    {
++        [default] interface Windows.Web.Http.Headers.IHttpCacheDirectiveHeaderValueCollection;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpChallengeHeaderValueCollection
++    {
++        [default] interface Windows.Web.Http.Headers.IHttpChallengeHeaderValueCollection;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpConnectionOptionHeaderValueCollection
++    {
++        [default] interface Windows.Web.Http.Headers.IHttpConnectionOptionHeaderValueCollection;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpContentCodingWithQualityHeaderValueCollection
++    {
++        [default] interface Windows.Web.Http.Headers.IHttpContentCodingWithQualityHeaderValueCollection;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpCookiePairHeaderValueCollection
++    {
++        [default] interface Windows.Web.Http.Headers.IHttpCookiePairHeaderValueCollection;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpCredentialsHeaderValue
++    {
++        [default] interface Windows.Web.Http.Headers.IHttpCredentialsHeaderValue;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpDateOrDeltaHeaderValue
++    {
++        [default] interface Windows.Web.Http.Headers.IHttpDateOrDeltaHeaderValue;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpExpectationHeaderValueCollection
++    {
++        [default] interface Windows.Web.Http.Headers.IHttpExpectationHeaderValueCollection;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpLanguageRangeWithQualityHeaderValueCollection
++    {
++        [default] interface Windows.Web.Http.Headers.IHttpLanguageRangeWithQualityHeaderValueCollection;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpMediaTypeWithQualityHeaderValueCollection
++    {
++        [default] interface Windows.Web.Http.Headers.IHttpMediaTypeWithQualityHeaderValueCollection;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpMethodHeaderValueCollection
++    {
++        [default] interface Windows.Web.Http.Headers.IHttpMethodHeaderValueCollection;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpNameValueHeaderValue
++    {
++        [default] interface Windows.Web.Http.Headers.IHttpNameValueHeaderValue;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpProductInfoHeaderValueCollection
++    {
++        [default] interface Windows.Web.Http.Headers.IHttpProductInfoHeaderValueCollection;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpRequestHeaderCollection
++    {
++        [default] interface Windows.Web.Http.Headers.IHttpRequestHeaderCollection;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpResponseHeaderCollection
++    {
++        [default] interface Windows.Web.Http.Headers.IHttpResponseHeaderCollection;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HttpTransferCodingHeaderValueCollection
++    {
++        [default] interface Windows.Web.Http.Headers.IHttpTransferCodingHeaderValueCollection;
++    }
++
++}
++
