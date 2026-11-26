@@ -1,0 +1,521 @@
+Subject: twinapi.appcore: Clipboard reads text from the Win32 clipboard
+
+diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
+index 989319f..576dcb9 100644
+--- a/dlls/twinapi.appcore/Makefile.in
++++ b/dlls/twinapi.appcore/Makefile.in
+@@ -10,6 +10,7 @@ SOURCES = \
+ 	classes.idl \
+ 	auth_probe.c \
+ 	client_device_information.c \
++	clipboard.c \
+ 	current_app.c \
+ 	causality.c \
+ 	core_gen.c \
+diff --git a/dlls/twinapi.appcore/classes.idl b/dlls/twinapi.appcore/classes.idl
+index cdc7a8f..ca3aa66 100644
+--- a/dlls/twinapi.appcore/classes.idl
++++ b/dlls/twinapi.appcore/classes.idl
+@@ -52,6 +52,7 @@ namespace Windows.ApplicationModel.Core {
+     runtimeclass CoreApplication;
+ }
+ namespace Windows.ApplicationModel.DataTransfer {
++    runtimeclass Clipboard;
+     runtimeclass DataTransferManager;
+ }
+ namespace Windows.UI.Core {
+diff --git a/dlls/twinapi.appcore/clipboard.c b/dlls/twinapi.appcore/clipboard.c
+new file mode 100644
+index 0000000..455d4a7
+--- /dev/null
++++ b/dlls/twinapi.appcore/clipboard.c
+@@ -0,0 +1,464 @@
++/* WinRT Windows.ApplicationModel.DataTransfer.Clipboard
++ *
++ * Reads text from the Win32 clipboard; other formats, and setting the clipboard, are not
++ * supported yet.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
++
++static const WCHAR text_format[] = L"Text";
++
++static BOOL has_text(void)
++{
++    return IsClipboardFormatAvailable(CF_UNICODETEXT);
++}
++
++static HRESULT clipboard_text(HSTRING *text)
++{
++    HRESULT hr = S_OK;
++    HANDLE data;
++    WCHAR *str;
++
++    *text = NULL;
++    if (!OpenClipboard(NULL)) return HRESULT_FROM_WIN32(GetLastError());
++    if (!(data = GetClipboardData(CF_UNICODETEXT)) || !(str = GlobalLock(data)))
++        hr = DV_E_FORMATETC;
++    else
++    {
++        hr = WindowsCreateString(str, wcslen(str), text);
++        GlobalUnlock(data);
++    }
++    CloseClipboard();
++    return hr;
++}
++
++/* ===== IAsyncOperation<HSTRING>, complete when returned ===== */
++
++struct text_op
++{
++    IAsyncOperation_HSTRING IAsyncOperation_HSTRING_iface;
++    IAsyncInfo IAsyncInfo_iface;
++    LONG ref;
++    HRESULT hr;
++    HSTRING text;
++    IAsyncOperationCompletedHandler_HSTRING *handler;
++};
++
++static inline struct text_op *impl_from_IAsyncOperation_HSTRING(IAsyncOperation_HSTRING *iface)
++{ return CONTAINING_RECORD(iface, struct text_op, IAsyncOperation_HSTRING_iface); }
++
++static HRESULT WINAPI text_op_QueryInterface(IAsyncOperation_HSTRING *iface, REFIID iid, void **out)
++{
++    struct text_op *impl = impl_from_IAsyncOperation_HSTRING(iface);
++
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IAsyncOperation_HSTRING))
++        *out = &impl->IAsyncOperation_HSTRING_iface;
++    else if (IsEqualGUID(iid, &IID_IAsyncInfo))
++        *out = &impl->IAsyncInfo_iface;
++    else
++    {
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    InterlockedIncrement(&impl->ref);
++    return S_OK;
++}
++static ULONG WINAPI text_op_AddRef(IAsyncOperation_HSTRING *iface)
++{ return InterlockedIncrement(&impl_from_IAsyncOperation_HSTRING(iface)->ref); }
++static ULONG WINAPI text_op_Release(IAsyncOperation_HSTRING *iface)
++{
++    struct text_op *impl = impl_from_IAsyncOperation_HSTRING(iface);
++    ULONG ref = InterlockedDecrement(&impl->ref);
++    if (!ref)
++    {
++        WindowsDeleteString(impl->text);
++        if (impl->handler) IAsyncOperationCompletedHandler_HSTRING_Release(impl->handler);
++        free(impl);
++    }
++    return ref;
++}
++static HRESULT WINAPI text_op_GetIids(IAsyncOperation_HSTRING *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI text_op_GetRuntimeClassName(IAsyncOperation_HSTRING *iface, HSTRING *name) { return E_NOTIMPL; }
++static HRESULT WINAPI text_op_GetTrustLevel(IAsyncOperation_HSTRING *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI text_op_put_Completed(IAsyncOperation_HSTRING *iface, IAsyncOperationCompletedHandler_HSTRING *handler)
++{
++    struct text_op *impl = impl_from_IAsyncOperation_HSTRING(iface);
++
++    if (!handler) return E_POINTER;
++    if (impl->handler) return E_ILLEGAL_DELEGATE_ASSIGNMENT;
++    impl->handler = handler;
++    IAsyncOperationCompletedHandler_HSTRING_AddRef(handler);
++    IAsyncOperationCompletedHandler_HSTRING_Invoke(handler, iface, SUCCEEDED(impl->hr) ? Completed : Error);
++    return S_OK;
++}
++static HRESULT WINAPI text_op_get_Completed(IAsyncOperation_HSTRING *iface, IAsyncOperationCompletedHandler_HSTRING **handler)
++{
++    struct text_op *impl = impl_from_IAsyncOperation_HSTRING(iface);
++    if ((*handler = impl->handler)) IAsyncOperationCompletedHandler_HSTRING_AddRef(*handler);
++    return S_OK;
++}
++static HRESULT WINAPI text_op_GetResults(IAsyncOperation_HSTRING *iface, HSTRING *results)
++{
++    struct text_op *impl = impl_from_IAsyncOperation_HSTRING(iface);
++    *results = NULL;
++    if (FAILED(impl->hr)) return impl->hr;
++    return WindowsDuplicateString(impl->text, results);
++}
++static const IAsyncOperation_HSTRINGVtbl text_op_vtbl =
++{
++    text_op_QueryInterface, text_op_AddRef, text_op_Release,
++    text_op_GetIids, text_op_GetRuntimeClassName, text_op_GetTrustLevel,
++    text_op_put_Completed, text_op_get_Completed, text_op_GetResults,
++};
++
++static inline struct text_op *impl_from_IAsyncInfo(IAsyncInfo *iface)
++{ return CONTAINING_RECORD(iface, struct text_op, IAsyncInfo_iface); }
++static HRESULT WINAPI text_info_QueryInterface(IAsyncInfo *iface, REFIID iid, void **out)
++{ return text_op_QueryInterface(&impl_from_IAsyncInfo(iface)->IAsyncOperation_HSTRING_iface, iid, out); }
++static ULONG WINAPI text_info_AddRef(IAsyncInfo *iface)
++{ return text_op_AddRef(&impl_from_IAsyncInfo(iface)->IAsyncOperation_HSTRING_iface); }
++static ULONG WINAPI text_info_Release(IAsyncInfo *iface)
++{ return text_op_Release(&impl_from_IAsyncInfo(iface)->IAsyncOperation_HSTRING_iface); }
++static HRESULT WINAPI text_info_GetIids(IAsyncInfo *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI text_info_GetRuntimeClassName(IAsyncInfo *iface, HSTRING *name) { return E_NOTIMPL; }
++static HRESULT WINAPI text_info_GetTrustLevel(IAsyncInfo *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI text_info_get_Id(IAsyncInfo *iface, UINT32 *id) { *id = 1; return S_OK; }
++static HRESULT WINAPI text_info_get_Status(IAsyncInfo *iface, AsyncStatus *status)
++{ *status = SUCCEEDED(impl_from_IAsyncInfo(iface)->hr) ? Completed : Error; return S_OK; }
++static HRESULT WINAPI text_info_get_ErrorCode(IAsyncInfo *iface, HRESULT *error)
++{ *error = impl_from_IAsyncInfo(iface)->hr; return S_OK; }
++static HRESULT WINAPI text_info_Cancel(IAsyncInfo *iface) { return S_OK; }
++static HRESULT WINAPI text_info_Close(IAsyncInfo *iface) { return S_OK; }
++static const IAsyncInfoVtbl text_info_vtbl =
++{
++    text_info_QueryInterface, text_info_AddRef, text_info_Release,
++    text_info_GetIids, text_info_GetRuntimeClassName, text_info_GetTrustLevel,
++    text_info_get_Id, text_info_get_Status, text_info_get_ErrorCode, text_info_Cancel, text_info_Close,
++};
++
++static HRESULT text_op_create(IAsyncOperation_HSTRING **out)
++{
++    struct text_op *impl;
++
++    if (!(impl = calloc(1, sizeof(*impl)))) return E_OUTOFMEMORY;
++    impl->IAsyncOperation_HSTRING_iface.lpVtbl = &text_op_vtbl;
++    impl->IAsyncInfo_iface.lpVtbl = &text_info_vtbl;
++    impl->ref = 1;
++    impl->hr = clipboard_text(&impl->text);
++    *out = &impl->IAsyncOperation_HSTRING_iface;
++    return S_OK;
++}
++
++/* ===== IVectorView<HSTRING>: the available formats ===== */
++
++struct formats
++{
++    IVectorView_HSTRING IVectorView_HSTRING_iface;
++    LONG ref;
++    BOOL text;
++};
++
++static inline struct formats *impl_from_IVectorView_HSTRING(IVectorView_HSTRING *iface)
++{ return CONTAINING_RECORD(iface, struct formats, IVectorView_HSTRING_iface); }
++
++static HRESULT WINAPI formats_QueryInterface(IVectorView_HSTRING *iface, REFIID iid, void **out)
++{
++    struct formats *impl = impl_from_IVectorView_HSTRING(iface);
++
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IVectorView_HSTRING))
++    {
++        InterlockedIncrement(&impl->ref);
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI formats_AddRef(IVectorView_HSTRING *iface)
++{ return InterlockedIncrement(&impl_from_IVectorView_HSTRING(iface)->ref); }
++static ULONG WINAPI formats_Release(IVectorView_HSTRING *iface)
++{
++    struct formats *impl = impl_from_IVectorView_HSTRING(iface);
++    ULONG ref = InterlockedDecrement(&impl->ref);
++    if (!ref) free(impl);
++    return ref;
++}
++static HRESULT WINAPI formats_GetIids(IVectorView_HSTRING *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI formats_GetRuntimeClassName(IVectorView_HSTRING *iface, HSTRING *name) { return E_NOTIMPL; }
++static HRESULT WINAPI formats_GetTrustLevel(IVectorView_HSTRING *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI formats_GetAt(IVectorView_HSTRING *iface, UINT32 index, HSTRING *value)
++{
++    *value = NULL;
++    if (index || !impl_from_IVectorView_HSTRING(iface)->text) return E_BOUNDS;
++    return WindowsCreateString(text_format, wcslen(text_format), value);
++}
++static HRESULT WINAPI formats_get_Size(IVectorView_HSTRING *iface, UINT32 *value)
++{
++    *value = impl_from_IVectorView_HSTRING(iface)->text ? 1 : 0;
++    return S_OK;
++}
++static HRESULT WINAPI formats_IndexOf(IVectorView_HSTRING *iface, HSTRING element, UINT32 *index, BOOLEAN *found)
++{
++    *index = 0;
++    *found = impl_from_IVectorView_HSTRING(iface)->text && !wcscmp(WindowsGetStringRawBuffer(element, NULL), text_format);
++    return S_OK;
++}
++static HRESULT WINAPI formats_GetMany(IVectorView_HSTRING *iface, UINT32 start, UINT32 size, HSTRING *items, UINT32 *count)
++{
++    *count = 0;
++    if (start || !size || !impl_from_IVectorView_HSTRING(iface)->text) return S_OK;
++    *count = 1;
++    return WindowsCreateString(text_format, wcslen(text_format), items);
++}
++static const IVectorView_HSTRINGVtbl formats_vtbl =
++{
++    formats_QueryInterface, formats_AddRef, formats_Release,
++    formats_GetIids, formats_GetRuntimeClassName, formats_GetTrustLevel,
++    formats_GetAt, formats_get_Size, formats_IndexOf, formats_GetMany,
++};
++
++/* ===== DataPackageView: a snapshot of the clipboard ===== */
++
++struct package_view
++{
++    IDataPackageView IDataPackageView_iface;
++    LONG ref;
++};
++
++static inline struct package_view *impl_from_IDataPackageView(IDataPackageView *iface)
++{ return CONTAINING_RECORD(iface, struct package_view, IDataPackageView_iface); }
++
++static HRESULT WINAPI view_QueryInterface(IDataPackageView *iface, REFIID iid, void **out)
++{
++    struct package_view *impl = impl_from_IDataPackageView(iface);
++
++    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
++
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IDataPackageView))
++    {
++        InterlockedIncrement(&impl->ref);
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI view_AddRef(IDataPackageView *iface)
++{ return InterlockedIncrement(&impl_from_IDataPackageView(iface)->ref); }
++static ULONG WINAPI view_Release(IDataPackageView *iface)
++{
++    struct package_view *impl = impl_from_IDataPackageView(iface);
++    ULONG ref = InterlockedDecrement(&impl->ref);
++    if (!ref) free(impl);
++    return ref;
++}
++static HRESULT WINAPI view_GetIids(IDataPackageView *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI view_GetRuntimeClassName(IDataPackageView *iface, HSTRING *name)
++{ return WindowsCreateString(L"Windows.ApplicationModel.DataTransfer.DataPackageView", 52, name); }
++static HRESULT WINAPI view_GetTrustLevel(IDataPackageView *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI view_get_Properties(IDataPackageView *iface, IDataPackagePropertySetView **value)
++{
++    FIXME("iface %p, value %p stub!\n", iface, value);
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI view_get_RequestedOperation(IDataPackageView *iface, DataPackageOperation *value)
++{
++    *value = DataPackageOperation_Copy;
++    return S_OK;
++}
++static HRESULT WINAPI view_ReportOperationCompleted(IDataPackageView *iface, DataPackageOperation value)
++{
++    TRACE("iface %p, value %d.\n", iface, value);
++    return S_OK;
++}
++static HRESULT WINAPI view_get_AvailableFormats(IDataPackageView *iface, IVectorView_HSTRING **value)
++{
++    struct formats *formats;
++
++    TRACE("iface %p, value %p.\n", iface, value);
++    if (!(formats = calloc(1, sizeof(*formats)))) return E_OUTOFMEMORY;
++    formats->IVectorView_HSTRING_iface.lpVtbl = &formats_vtbl;
++    formats->ref = 1;
++    formats->text = has_text();
++    *value = &formats->IVectorView_HSTRING_iface;
++    return S_OK;
++}
++static HRESULT WINAPI view_Contains(IDataPackageView *iface, HSTRING format_id, boolean *value)
++{
++    TRACE("iface %p, format_id %s, value %p.\n", iface, debugstr_hstring(format_id), value);
++    *value = !wcscmp(WindowsGetStringRawBuffer(format_id, NULL), text_format) && has_text();
++    return S_OK;
++}
++static HRESULT WINAPI view_GetDataAsync(IDataPackageView *iface, HSTRING format_id, IAsyncOperation_IInspectable **operation)
++{
++    FIXME("iface %p, format_id %s, operation %p stub!\n", iface, debugstr_hstring(format_id), operation);
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI view_GetTextAsync(IDataPackageView *iface, IAsyncOperation_HSTRING **operation)
++{
++    TRACE("iface %p, operation %p.\n", iface, operation);
++    return text_op_create(operation);
++}
++static HRESULT WINAPI view_GetCustomTextAsync(IDataPackageView *iface, HSTRING format_id, IAsyncOperation_HSTRING **operation)
++{
++    if (!wcscmp(WindowsGetStringRawBuffer(format_id, NULL), text_format)) return text_op_create(operation);
++    FIXME("iface %p, format_id %s, operation %p stub!\n", iface, debugstr_hstring(format_id), operation);
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI view_GetUriAsync(IDataPackageView *iface, IAsyncOperation_Uri **operation)
++{
++    FIXME("iface %p, operation %p stub!\n", iface, operation);
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI view_GetHtmlFormatAsync(IDataPackageView *iface, IAsyncOperation_HSTRING **operation)
++{
++    FIXME("iface %p, operation %p stub!\n", iface, operation);
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI view_GetResourceMapAsync(IDataPackageView *iface, IAsyncOperation_IMapView_HSTRING_RandomAccessStreamReference **operation)
++{
++    FIXME("iface %p, operation %p stub!\n", iface, operation);
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI view_GetRtfAsync(IDataPackageView *iface, IAsyncOperation_HSTRING **operation)
++{
++    FIXME("iface %p, operation %p stub!\n", iface, operation);
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI view_GetBitmapAsync(IDataPackageView *iface, IAsyncOperation_RandomAccessStreamReference **operation)
++{
++    FIXME("iface %p, operation %p stub!\n", iface, operation);
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI view_GetStorageItemsAsync(IDataPackageView *iface, IAsyncOperation_IVectorView_IStorageItem **operation)
++{
++    FIXME("iface %p, operation %p stub!\n", iface, operation);
++    return E_NOTIMPL;
++}
++
++static const IDataPackageViewVtbl view_vtbl =
++{
++    view_QueryInterface, view_AddRef, view_Release,
++    view_GetIids, view_GetRuntimeClassName, view_GetTrustLevel,
++    view_get_Properties, view_get_RequestedOperation, view_ReportOperationCompleted,
++    view_get_AvailableFormats, view_Contains, view_GetDataAsync, view_GetTextAsync, view_GetCustomTextAsync,
++    view_GetUriAsync, view_GetHtmlFormatAsync, view_GetResourceMapAsync, view_GetRtfAsync,
++    view_GetBitmapAsync, view_GetStorageItemsAsync,
++};
++
++/* ===== Clipboard statics ===== */
++
++struct clipboard_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IClipboardStatics IClipboardStatics_iface;
++    LONG ref;
++};
++
++static inline struct clipboard_statics *impl_from_IActivationFactory(IActivationFactory *iface)
++{ return CONTAINING_RECORD(iface, struct clipboard_statics, IActivationFactory_iface); }
++
++static HRESULT WINAPI factory_QueryInterface(IActivationFactory *iface, REFIID iid, void **out)
++{
++    struct clipboard_statics *impl = impl_from_IActivationFactory(iface);
++
++    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
++
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IActivationFactory))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID(iid, &IID_IClipboardStatics))
++        *out = &impl->IClipboardStatics_iface;
++    else
++    {
++        FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef((IInspectable *)*out);
++    return S_OK;
++}
++static ULONG WINAPI factory_AddRef(IActivationFactory *iface) { return InterlockedIncrement(&impl_from_IActivationFactory(iface)->ref); }
++static ULONG WINAPI factory_Release(IActivationFactory *iface) { return InterlockedDecrement(&impl_from_IActivationFactory(iface)->ref); }
++static HRESULT WINAPI factory_GetIids(IActivationFactory *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName(IActivationFactory *iface, HSTRING *name) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetTrustLevel(IActivationFactory *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI factory_ActivateInstance(IActivationFactory *iface, IInspectable **instance) { return E_NOTIMPL; }
++static const IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface, factory_AddRef, factory_Release,
++    factory_GetIids, factory_GetRuntimeClassName, factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( statics, IClipboardStatics, struct clipboard_statics, IActivationFactory_iface );
++
++static HRESULT WINAPI statics_GetContent(IClipboardStatics *iface, IDataPackageView **result)
++{
++    struct package_view *view;
++
++    TRACE("iface %p, result %p.\n", iface, result);
++    if (!result) return E_POINTER;
++    if (!(view = calloc(1, sizeof(*view)))) return E_OUTOFMEMORY;
++    view->IDataPackageView_iface.lpVtbl = &view_vtbl;
++    view->ref = 1;
++    *result = &view->IDataPackageView_iface;
++    return S_OK;
++}
++static HRESULT WINAPI statics_SetContent(IClipboardStatics *iface, IDataPackage *content)
++{
++    FIXME("iface %p, content %p stub!\n", iface, content);
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI statics_Flush(IClipboardStatics *iface) { return S_OK; }
++static HRESULT WINAPI statics_Clear(IClipboardStatics *iface)
++{
++    TRACE("iface %p.\n", iface);
++    if (!OpenClipboard(NULL)) return HRESULT_FROM_WIN32(GetLastError());
++    EmptyClipboard();
++    CloseClipboard();
++    return S_OK;
++}
++static HRESULT WINAPI statics_add_ContentChanged(IClipboardStatics *iface, IEventHandler_IInspectable *handler, EventRegistrationToken *token)
++{
++    FIXME("iface %p, handler %p, token %p: handler is kept but never raised.\n", iface, handler, token);
++    if (!handler || !token) return E_POINTER;
++    token->value = 0x636c;
++    return S_OK;
++}
++static HRESULT WINAPI statics_remove_ContentChanged(IClipboardStatics *iface, EventRegistrationToken token)
++{
++    TRACE("iface %p, token %#I64x.\n", iface, token.value);
++    return S_OK;
++}
++static const IClipboardStaticsVtbl statics_vtbl =
++{
++    statics_QueryInterface, statics_AddRef, statics_Release,
++    statics_GetIids, statics_GetRuntimeClassName, statics_GetTrustLevel,
++    statics_GetContent, statics_SetContent, statics_Flush, statics_Clear,
++    statics_add_ContentChanged, statics_remove_ContentChanged,
++};
++
++static struct clipboard_statics clipboard_statics = { {&factory_vtbl}, {&statics_vtbl}, 1 };
++
++IActivationFactory *clipboard_factory = &clipboard_statics.IActivationFactory_iface;
+diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
+index 025c9c8..fa4c42d 100644
+--- a/dlls/twinapi.appcore/main.c
++++ b/dlls/twinapi.appcore/main.c
+@@ -79,6 +79,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( advertising_manager_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, RuntimeClass_Windows_UI_ViewManagement_ApplicationView ))
+         IActivationFactory_QueryInterface( application_view_factory, &IID_IActivationFactory, (void **)factory );
++    else if (!wcscmp( buffer, RuntimeClass_Windows_ApplicationModel_DataTransfer_Clipboard ))
++        IActivationFactory_QueryInterface( clipboard_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, RuntimeClass_Windows_ApplicationModel_DataTransfer_DataTransferManager ))
+         IActivationFactory_QueryInterface( data_transfer_manager_statics_factory, &IID_IActivationFactory, (void **)factory );
+ 
+diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
+index 1081215..b48aece 100644
+--- a/dlls/twinapi.appcore/private.h
++++ b/dlls/twinapi.appcore/private.h
+@@ -75,6 +75,7 @@ extern IActivationFactory *message_dialog_factory;
+ extern void message_dialog_init(void);
+ extern IActivationFactory *hardware_identification_factory;
+ extern IActivationFactory *diagnostics_settings_factory;
++extern IActivationFactory *clipboard_factory;
+ extern IActivationFactory *web_token_manager_factory, *web_token_request_factory, *web_account_provider_factory, *user_picker_factory, *system_user_factory, *launcher_factory, *web_account_factory, *web_token_response_factory, *thread_pool_timer_factory, *user_statics_factory, *store_context_real_factory, *message_websocket_factory, *store_context_factory, *logging_options_factory, *logging_fields_factory, *push_manager_factory, *logging_channel_factory, *loggingchanneloptions_factory, *loggingactivity_factory, *loggingsession_factory;
+ extern IActivationFactory *async_causality_tracer_factory;   /* causality.c */
+ extern IActivationFactory *mouse_device_factory;   /* mouse.c */

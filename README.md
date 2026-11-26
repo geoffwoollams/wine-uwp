@@ -273,7 +273,8 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 "name not resolved"), 0064 store objects' interfaces, 0065 StorageFolder
                 CreateFolderAsync/GetFolderAsync, 0066 PlatformDiagnosticsAndUsageDataSettings, 0067
                 twinapi shims answering only their own interfaces and CoreDispatcher.RunIdleAsync, 0068
-                ApiInformation answers and HighContrastChanged
+                ApiInformation answers and HighContrastChanged, 0069 StorageFile and file streams,
+                0070 Clipboard text
 patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings

@@ -1,0 +1,1188 @@
+Subject: windows.storage.applicationdata: StorageFile, file streams, StorageFolder CreateFileAsync and GetFileAsync
+
+diff --git a/dlls/windows.storage.applicationdata/Makefile.in b/dlls/windows.storage.applicationdata/Makefile.in
+index 9226d7b..15586bb 100644
+--- a/dlls/windows.storage.applicationdata/Makefile.in
++++ b/dlls/windows.storage.applicationdata/Makefile.in
+@@ -5,5 +5,6 @@ SOURCES = \
+ 	applicationdata.c \
+ 	classes.idl \
+ 	main.c \
++	storagefile.c \
+ 	storagefolder_gen.c \
+ 	propertyset.c
+diff --git a/dlls/windows.storage.applicationdata/private.h b/dlls/windows.storage.applicationdata/private.h
+index 9c8fcd3..b199e9c 100644
+--- a/dlls/windows.storage.applicationdata/private.h
++++ b/dlls/windows.storage.applicationdata/private.h
+@@ -33,10 +33,14 @@
+ #define WIDL_using_Windows_Foundation_Collections
+ #include "windows.foundation.h"
+ #define WIDL_using_Windows_Storage
++#define WIDL_using_Windows_Storage_Streams
++#define WIDL_using_Windows_Storage_FileProperties
+ #include "windows.storage.h"
+ 
+ extern IActivationFactory *application_data_factory;
+ extern HRESULT storage_folder_create( const WCHAR *path, IStorageFolder **out );
++extern HRESULT storage_file_create( const WCHAR *path, IStorageFile **out );
++extern HRESULT storage_file_operation( HRESULT hr, IStorageFile *file, IAsyncOperation_StorageFile **operation );
+ extern HRESULT property_set_create( BOOL missing_is_null, IPropertySet **out );
+ extern HRESULT property_set_create_persistent( BOOL missing_is_null, const WCHAR *path, IPropertySet **out );
+ 
+diff --git a/dlls/windows.storage.applicationdata/storagefile.c b/dlls/windows.storage.applicationdata/storagefile.c
+new file mode 100644
+index 0000000..6f45eb4
+--- /dev/null
++++ b/dlls/windows.storage.applicationdata/storagefile.c
+@@ -0,0 +1,1051 @@
++/* WinRT Windows.Storage.StorageFile and file streams
++ *
++ * The file work is done synchronously on the caller's thread; the async operations handed
++ * back are already complete, and a completion handler set on one is called straight away.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#include "robuffer.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(data);
++
++static const GUID iid_buffer_byte_access = {0x905a0fef,0xbc53,0x11df,{0x8c,0x49,0x00,0x1e,0x4f,0xc6,0x86,0xda}};
++
++/* ===== a completed async operation, for every result type used here =====
++ *
++ * IAsyncOperation<T>, IAsyncOperationWithProgress<T, P> and IAsyncAction have the same
++ * shape apart from where put_Completed sits, so one object serves all of them: results are
++ * either an interface (AddRef'd out) or a plain value copied out. */
++
++enum done_kind { DONE_ACTION, DONE_OPERATION, DONE_PROGRESS };
++
++struct done_op
++{
++    const void *const *lpVtbl;
++    IAsyncInfo IAsyncInfo_iface;
++    LONG ref;
++    const GUID *iid;
++    HRESULT hr;
++    IUnknown *object;     /* interface result, or NULL */
++    UINT64 value;         /* value result */
++    UINT32 value_size;
++    IUnknown *handler;
++    IUnknown *progress;
++};
++
++/* every completion handler is IUnknown + Invoke(handler, operation, status) */
++struct handler_vtbl
++{
++    HRESULT (WINAPI *QueryInterface)(IUnknown *, REFIID, void **);
++    ULONG (WINAPI *AddRef)(IUnknown *);
++    ULONG (WINAPI *Release)(IUnknown *);
++    HRESULT (WINAPI *Invoke)(IUnknown *, void *, AsyncStatus);
++};
++
++static HRESULT WINAPI done_QueryInterface(struct done_op *op, REFIID iid, void **out)
++{
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, op->iid))
++        *out = op;
++    else if (IsEqualGUID(iid, &IID_IAsyncInfo))
++        *out = &op->IAsyncInfo_iface;
++    else
++    {
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    InterlockedIncrement(&op->ref);
++    return S_OK;
++}
++static ULONG WINAPI done_AddRef(struct done_op *op) { return InterlockedIncrement(&op->ref); }
++static ULONG WINAPI done_Release(struct done_op *op)
++{
++    ULONG ref = InterlockedDecrement(&op->ref);
++    if (!ref)
++    {
++        if (op->object) IUnknown_Release(op->object);
++        if (op->handler) IUnknown_Release(op->handler);
++        if (op->progress) IUnknown_Release(op->progress);
++        free(op);
++    }
++    return ref;
++}
++static HRESULT WINAPI done_GetIids(struct done_op *op, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI done_GetRuntimeClassName(struct done_op *op, HSTRING *name) { return E_NOTIMPL; }
++static HRESULT WINAPI done_GetTrustLevel(struct done_op *op, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI done_put_Completed(struct done_op *op, IUnknown *handler)
++{
++    if (!handler) return E_POINTER;
++    if (op->handler) return E_ILLEGAL_DELEGATE_ASSIGNMENT;
++    op->handler = handler;
++    IUnknown_AddRef(handler);
++    ((const struct handler_vtbl *)handler->lpVtbl)->Invoke(handler, op, SUCCEEDED(op->hr) ? Completed : Error);
++    return S_OK;
++}
++static HRESULT WINAPI done_get_Completed(struct done_op *op, IUnknown **handler)
++{
++    if ((*handler = op->handler)) IUnknown_AddRef(*handler);
++    return S_OK;
++}
++static HRESULT WINAPI done_put_Progress(struct done_op *op, IUnknown *handler)
++{
++    /* finished before any progress could be reported */
++    if (op->progress) IUnknown_Release(op->progress);
++    if ((op->progress = handler)) IUnknown_AddRef(handler);
++    return S_OK;
++}
++static HRESULT WINAPI done_get_Progress(struct done_op *op, IUnknown **handler)
++{
++    if ((*handler = op->progress)) IUnknown_AddRef(*handler);
++    return S_OK;
++}
++static HRESULT WINAPI done_GetResults(struct done_op *op, void *results)
++{
++    if (FAILED(op->hr)) return op->hr;
++    if (!results) return S_OK;
++    if (op->object)
++    {
++        *(IUnknown **)results = op->object;
++        IUnknown_AddRef(op->object);
++    }
++    else memcpy(results, &op->value, op->value_size);
++    return S_OK;
++}
++static HRESULT WINAPI done_action_GetResults(struct done_op *op) { return op->hr; }
++
++static const void *const done_action_vtbl[] =
++{
++    done_QueryInterface, done_AddRef, done_Release, done_GetIids, done_GetRuntimeClassName, done_GetTrustLevel,
++    done_put_Completed, done_get_Completed, done_action_GetResults,
++};
++static const void *const done_operation_vtbl[] =
++{
++    done_QueryInterface, done_AddRef, done_Release, done_GetIids, done_GetRuntimeClassName, done_GetTrustLevel,
++    done_put_Completed, done_get_Completed, done_GetResults,
++};
++static const void *const done_progress_vtbl[] =
++{
++    done_QueryInterface, done_AddRef, done_Release, done_GetIids, done_GetRuntimeClassName, done_GetTrustLevel,
++    done_put_Progress, done_get_Progress, done_put_Completed, done_get_Completed, done_GetResults,
++};
++
++static inline struct done_op *impl_from_done_info(IAsyncInfo *iface)
++{ return CONTAINING_RECORD(iface, struct done_op, IAsyncInfo_iface); }
++static HRESULT WINAPI done_info_QueryInterface(IAsyncInfo *iface, REFIID iid, void **out)
++{ return done_QueryInterface(impl_from_done_info(iface), iid, out); }
++static ULONG WINAPI done_info_AddRef(IAsyncInfo *iface) { return done_AddRef(impl_from_done_info(iface)); }
++static ULONG WINAPI done_info_Release(IAsyncInfo *iface) { return done_Release(impl_from_done_info(iface)); }
++static HRESULT WINAPI done_info_GetIids(IAsyncInfo *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI done_info_GetRuntimeClassName(IAsyncInfo *iface, HSTRING *name) { return E_NOTIMPL; }
++static HRESULT WINAPI done_info_GetTrustLevel(IAsyncInfo *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI done_info_get_Id(IAsyncInfo *iface, UINT32 *id) { *id = 1; return S_OK; }
++static HRESULT WINAPI done_info_get_Status(IAsyncInfo *iface, AsyncStatus *status)
++{ *status = SUCCEEDED(impl_from_done_info(iface)->hr) ? Completed : Error; return S_OK; }
++static HRESULT WINAPI done_info_get_ErrorCode(IAsyncInfo *iface, HRESULT *error)
++{ *error = impl_from_done_info(iface)->hr; return S_OK; }
++static HRESULT WINAPI done_info_Cancel(IAsyncInfo *iface) { return S_OK; }
++static HRESULT WINAPI done_info_Close(IAsyncInfo *iface) { return S_OK; }
++static const IAsyncInfoVtbl done_info_vtbl =
++{
++    done_info_QueryInterface, done_info_AddRef, done_info_Release,
++    done_info_GetIids, done_info_GetRuntimeClassName, done_info_GetTrustLevel,
++    done_info_get_Id, done_info_get_Status, done_info_get_ErrorCode, done_info_Cancel, done_info_Close,
++};
++
++/* object (if any) is taken over by the operation */
++static HRESULT done_create(enum done_kind kind, const GUID *iid, HRESULT hr, IUnknown *object,
++                           const void *value, UINT32 value_size, void **out)
++{
++    struct done_op *op;
++
++    *out = NULL;
++    if (!(op = calloc(1, sizeof(*op))))
++    {
++        if (object) IUnknown_Release(object);
++        return E_OUTOFMEMORY;
++    }
++    op->lpVtbl = kind == DONE_ACTION ? done_action_vtbl : kind == DONE_PROGRESS ? done_progress_vtbl : done_operation_vtbl;
++    op->IAsyncInfo_iface.lpVtbl = &done_info_vtbl;
++    op->ref = 1;
++    op->iid = iid;
++    op->hr = hr;
++    op->object = object;
++    if (value_size > sizeof(op->value)) value_size = sizeof(op->value);
++    if (value) memcpy(&op->value, value, value_size);
++    op->value_size = value_size;
++    *out = op;
++    return S_OK;
++}
++
++static HRESULT done_action(HRESULT hr, IAsyncAction **out)
++{
++    return done_create(DONE_ACTION, &IID_IAsyncAction, hr, NULL, NULL, 0, (void **)out);
++}
++
++static HRESULT last_error(void)
++{
++    DWORD error = GetLastError();
++    return error ? HRESULT_FROM_WIN32(error) : E_FAIL;
++}
++
++static BYTE *buffer_bytes(IBuffer *buffer)
++{
++    IBufferByteAccess *access;
++    BYTE *bytes = NULL;
++
++    if (FAILED(IBuffer_QueryInterface(buffer, &iid_buffer_byte_access, (void **)&access))) return NULL;
++    if (FAILED(IBufferByteAccess_Buffer(access, &bytes))) bytes = NULL;
++    IBufferByteAccess_Release(access);
++    return bytes;
++}
++
++/* ===== the file stream: IRandomAccessStream, IInputStream, IOutputStream, IClosable ===== */
++
++struct file_stream
++{
++    IRandomAccessStream IRandomAccessStream_iface;
++    IInputStream IInputStream_iface;
++    IOutputStream IOutputStream_iface;
++    IClosable IClosable_iface;
++    LONG ref;
++    HANDLE file;      /* each stream object has its own handle (and position) */
++    UINT64 position;
++    BOOL can_write;
++};
++
++static HRESULT file_stream_create(HANDLE file, UINT64 position, BOOL can_write, struct file_stream **out);
++
++static inline struct file_stream *impl_from_IRandomAccessStream(IRandomAccessStream *iface)
++{ return CONTAINING_RECORD(iface, struct file_stream, IRandomAccessStream_iface); }
++
++static HRESULT WINAPI file_stream_QueryInterface(IRandomAccessStream *iface, REFIID iid, void **out)
++{
++    struct file_stream *impl = impl_from_IRandomAccessStream(iface);
++
++    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
++
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IRandomAccessStream))
++        *out = &impl->IRandomAccessStream_iface;
++    else if (IsEqualGUID(iid, &IID_IInputStream))
++        *out = &impl->IInputStream_iface;
++    else if (IsEqualGUID(iid, &IID_IOutputStream))
++        *out = &impl->IOutputStream_iface;
++    else if (IsEqualGUID(iid, &IID_IClosable))
++        *out = &impl->IClosable_iface;
++    else
++    {
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef((IInspectable *)*out);
++    return S_OK;
++}
++
++static ULONG WINAPI file_stream_AddRef(IRandomAccessStream *iface)
++{
++    return InterlockedIncrement(&impl_from_IRandomAccessStream(iface)->ref);
++}
++
++static ULONG WINAPI file_stream_Release(IRandomAccessStream *iface)
++{
++    struct file_stream *impl = impl_from_IRandomAccessStream(iface);
++    ULONG ref = InterlockedDecrement(&impl->ref);
++
++    if (!ref)
++    {
++        if (impl->file != INVALID_HANDLE_VALUE) CloseHandle(impl->file);
++        free(impl);
++    }
++    return ref;
++}
++
++static HRESULT WINAPI file_stream_GetIids(IRandomAccessStream *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI file_stream_GetRuntimeClassName(IRandomAccessStream *iface, HSTRING *name)
++{
++    return WindowsCreateString(L"Windows.Storage.Streams.FileRandomAccessStream", 46, name);
++}
++static HRESULT WINAPI file_stream_GetTrustLevel(IRandomAccessStream *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI file_stream_get_Size(IRandomAccessStream *iface, UINT64 *value)
++{
++    struct file_stream *impl = impl_from_IRandomAccessStream(iface);
++    LARGE_INTEGER size;
++
++    if (impl->file == INVALID_HANDLE_VALUE) return RO_E_CLOSED;
++    if (!GetFileSizeEx(impl->file, &size)) return last_error();
++    *value = size.QuadPart;
++    return S_OK;
++}
++
++static HRESULT WINAPI file_stream_put_Size(IRandomAccessStream *iface, UINT64 value)
++{
++    struct file_stream *impl = impl_from_IRandomAccessStream(iface);
++    FILE_END_OF_FILE_INFO info;
++
++    TRACE("iface %p, value %I64u.\n", iface, value);
++    if (impl->file == INVALID_HANDLE_VALUE) return RO_E_CLOSED;
++    if (!impl->can_write) return E_ACCESSDENIED;
++    info.EndOfFile.QuadPart = value;
++    if (!SetFileInformationByHandle(impl->file, FileEndOfFileInfo, &info, sizeof(info))) return last_error();
++    return S_OK;
++}
++
++static HRESULT clone_at(struct file_stream *impl, UINT64 position, struct file_stream **out)
++{
++    HANDLE file;
++
++    if (impl->file == INVALID_HANDLE_VALUE) return RO_E_CLOSED;
++    if (!DuplicateHandle(GetCurrentProcess(), impl->file, GetCurrentProcess(), &file, 0, FALSE, DUPLICATE_SAME_ACCESS))
++        return last_error();
++    return file_stream_create(file, position, impl->can_write, out);
++}
++
++static HRESULT WINAPI file_stream_GetInputStreamAt(IRandomAccessStream *iface, UINT64 position, IInputStream **stream)
++{
++    struct file_stream *clone;
++    HRESULT hr;
++
++    TRACE("iface %p, position %I64u, stream %p.\n", iface, position, stream);
++    if (FAILED(hr = clone_at(impl_from_IRandomAccessStream(iface), position, &clone))) return hr;
++    *stream = &clone->IInputStream_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI file_stream_GetOutputStreamAt(IRandomAccessStream *iface, UINT64 position, IOutputStream **stream)
++{
++    struct file_stream *impl = impl_from_IRandomAccessStream(iface), *clone;
++    HRESULT hr;
++
++    TRACE("iface %p, position %I64u, stream %p.\n", iface, position, stream);
++    if (!impl->can_write) return E_ACCESSDENIED;
++    if (FAILED(hr = clone_at(impl, position, &clone))) return hr;
++    *stream = &clone->IOutputStream_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI file_stream_get_Position(IRandomAccessStream *iface, UINT64 *value)
++{
++    *value = impl_from_IRandomAccessStream(iface)->position;
++    return S_OK;
++}
++
++static HRESULT WINAPI file_stream_Seek(IRandomAccessStream *iface, UINT64 position)
++{
++    TRACE("iface %p, position %I64u.\n", iface, position);
++    impl_from_IRandomAccessStream(iface)->position = position;
++    return S_OK;
++}
++
++static HRESULT WINAPI file_stream_CloneStream(IRandomAccessStream *iface, IRandomAccessStream **stream)
++{
++    struct file_stream *clone;
++    HRESULT hr;
++
++    TRACE("iface %p, stream %p.\n", iface, stream);
++    if (FAILED(hr = clone_at(impl_from_IRandomAccessStream(iface), 0, &clone))) return hr;
++    *stream = &clone->IRandomAccessStream_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI file_stream_get_CanRead(IRandomAccessStream *iface, boolean *value)
++{
++    *value = TRUE;
++    return S_OK;
++}
++
++static HRESULT WINAPI file_stream_get_CanWrite(IRandomAccessStream *iface, boolean *value)
++{
++    *value = impl_from_IRandomAccessStream(iface)->can_write;
++    return S_OK;
++}
++
++static const IRandomAccessStreamVtbl file_stream_vtbl =
++{
++    file_stream_QueryInterface,
++    file_stream_AddRef,
++    file_stream_Release,
++    file_stream_GetIids,
++    file_stream_GetRuntimeClassName,
++    file_stream_GetTrustLevel,
++    file_stream_get_Size,
++    file_stream_put_Size,
++    file_stream_GetInputStreamAt,
++    file_stream_GetOutputStreamAt,
++    file_stream_get_Position,
++    file_stream_Seek,
++    file_stream_CloneStream,
++    file_stream_get_CanRead,
++    file_stream_get_CanWrite,
++};
++
++/* ---- IInputStream ---- */
++static inline struct file_stream *impl_from_IInputStream(IInputStream *iface)
++{ return CONTAINING_RECORD(iface, struct file_stream, IInputStream_iface); }
++
++static HRESULT WINAPI input_QueryInterface(IInputStream *iface, REFIID iid, void **out)
++{ return file_stream_QueryInterface(&impl_from_IInputStream(iface)->IRandomAccessStream_iface, iid, out); }
++static ULONG WINAPI input_AddRef(IInputStream *iface)
++{ return file_stream_AddRef(&impl_from_IInputStream(iface)->IRandomAccessStream_iface); }
++static ULONG WINAPI input_Release(IInputStream *iface)
++{ return file_stream_Release(&impl_from_IInputStream(iface)->IRandomAccessStream_iface); }
++static HRESULT WINAPI input_GetIids(IInputStream *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI input_GetRuntimeClassName(IInputStream *iface, HSTRING *name)
++{ return file_stream_GetRuntimeClassName(&impl_from_IInputStream(iface)->IRandomAccessStream_iface, name); }
++static HRESULT WINAPI input_GetTrustLevel(IInputStream *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI input_ReadAsync(IInputStream *iface, IBuffer *buffer, UINT32 count, InputStreamOptions options,
++                                      IAsyncOperationWithProgress_IBuffer_UINT32 **operation)
++{
++    struct file_stream *impl = impl_from_IInputStream(iface);
++    UINT32 capacity;
++    OVERLAPPED ovl = {0};
++    DWORD done = 0;
++    HRESULT hr = S_OK;
++    BYTE *bytes;
++
++    TRACE("iface %p, buffer %p, count %u, options %#x, operation %p.\n", iface, buffer, count, options, operation);
++
++    if (!buffer || !operation) return E_POINTER;
++    if (impl->file == INVALID_HANDLE_VALUE) return RO_E_CLOSED;
++    if (FAILED(IBuffer_get_Capacity(buffer, &capacity))) capacity = 0;
++    if (count > capacity) return E_INVALIDARG;
++    if (!(bytes = buffer_bytes(buffer))) return E_INVALIDARG;
++
++    ovl.Offset = (DWORD)impl->position;
++    ovl.OffsetHigh = (DWORD)(impl->position >> 32);
++    if (!ReadFile(impl->file, bytes, count, &done, &ovl) && GetLastError() != ERROR_HANDLE_EOF)
++        hr = last_error();
++    if (SUCCEEDED(hr))
++    {
++        impl->position += done;
++        IBuffer_put_Length(buffer, done);
++        IBuffer_AddRef(buffer);
++    }
++    return done_create(DONE_PROGRESS, &IID_IAsyncOperationWithProgress_IBuffer_UINT32, hr,
++                       SUCCEEDED(hr) ? (IUnknown *)buffer : NULL, NULL, 0, (void **)operation);
++}
++
++static const IInputStreamVtbl input_vtbl =
++{
++    input_QueryInterface,
++    input_AddRef,
++    input_Release,
++    input_GetIids,
++    input_GetRuntimeClassName,
++    input_GetTrustLevel,
++    input_ReadAsync,
++};
++
++/* ---- IOutputStream ---- */
++static inline struct file_stream *impl_from_IOutputStream(IOutputStream *iface)
++{ return CONTAINING_RECORD(iface, struct file_stream, IOutputStream_iface); }
++
++static HRESULT WINAPI output_QueryInterface(IOutputStream *iface, REFIID iid, void **out)
++{ return file_stream_QueryInterface(&impl_from_IOutputStream(iface)->IRandomAccessStream_iface, iid, out); }
++static ULONG WINAPI output_AddRef(IOutputStream *iface)
++{ return file_stream_AddRef(&impl_from_IOutputStream(iface)->IRandomAccessStream_iface); }
++static ULONG WINAPI output_Release(IOutputStream *iface)
++{ return file_stream_Release(&impl_from_IOutputStream(iface)->IRandomAccessStream_iface); }
++static HRESULT WINAPI output_GetIids(IOutputStream *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI output_GetRuntimeClassName(IOutputStream *iface, HSTRING *name)
++{ return file_stream_GetRuntimeClassName(&impl_from_IOutputStream(iface)->IRandomAccessStream_iface, name); }
++static HRESULT WINAPI output_GetTrustLevel(IOutputStream *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI output_WriteAsync(IOutputStream *iface, IBuffer *buffer, IAsyncOperationWithProgress_UINT32_UINT32 **operation)
++{
++    struct file_stream *impl = impl_from_IOutputStream(iface);
++    OVERLAPPED ovl = {0};
++    UINT32 length = 0;
++    DWORD done = 0;
++    HRESULT hr = S_OK;
++    BYTE *bytes;
++
++    TRACE("iface %p, buffer %p, operation %p.\n", iface, buffer, operation);
++
++    if (!buffer || !operation) return E_POINTER;
++    if (impl->file == INVALID_HANDLE_VALUE) return RO_E_CLOSED;
++    if (!impl->can_write) return E_ACCESSDENIED;
++    IBuffer_get_Length(buffer, &length);
++    if (length && !(bytes = buffer_bytes(buffer))) return E_INVALIDARG;
++
++    ovl.Offset = (DWORD)impl->position;
++    ovl.OffsetHigh = (DWORD)(impl->position >> 32);
++    if (length && !WriteFile(impl->file, bytes, length, &done, &ovl)) hr = last_error();
++    if (SUCCEEDED(hr)) impl->position += done;
++    return done_create(DONE_PROGRESS, &IID_IAsyncOperationWithProgress_UINT32_UINT32, hr, NULL,
++                       &done, sizeof(UINT32), (void **)operation);
++}
++
++static HRESULT WINAPI output_FlushAsync(IOutputStream *iface, IAsyncOperation_boolean **operation)
++{
++    struct file_stream *impl = impl_from_IOutputStream(iface);
++    boolean flushed;
++
++    TRACE("iface %p, operation %p.\n", iface, operation);
++
++    if (!operation) return E_POINTER;
++    if (impl->file == INVALID_HANDLE_VALUE) return RO_E_CLOSED;
++    flushed = FlushFileBuffers(impl->file) != 0;
++    return done_create(DONE_OPERATION, &IID_IAsyncOperation_boolean, S_OK, NULL, &flushed, sizeof(flushed), (void **)operation);
++}
++
++static const IOutputStreamVtbl output_vtbl =
++{
++    output_QueryInterface,
++    output_AddRef,
++    output_Release,
++    output_GetIids,
++    output_GetRuntimeClassName,
++    output_GetTrustLevel,
++    output_WriteAsync,
++    output_FlushAsync,
++};
++
++/* ---- IClosable ---- */
++static inline struct file_stream *impl_from_IClosable(IClosable *iface)
++{ return CONTAINING_RECORD(iface, struct file_stream, IClosable_iface); }
++
++static HRESULT WINAPI closable_QueryInterface(IClosable *iface, REFIID iid, void **out)
++{ return file_stream_QueryInterface(&impl_from_IClosable(iface)->IRandomAccessStream_iface, iid, out); }
++static ULONG WINAPI closable_AddRef(IClosable *iface)
++{ return file_stream_AddRef(&impl_from_IClosable(iface)->IRandomAccessStream_iface); }
++static ULONG WINAPI closable_Release(IClosable *iface)
++{ return file_stream_Release(&impl_from_IClosable(iface)->IRandomAccessStream_iface); }
++static HRESULT WINAPI closable_GetIids(IClosable *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI closable_GetRuntimeClassName(IClosable *iface, HSTRING *name)
++{ return file_stream_GetRuntimeClassName(&impl_from_IClosable(iface)->IRandomAccessStream_iface, name); }
++static HRESULT WINAPI closable_GetTrustLevel(IClosable *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI closable_Close(IClosable *iface)
++{
++    struct file_stream *impl = impl_from_IClosable(iface);
++    HANDLE file = InterlockedExchangePointer(&impl->file, INVALID_HANDLE_VALUE);
++
++    TRACE("iface %p.\n", iface);
++    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
++    return S_OK;
++}
++
++static const IClosableVtbl closable_vtbl =
++{
++    closable_QueryInterface,
++    closable_AddRef,
++    closable_Release,
++    closable_GetIids,
++    closable_GetRuntimeClassName,
++    closable_GetTrustLevel,
++    closable_Close,
++};
++
++static HRESULT file_stream_create(HANDLE file, UINT64 position, BOOL can_write, struct file_stream **out)
++{
++    struct file_stream *impl;
++
++    if (!(impl = calloc(1, sizeof(*impl))))
++    {
++        CloseHandle(file);
++        return E_OUTOFMEMORY;
++    }
++    impl->IRandomAccessStream_iface.lpVtbl = &file_stream_vtbl;
++    impl->IInputStream_iface.lpVtbl = &input_vtbl;
++    impl->IOutputStream_iface.lpVtbl = &output_vtbl;
++    impl->IClosable_iface.lpVtbl = &closable_vtbl;
++    impl->ref = 1;
++    impl->file = file;
++    impl->position = position;
++    impl->can_write = can_write;
++    *out = impl;
++    return S_OK;
++}
++
++static HRESULT open_file_stream(const WCHAR *path, BOOL write, struct file_stream **out)
++{
++    HANDLE file;
++
++    file = CreateFileW(path, GENERIC_READ | (write ? GENERIC_WRITE : 0), FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                       NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
++    if (file == INVALID_HANDLE_VALUE) return last_error();
++    return file_stream_create(file, 0, write, out);
++}
++
++/* ===== StorageFile ===== */
++
++struct storage_file
++{
++    IStorageFile IStorageFile_iface;
++    IStorageItem IStorageItem_iface;
++    IRandomAccessStreamReference IRandomAccessStreamReference_iface;
++    IInputStreamReference IInputStreamReference_iface;
++    LONG ref;
++    WCHAR path[MAX_PATH];
++};
++
++static inline struct storage_file *impl_from_IStorageFile(IStorageFile *iface)
++{ return CONTAINING_RECORD(iface, struct storage_file, IStorageFile_iface); }
++
++static HRESULT WINAPI storage_file_QueryInterface(IStorageFile *iface, REFIID iid, void **out)
++{
++    struct storage_file *impl = impl_from_IStorageFile(iface);
++
++    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
++
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IStorageFile))
++        *out = &impl->IStorageFile_iface;
++    else if (IsEqualGUID(iid, &IID_IStorageItem))
++        *out = &impl->IStorageItem_iface;
++    else if (IsEqualGUID(iid, &IID_IRandomAccessStreamReference))
++        *out = &impl->IRandomAccessStreamReference_iface;
++    else if (IsEqualGUID(iid, &IID_IInputStreamReference))
++        *out = &impl->IInputStreamReference_iface;
++    else
++    {
++        FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef((IInspectable *)*out);
++    return S_OK;
++}
++
++static ULONG WINAPI storage_file_AddRef(IStorageFile *iface)
++{
++    return InterlockedIncrement(&impl_from_IStorageFile(iface)->ref);
++}
++
++static ULONG WINAPI storage_file_Release(IStorageFile *iface)
++{
++    struct storage_file *impl = impl_from_IStorageFile(iface);
++    ULONG ref = InterlockedDecrement(&impl->ref);
++    if (!ref) free(impl);
++    return ref;
++}
++
++static HRESULT WINAPI storage_file_GetIids(IStorageFile *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI storage_file_GetRuntimeClassName(IStorageFile *iface, HSTRING *name)
++{
++    return WindowsCreateString(L"Windows.Storage.StorageFile", 27, name);
++}
++static HRESULT WINAPI storage_file_GetTrustLevel(IStorageFile *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI storage_file_get_FileType(IStorageFile *iface, HSTRING *value)
++{
++    struct storage_file *impl = impl_from_IStorageFile(iface);
++    const WCHAR *name = wcsrchr(impl->path, '\\'), *ext;
++
++    name = name ? name + 1 : impl->path;
++    ext = wcsrchr(name, '.');
++    if (!ext) ext = L"";
++    return WindowsCreateString(ext, wcslen(ext), value);
++}
++
++static HRESULT WINAPI storage_file_get_ContentType(IStorageFile *iface, HSTRING *value)
++{
++    FIXME("iface %p, value %p semi-stub!\n", iface, value);
++    return WindowsCreateString(L"application/octet-stream", 24, value);
++}
++
++static HRESULT WINAPI storage_file_OpenAsync(IStorageFile *iface, FileAccessMode mode, IAsyncOperation_IRandomAccessStream **operation)
++{
++    struct storage_file *impl = impl_from_IStorageFile(iface);
++    struct file_stream *stream = NULL;
++    HRESULT hr;
++
++    TRACE("iface %p, mode %d, operation %p, path %s.\n", iface, mode, operation, debugstr_w(impl->path));
++
++    if (!operation) return E_POINTER;
++    hr = open_file_stream(impl->path, mode == FileAccessMode_ReadWrite, &stream);
++    return done_create(DONE_OPERATION, &IID_IAsyncOperation_IRandomAccessStream, hr,
++                       stream ? (IUnknown *)&stream->IRandomAccessStream_iface : NULL, NULL, 0, (void **)operation);
++}
++
++static HRESULT WINAPI storage_file_OpenTransactedWriteAsync(IStorageFile *iface, IAsyncOperation_StorageStreamTransaction **operation)
++{
++    FIXME("iface %p, operation %p stub!\n", iface, operation);
++    return E_NOTIMPL;
++}
++
++static HRESULT folder_path(IStorageFolder *folder, HSTRING name, const WCHAR *fallback, WCHAR *path)
++{
++    IStorageItem *item;
++    HSTRING dir;
++    HRESULT hr;
++    const WCHAR *file;
++
++    if (!folder) return E_POINTER;
++    if (FAILED(hr = IStorageFolder_QueryInterface(folder, &IID_IStorageItem, (void **)&item))) return hr;
++    hr = IStorageItem_get_Path(item, &dir);
++    IStorageItem_Release(item);
++    if (FAILED(hr)) return hr;
++    file = name ? WindowsGetStringRawBuffer(name, NULL) : fallback;
++    if (wcschr(file, '\\') || wcschr(file, '/')) hr = E_INVALIDARG;
++    else swprintf(path, MAX_PATH, L"%s\\%s", WindowsGetStringRawBuffer(dir, NULL), file);
++    WindowsDeleteString(dir);
++    return hr;
++}
++
++static const WCHAR *file_name(struct storage_file *impl)
++{
++    const WCHAR *name = wcsrchr(impl->path, '\\');
++    return name ? name + 1 : impl->path;
++}
++
++static HRESULT WINAPI storage_file_CopyOverload(IStorageFile *iface, IStorageFolder *folder, HSTRING name,
++                                                NameCollisionOption option, IAsyncOperation_StorageFile **operation)
++{
++    struct storage_file *impl = impl_from_IStorageFile(iface);
++    IStorageFile *copy = NULL;
++    WCHAR path[MAX_PATH];
++    HRESULT hr;
++
++    TRACE("iface %p, folder %p, name %s, option %d, operation %p.\n", iface, folder, debugstr_hstring(name), option, operation);
++
++    if (SUCCEEDED(hr = folder_path(folder, name, file_name(impl), path)))
++    {
++        if (option == NameCollisionOption_GenerateUniqueName) FIXME("unique names are not generated.\n");
++        if (!CopyFileW(impl->path, path, option == NameCollisionOption_FailIfExists)) hr = last_error();
++        else hr = storage_file_create(path, &copy);
++    }
++    return done_create(DONE_OPERATION, &IID_IAsyncOperation_StorageFile, hr, (IUnknown *)copy, NULL, 0, (void **)operation);
++}
++
++static HRESULT WINAPI storage_file_CopyOverloadDefaultNameAndOptions(IStorageFile *iface, IStorageFolder *folder, IAsyncOperation_StorageFile **operation)
++{
++    return storage_file_CopyOverload(iface, folder, NULL, NameCollisionOption_FailIfExists, operation);
++}
++
++static HRESULT WINAPI storage_file_CopyOverloadDefaultOptions(IStorageFile *iface, IStorageFolder *folder, HSTRING name, IAsyncOperation_StorageFile **operation)
++{
++    return storage_file_CopyOverload(iface, folder, name, NameCollisionOption_FailIfExists, operation);
++}
++
++static HRESULT item_path(IStorageFile *file, WCHAR *path)
++{
++    IStorageItem *item;
++    HSTRING str;
++    HRESULT hr;
++
++    if (!file) return E_POINTER;
++    if (FAILED(hr = IStorageFile_QueryInterface(file, &IID_IStorageItem, (void **)&item))) return hr;
++    hr = IStorageItem_get_Path(item, &str);
++    IStorageItem_Release(item);
++    if (FAILED(hr)) return hr;
++    lstrcpynW(path, WindowsGetStringRawBuffer(str, NULL), MAX_PATH);
++    WindowsDeleteString(str);
++    return S_OK;
++}
++
++static HRESULT WINAPI storage_file_CopyAndReplaceAsync(IStorageFile *iface, IStorageFile *file, IAsyncAction **operation)
++{
++    struct storage_file *impl = impl_from_IStorageFile(iface);
++    WCHAR path[MAX_PATH];
++    HRESULT hr;
++
++    TRACE("iface %p, file %p, operation %p.\n", iface, file, operation);
++    if (SUCCEEDED(hr = item_path(file, path)) && !CopyFileW(impl->path, path, FALSE)) hr = last_error();
++    return done_action(hr, operation);
++}
++
++static HRESULT WINAPI storage_file_MoveOverload(IStorageFile *iface, IStorageFolder *folder, HSTRING name,
++                                                NameCollisionOption option, IAsyncAction **operation)
++{
++    struct storage_file *impl = impl_from_IStorageFile(iface);
++    WCHAR path[MAX_PATH];
++    HRESULT hr;
++
++    TRACE("iface %p, folder %p, name %s, option %d, operation %p.\n", iface, folder, debugstr_hstring(name), option, operation);
++
++    if (SUCCEEDED(hr = folder_path(folder, name, file_name(impl), path)))
++    {
++        if (!MoveFileExW(impl->path, path, option == NameCollisionOption_ReplaceExisting ? MOVEFILE_REPLACE_EXISTING : 0))
++            hr = last_error();
++        else lstrcpynW(impl->path, path, MAX_PATH);
++    }
++    return done_action(hr, operation);
++}
++
++static HRESULT WINAPI storage_file_MoveOverloadDefaultNameAndOptions(IStorageFile *iface, IStorageFolder *folder, IAsyncAction **operation)
++{
++    return storage_file_MoveOverload(iface, folder, NULL, NameCollisionOption_FailIfExists, operation);
++}
++
++static HRESULT WINAPI storage_file_MoveOverloadDefaultOptions(IStorageFile *iface, IStorageFolder *folder, HSTRING name, IAsyncAction **operation)
++{
++    return storage_file_MoveOverload(iface, folder, name, NameCollisionOption_FailIfExists, operation);
++}
++
++static HRESULT WINAPI storage_file_MoveAndReplaceAsync(IStorageFile *iface, IStorageFile *file, IAsyncAction **operation)
++{
++    struct storage_file *impl = impl_from_IStorageFile(iface);
++    WCHAR path[MAX_PATH];
++    HRESULT hr;
++
++    TRACE("iface %p, file %p, operation %p.\n", iface, file, operation);
++    if (SUCCEEDED(hr = item_path(file, path)))
++    {
++        if (!MoveFileExW(impl->path, path, MOVEFILE_REPLACE_EXISTING)) hr = last_error();
++        else lstrcpynW(impl->path, path, MAX_PATH);
++    }
++    return done_action(hr, operation);
++}
++
++static const IStorageFileVtbl storage_file_vtbl =
++{
++    storage_file_QueryInterface,
++    storage_file_AddRef,
++    storage_file_Release,
++    storage_file_GetIids,
++    storage_file_GetRuntimeClassName,
++    storage_file_GetTrustLevel,
++    storage_file_get_FileType,
++    storage_file_get_ContentType,
++    storage_file_OpenAsync,
++    storage_file_OpenTransactedWriteAsync,
++    storage_file_CopyOverloadDefaultNameAndOptions,
++    storage_file_CopyOverloadDefaultOptions,
++    storage_file_CopyOverload,
++    storage_file_CopyAndReplaceAsync,
++    storage_file_MoveOverloadDefaultNameAndOptions,
++    storage_file_MoveOverloadDefaultOptions,
++    storage_file_MoveOverload,
++    storage_file_MoveAndReplaceAsync,
++};
++
++/* ---- IStorageItem on StorageFile ---- */
++static inline struct storage_file *impl_from_IStorageItem(IStorageItem *iface)
++{ return CONTAINING_RECORD(iface, struct storage_file, IStorageItem_iface); }
++
++static HRESULT WINAPI file_item_QueryInterface(IStorageItem *iface, REFIID iid, void **out)
++{ return storage_file_QueryInterface(&impl_from_IStorageItem(iface)->IStorageFile_iface, iid, out); }
++static ULONG WINAPI file_item_AddRef(IStorageItem *iface)
++{ return storage_file_AddRef(&impl_from_IStorageItem(iface)->IStorageFile_iface); }
++static ULONG WINAPI file_item_Release(IStorageItem *iface)
++{ return storage_file_Release(&impl_from_IStorageItem(iface)->IStorageFile_iface); }
++static HRESULT WINAPI file_item_GetIids(IStorageItem *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI file_item_GetRuntimeClassName(IStorageItem *iface, HSTRING *name)
++{ return storage_file_GetRuntimeClassName(&impl_from_IStorageItem(iface)->IStorageFile_iface, name); }
++static HRESULT WINAPI file_item_GetTrustLevel(IStorageItem *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI file_item_RenameAsync(IStorageItem *iface, HSTRING name, NameCollisionOption option, IAsyncAction **operation)
++{
++    struct storage_file *impl = impl_from_IStorageItem(iface);
++    const WCHAR *str = WindowsGetStringRawBuffer(name, NULL);
++    WCHAR path[MAX_PATH], *p;
++    HRESULT hr = S_OK;
++
++    TRACE("iface %p, name %s, option %d, operation %p.\n", iface, debugstr_hstring(name), option, operation);
++
++    if (!str || !*str || wcschr(str, '\\') || wcschr(str, '/')) hr = E_INVALIDARG;
++    else
++    {
++        lstrcpynW(path, impl->path, MAX_PATH);
++        if ((p = wcsrchr(path, '\\'))) p[1] = 0; else path[0] = 0;
++        if (wcslen(path) + wcslen(str) >= MAX_PATH) hr = HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
++        else
++        {
++            wcscat(path, str);
++            if (!MoveFileExW(impl->path, path, option == NameCollisionOption_ReplaceExisting ? MOVEFILE_REPLACE_EXISTING : 0))
++                hr = last_error();
++            else lstrcpynW(impl->path, path, MAX_PATH);
++        }
++    }
++    return done_action(hr, operation);
++}
++
++static HRESULT WINAPI file_item_RenameAsyncOverloadDefaultOptions(IStorageItem *iface, HSTRING name, IAsyncAction **operation)
++{
++    return file_item_RenameAsync(iface, name, NameCollisionOption_FailIfExists, operation);
++}
++
++static HRESULT WINAPI file_item_DeleteAsync(IStorageItem *iface, StorageDeleteOption option, IAsyncAction **operation)
++{
++    struct storage_file *impl = impl_from_IStorageItem(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("iface %p, option %d, operation %p, path %s.\n", iface, option, operation, debugstr_w(impl->path));
++    if (!DeleteFileW(impl->path)) hr = last_error();
++    return done_action(hr, operation);
++}
++
++static HRESULT WINAPI file_item_DeleteAsyncOverloadDefaultOptions(IStorageItem *iface, IAsyncAction **operation)
++{
++    return file_item_DeleteAsync(iface, StorageDeleteOption_Default, operation);
++}
++
++static HRESULT WINAPI file_item_GetBasicPropertiesAsync(IStorageItem *iface, IAsyncOperation_BasicProperties **operation)
++{
++    FIXME("iface %p, operation %p stub!\n", iface, operation);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI file_item_get_Name(IStorageItem *iface, HSTRING *value)
++{
++    const WCHAR *name = file_name(impl_from_IStorageItem(iface));
++    return WindowsCreateString(name, wcslen(name), value);
++}
++
++static HRESULT WINAPI file_item_get_Path(IStorageItem *iface, HSTRING *value)
++{
++    struct storage_file *impl = impl_from_IStorageItem(iface);
++    return WindowsCreateString(impl->path, wcslen(impl->path), value);
++}
++
++static HRESULT WINAPI file_item_get_Attributes(IStorageItem *iface, FileAttributes *value)
++{
++    struct storage_file *impl = impl_from_IStorageItem(iface);
++    DWORD attrs = GetFileAttributesW(impl->path);
++
++    *value = FileAttributes_Normal;
++    if (attrs != INVALID_FILE_ATTRIBUTES)
++    {
++        if (attrs & FILE_ATTRIBUTE_READONLY) *value |= FileAttributes_ReadOnly;
++        if (attrs & FILE_ATTRIBUTE_ARCHIVE) *value |= FileAttributes_Archive;
++        if (attrs & FILE_ATTRIBUTE_TEMPORARY) *value |= FileAttributes_Temporary;
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI file_item_get_DateCreated(IStorageItem *iface, DateTime *value)
++{
++    struct storage_file *impl = impl_from_IStorageItem(iface);
++    WIN32_FILE_ATTRIBUTE_DATA data;
++
++    if (!GetFileAttributesExW(impl->path, GetFileExInfoStandard, &data)) return last_error();
++    /* DateTime counts 100ns ticks from 1601, like FILETIME */
++    value->UniversalTime = ((INT64)data.ftCreationTime.dwHighDateTime << 32) | data.ftCreationTime.dwLowDateTime;
++    return S_OK;
++}
++
++static HRESULT WINAPI file_item_IsOfType(IStorageItem *iface, StorageItemTypes type, boolean *value)
++{
++    *value = type == StorageItemTypes_File;
++    return S_OK;
++}
++
++static const IStorageItemVtbl file_item_vtbl =
++{
++    file_item_QueryInterface,
++    file_item_AddRef,
++    file_item_Release,
++    file_item_GetIids,
++    file_item_GetRuntimeClassName,
++    file_item_GetTrustLevel,
++    file_item_RenameAsyncOverloadDefaultOptions,
++    file_item_RenameAsync,
++    file_item_DeleteAsyncOverloadDefaultOptions,
++    file_item_DeleteAsync,
++    file_item_GetBasicPropertiesAsync,
++    file_item_get_Name,
++    file_item_get_Path,
++    file_item_get_Attributes,
++    file_item_get_DateCreated,
++    file_item_IsOfType,
++};
++
++/* ---- IRandomAccessStreamReference on StorageFile ---- */
++static inline struct storage_file *impl_from_IRandomAccessStreamReference(IRandomAccessStreamReference *iface)
++{ return CONTAINING_RECORD(iface, struct storage_file, IRandomAccessStreamReference_iface); }
++
++static HRESULT WINAPI stream_ref_QueryInterface(IRandomAccessStreamReference *iface, REFIID iid, void **out)
++{ return storage_file_QueryInterface(&impl_from_IRandomAccessStreamReference(iface)->IStorageFile_iface, iid, out); }
++static ULONG WINAPI stream_ref_AddRef(IRandomAccessStreamReference *iface)
++{ return storage_file_AddRef(&impl_from_IRandomAccessStreamReference(iface)->IStorageFile_iface); }
++static ULONG WINAPI stream_ref_Release(IRandomAccessStreamReference *iface)
++{ return storage_file_Release(&impl_from_IRandomAccessStreamReference(iface)->IStorageFile_iface); }
++static HRESULT WINAPI stream_ref_GetIids(IRandomAccessStreamReference *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI stream_ref_GetRuntimeClassName(IRandomAccessStreamReference *iface, HSTRING *name)
++{ return storage_file_GetRuntimeClassName(&impl_from_IRandomAccessStreamReference(iface)->IStorageFile_iface, name); }
++static HRESULT WINAPI stream_ref_GetTrustLevel(IRandomAccessStreamReference *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI stream_ref_OpenReadAsync(IRandomAccessStreamReference *iface, IAsyncOperation_IRandomAccessStreamWithContentType **operation)
++{
++    FIXME("iface %p, operation %p stub!\n", iface, operation);
++    return E_NOTIMPL;
++}
++
++static const IRandomAccessStreamReferenceVtbl stream_ref_vtbl =
++{
++    stream_ref_QueryInterface,
++    stream_ref_AddRef,
++    stream_ref_Release,
++    stream_ref_GetIids,
++    stream_ref_GetRuntimeClassName,
++    stream_ref_GetTrustLevel,
++    stream_ref_OpenReadAsync,
++};
++
++/* ---- IInputStreamReference on StorageFile ---- */
++static inline struct storage_file *impl_from_IInputStreamReference(IInputStreamReference *iface)
++{ return CONTAINING_RECORD(iface, struct storage_file, IInputStreamReference_iface); }
++
++static HRESULT WINAPI input_ref_QueryInterface(IInputStreamReference *iface, REFIID iid, void **out)
++{ return storage_file_QueryInterface(&impl_from_IInputStreamReference(iface)->IStorageFile_iface, iid, out); }
++static ULONG WINAPI input_ref_AddRef(IInputStreamReference *iface)
++{ return storage_file_AddRef(&impl_from_IInputStreamReference(iface)->IStorageFile_iface); }
++static ULONG WINAPI input_ref_Release(IInputStreamReference *iface)
++{ return storage_file_Release(&impl_from_IInputStreamReference(iface)->IStorageFile_iface); }
++static HRESULT WINAPI input_ref_GetIids(IInputStreamReference *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI input_ref_GetRuntimeClassName(IInputStreamReference *iface, HSTRING *name)
++{ return storage_file_GetRuntimeClassName(&impl_from_IInputStreamReference(iface)->IStorageFile_iface, name); }
++static HRESULT WINAPI input_ref_GetTrustLevel(IInputStreamReference *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI input_ref_OpenSequentialReadAsync(IInputStreamReference *iface, IAsyncOperation_IInputStream **operation)
++{
++    struct storage_file *impl = impl_from_IInputStreamReference(iface);
++    struct file_stream *stream = NULL;
++    HRESULT hr;
++
++    TRACE("iface %p, operation %p.\n", iface, operation);
++    hr = open_file_stream(impl->path, FALSE, &stream);
++    return done_create(DONE_OPERATION, &IID_IAsyncOperation_IInputStream, hr,
++                       stream ? (IUnknown *)&stream->IInputStream_iface : NULL, NULL, 0, (void **)operation);
++}
++
++static const IInputStreamReferenceVtbl input_ref_vtbl =
++{
++    input_ref_QueryInterface,
++    input_ref_AddRef,
++    input_ref_Release,
++    input_ref_GetIids,
++    input_ref_GetRuntimeClassName,
++    input_ref_GetTrustLevel,
++    input_ref_OpenSequentialReadAsync,
++};
++
++HRESULT storage_file_create(const WCHAR *path, IStorageFile **out)
++{
++    struct storage_file *impl;
++
++    if (!(impl = calloc(1, sizeof(*impl)))) return E_OUTOFMEMORY;
++    impl->IStorageFile_iface.lpVtbl = &storage_file_vtbl;
++    impl->IStorageItem_iface.lpVtbl = &file_item_vtbl;
++    impl->IRandomAccessStreamReference_iface.lpVtbl = &stream_ref_vtbl;
++    impl->IInputStreamReference_iface.lpVtbl = &input_ref_vtbl;
++    impl->ref = 1;
++    lstrcpynW(impl->path, path, MAX_PATH);
++    *out = &impl->IStorageFile_iface;
++    return S_OK;
++}
++
++/* the async result of a folder's file operation: file is taken over */
++HRESULT storage_file_operation(HRESULT hr, IStorageFile *file, IAsyncOperation_StorageFile **operation)
++{
++    return done_create(DONE_OPERATION, &IID_IAsyncOperation_StorageFile, hr, (IUnknown *)file, NULL, 0, (void **)operation);
++}
+diff --git a/dlls/windows.storage.applicationdata/storagefolder_gen.c b/dlls/windows.storage.applicationdata/storagefolder_gen.c
+index b53c3de..c13f19c 100644
+--- a/dlls/windows.storage.applicationdata/storagefolder_gen.c
++++ b/dlls/windows.storage.applicationdata/storagefolder_gen.c
+@@ -55,18 +55,6 @@ static HRESULT WINAPI storage_folder_GetRuntimeClassName(IStorageFolder *iface,
+ static HRESULT WINAPI storage_folder_GetTrustLevel(IStorageFolder *iface, TrustLevel *level)
+ { *level = BaseTrust; return S_OK; }
+ 
+-static HRESULT WINAPI storage_folder_CreateFileAsyncOverloadDefaultOptions(IStorageFolder *iface, HSTRING name, __FIAsyncOperation_1_Windows__CStorage__CStorageFile **operation)
+-{
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI storage_folder_CreateFileAsync(IStorageFolder *iface, HSTRING name, __x_ABI_CWindows_CStorage_CCreationCollisionOption options, __FIAsyncOperation_1_Windows__CStorage__CStorageFile **operation)
+-{
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
+-}
+-
+ /* ---- IAsyncOperation<StorageFolder>: done by the time it is returned (the folder work is synchronous) ---- */
+ 
+ struct folder_op
+@@ -241,10 +229,72 @@ static HRESULT WINAPI storage_folder_CreateFolderAsyncOverloadDefaultOptions(ISt
+     return storage_folder_CreateFolderAsync(iface, name, CreationCollisionOption_FailIfExists, operation);
+ }
+ 
+-static HRESULT WINAPI storage_folder_GetFileAsync(IStorageFolder *iface, HSTRING name, __FIAsyncOperation_1_Windows__CStorage__CStorageFile **operation)
++static HRESULT WINAPI storage_folder_CreateFileAsync(IStorageFolder *iface, HSTRING name, CreationCollisionOption options, IAsyncOperation_StorageFile **operation)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    struct storage_folder *impl = impl_from_storage_folder(iface);
++    IStorageFile *file = NULL;
++    WCHAR path[MAX_PATH];
++    DWORD disposition;
++    HANDLE handle;
++    HRESULT hr;
++    int i;
++
++    TRACE("iface %p, name %s, options %d.\n", iface, debugstr_hstring(name), options);
++    if (!operation) return E_POINTER;
++    if (FAILED(hr = child_path(impl, name, path))) return storage_file_operation(hr, NULL, operation);
++
++    switch (options)
++    {
++    case CreationCollisionOption_ReplaceExisting: disposition = CREATE_ALWAYS; break;
++    case CreationCollisionOption_OpenIfExists:    disposition = OPEN_ALWAYS; break;
++    case CreationCollisionOption_GenerateUniqueName:
++    {
++        /* "name (2).ext", "name (3).ext" ... */
++        const WCHAR *str = WindowsGetStringRawBuffer(name, NULL), *ext = wcsrchr(str, '.');
++        int stem = ext ? ext - str : wcslen(str);
++        for (i = 2; i < 1000 && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES; i++)
++            swprintf(path, MAX_PATH, L"%s\\%.*s (%d)%s", impl->path, stem, str, i, ext ? ext : L"");
++        disposition = CREATE_NEW;
++        break;
++    }
++    default:                                      disposition = CREATE_NEW; break;
++    }
++    if (GetFileAttributesW(path) & FILE_ATTRIBUTE_DIRECTORY && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES)
++        return storage_file_operation(HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), NULL, operation);
++    handle = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                         NULL, disposition, FILE_ATTRIBUTE_NORMAL, NULL);
++    if (handle == INVALID_HANDLE_VALUE)
++    {
++        DWORD error = GetLastError();
++        if (error == ERROR_FILE_EXISTS) error = ERROR_ALREADY_EXISTS;
++        return storage_file_operation(HRESULT_FROM_WIN32(error), NULL, operation);
++    }
++    CloseHandle(handle);
++    hr = storage_file_create(path, &file);
++    return storage_file_operation(hr, file, operation);
++}
++
++static HRESULT WINAPI storage_folder_CreateFileAsyncOverloadDefaultOptions(IStorageFolder *iface, HSTRING name, IAsyncOperation_StorageFile **operation)
++{
++    return storage_folder_CreateFileAsync(iface, name, CreationCollisionOption_FailIfExists, operation);
++}
++
++static HRESULT WINAPI storage_folder_GetFileAsync(IStorageFolder *iface, HSTRING name, IAsyncOperation_StorageFile **operation)
++{
++    struct storage_folder *impl = impl_from_storage_folder(iface);
++    IStorageFile *file = NULL;
++    WCHAR path[MAX_PATH];
++    DWORD attrs;
++    HRESULT hr;
++
++    TRACE("iface %p, name %s.\n", iface, debugstr_hstring(name));
++    if (!operation) return E_POINTER;
++    if (FAILED(hr = child_path(impl, name, path))) return storage_file_operation(hr, NULL, operation);
++    attrs = GetFileAttributesW(path);
++    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY))
++        return storage_file_operation(HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND), NULL, operation);
++    hr = storage_file_create(path, &file);
++    return storage_file_operation(hr, file, operation);
+ }
+ 
+ static HRESULT WINAPI storage_folder_GetFolderAsync(IStorageFolder *iface, HSTRING name, IAsyncOperation_StorageFolder **operation)
