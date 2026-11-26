@@ -18,7 +18,7 @@ docker run --rm -u "$(id -u):$(id -g)" -v "$BUILD:/build" -w /build/obj/wine win
             -I/build/src/wine/include/msvcrt -D_MSVCR_VER=0 -D__WINE_PE_BUILD -D_UCRT -Wall -O1 -fno-strict-aliasing
         tools/winegcc/winegcc -o /build/tests/xaml/$t.exe --wine-objdir . -b x86_64-w64-mingw32 -mconsole \
             /build/tests/xaml/$t.o dlls/combase/x86_64-windows/libcombase.a dlls/user32/x86_64-windows/libuser32.a \
-            dlls/gdi32/x86_64-windows/libgdi32.a dlls/advapi32/x86_64-windows/libadvapi32.a libs/uuid/x86_64-windows/libuuid.a dlls/winecrt0/x86_64-windows/libwinecrt0.a \
+            dlls/gdi32/x86_64-windows/libgdi32.a dlls/advapi32/x86_64-windows/libadvapi32.a libs/uuid/x86_64-windows/libuuid.a libs/winecrt0/x86_64-windows/libwinecrt0.a \
             dlls/ucrtbase/x86_64-windows/libucrtbase.a dlls/kernel32/x86_64-windows/libkernel32.a dlls/ntdll/x86_64-windows/libntdll.a
     done'
 info "built xamlhello.exe, xamllayout.exe, xamlmarkup.exe and the markup in $BUILD/tests/xaml"
