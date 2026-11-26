@@ -688,3 +688,45 @@ Patch 0048 is the code (`image.c`).
   - an ImageBrush painting a Border;
   - `DecodePixelWidth=20` decoding it at 20×10 from code.
 - Milestones 1 and 2 still pass 34/34.
+
+## 20. Milestone 5, part 4: ListView, GridView and their items (patches 0049-0050)
+
+Patch 0049 is the IDL. `winmd2idl.py` generated `Controls.ListView`, `GridView`, `ListViewBase`, `ListViewItem`,
+`GridViewItem`, `ItemsStackPanel`, `ItemsWrapGrid`, `Primitives.Selector` and `SelectorItem`, with their event
+arguments and delegates.
+- The generator missed `AsyncOperationCompletedHandler<LoadMoreItemsResult>` again; it is declared by hand.
+
+Patch 0050 is the code: `items.c` (ListView and GridView), the new `listview.c` (the items) and `panel.c` (the two panels).
+
+**What was built:**
+
+- **`ListView` and `GridView`** are ItemsControls with a kind, as Button and ToggleButton share one object.
+  - **Containers:** each item goes in a `ListViewItem` or `GridViewItem`, unless it already is one. The item's visual comes from `ItemTemplate`, the item itself if it is a UIElement, or text.
+  - **Panels and scrolling:** a ListView stacks its items in an `ItemsStackPanel`, a GridView wraps them in a horizontal `ItemsWrapGrid`. Both sit in a built-in `ScrollViewer` that scrolls vertically.
+  - **Selection** (`ISelector`, `IListViewBase`): `SelectionMode` None, Single, Multiple or Extended; `SelectedIndex`, `SelectedItem`, `SelectedValue` and `SelectedItems`; `SelectionChanged` with `AddedItems` and `RemovedItems`; `SelectAll`.
+    - Changes the app makes to `SelectedItems` or `ListViewItem.IsSelected` update the list.
+    - A `SelectedIndex` set before the items exist (as markup does) is applied once they do.
+    - Items that go away leave the selection.
+  - **Clicks:** a click selects in Single mode, toggles in Multiple, and in Extended mode Ctrl toggles and Shift selects a range. With `IsItemClickEnabled`, a click raises `ItemClick` with the `ClickedItem` and doesn't select (except in Multiple mode).
+  - **Keyboard:** the list takes the focus, not its items. The arrow keys (Left and Right in a GridView, Up and Down by a row), Home and End move through the items. They select in Single mode and in Extended mode without Ctrl (Shift for a range). Space selects, Enter raises ItemClick, and the item is scrolled into view.
+  - **`ScrollIntoView`** with either alignment.
+  - **Not supported:** virtualization, incremental loading, `Header` (it is kept but not shown), drag and drop, reordering, swipe, grouping, `ItemContainerStyle`, and the newer `IListViewBase2-6` interfaces.
+- **`ListViewItem` and `GridViewItem`** are ContentControls: two more kinds of the shared Button object, with `ISelectorItem.IsSelected`. They draw Windows 10's default looks:
+  - **ListViewItem:** 40 px minimum height and 12 px padding; translucent grey under the pointer and while pressed; the accent colour at 60% when selected (80% under the pointer, 90% pressed).
+  - **GridViewItem:** a 4 px gap, a grey frame under the pointer, and when selected an accent frame with a check mark in the top-right corner.
+  - The item the keyboard is on gets a focus frame while its list has keyboard focus.
+- **`ItemsStackPanel`** stacks like a StackPanel. **`ItemsWrapGrid`** gives every item the first item's size (or `ItemWidth`/`ItemHeight`) and wraps rows or columns, at most `MaximumRowsOrColumns` per line. Both report every item as visible.
+- **Markup:** the six classes; `SelectionMode`, `SelectedIndex`, `IsItemClickEnabled`, `CanDragItems`, `CanReorderItems` and `IsSwipeEnabled`; `IsSelected` on an item; the panels' `Orientation`, `MaximumRowsOrColumns`, `ItemWidth` and `ItemHeight`.
+- **A fix in the markup reader:** `<x:String>`, `<x:Double>` and the like as children of an ItemsControl were dropped. They are added to `Items` boxed as PropertyValues now.
+
+**Tests:**
+
+- **`xamlmarkup`: 221/221 checks pass**, 23 of them new. A ListView of six strings, an Extended ListView of `ListViewItem`s and a Multiple GridView of five tiles check:
+  - `SelectedIndex="1"` from markup, `SelectedItem` as the string, and the 60% accent colour;
+  - `IsSelected="True"` on a ListViewItem;
+  - a click selecting, with one `SelectionChanged` that adds one item and removes one;
+  - Down selecting the next item and scrolling it into view, End selecting the last, and `SelectedItem = null` clearing the selection;
+  - Ctrl+click adding to an Extended selection, and a plain click selecting just that item;
+  - the GridView's four tiles to a row with the fifth wrapping;
+  - `ItemClick` with the Border as `ClickedItem`, Multiple's clicks toggling, the accent frame, and `SelectAll`.
+- Milestones 1 and 2 still pass 34/34.

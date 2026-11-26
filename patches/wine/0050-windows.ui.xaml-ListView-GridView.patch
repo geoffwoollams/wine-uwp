@@ -1,0 +1,2721 @@
+Subject: windows.ui.xaml: ListView, GridView, ListViewItem, GridViewItem, ItemsStackPanel and ItemsWrapGrid (milestone 5 part 4)
+
+diff --git a/dlls/windows.ui.xaml/Makefile.in b/dlls/windows.ui.xaml/Makefile.in
+index 25a4233..8d15bc7 100644
+--- a/dlls/windows.ui.xaml/Makefile.in
++++ b/dlls/windows.ui.xaml/Makefile.in
+@@ -17,6 +17,7 @@ SOURCES = \
+ 	focus.c \
+ 	image.c \
+ 	items.c \
++	listview.c \
+ 	main.c \
+ 	media.c \
+ 	panel.c \
+diff --git a/dlls/windows.ui.xaml/button.c b/dlls/windows.ui.xaml/button.c
+index 509a508..2746392 100644
+--- a/dlls/windows.ui.xaml/button.c
++++ b/dlls/windows.ui.xaml/button.c
+@@ -113,7 +113,7 @@ static void button_text_format( struct button *impl, struct text_format *format
+     format->weight = impl->font_weight.Weight;
+     format->italic = impl->font_style != FontStyle_Normal;
+     format->wrap = FALSE;
+-    format->alignment = has_glyph( impl ) ? TextAlignment_Left : TextAlignment_Center;
++    format->alignment = has_glyph( impl ) || impl->kind == BUTTON_LIST_ITEM ? TextAlignment_Left : TextAlignment_Center;
+ }
+ 
+ static HRESULT button_query_interface( struct xaml_element *element, REFIID iid, void **out )
+@@ -127,10 +127,12 @@ static HRESULT button_query_interface( struct xaml_element *element, REFIID iid,
+         IInspectable_AddRef( (IInspectable *)*out );
+         return S_OK;
+     }
+-    if (impl->kind == BUTTON_SCROLL)
++    if (impl->kind == BUTTON_SCROLL || is_item_kind( impl ))
+     {
+         if (IsEqualGUID( iid, &IID_IContentControl )) *out = &impl->IContentControl_iface;
+         else if (IsEqualGUID( iid, &IID_IControl )) *out = &impl->IControl_iface;
++        else if (is_item_kind( impl )) return item_query_interface( impl, iid, out );
++        else if (IsEqualGUID( iid, &IID_IControl )) *out = &impl->IControl_iface;
+         else return scroll_query_interface( impl, iid, out );
+         IInspectable_AddRef( (IInspectable *)*out );
+         return S_OK;
+@@ -200,6 +202,12 @@ static void button_measure( struct xaml_element *element, struct layout_context
+     }
+     *width += extra_width;
+     *height += extra_height;
++    if (impl->kind == BUTTON_LIST_ITEM)
++    {
++        /* the default ListViewItem style's MinWidth and MinHeight */
++        *width = max( *width, 88.0f );
++        *height = max( *height, 40.0f );
++    }
+     if (has_glyph( impl ))
+     {
+         /* the default templates: a 20 px glyph column, and a 32 px minimum height */
+@@ -357,6 +365,17 @@ static void render_content( struct button *impl, struct layout_context *ctx, COL
+     {
+         button_inner_rect( impl, &inner );
+         button_text_format( impl, &format );
++        if (is_item_kind( impl ))
++        {
++            /* a list item's text is centred vertically (VerticalContentAlignment) */
++            float w, h;
++            text_measure( ctx, &format, impl->content_text, inner.width, &w, &h );
++            if (h < inner.height)
++            {
++                inner.y += (inner.height - h) / 2;
++                inner.height = h;
++            }
++        }
+         text_draw( ctx, &format, impl->content_text, &inner, text );
+     }
+ }
+@@ -489,6 +508,14 @@ static void button_render( struct xaml_element *element, struct layout_context *
+         render_glyph_control( impl, ctx );
+         return;
+     }
++    if (is_item_kind( impl ))
++    {
++        item_render_background( impl, ctx );
++        if (impl->foreground) brush_look( impl->foreground, &fg );
++        render_content( impl, ctx, fg.color );
++        item_render_overlay( impl, ctx );
++        return;
++    }
+ 
+     /* the Windows 10 defaults */
+     if (!impl->enabled)
+@@ -626,6 +653,10 @@ static void button_raise_click( struct button *impl )
+ {
+     switch (impl->kind)
+     {
++    case BUTTON_LIST_ITEM:
++    case BUTTON_GRID_ITEM:
++        item_clicked( impl );   /* the ListView handles it: selection and ItemClick */
++        return;
+     case BUTTON_PLAIN:
+         break;
+     case BUTTON_RADIO:
+@@ -718,7 +749,8 @@ static void button_destroy( struct xaml_element *element )
+ static BOOL button_focusable( struct xaml_element *element )
+ {
+     struct button *impl = impl_from_element( element );
+-    return impl->enabled && impl->kind != BUTTON_PROGRESS && impl->kind != BUTTON_SCROLL;
++    /* a ListView takes the focus for its items */
++    return impl->enabled && impl->kind != BUTTON_PROGRESS && impl->kind != BUTTON_SCROLL && !is_item_kind( impl );
+ }
+ 
+ /* Space presses and releases a button (Click on release), Enter clicks a Button at once */
+@@ -729,6 +761,7 @@ static BOOL button_key( struct xaml_element *element, BOOL down, WPARAM vk )
+     if (impl->kind == BUTTON_SCROLL) return scroll_key( impl, down, vk );
+     if (is_text_kind( impl )) return textbox_key( impl, down, vk );
+     if (is_range_kind( impl )) return range_key( impl, down, vk );
++    if (is_item_kind( impl )) return FALSE;
+     if (!impl->enabled || element_focus_state( element ) == FocusState_Unfocused) return FALSE;
+     if (vk == VK_SPACE)
+     {
+@@ -1525,6 +1558,8 @@ static HRESULT button_create( enum button_kind kind, IInspectable *outer, IInspe
+         RuntimeClass_Windows_UI_Xaml_Controls_ScrollViewer,
+         RuntimeClass_Windows_UI_Xaml_Controls_TextBox,
+         RuntimeClass_Windows_UI_Xaml_Controls_PasswordBox,
++        RuntimeClass_Windows_UI_Xaml_Controls_ListViewItem,
++        RuntimeClass_Windows_UI_Xaml_Controls_GridViewItem,
+     };
+     struct button *impl;
+     void *iface;
+@@ -1566,6 +1601,7 @@ static HRESULT button_create( enum button_kind kind, IInspectable *outer, IInspe
+         impl->content_vertical = VerticalAlignment_Center;
+     }
+     if (is_range_kind( impl )) range_init( impl );
++    if (is_item_kind( impl )) item_init( impl );
+     /* not tab stops by default: a ProgressBar, and a ScrollViewer (its content is) */
+     if (kind == BUTTON_PROGRESS || kind == BUTTON_SCROLL) impl->element.is_tab_stop = FALSE;
+     if (kind == BUTTON_SCROLL && FAILED(scroll_init( impl )))
+@@ -1582,6 +1618,7 @@ static HRESULT button_create( enum button_kind kind, IInspectable *outer, IInspe
+     {
+     case BUTTON_TEXTBOX: case BUTTON_PASSWORD: iface = textbox_default_iface( impl ); break;
+     case BUTTON_SCROLL: iface = scroll_default_iface( impl ); break;
++    case BUTTON_LIST_ITEM: case BUTTON_GRID_ITEM: iface = item_default_iface( impl ); break;
+     case BUTTON_TOGGLE_SWITCH: case BUTTON_SLIDER: case BUTTON_PROGRESS: iface = range_default_iface( impl ); break;
+     case BUTTON_PLAIN: iface = &impl->IButton_iface; break;
+     case BUTTON_CHECK: iface = &impl->ICheckBox_iface; break;
+@@ -1604,6 +1641,8 @@ struct button_statics
+     ISliderFactory ISliderFactory_iface;
+     IProgressBarFactory IProgressBarFactory_iface;
+     ITextBoxFactory ITextBoxFactory_iface;
++    IListViewItemFactory IListViewItemFactory_iface;
++    IGridViewItemFactory IGridViewItemFactory_iface;
+     enum button_kind kind;
+ };
+ 
+@@ -1633,6 +1672,10 @@ static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID
+         *out = &impl->IProgressBarFactory_iface;
+     else if (impl->kind == BUTTON_TEXTBOX && IsEqualGUID( iid, &IID_ITextBoxFactory ))
+         *out = &impl->ITextBoxFactory_iface;
++    else if (impl->kind == BUTTON_LIST_ITEM && IsEqualGUID( iid, &IID_IListViewItemFactory ))
++        *out = &impl->IListViewItemFactory_iface;
++    else if (impl->kind == BUTTON_GRID_ITEM && IsEqualGUID( iid, &IID_IGridViewItemFactory ))
++        *out = &impl->IGridViewItemFactory_iface;
+     else
+     {
+         FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
+@@ -1708,11 +1751,14 @@ BUTTON_FACTORY( radio_button_factory_iface, IRadioButtonFactory, IRadioButton, I
+ BUTTON_FACTORY( slider_factory_iface, ISliderFactory, ISlider, ISliderFactory_iface, BUTTON_SLIDER )
+ BUTTON_FACTORY( progress_bar_factory_iface, IProgressBarFactory, IProgressBar, IProgressBarFactory_iface, BUTTON_PROGRESS )
+ BUTTON_FACTORY( text_box_factory_iface, ITextBoxFactory, ITextBox, ITextBoxFactory_iface, BUTTON_TEXTBOX )
++BUTTON_FACTORY( list_view_item_factory_iface, IListViewItemFactory, IListViewItem, IListViewItemFactory_iface, BUTTON_LIST_ITEM )
++BUTTON_FACTORY( grid_view_item_factory_iface, IGridViewItemFactory, IGridViewItem, IGridViewItemFactory_iface, BUTTON_GRID_ITEM )
+ 
+ #define BUTTON_STATICS( kind ) \
+     { {&factory_vtbl}, {&button_factory_iface_vtbl}, {&toggle_button_factory_iface_vtbl}, \
+       {&check_box_factory_iface_vtbl}, {&radio_button_factory_iface_vtbl}, {&slider_factory_iface_vtbl}, \
+-      {&progress_bar_factory_iface_vtbl}, {&text_box_factory_iface_vtbl}, kind }
++      {&progress_bar_factory_iface_vtbl}, {&text_box_factory_iface_vtbl}, {&list_view_item_factory_iface_vtbl}, \
++      {&grid_view_item_factory_iface_vtbl}, kind }
+ 
+ static struct button_statics button_statics = BUTTON_STATICS( BUTTON_PLAIN );
+ static struct button_statics toggle_button_statics = BUTTON_STATICS( BUTTON_TOGGLE );
+@@ -1736,3 +1782,9 @@ IActivationFactory *progress_bar_factory = &progress_bar_statics.IActivationFact
+ IActivationFactory *scroll_viewer_factory = &scroll_viewer_statics.IActivationFactory_iface;
+ IActivationFactory *text_box_factory = &text_box_statics.IActivationFactory_iface;
+ IActivationFactory *password_box_factory = &password_box_statics.IActivationFactory_iface;
++
++static struct button_statics list_view_item_statics = BUTTON_STATICS( BUTTON_LIST_ITEM );
++static struct button_statics grid_view_item_statics = BUTTON_STATICS( BUTTON_GRID_ITEM );
++
++IActivationFactory *list_view_item_factory = &list_view_item_statics.IActivationFactory_iface;
++IActivationFactory *grid_view_item_factory = &grid_view_item_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/classes.idl b/dlls/windows.ui.xaml/classes.idl
+index 0eecabc..7e7b02a 100644
+--- a/dlls/windows.ui.xaml/classes.idl
++++ b/dlls/windows.ui.xaml/classes.idl
+@@ -42,8 +42,14 @@ namespace Windows.UI.Xaml.Controls {
+     runtimeclass ContentPresenter;
+     runtimeclass Frame;
+     runtimeclass Grid;
++    runtimeclass GridView;
++    runtimeclass GridViewItem;
+     runtimeclass Image;
+     runtimeclass ItemsControl;
++    runtimeclass ItemsStackPanel;
++    runtimeclass ItemsWrapGrid;
++    runtimeclass ListView;
++    runtimeclass ListViewItem;
+     runtimeclass Page;
+     runtimeclass PasswordBox;
+     runtimeclass ProgressBar;
+diff --git a/dlls/windows.ui.xaml/control.h b/dlls/windows.ui.xaml/control.h
+index 289db48..e2b081a 100644
+--- a/dlls/windows.ui.xaml/control.h
++++ b/dlls/windows.ui.xaml/control.h
+@@ -33,6 +33,8 @@ enum button_kind
+     BUTTON_SCROLL,          /* scroll.c: ScrollViewer, a ContentControl that scrolls its content */
+     BUTTON_TEXTBOX,         /* textbox.c: TextBox and PasswordBox, text editing Controls */
+     BUTTON_PASSWORD,
++    BUTTON_LIST_ITEM,       /* listview.c: ListViewItem and GridViewItem, a ListView's / GridView's containers */
++    BUTTON_GRID_ITEM,
+ };
+ 
+ enum check_state
+@@ -90,6 +92,12 @@ struct button
+     struct scroll_state *scroll;
+     /* textbox.c: TextBox and PasswordBox */
+     struct text_edit *edit;
++    /* listview.c: ListViewItem and GridViewItem */
++    ISelectorItem ISelectorItem_iface;
++    IListViewItem IListViewItem_iface;
++    IGridViewItem IGridViewItem_iface;
++    struct xaml_element *selector;   /* the ListView or GridView showing it (not referenced) */
++    boolean is_selected, is_current;
+ };
+ 
+ static inline struct button *impl_from_element( struct xaml_element *element )
+@@ -151,6 +159,18 @@ BOOL textbox_key( struct button *impl, BOOL down, WPARAM vk );
+ BOOL textbox_char( struct button *impl, WCHAR ch );
+ void textbox_destroy( struct button *impl );
+ 
++/* listview.c */
++static inline BOOL is_item_kind( struct button *impl )
++{
++    return impl->kind == BUTTON_LIST_ITEM || impl->kind == BUTTON_GRID_ITEM;
++}
++void item_init( struct button *impl );
++void *item_default_iface( struct button *impl );
++HRESULT item_query_interface( struct button *impl, REFIID iid, void **out );
++void item_render_background( struct button *impl, struct layout_context *ctx );
++void item_render_overlay( struct button *impl, struct layout_context *ctx );
++void item_clicked( struct button *impl );
++
+ 
+ 
+ #endif
+diff --git a/dlls/windows.ui.xaml/element.c b/dlls/windows.ui.xaml/element.c
+index ac4cab7..6fb78c9 100644
+--- a/dlls/windows.ui.xaml/element.c
++++ b/dlls/windows.ui.xaml/element.c
+@@ -1782,7 +1782,7 @@ void element_fill_color( struct layout_context *ctx, const struct layout_rect *r
+ }
+ 
+ /* a fill with alpha: theme brushes such as SystemControlBackgroundBaseLowBrush are translucent black or white */
+-static void fill_argb( struct layout_context *ctx, const struct layout_rect *rect, Color c )
++void element_fill_argb( struct layout_context *ctx, const struct layout_rect *rect, Color c )
+ {
+     BLENDFUNCTION blend = { AC_SRC_OVER, 0, c.A, 0 };
+     BITMAPINFO info = {{ sizeof(info.bmiHeader), 1, 1, 1, 32 }};
+@@ -1823,7 +1823,7 @@ void element_fill( struct layout_context *ctx, const struct layout_rect *rect, I
+         return;
+     }
+     if (!brush || !brush_get_color( brush, &c ) || !c.A) return;
+-    fill_argb( ctx, rect, c );
++    element_fill_argb( ctx, rect, c );
+ }
+ 
+ /* ---- shapes: rounded rectangles (one radius per corner) and ellipses, as GDI regions ---- */
+@@ -1892,7 +1892,7 @@ static void fill_region( struct layout_context *ctx, HRGN region, Color c )
+     all.y = box.top / ctx->scale;
+     all.width = (box.right - box.left) / ctx->scale + 1;
+     all.height = (box.bottom - box.top) / ctx->scale + 1;
+-    fill_argb( ctx, &all, c );
++    element_fill_argb( ctx, &all, c );
+     SelectClipRgn( ctx->hdc, had_clip ? saved : NULL );
+ done:
+     DeleteObject( saved );
+@@ -2036,18 +2036,18 @@ void element_frame( struct layout_context *ctx, const struct layout_rect *rect,
+     }
+     side = *rect;
+     side.height = min( (float)t->Top, rect->height );
+-    fill_argb( ctx, &side, c );
++    element_fill_argb( ctx, &side, c );
+     side.y = rect->y + rect->height - min( (float)t->Bottom, rect->height );
+     side.height = min( (float)t->Bottom, rect->height );
+-    fill_argb( ctx, &side, c );
++    element_fill_argb( ctx, &side, c );
+     side = *rect;
+     side.y += t->Top;
+     side.height = max( 0.0f, rect->height - t->Top - t->Bottom );
+     side.width = min( (float)t->Left, rect->width );
+-    fill_argb( ctx, &side, c );
++    element_fill_argb( ctx, &side, c );
+     side.x = rect->x + rect->width - min( (float)t->Right, rect->width );
+     side.width = min( (float)t->Right, rect->width );
+-    fill_argb( ctx, &side, c );
++    element_fill_argb( ctx, &side, c );
+ }
+ 
+ /* text */
+diff --git a/dlls/windows.ui.xaml/items.c b/dlls/windows.ui.xaml/items.c
+index 7cb0648..fab2da0 100644
+--- a/dlls/windows.ui.xaml/items.c
++++ b/dlls/windows.ui.xaml/items.c
+@@ -24,8 +24,23 @@ WINE_DEFAULT_DEBUG_CHANNEL(xaml);
+ /* An ItemsControl shows its items (Items, or ItemsSource: IIterable<Object>, IBindableIterable or a vector) in
+  * its ItemsPanel (a StackPanel by default): UIElement items as they are, others through ItemTemplate with the
+  * item as the DataContext, or as text. An observable ItemsSource (IObservableVector<Object>) and changes to
+- * Items regenerate them. There is no control template (ItemsPresenter), no containers, grouping or
+- * DisplayMemberPath. */
++ * Items regenerate them. There is no control template (ItemsPresenter), grouping or DisplayMemberPath.
++ *
++ * ListView and GridView (ListViewBase, a Selector) are ItemsControls too (kind): each item goes in a container,
++ * a ListViewItem or GridViewItem (listview.c) unless it is one, in an ItemsStackPanel or a horizontal
++ * ItemsWrapGrid, inside a ScrollViewer that scrolls vertically. They keep the selection (SelectionMode,
++ * SelectedIndex / Item / Items, SelectionChanged), raise ItemClick when IsItemClickEnabled, and take the keyboard
++ * focus: the arrow keys, Home and End move through the items (selecting them in Single and Extended mode, with
++ * Shift for a range), Space selects, Enter clicks, and the list scrolls the item into view. Ctrl+click toggles
++ * an item in Extended mode, Shift+click selects a range. There is no virtualization, Header, incremental loading,
++ * drag and drop or reordering. */
++
++enum items_kind
++{
++    ITEMS_CONTROL,
++    ITEMS_LIST_VIEW,
++    ITEMS_GRID_VIEW,
++};
+ 
+ struct items_control
+ {
+@@ -42,8 +57,36 @@ struct items_control
+     IInspectable *panel_object;
+     struct xaml_element *panel;
+     BOOL dirty;
++
++    /* ListView and GridView */
++    enum items_kind kind;
++    ISelector ISelector_iface;
++    IListViewBase IListViewBase_iface;
++    IListView IListView_iface;
++    IGridView IGridView_iface;
++    IInspectable *scroll_object;          /* the ScrollViewer around the panel */
++    struct xaml_element *scroll;
++    IInspectable **data;                  /* the items, and their containers (children of the panel) */
++    struct xaml_element **containers;
++    UINT32 count, capacity;
++    IInspectable *selected;               /* SelectedItems, an IVector<Object> */
++    ListViewSelectionMode selection_mode;
++    boolean item_click_enabled, swipe_enabled, can_drag, can_reorder;
++    double data_fetch_size, incremental_threshold;
++    IncrementalLoadingTrigger incremental_trigger;
++    IInspectable *header;
++    IDataTemplate *header_template;
++    HSTRING selected_value_path;
++    INT32 current, anchor;                /* the keyboard's item, and where a Shift range starts */
++    INT32 pending_index;                  /* SelectedIndex set before there were that many items, or -1 */
++    BOOL updating;                        /* changing SelectedItems ourselves */
++    struct event_list selection_changed, item_click, drag_items_starting;
+ };
+ 
++static void list_generated( struct items_control *impl );
++static void list_add_item( struct items_control *impl, IVector_UIElement *children, IInspectable *item );
++static void list_free_data( struct items_control *impl );
++
+ static const struct element_ops items_control_ops;
+ static const struct IItemsControlVtbl items_control_vtbl;
+ 
+@@ -84,8 +127,12 @@ static HRESULT items_control_query_interface( struct xaml_element *element, REFI
+ {
+     struct items_control *impl = impl_from_element( element );
+ 
+-    if (!IsEqualGUID( iid, &IID_IItemsControl )) return E_NOINTERFACE;
+-    *out = &impl->IItemsControl_iface;
++    if (IsEqualGUID( iid, &IID_IItemsControl )) *out = &impl->IItemsControl_iface;
++    else if (impl->kind != ITEMS_CONTROL && IsEqualGUID( iid, &IID_ISelector )) *out = &impl->ISelector_iface;
++    else if (impl->kind != ITEMS_CONTROL && IsEqualGUID( iid, &IID_IListViewBase )) *out = &impl->IListViewBase_iface;
++    else if (impl->kind == ITEMS_LIST_VIEW && IsEqualGUID( iid, &IID_IListView )) *out = &impl->IListView_iface;
++    else if (impl->kind == ITEMS_GRID_VIEW && IsEqualGUID( iid, &IID_IGridView )) *out = &impl->IGridView_iface;
++    else return E_NOINTERFACE;
+     IInspectable_AddRef( (IInspectable *)*out );
+     return S_OK;
+ }
+@@ -130,12 +177,83 @@ static IUIElement *container_for( struct items_control *impl, IInspectable *item
+ 
+ static void add_item( struct items_control *impl, IVector_UIElement *children, IInspectable *item )
+ {
+-    IUIElement *ui = container_for( impl, item );
++    IUIElement *ui;
++
++    if (impl->kind != ITEMS_CONTROL)
++    {
++        list_add_item( impl, children, item );
++        return;
++    }
++    ui = container_for( impl, item );
+     if (!ui) return;
+     IVector_UIElement_Append( children, ui );
+     IUIElement_Release( ui );
+ }
+ 
++static void create_default_panel( struct items_control *impl )
++{
++    IItemsWrapGrid *wrap;
++
++    switch (impl->kind)
++    {
++    case ITEMS_CONTROL:
++        IActivationFactory_ActivateInstance( stack_panel_factory, &impl->panel_object );
++        break;
++    case ITEMS_LIST_VIEW:
++        IActivationFactory_ActivateInstance( items_stack_panel_factory, &impl->panel_object );
++        break;
++    case ITEMS_GRID_VIEW:
++        /* the default GridView ItemsPanel: <ItemsWrapGrid Orientation="Horizontal"/> */
++        if (FAILED(IActivationFactory_ActivateInstance( items_wrap_grid_factory, &impl->panel_object ))) break;
++        if (SUCCEEDED(IInspectable_QueryInterface( impl->panel_object, &IID_IItemsWrapGrid, (void **)&wrap )))
++        {
++            IItemsWrapGrid_put_Orientation( wrap, Orientation_Horizontal );
++            IItemsWrapGrid_Release( wrap );
++        }
++        break;
++    }
++}
++
++static void set_scroll_content( struct items_control *impl, IInspectable *content )
++{
++    IContentControl *cc;
++
++    if (!impl->scroll_object) return;
++    if (SUCCEEDED(IInspectable_QueryInterface( impl->scroll_object, &IID_IContentControl, (void **)&cc )))
++    {
++        IContentControl_put_Content( cc, content );
++        IContentControl_Release( cc );
++    }
++}
++
++/* the panel goes in the element, or for a ListView / GridView in its ScrollViewer */
++static void attach_panel( struct items_control *impl )
++{
++    if (impl->kind == ITEMS_CONTROL)
++    {
++        element_set_parent( impl->panel, &impl->element );
++        return;
++    }
++    if (!impl->scroll_object)
++    {
++        if (FAILED(IActivationFactory_ActivateInstance( scroll_viewer_factory, &impl->scroll_object ))) return;
++        if (!(impl->scroll = element_from_object( impl->scroll_object ))) return;
++        element_set_parent( impl->scroll, &impl->element );
++    }
++    set_scroll_content( impl, impl->panel_object );
++}
++
++static void detach_panel( struct items_control *impl )
++{
++    if (impl->scroll_object) set_scroll_content( impl, NULL );
++    else element_set_parent( impl->panel, NULL );
++}
++
++static struct xaml_element *top_child( struct items_control *impl )
++{
++    return impl->scroll ? impl->scroll : impl->panel;
++}
++
+ static void generate( struct items_control *impl )
+ {
+     IVector_UIElement *children;
+@@ -152,10 +270,11 @@ static void generate( struct items_control *impl )
+     if (!impl->panel)
+     {
+         if (impl->items_panel) impl->panel_object = template_load_content( (IInspectable *)impl->items_panel );
+-        if (!impl->panel_object) IActivationFactory_ActivateInstance( stack_panel_factory, &impl->panel_object );
++        if (!impl->panel_object) create_default_panel( impl );
+         if (!impl->panel_object || !(impl->panel = element_from_object( impl->panel_object ))) return;
+-        element_set_parent( impl->panel, &impl->element );
++        attach_panel( impl );
+     }
++    list_free_data( impl );
+     if (FAILED(IInspectable_QueryInterface( impl->panel_object, &IID_IPanel, (void **)&panel ))) return;
+     IPanel_get_Children( panel, &children );
+     IPanel_Release( panel );
+@@ -197,6 +316,7 @@ static void generate( struct items_control *impl )
+     }
+     else FIXME( "ItemsSource %p is not an IIterable<Object> or IBindableIterable.\n", impl->items_source );
+     IVector_UIElement_Release( children );
++    if (impl->kind != ITEMS_CONTROL) list_generated( impl );
+ }
+ 
+ static void items_control_measure( struct xaml_element *element, struct layout_context *ctx, float avail_width,
+@@ -204,36 +324,44 @@ static void items_control_measure( struct xaml_element *element, struct layout_c
+ {
+     struct items_control *impl = impl_from_element( element );
+ 
++    struct xaml_element *top;
++
+     if (impl->dirty) generate( impl );
+     *width = *height = 0;
+-    if (!impl->panel) return;
+-    element_measure( impl->panel, ctx, avail_width, avail_height );
+-    *width = impl->panel->desired_width;
+-    *height = impl->panel->desired_height;
++    if (!(top = top_child( impl ))) return;
++    element_measure( top, ctx, avail_width, avail_height );
++    *width = top->desired_width;
++    *height = top->desired_height;
+ }
+ 
+ static void items_control_arrange( struct xaml_element *element, struct layout_context *ctx )
+ {
+     struct items_control *impl = impl_from_element( element );
+-    if (impl->panel) element_arrange( impl->panel, ctx, element->bounds.x, element->bounds.y, element->bounds.width, element->bounds.height );
++    struct xaml_element *top = top_child( impl );
++    if (top) element_arrange( top, ctx, element->bounds.x, element->bounds.y, element->bounds.width, element->bounds.height );
+ }
+ 
+ static void items_control_render( struct xaml_element *element, struct layout_context *ctx )
+ {
+     struct items_control *impl = impl_from_element( element );
+-    if (impl->panel) element_render( impl->panel, ctx );
++    struct xaml_element *top = top_child( impl );
++    if (top) element_render( top, ctx );
+ }
+ 
+ static UINT32 items_control_child_count( struct xaml_element *element )
+ {
+-    return impl_from_element( element )->panel ? 1 : 0;
++    return top_child( impl_from_element( element ) ) ? 1 : 0;
+ }
+ 
+ static struct xaml_element *items_control_child_at( struct xaml_element *element, UINT32 index )
+ {
+-    return impl_from_element( element )->panel;
++    return top_child( impl_from_element( element ) );
+ }
+ 
++static BOOL list_focusable( struct xaml_element *element );
++static BOOL list_key( struct xaml_element *element, BOOL down, WPARAM vk );
++static void list_focus_changed( struct xaml_element *element );
++
+ static void stop_observing( struct items_control *impl )
+ {
+     if (!impl->observed) return;
+@@ -247,8 +375,23 @@ static void items_control_destroy( struct xaml_element *element )
+     struct items_control *impl = impl_from_element( element );
+ 
+     stop_observing( impl );
+-    if (impl->panel) element_set_parent( impl->panel, NULL );
++    list_free_data( impl );
++    if (impl->panel) detach_panel( impl );
++    if (impl->scroll) element_set_parent( impl->scroll, NULL );
++    if (impl->scroll_object) IInspectable_Release( impl->scroll_object );
+     if (impl->panel_object) IInspectable_Release( impl->panel_object );
++    if (impl->selected)
++    {
++        impl->updating = TRUE;   /* no SelectionChanged while going away */
++        vector_detach( impl->selected );
++        IInspectable_Release( impl->selected );
++    }
++    if (impl->header) IInspectable_Release( impl->header );
++    if (impl->header_template) IDataTemplate_Release( impl->header_template );
++    WindowsDeleteString( impl->selected_value_path );
++    event_list_clear( &impl->selection_changed );
++    event_list_clear( &impl->item_click );
++    event_list_clear( &impl->drag_items_starting );
+     if (impl->items_source) IInspectable_Release( impl->items_source );
+     if (impl->item_template) IDataTemplate_Release( impl->item_template );
+     if (impl->items_panel) IItemsPanelTemplate_Release( impl->items_panel );
+@@ -269,6 +412,9 @@ static const struct element_ops items_control_ops =
+     .child_count = items_control_child_count,
+     .child_at = items_control_child_at,
+     .destroy = items_control_destroy,
++    .focusable = list_focusable,
++    .key = list_key,
++    .focus_changed = list_focus_changed,
+ };
+ 
+ /* Items: IObservableVector<Object>, with the vector interfaces from our vector */
+@@ -411,7 +557,8 @@ static HRESULT WINAPI items_control_put_ItemsPanel( IItemsControl *iface, IItems
+     if (impl->panel)
+     {
+         /* a new panel on the next layout */
+-        element_set_parent( impl->panel, NULL );
++        list_free_data( impl );
++        detach_panel( impl );
+         IInspectable_Release( impl->panel_object );
+         impl->panel_object = NULL;
+         impl->panel = NULL;
+@@ -546,6 +693,1124 @@ static const struct IItemsControlVtbl items_control_vtbl =
+ };
+ 
+ 
++/* ---- ListView and GridView: containers and selection ---- */
++
++static BOOL same_object( IInspectable *a, IInspectable *b )
++{
++    IUnknown *ua, *ub;
++    BOOL same;
++
++    if (a == b) return TRUE;
++    if (!a || !b) return FALSE;
++    if (FAILED(IInspectable_QueryInterface( a, &IID_IUnknown, (void **)&ua ))) return FALSE;
++    if (FAILED(IInspectable_QueryInterface( b, &IID_IUnknown, (void **)&ub )))
++    {
++        IUnknown_Release( ua );
++        return FALSE;
++    }
++    same = ua == ub;
++    IUnknown_Release( ua );
++    IUnknown_Release( ub );
++    return same;
++}
++
++static INT32 index_of_item( struct items_control *impl, IInspectable *item )
++{
++    UINT32 i;
++    for (i = 0; i < impl->count; i++) if (same_object( impl->data[i], item )) return i;
++    return -1;
++}
++
++static INT32 index_of_container( struct items_control *impl, struct xaml_element *container )
++{
++    UINT32 i;
++    for (i = 0; i < impl->count; i++) if (impl->containers[i] == container) return i;
++    return -1;
++}
++
++static INT32 selected_position( struct items_control *impl, IInspectable *item )
++{
++    UINT32 i, count = vector_size( impl->selected );
++    for (i = 0; i < count; i++) if (same_object( vector_get( impl->selected, i ), item )) return i;
++    return -1;
++}
++
++static IVector_IInspectable *vector_iface( IInspectable *vector )
++{
++    IVector_IInspectable *out = NULL;
++    IInspectable_QueryInterface( vector, &IID_IVector_IInspectable, (void **)&out );
++    return out;
++}
++
++static void list_free_data( struct items_control *impl )
++{
++    UINT32 i;
++
++    for (i = 0; i < impl->count; i++)
++    {
++        if (impl->containers[i]) selector_item_attach( impl->containers[i], NULL );
++        if (impl->data[i]) IInspectable_Release( impl->data[i] );
++    }
++    impl->count = 0;
++}
++
++static void list_add_item( struct items_control *impl, IVector_UIElement *children, IInspectable *item )
++{
++    struct xaml_element *container = impl->item_template ? NULL : selector_item_from_object( item );
++    IInspectable *object = NULL;
++    IContentControl *cc;
++    IUIElement *ui = NULL, *content;
++    void *grow;
++
++    if (container && container->parent) container = NULL;   /* shown elsewhere */
++    if (container) IInspectable_QueryInterface( item, &IID_IUIElement, (void **)&ui );
++    else
++    {
++        IActivationFactory *factory = impl->kind == ITEMS_GRID_VIEW ? grid_view_item_factory : list_view_item_factory;
++        if (FAILED(IActivationFactory_ActivateInstance( factory, &object ))) return;
++        if ((content = container_for( impl, item )))
++        {
++            if (SUCCEEDED(IInspectable_QueryInterface( object, &IID_IContentControl, (void **)&cc )))
++            {
++                IContentControl_put_Content( cc, (IInspectable *)content );
++                IContentControl_Release( cc );
++            }
++            IUIElement_Release( content );
++        }
++        container = element_from_object( object );
++        IInspectable_QueryInterface( object, &IID_IUIElement, (void **)&ui );
++        IInspectable_Release( object );
++    }
++    if (!ui || !container) goto done;
++
++    if (impl->count == impl->capacity)
++    {
++        UINT32 capacity = max( 16, impl->capacity * 2 );
++        if (!(grow = realloc( impl->data, capacity * sizeof(*impl->data) ))) goto done;
++        impl->data = grow;
++        if (!(grow = realloc( impl->containers, capacity * sizeof(*impl->containers) ))) goto done;
++        impl->containers = grow;
++        impl->capacity = capacity;
++    }
++    if ((impl->data[impl->count] = item)) IInspectable_AddRef( item );
++    impl->containers[impl->count++] = container;
++    selector_item_attach( container, &impl->element );
++    if (selector_item_is_selected( container ) && selected_position( impl, item ) < 0)
++    {
++        /* <ListViewItem IsSelected="True"> */
++        IVector_IInspectable *vector = vector_iface( impl->selected );
++        impl->updating = TRUE;
++        if (vector) IVector_IInspectable_Append( vector, item );
++        impl->updating = FALSE;
++        if (vector) IVector_IInspectable_Release( vector );
++    }
++    else selector_item_set_selected( container, selected_position( impl, item ) >= 0 );
++    selector_item_set_current( container, FALSE );
++    IVector_UIElement_Append( children, ui );
++done:
++    if (ui) IUIElement_Release( ui );
++}
++
++/* SelectionChangedEventArgs and ItemClickEventArgs (both RoutedEventArgs) */
++
++struct list_event_args
++{
++    IInspectable IInspectable_inner;
++    ISelectionChangedEventArgs ISelectionChangedEventArgs_iface;
++    IItemClickEventArgs IItemClickEventArgs_iface;
++    IRoutedEventArgs IRoutedEventArgs_iface;
++    LONG ref;
++    BOOL click;
++    IInspectable *source, *added, *removed, *clicked;
++};
++
++static inline struct list_event_args *args_from_inner( IInspectable *iface )
++{
++    return CONTAINING_RECORD( iface, struct list_event_args, IInspectable_inner );
++}
++
++static HRESULT WINAPI list_args_QueryInterface( IInspectable *iface, REFIID iid, void **out )
++{
++    struct list_event_args *impl = args_from_inner( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ))
++        *out = &impl->IInspectable_inner;
++    else if (!impl->click && IsEqualGUID( iid, &IID_ISelectionChangedEventArgs ))
++        *out = &impl->ISelectionChangedEventArgs_iface;
++    else if (impl->click && IsEqualGUID( iid, &IID_IItemClickEventArgs ))
++        *out = &impl->IItemClickEventArgs_iface;
++    else if (IsEqualGUID( iid, &IID_IRoutedEventArgs ))
++        *out = &impl->IRoutedEventArgs_iface;
++    else
++    {
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI list_args_AddRef( IInspectable *iface )
++{
++    return InterlockedIncrement( &args_from_inner( iface )->ref );
++}
++
++static ULONG WINAPI list_args_Release( IInspectable *iface )
++{
++    struct list_event_args *impl = args_from_inner( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        if (impl->source) IInspectable_Release( impl->source );
++        if (impl->added) IInspectable_Release( impl->added );
++        if (impl->removed) IInspectable_Release( impl->removed );
++        if (impl->clicked) IInspectable_Release( impl->clicked );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI list_args_GetIids( IInspectable *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI list_args_GetRuntimeClassName( IInspectable *iface, HSTRING *class_name )
++{
++    const WCHAR *name = args_from_inner( iface )->click ? RuntimeClass_Windows_UI_Xaml_Controls_ItemClickEventArgs
++                                                         : RuntimeClass_Windows_UI_Xaml_Controls_SelectionChangedEventArgs;
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI list_args_GetTrustLevel( IInspectable *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static const struct IInspectableVtbl list_args_vtbl =
++{
++    list_args_QueryInterface,
++    list_args_AddRef,
++    list_args_Release,
++    list_args_GetIids,
++    list_args_GetRuntimeClassName,
++    list_args_GetTrustLevel,
++};
++
++DEFINE_IINSPECTABLE( selection_args, ISelectionChangedEventArgs, struct list_event_args, IInspectable_inner )
++
++static HRESULT WINAPI selection_args_get_AddedItems( ISelectionChangedEventArgs *iface, IVector_IInspectable **value )
++{
++    *value = vector_iface( impl_from_ISelectionChangedEventArgs( iface )->added );
++    return *value ? S_OK : E_FAIL;
++}
++
++static HRESULT WINAPI selection_args_get_RemovedItems( ISelectionChangedEventArgs *iface, IVector_IInspectable **value )
++{
++    *value = vector_iface( impl_from_ISelectionChangedEventArgs( iface )->removed );
++    return *value ? S_OK : E_FAIL;
++}
++
++static const struct ISelectionChangedEventArgsVtbl selection_args_vtbl =
++{
++    selection_args_QueryInterface,
++    selection_args_AddRef,
++    selection_args_Release,
++    /* IInspectable methods */
++    selection_args_GetIids,
++    selection_args_GetRuntimeClassName,
++    selection_args_GetTrustLevel,
++    /* ISelectionChangedEventArgs methods */
++    selection_args_get_AddedItems,
++    selection_args_get_RemovedItems,
++};
++
++DEFINE_IINSPECTABLE( click_args, IItemClickEventArgs, struct list_event_args, IInspectable_inner )
++
++static HRESULT WINAPI click_args_get_ClickedItem( IItemClickEventArgs *iface, IInspectable **value )
++{
++    if ((*value = impl_from_IItemClickEventArgs( iface )->clicked)) IInspectable_AddRef( *value );
++    return S_OK;
++}
++
++static const struct IItemClickEventArgsVtbl click_args_vtbl =
++{
++    click_args_QueryInterface,
++    click_args_AddRef,
++    click_args_Release,
++    /* IInspectable methods */
++    click_args_GetIids,
++    click_args_GetRuntimeClassName,
++    click_args_GetTrustLevel,
++    /* IItemClickEventArgs methods */
++    click_args_get_ClickedItem,
++};
++
++DEFINE_IINSPECTABLE( routed_args, IRoutedEventArgs, struct list_event_args, IInspectable_inner )
++
++static HRESULT WINAPI routed_args_get_OriginalSource( IRoutedEventArgs *iface, IInspectable **value )
++{
++    if ((*value = impl_from_IRoutedEventArgs( iface )->source)) IInspectable_AddRef( *value );
++    return S_OK;
++}
++
++static const struct IRoutedEventArgsVtbl routed_args_vtbl =
++{
++    routed_args_QueryInterface,
++    routed_args_AddRef,
++    routed_args_Release,
++    /* IInspectable methods */
++    routed_args_GetIids,
++    routed_args_GetRuntimeClassName,
++    routed_args_GetTrustLevel,
++    /* IRoutedEventArgs methods */
++    routed_args_get_OriginalSource,
++};
++
++static struct list_event_args *list_args_create( IInspectable *source, BOOL click )
++{
++    struct list_event_args *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return NULL;
++    impl->IInspectable_inner.lpVtbl = &list_args_vtbl;
++    impl->ISelectionChangedEventArgs_iface.lpVtbl = &selection_args_vtbl;
++    impl->IItemClickEventArgs_iface.lpVtbl = &click_args_vtbl;
++    impl->IRoutedEventArgs_iface.lpVtbl = &routed_args_vtbl;
++    impl->ref = 1;
++    impl->click = click;
++    if ((impl->source = source)) IInspectable_AddRef( source );
++    return impl;
++}
++
++/* copies of the handlers, so that a handler may remove itself */
++static IUnknown **copy_handlers( struct event_list *list, UINT32 *count )
++{
++    IUnknown **handlers;
++    UINT32 i;
++
++    *count = list->count;
++    if (!*count || !(handlers = calloc( *count, sizeof(*handlers) ))) return NULL;
++    for (i = 0; i < *count; i++) if ((handlers[i] = list->handlers[i])) IUnknown_AddRef( handlers[i] );
++    return handlers;
++}
++
++static void free_handlers( IUnknown **handlers, UINT32 count )
++{
++    UINT32 i;
++    for (i = 0; i < count; i++) if (handlers[i]) IUnknown_Release( handlers[i] );
++    free( handlers );
++}
++
++static const struct vector_callbacks no_callbacks;
++
++static void raise_selection_changed( struct items_control *impl, IInspectable *added, IInspectable *removed )
++{
++    struct list_event_args *args;
++    IUnknown **handlers;
++    UINT32 i, count;
++    HRESULT hr;
++
++    element_property_changed( impl->element.outer, L"SelectedIndex" );
++    element_property_changed( impl->element.outer, L"SelectedItem" );
++    element_property_changed( impl->element.outer, L"SelectedValue" );
++    if (!(handlers = copy_handlers( &impl->selection_changed, &count ))) return;
++    if ((args = list_args_create( impl->element.outer, FALSE )))
++    {
++        IInspectable_AddRef( (args->added = added) );
++        IInspectable_AddRef( (args->removed = removed) );
++        TRACE( "%p: SelectionChanged, %u added, %u removed.\n", impl, vector_size( added ), vector_size( removed ) );
++        for (i = 0; i < count; i++)
++        {
++            if (!handlers[i]) continue;
++            hr = ISelectionChangedEventHandler_Invoke( (ISelectionChangedEventHandler *)handlers[i], impl->element.outer,
++                                                       &args->ISelectionChangedEventArgs_iface );
++            if (FAILED(hr)) WARN( "SelectionChanged handler %p failed, hr %#lx.\n", handlers[i], hr );
++        }
++        IInspectable_Release( &args->IInspectable_inner );
++    }
++    free_handlers( handlers, count );
++}
++
++static void raise_item_click( struct items_control *impl, IInspectable *item )
++{
++    struct list_event_args *args;
++    IUnknown **handlers;
++    UINT32 i, count;
++    HRESULT hr;
++
++    if (!(handlers = copy_handlers( &impl->item_click, &count ))) return;
++    if ((args = list_args_create( impl->element.outer, TRUE )))
++    {
++        if ((args->clicked = item)) IInspectable_AddRef( item );
++        TRACE( "%p: ItemClick, item %p.\n", impl, item );
++        for (i = 0; i < count; i++)
++        {
++            if (!handlers[i]) continue;
++            hr = IItemClickEventHandler_Invoke( (IItemClickEventHandler *)handlers[i], impl->element.outer,
++                                                &args->IItemClickEventArgs_iface );
++            if (FAILED(hr)) WARN( "ItemClick handler %p failed, hr %#lx.\n", handlers[i], hr );
++        }
++        IInspectable_Release( &args->IInspectable_inner );
++    }
++    free_handlers( handlers, count );
++}
++
++/* make the selection what want says, item by item; SelectionChanged if it changed */
++static void apply_selection( struct items_control *impl, const BOOL *want )
++{
++    IVector_IInspectable *selected, *added_vec, *removed_vec;
++    IInspectable *added = NULL, *removed = NULL;
++    BOOL changed = FALSE;
++    INT32 pos;
++    UINT32 i;
++
++    if (!(selected = vector_iface( impl->selected ))) return;
++    if (FAILED(vector_create( &items_iids, &no_callbacks, NULL, &added )) ||
++        FAILED(vector_create( &items_iids, &no_callbacks, NULL, &removed )))
++    {
++        if (added) IInspectable_Release( added );
++        IVector_IInspectable_Release( selected );
++        return;
++    }
++    added_vec = vector_iface( added );
++    removed_vec = vector_iface( removed );
++    impl->updating = TRUE;
++    for (i = 0; i < impl->count; i++)
++    {
++        if (!!selector_item_is_selected( impl->containers[i] ) == !!want[i]) continue;
++        changed = TRUE;
++        selector_item_set_selected( impl->containers[i], want[i] );
++        if (want[i])
++        {
++            IVector_IInspectable_Append( selected, impl->data[i] );
++            IVector_IInspectable_Append( added_vec, impl->data[i] );
++        }
++        else
++        {
++            if ((pos = selected_position( impl, impl->data[i] )) >= 0) IVector_IInspectable_RemoveAt( selected, pos );
++            IVector_IInspectable_Append( removed_vec, impl->data[i] );
++        }
++    }
++    impl->updating = FALSE;
++    IVector_IInspectable_Release( added_vec );
++    IVector_IInspectable_Release( removed_vec );
++    IVector_IInspectable_Release( selected );
++    if (changed) raise_selection_changed( impl, added, removed );
++    IInspectable_Release( added );
++    IInspectable_Release( removed );
++}
++
++enum select_op
++{
++    SELECT_ONLY,     /* just the item (or nothing for -1) */
++    SELECT_TOGGLE,   /* the item in or out of the selection */
++    SELECT_RANGE,    /* just the items from the anchor to the item */
++    SELECT_ALL,
++};
++
++static void select_items( struct items_control *impl, enum select_op op, INT32 index )
++{
++    INT32 i, from, to;
++    BOOL *want;
++
++    if (!(want = calloc( max( impl->count, 1 ), sizeof(*want) ))) return;
++    switch (op)
++    {
++    case SELECT_ONLY:
++        if (index >= 0 && index < impl->count) want[index] = TRUE;
++        break;
++    case SELECT_TOGGLE:
++        if (index < 0 || index >= impl->count) break;
++        if (impl->selection_mode != ListViewSelectionMode_Single)
++            for (i = 0; i < impl->count; i++) want[i] = selector_item_is_selected( impl->containers[i] );
++        want[index] = !selector_item_is_selected( impl->containers[index] );
++        break;
++    case SELECT_RANGE:
++        from = impl->anchor >= 0 && impl->anchor < impl->count ? impl->anchor : index;
++        to = index;
++        if (from > to) { i = from; from = to; to = i; }
++        for (i = max( from, 0 ); i <= to && i < impl->count; i++) want[i] = TRUE;
++        break;
++    case SELECT_ALL:
++        for (i = 0; i < impl->count; i++) want[i] = TRUE;
++        break;
++    }
++    apply_selection( impl, want );
++    free( want );
++}
++
++static void ensure_items( struct items_control *impl )
++{
++    if (impl->dirty) generate( impl );
++}
++
++static INT32 first_selected( struct items_control *impl )
++{
++    UINT32 i;
++    for (i = 0; i < impl->count; i++) if (selector_item_is_selected( impl->containers[i] )) return i;
++    return -1;
++}
++
++static void set_current( struct items_control *impl, INT32 index )
++{
++    if (impl->current >= 0 && impl->current < impl->count) selector_item_set_current( impl->containers[impl->current], FALSE );
++    impl->current = index;
++    if (index >= 0 && index < impl->count) selector_item_set_current( impl->containers[index], TRUE );
++}
++
++/* after generating the containers: drop selected items that are gone, apply a pending SelectedIndex */
++static void list_generated( struct items_control *impl )
++{
++    IVector_IInspectable *selected = vector_iface( impl->selected );
++    IInspectable *added = NULL, *removed = NULL;
++    IVector_IInspectable *removed_vec;
++    UINT32 i;
++
++    if (selected && SUCCEEDED(vector_create( &items_iids, &no_callbacks, NULL, &removed )))
++    {
++        removed_vec = vector_iface( removed );
++        impl->updating = TRUE;
++        for (i = vector_size( impl->selected ); i > 0; i--)
++        {
++            IInspectable *item = vector_get( impl->selected, i - 1 );
++            if (index_of_item( impl, item ) >= 0) continue;
++            IVector_IInspectable_Append( removed_vec, item );
++            IVector_IInspectable_RemoveAt( selected, i - 1 );
++        }
++        impl->updating = FALSE;
++        if (vector_size( removed ) && SUCCEEDED(vector_create( &items_iids, &no_callbacks, NULL, &added )))
++        {
++            raise_selection_changed( impl, added, removed );
++            IInspectable_Release( added );
++        }
++        IVector_IInspectable_Release( removed_vec );
++        IInspectable_Release( removed );
++    }
++    if (selected) IVector_IInspectable_Release( selected );
++    if (impl->current >= (INT32)impl->count) impl->current = impl->count - 1;
++    set_current( impl, impl->current );
++    if (impl->pending_index >= 0 && impl->pending_index < impl->count)
++    {
++        INT32 index = impl->pending_index;
++        impl->pending_index = -1;
++        if (impl->selection_mode != ListViewSelectionMode_None)
++        {
++            select_items( impl, SELECT_ONLY, index );
++            impl->anchor = index;
++        }
++    }
++}
++
++/* scroll the ScrollViewer so that the item shows */
++static void scroll_into_view( struct items_control *impl, INT32 index, BOOL leading )
++{
++    const struct layout_rect *c, *view;
++    IScrollViewer *scroll;
++    DOUBLE offset, target;
++
++    if (index < 0 || index >= impl->count || !impl->scroll_object || !impl->scroll) return;
++    if (FAILED(IInspectable_QueryInterface( impl->scroll_object, &IID_IScrollViewer, (void **)&scroll ))) return;
++    c = &impl->containers[index]->bounds;
++    view = &impl->scroll->bounds;
++    IScrollViewer_get_VerticalOffset( scroll, &offset );
++    target = offset;
++    if (leading || c->y < view->y) target = offset + (c->y - view->y);
++    else if (c->y + c->height > view->y + view->height) target = offset + (c->y + c->height - view->y - view->height);
++    if (target != offset)
++    {
++        TRACE( "%p: item %d, offset %.1f -> %.1f.\n", impl, index, offset, target );
++        IScrollViewer_ScrollToVerticalOffset( scroll, target );
++    }
++    IScrollViewer_Release( scroll );
++}
++
++/* a click on a container (listview.c) */
++void list_view_item_clicked( struct xaml_element *owner, struct xaml_element *container )
++{
++    struct items_control *impl = impl_from_element( owner );
++    BOOL ctrl = GetKeyState( VK_CONTROL ) < 0, shift = GetKeyState( VK_SHIFT ) < 0;
++    INT32 index = index_of_container( impl, container );
++
++    TRACE( "%p: item %d clicked, mode %d.\n", impl, index, impl->selection_mode );
++    if (index < 0) return;
++    IInspectable_AddRef( impl->element.outer );
++    set_current( impl, index );
++    focus_set( &impl->element, FocusState_Pointer );
++    if (impl->item_click_enabled)
++    {
++        raise_item_click( impl, impl->data[index] );
++        /* clicking doesn't select then, except for Multiple's check boxes */
++        if (impl->selection_mode != ListViewSelectionMode_Multiple || index >= impl->count) goto done;
++    }
++    switch (impl->selection_mode)
++    {
++    case ListViewSelectionMode_None:
++        break;
++    case ListViewSelectionMode_Single:
++        if (ctrl && selector_item_is_selected( container )) select_items( impl, SELECT_ONLY, -1 );
++        else select_items( impl, SELECT_ONLY, index );
++        break;
++    case ListViewSelectionMode_Multiple:
++        select_items( impl, SELECT_TOGGLE, index );
++        break;
++    case ListViewSelectionMode_Extended:
++        if (shift) select_items( impl, SELECT_RANGE, index );
++        else if (ctrl) select_items( impl, SELECT_TOGGLE, index );
++        else select_items( impl, SELECT_ONLY, index );
++        break;
++    }
++    if (!shift) impl->anchor = index;
++done:
++    IInspectable_Release( impl->element.outer );
++}
++
++/* ListViewItem.IsSelected set by the app (listview.c) */
++void list_view_item_selected( struct xaml_element *owner, struct xaml_element *container, BOOL selected )
++{
++    struct items_control *impl = impl_from_element( owner );
++    INT32 index = index_of_container( impl, container );
++
++    if (index < 0 || impl->selection_mode == ListViewSelectionMode_None) return;
++    if (selected && impl->selection_mode == ListViewSelectionMode_Single) select_items( impl, SELECT_ONLY, index );
++    else if (!!selected != !!selector_item_is_selected( container )) select_items( impl, SELECT_TOGGLE, index );
++}
++
++/* SelectedItems changed by the app */
++static HRESULT selected_inserted( void *owner, IInspectable *item )
++{
++    struct items_control *impl = owner;
++    IInspectable *added, *removed;
++    IVector_IInspectable *vec;
++    INT32 index;
++
++    if (impl->updating) return S_OK;
++    if ((index = index_of_item( impl, item )) >= 0) selector_item_set_selected( impl->containers[index], TRUE );
++    if (SUCCEEDED(vector_create( &items_iids, &no_callbacks, NULL, &added )))
++    {
++        if (SUCCEEDED(vector_create( &items_iids, &no_callbacks, NULL, &removed )))
++        {
++            if ((vec = vector_iface( added )))
++            {
++                IVector_IInspectable_Append( vec, item );
++                IVector_IInspectable_Release( vec );
++            }
++            raise_selection_changed( impl, added, removed );
++            IInspectable_Release( removed );
++        }
++        IInspectable_Release( added );
++    }
++    return S_OK;
++}
++
++static void selected_removed( void *owner, IInspectable *item )
++{
++    struct items_control *impl = owner;
++    IInspectable *added, *removed;
++    IVector_IInspectable *vec;
++    INT32 index;
++
++    if (impl->updating) return;
++    if ((index = index_of_item( impl, item )) >= 0) selector_item_set_selected( impl->containers[index], FALSE );
++    if (SUCCEEDED(vector_create( &items_iids, &no_callbacks, NULL, &added )))
++    {
++        if (SUCCEEDED(vector_create( &items_iids, &no_callbacks, NULL, &removed )))
++        {
++            if ((vec = vector_iface( removed )))
++            {
++                IVector_IInspectable_Append( vec, item );
++                IVector_IInspectable_Release( vec );
++            }
++            raise_selection_changed( impl, added, removed );
++            IInspectable_Release( removed );
++        }
++        IInspectable_Release( added );
++    }
++}
++
++static const struct vector_callbacks selected_callbacks = { selected_inserted, selected_removed };
++
++/* ---- keyboard ---- */
++
++static BOOL list_focusable( struct xaml_element *element )
++{
++    struct items_control *impl = impl_from_element( element );
++    return impl->kind != ITEMS_CONTROL;
++}
++
++static void list_focus_changed( struct xaml_element *element )
++{
++    struct items_control *impl = impl_from_element( element );
++
++    if (impl->kind == ITEMS_CONTROL) return;
++    ensure_items( impl );
++    if (impl->current < 0 && impl->count)
++    {
++        INT32 index = first_selected( impl );
++        set_current( impl, index >= 0 ? index : 0 );
++    }
++    window_invalidate();
++}
++
++/* items per row of a GridView's wrap grid, from the arranged containers */
++static INT32 items_per_row( struct items_control *impl )
++{
++    UINT32 i;
++
++    if (impl->kind != ITEMS_GRID_VIEW) return 1;
++    for (i = 1; i < impl->count; i++)
++        if (impl->containers[i]->bounds.y != impl->containers[0]->bounds.y) break;
++    return max( 1, i );
++}
++
++static BOOL list_key( struct xaml_element *element, BOOL down, WPARAM vk )
++{
++    struct items_control *impl = impl_from_element( element );
++    BOOL ctrl = GetKeyState( VK_CONTROL ) < 0, shift = GetKeyState( VK_SHIFT ) < 0;
++    INT32 index, step = items_per_row( impl );
++
++    if (impl->kind == ITEMS_CONTROL || !down) return FALSE;
++    ensure_items( impl );
++    if (!impl->count) return FALSE;
++    index = impl->current >= 0 ? impl->current : 0;
++    switch (vk)
++    {
++    case VK_UP: index -= step; break;
++    case VK_DOWN: index += step; break;
++    case VK_LEFT: if (impl->kind != ITEMS_GRID_VIEW) return FALSE; index--; break;
++    case VK_RIGHT: if (impl->kind != ITEMS_GRID_VIEW) return FALSE; index++; break;
++    case VK_HOME: index = 0; break;
++    case VK_END: index = impl->count - 1; break;
++    case VK_SPACE:
++        if (impl->selection_mode == ListViewSelectionMode_None) return TRUE;
++        if (impl->selection_mode == ListViewSelectionMode_Single) select_items( impl, SELECT_ONLY, index );
++        else select_items( impl, SELECT_TOGGLE, index );
++        impl->anchor = index;
++        return TRUE;
++    case VK_RETURN:
++        if (impl->item_click_enabled) raise_item_click( impl, impl->data[index] );
++        return impl->item_click_enabled;
++    default:
++        return FALSE;
++    }
++    index = max( 0, min( index, (INT32)impl->count - 1 ) );
++    set_current( impl, index );
++    if (impl->selection_mode == ListViewSelectionMode_Single ||
++        (impl->selection_mode == ListViewSelectionMode_Extended && !ctrl))
++    {
++        if (shift && impl->selection_mode == ListViewSelectionMode_Extended) select_items( impl, SELECT_RANGE, index );
++        else
++        {
++            select_items( impl, SELECT_ONLY, index );
++            impl->anchor = index;
++        }
++    }
++    scroll_into_view( impl, index, FALSE );
++    window_invalidate();
++    return TRUE;
++}
++
++/* ---- ISelector ---- */
++
++DEFINE_IINSPECTABLE_( selector, ISelector, struct items_control, impl_from_ISelector, ISelector_iface, impl->element.outer )
++
++static HRESULT WINAPI selector_get_SelectedIndex( ISelector *iface, INT32 *value )
++{
++    struct items_control *impl = impl_from_ISelector( iface );
++
++    ensure_items( impl );
++    *value = first_selected( impl );
++    if (*value < 0 && impl->pending_index >= 0) *value = impl->pending_index;
++    return S_OK;
++}
++
++static HRESULT WINAPI selector_put_SelectedIndex( ISelector *iface, INT32 value )
++{
++    struct items_control *impl = impl_from_ISelector( iface );
++
++    TRACE( "iface %p, value %d.\n", iface, value );
++    if (value < -1) return E_INVALIDARG;
++    ensure_items( impl );
++    impl->pending_index = -1;
++    if (value >= (INT32)impl->count)
++    {
++        /* markup sets SelectedIndex before it adds the items */
++        impl->pending_index = value;
++        return S_OK;
++    }
++    if (impl->selection_mode == ListViewSelectionMode_None && value >= 0) return S_OK;
++    select_items( impl, SELECT_ONLY, value );
++    if (value >= 0) impl->anchor = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI selector_get_SelectedItem( ISelector *iface, IInspectable **value )
++{
++    struct items_control *impl = impl_from_ISelector( iface );
++    INT32 index;
++
++    ensure_items( impl );
++    *value = NULL;
++    if ((index = first_selected( impl )) >= 0 && (*value = impl->data[index])) IInspectable_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI selector_put_SelectedItem( ISelector *iface, IInspectable *value )
++{
++    struct items_control *impl = impl_from_ISelector( iface );
++    INT32 index;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    ensure_items( impl );
++    if (!value) select_items( impl, SELECT_ONLY, -1 );
++    else if ((index = index_of_item( impl, value )) >= 0 && impl->selection_mode != ListViewSelectionMode_None)
++    {
++        select_items( impl, SELECT_ONLY, index );
++        impl->anchor = index;
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI selector_get_SelectedValue( ISelector *iface, IInspectable **value )
++{
++    struct items_control *impl = impl_from_ISelector( iface );
++    if (impl->selected_value_path) FIXME( "SelectedValuePath %s not supported.\n", debugstr_hstring(impl->selected_value_path) );
++    return selector_get_SelectedItem( iface, value );
++}
++
++static HRESULT WINAPI selector_put_SelectedValue( ISelector *iface, IInspectable *value )
++{
++    struct items_control *impl = impl_from_ISelector( iface );
++    if (impl->selected_value_path) FIXME( "SelectedValuePath %s not supported.\n", debugstr_hstring(impl->selected_value_path) );
++    return selector_put_SelectedItem( iface, value );
++}
++
++static HRESULT WINAPI selector_get_SelectedValuePath( ISelector *iface, HSTRING *value )
++{
++    return WindowsDuplicateString( impl_from_ISelector( iface )->selected_value_path, value );
++}
++
++static HRESULT WINAPI selector_put_SelectedValuePath( ISelector *iface, HSTRING value )
++{
++    struct items_control *impl = impl_from_ISelector( iface );
++    WindowsDeleteString( impl->selected_value_path );
++    return WindowsDuplicateString( value, &impl->selected_value_path );
++}
++
++static HRESULT WINAPI selector_get_IsSynchronizedWithCurrentItem( ISelector *iface, IReference_boolean **value )
++{
++    *value = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI selector_put_IsSynchronizedWithCurrentItem( ISelector *iface, IReference_boolean *value )
++{
++    TRACE( "iface %p, value %p: there is no CollectionView.\n", iface, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI selector_add_SelectionChanged( ISelector *iface, ISelectionChangedEventHandler *handler,
++                                                     EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return event_list_add( &impl_from_ISelector( iface )->selection_changed, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI selector_remove_SelectionChanged( ISelector *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_ISelector( iface )->selection_changed, token );
++}
++
++static const struct ISelectorVtbl selector_vtbl =
++{
++    selector_QueryInterface,
++    selector_AddRef,
++    selector_Release,
++    /* IInspectable methods */
++    selector_GetIids,
++    selector_GetRuntimeClassName,
++    selector_GetTrustLevel,
++    /* ISelector methods */
++    selector_get_SelectedIndex,
++    selector_put_SelectedIndex,
++    selector_get_SelectedItem,
++    selector_put_SelectedItem,
++    selector_get_SelectedValue,
++    selector_put_SelectedValue,
++    selector_get_SelectedValuePath,
++    selector_put_SelectedValuePath,
++    selector_get_IsSynchronizedWithCurrentItem,
++    selector_put_IsSynchronizedWithCurrentItem,
++    selector_add_SelectionChanged,
++    selector_remove_SelectionChanged,
++};
++
++/* ---- IListViewBase ---- */
++
++DEFINE_IINSPECTABLE_( list_base, IListViewBase, struct items_control, impl_from_IListViewBase, IListViewBase_iface,
++                      impl->element.outer )
++
++static HRESULT WINAPI list_base_get_SelectedItems( IListViewBase *iface, IVector_IInspectable **value )
++{
++    struct items_control *impl = impl_from_IListViewBase( iface );
++    ensure_items( impl );
++    *value = vector_iface( impl->selected );
++    return *value ? S_OK : E_FAIL;
++}
++
++static HRESULT WINAPI list_base_get_SelectionMode( IListViewBase *iface, ListViewSelectionMode *value )
++{
++    *value = impl_from_IListViewBase( iface )->selection_mode;
++    return S_OK;
++}
++
++static HRESULT WINAPI list_base_put_SelectionMode( IListViewBase *iface, ListViewSelectionMode value )
++{
++    struct items_control *impl = impl_from_IListViewBase( iface );
++
++    TRACE( "iface %p, value %d.\n", iface, value );
++    impl->selection_mode = value;
++    ensure_items( impl );
++    if (value == ListViewSelectionMode_None) select_items( impl, SELECT_ONLY, -1 );
++    else if (value == ListViewSelectionMode_Single && vector_size( impl->selected ) > 1)
++        select_items( impl, SELECT_ONLY, first_selected( impl ) );
++    window_invalidate();
++    return S_OK;
++}
++
++#define LIST_BASE_PROPERTY( Name, type, field ) \
++static HRESULT WINAPI list_base_get_##Name( IListViewBase *iface, type *value ) \
++{ \
++    *value = impl_from_IListViewBase( iface )->field; \
++    return S_OK; \
++} \
++static HRESULT WINAPI list_base_put_##Name( IListViewBase *iface, type value ) \
++{ \
++    TRACE( "iface %p.\n", iface ); \
++    impl_from_IListViewBase( iface )->field = value; \
++    return S_OK; \
++}
++
++LIST_BASE_PROPERTY( IsSwipeEnabled, boolean, swipe_enabled )
++LIST_BASE_PROPERTY( CanDragItems, boolean, can_drag )
++LIST_BASE_PROPERTY( CanReorderItems, boolean, can_reorder )
++LIST_BASE_PROPERTY( IsItemClickEnabled, boolean, item_click_enabled )
++LIST_BASE_PROPERTY( DataFetchSize, DOUBLE, data_fetch_size )
++LIST_BASE_PROPERTY( IncrementalLoadingThreshold, DOUBLE, incremental_threshold )
++LIST_BASE_PROPERTY( IncrementalLoadingTrigger, IncrementalLoadingTrigger, incremental_trigger )
++
++static HRESULT WINAPI list_base_add_ItemClick( IListViewBase *iface, IItemClickEventHandler *handler,
++                                               EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return event_list_add( &impl_from_IListViewBase( iface )->item_click, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI list_base_remove_ItemClick( IListViewBase *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IListViewBase( iface )->item_click, token );
++}
++
++static HRESULT WINAPI list_base_add_DragItemsStarting( IListViewBase *iface, IDragItemsStartingEventHandler *handler,
++                                                       EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p: items can't be dragged.\n", iface, handler );
++    return event_list_add( &impl_from_IListViewBase( iface )->drag_items_starting, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI list_base_remove_DragItemsStarting( IListViewBase *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IListViewBase( iface )->drag_items_starting, token );
++}
++
++static HRESULT WINAPI list_base_ScrollIntoView( IListViewBase *iface, IInspectable *item )
++{
++    struct items_control *impl = impl_from_IListViewBase( iface );
++
++    TRACE( "iface %p, item %p.\n", iface, item );
++    ensure_items( impl );
++    scroll_into_view( impl, index_of_item( impl, item ), FALSE );
++    return S_OK;
++}
++
++static HRESULT WINAPI list_base_SelectAll( IListViewBase *iface )
++{
++    struct items_control *impl = impl_from_IListViewBase( iface );
++
++    TRACE( "iface %p.\n", iface );
++    ensure_items( impl );
++    if (impl->selection_mode == ListViewSelectionMode_Multiple || impl->selection_mode == ListViewSelectionMode_Extended)
++        select_items( impl, SELECT_ALL, 0 );
++    return S_OK;
++}
++
++static HRESULT WINAPI list_base_LoadMoreItemsAsync( IListViewBase *iface, IAsyncOperation_LoadMoreItemsResult **value )
++{
++    FIXME( "iface %p: incremental loading isn't supported.\n", iface );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI list_base_ScrollIntoViewWithAlignment( IListViewBase *iface, IInspectable *item,
++                                                             ScrollIntoViewAlignment alignment )
++{
++    struct items_control *impl = impl_from_IListViewBase( iface );
++
++    TRACE( "iface %p, item %p, alignment %d.\n", iface, item, alignment );
++    ensure_items( impl );
++    scroll_into_view( impl, index_of_item( impl, item ), alignment == ScrollIntoViewAlignment_Leading );
++    return S_OK;
++}
++
++static HRESULT WINAPI list_base_get_Header( IListViewBase *iface, IInspectable **value )
++{
++    if ((*value = impl_from_IListViewBase( iface )->header)) IInspectable_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI list_base_put_Header( IListViewBase *iface, IInspectable *value )
++{
++    struct items_control *impl = impl_from_IListViewBase( iface );
++
++    FIXME( "iface %p, value %p: the Header isn't shown.\n", iface, value );
++    if (value) IInspectable_AddRef( value );
++    if (impl->header) IInspectable_Release( impl->header );
++    impl->header = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI list_base_get_HeaderTemplate( IListViewBase *iface, IDataTemplate **value )
++{
++    if ((*value = impl_from_IListViewBase( iface )->header_template)) IDataTemplate_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI list_base_put_HeaderTemplate( IListViewBase *iface, IDataTemplate *value )
++{
++    struct items_control *impl = impl_from_IListViewBase( iface );
++
++    if (value) IDataTemplate_AddRef( value );
++    if (impl->header_template) IDataTemplate_Release( impl->header_template );
++    impl->header_template = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI list_base_get_HeaderTransitions( IListViewBase *iface, IVector_Transition **value )
++{
++    *value = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI list_base_put_HeaderTransitions( IListViewBase *iface, IVector_Transition *value )
++{
++    TRACE( "iface %p, value %p: no transitions.\n", iface, value );
++    return S_OK;
++}
++
++static const struct IListViewBaseVtbl list_view_base_vtbl =
++{
++    list_base_QueryInterface,
++    list_base_AddRef,
++    list_base_Release,
++    /* IInspectable methods */
++    list_base_GetIids,
++    list_base_GetRuntimeClassName,
++    list_base_GetTrustLevel,
++    /* IListViewBase methods */
++    list_base_get_SelectedItems,
++    list_base_get_SelectionMode,
++    list_base_put_SelectionMode,
++    list_base_get_IsSwipeEnabled,
++    list_base_put_IsSwipeEnabled,
++    list_base_get_CanDragItems,
++    list_base_put_CanDragItems,
++    list_base_get_CanReorderItems,
++    list_base_put_CanReorderItems,
++    list_base_get_IsItemClickEnabled,
++    list_base_put_IsItemClickEnabled,
++    list_base_get_DataFetchSize,
++    list_base_put_DataFetchSize,
++    list_base_get_IncrementalLoadingThreshold,
++    list_base_put_IncrementalLoadingThreshold,
++    list_base_get_IncrementalLoadingTrigger,
++    list_base_put_IncrementalLoadingTrigger,
++    list_base_add_ItemClick,
++    list_base_remove_ItemClick,
++    list_base_add_DragItemsStarting,
++    list_base_remove_DragItemsStarting,
++    list_base_ScrollIntoView,
++    list_base_SelectAll,
++    list_base_LoadMoreItemsAsync,
++    list_base_ScrollIntoViewWithAlignment,
++    list_base_get_Header,
++    list_base_put_Header,
++    list_base_get_HeaderTemplate,
++    list_base_put_HeaderTemplate,
++    list_base_get_HeaderTransitions,
++    list_base_put_HeaderTransitions,
++};
++
++/* ---- IListView and IGridView: no methods of their own ---- */
++
++DEFINE_IINSPECTABLE_( list_view, IListView, struct items_control, impl_from_IListView, IListView_iface, impl->element.outer )
++
++static const struct IListViewVtbl list_view_vtbl =
++{
++    list_view_QueryInterface,
++    list_view_AddRef,
++    list_view_Release,
++    /* IInspectable methods */
++    list_view_GetIids,
++    list_view_GetRuntimeClassName,
++    list_view_GetTrustLevel,
++};
++
++DEFINE_IINSPECTABLE_( grid_view, IGridView, struct items_control, impl_from_IGridView, IGridView_iface, impl->element.outer )
++
++static const struct IGridViewVtbl grid_view_vtbl =
++{
++    grid_view_QueryInterface,
++    grid_view_AddRef,
++    grid_view_Release,
++    /* IInspectable methods */
++    grid_view_GetIids,
++    grid_view_GetRuntimeClassName,
++    grid_view_GetTrustLevel,
++};
++
++/* ListView / GridView properties set from markup: value is the text, or NULL for number (an enum, bool or number) */
++BOOL list_view_set_markup( IInspectable *object, const WCHAR *name, const WCHAR *value, double number )
++{
++#define FLAG() (value ? !wcsicmp( value, L"True" ) : number != 0)
++    struct xaml_element *element = element_from_object( object );
++    struct items_control *impl;
++
++    if (!element || element->ops != &items_control_ops) return FALSE;
++    impl = impl_from_element( element );
++    if (impl->kind == ITEMS_CONTROL) return FALSE;
++    if (!wcscmp( name, L"SelectionMode" ))
++    {
++        ListViewSelectionMode mode = value ? ListViewSelectionMode_Single : (ListViewSelectionMode)number;
++        if (!value) ;
++        else if (!wcsicmp( value, L"None" )) mode = ListViewSelectionMode_None;
++        else if (!wcsicmp( value, L"Multiple" )) mode = ListViewSelectionMode_Multiple;
++        else if (!wcsicmp( value, L"Extended" )) mode = ListViewSelectionMode_Extended;
++        list_base_put_SelectionMode( &impl->IListViewBase_iface, mode );
++    }
++    else if (!wcscmp( name, L"IsItemClickEnabled" )) impl->item_click_enabled = FLAG();
++    else if (!wcscmp( name, L"SelectedIndex" )) selector_put_SelectedIndex( &impl->ISelector_iface, value ? wcstol( value, NULL, 10 ) : number );
++    else if (!wcscmp( name, L"IsSwipeEnabled" )) impl->swipe_enabled = FLAG();
++    else if (!wcscmp( name, L"CanDragItems" )) impl->can_drag = FLAG();
++    else if (!wcscmp( name, L"CanReorderItems" )) impl->can_reorder = FLAG();
++    else if (!wcscmp( name, L"AllowDrop" ) || !wcscmp( name, L"ReorderMode" ) || !wcscmp( name, L"ShowsScrollingPlaceholders" ) ||
++             !wcscmp( name, L"IsMultiSelectCheckBoxEnabled" ) || !wcscmp( name, L"SingleSelectionFollowsFocus" ))
++        TRACE( "ignoring %s.\n", debugstr_w(name) );
++    else return FALSE;
++    return TRUE;
++#undef FLAG
++}
++
+ /* the items vector for markup (<ItemsControl><x:String>...</x:String></ItemsControl>) */
+ IInspectable *items_control_items( IInspectable *object )
+ {
+@@ -554,13 +1819,37 @@ IInspectable *items_control_items( IInspectable *object )
+     return impl_from_element( element )->items;
+ }
+ 
+-static HRESULT items_control_create( IInspectable *outer, IInspectable **inner, void **value )
++static const struct ISelectorVtbl selector_vtbl;
++static const struct IListViewBaseVtbl list_view_base_vtbl;
++static const struct IListViewVtbl list_view_vtbl;
++static const struct IGridViewVtbl grid_view_vtbl;
++static const struct vector_callbacks selected_callbacks;
++
++static HRESULT items_control_create( enum items_kind kind, IInspectable *outer, IInspectable **inner, void **value )
+ {
++    static const WCHAR *names[] =
++    {
++        RuntimeClass_Windows_UI_Xaml_Controls_ItemsControl,
++        RuntimeClass_Windows_UI_Xaml_Controls_ListView,
++        RuntimeClass_Windows_UI_Xaml_Controls_GridView,
++    };
+     struct items_control *impl;
++    void *iface;
+     HRESULT hr;
+ 
+     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+-    element_init( &impl->element, &items_control_ops, RuntimeClass_Windows_UI_Xaml_Controls_ItemsControl, outer );
++    element_init( &impl->element, &items_control_ops, names[kind], outer );
++    impl->kind = kind;
++    impl->ISelector_iface.lpVtbl = &selector_vtbl;
++    impl->IListViewBase_iface.lpVtbl = &list_view_base_vtbl;
++    impl->IListView_iface.lpVtbl = &list_view_vtbl;
++    impl->IGridView_iface.lpVtbl = &grid_view_vtbl;
++    impl->selection_mode = ListViewSelectionMode_Single;
++    impl->swipe_enabled = TRUE;
++    impl->data_fetch_size = 3.0;
++    impl->incremental_threshold = 0.0;
++    impl->incremental_trigger = IncrementalLoadingTrigger_Edge;
++    impl->current = impl->anchor = impl->pending_index = -1;
+     impl->IItemsControl_iface.lpVtbl = &items_control_vtbl;
+     impl->IObservableVector_iface.lpVtbl = &items_vector_vtbl;
+     impl->IVectorChangedEventHandler_iface.lpVtbl = &source_changed_vtbl;
+@@ -569,8 +1858,20 @@ static HRESULT items_control_create( IInspectable *outer, IInspectable **inner,
+         free( impl );
+         return hr;
+     }
++    if (kind != ITEMS_CONTROL && FAILED(hr = vector_create( &items_iids, &selected_callbacks, impl, &impl->selected )))
++    {
++        IInspectable_Release( impl->items );
++        free( impl );
++        return hr;
++    }
+     impl->dirty = TRUE;
+-    return element_compose( &impl->element, outer, inner, &impl->IItemsControl_iface, value );
++    switch (kind)
++    {
++    case ITEMS_LIST_VIEW: iface = &impl->IListView_iface; break;
++    case ITEMS_GRID_VIEW: iface = &impl->IGridView_iface; break;
++    default: iface = &impl->IItemsControl_iface; break;
++    }
++    return element_compose( &impl->element, outer, inner, iface, value );
+ }
+ 
+ /* activation factory: IActivationFactory and IItemsControlFactory */
+@@ -579,6 +1880,9 @@ struct items_control_statics
+ {
+     IActivationFactory IActivationFactory_iface;
+     IItemsControlFactory IItemsControlFactory_iface;
++    IListViewFactory IListViewFactory_iface;
++    IGridViewFactory IGridViewFactory_iface;
++    enum items_kind kind;
+ };
+ 
+ static inline struct items_control_statics *impl_from_IActivationFactory( IActivationFactory *iface )
+@@ -593,8 +1897,12 @@ static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID
+     if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+         IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
+         *out = &impl->IActivationFactory_iface;
+-    else if (IsEqualGUID( iid, &IID_IItemsControlFactory ))
++    else if (impl->kind == ITEMS_CONTROL && IsEqualGUID( iid, &IID_IItemsControlFactory ))
+         *out = &impl->IItemsControlFactory_iface;
++    else if (impl->kind == ITEMS_LIST_VIEW && IsEqualGUID( iid, &IID_IListViewFactory ))
++        *out = &impl->IListViewFactory_iface;
++    else if (impl->kind == ITEMS_GRID_VIEW && IsEqualGUID( iid, &IID_IGridViewFactory ))
++        *out = &impl->IGridViewFactory_iface;
+     else
+     {
+         FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
+@@ -617,7 +1925,7 @@ static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLev
+ 
+ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+ {
+-    return items_control_create( NULL, NULL, (void **)instance );
++    return items_control_create( impl_from_IActivationFactory( iface )->kind, NULL, NULL, (void **)instance );
+ }
+ 
+ static const struct IActivationFactoryVtbl factory_vtbl =
+@@ -639,7 +1947,7 @@ DEFINE_IINSPECTABLE_( items_factory, IItemsControlFactory, struct items_control_
+ static HRESULT WINAPI items_factory_CreateInstance( IItemsControlFactory *iface, IInspectable *outer, IInspectable **inner,
+                                                     IItemsControl **value )
+ {
+-    return items_control_create( outer, inner, (void **)value );
++    return items_control_create( ITEMS_CONTROL, outer, inner, (void **)value );
+ }
+ 
+ static const struct IItemsControlFactoryVtbl items_factory_vtbl =
+@@ -655,5 +1963,55 @@ static const struct IItemsControlFactoryVtbl items_factory_vtbl =
+     items_factory_CreateInstance,
+ };
+ 
+-static struct items_control_statics items_control_statics = { {&factory_vtbl}, {&items_factory_vtbl} };
++DEFINE_IINSPECTABLE_( list_view_factory, IListViewFactory, struct items_control_statics, impl_from_IListViewFactory,
++                      IListViewFactory_iface, &impl->IActivationFactory_iface )
++
++static HRESULT WINAPI list_view_factory_CreateInstance( IListViewFactory *iface, IInspectable *outer, IInspectable **inner,
++                                                        IListView **value )
++{
++    return items_control_create( ITEMS_LIST_VIEW, outer, inner, (void **)value );
++}
++
++static const struct IListViewFactoryVtbl list_view_factory_vtbl =
++{
++    list_view_factory_QueryInterface,
++    list_view_factory_AddRef,
++    list_view_factory_Release,
++    /* IInspectable methods */
++    list_view_factory_GetIids,
++    list_view_factory_GetRuntimeClassName,
++    list_view_factory_GetTrustLevel,
++    /* IListViewFactory methods */
++    list_view_factory_CreateInstance,
++};
++
++DEFINE_IINSPECTABLE_( grid_view_factory, IGridViewFactory, struct items_control_statics, impl_from_IGridViewFactory,
++                      IGridViewFactory_iface, &impl->IActivationFactory_iface )
++
++static HRESULT WINAPI grid_view_factory_CreateInstance( IGridViewFactory *iface, IInspectable *outer, IInspectable **inner,
++                                                        IGridView **value )
++{
++    return items_control_create( ITEMS_GRID_VIEW, outer, inner, (void **)value );
++}
++
++static const struct IGridViewFactoryVtbl grid_view_factory_vtbl =
++{
++    grid_view_factory_QueryInterface,
++    grid_view_factory_AddRef,
++    grid_view_factory_Release,
++    /* IInspectable methods */
++    grid_view_factory_GetIids,
++    grid_view_factory_GetRuntimeClassName,
++    grid_view_factory_GetTrustLevel,
++    /* IGridViewFactory methods */
++    grid_view_factory_CreateInstance,
++};
++
++#define ITEMS_STATICS( kind ) { {&factory_vtbl}, {&items_factory_vtbl}, {&list_view_factory_vtbl}, {&grid_view_factory_vtbl}, kind }
++
++static struct items_control_statics items_control_statics = ITEMS_STATICS( ITEMS_CONTROL );
++static struct items_control_statics list_view_statics = ITEMS_STATICS( ITEMS_LIST_VIEW );
++static struct items_control_statics grid_view_statics = ITEMS_STATICS( ITEMS_GRID_VIEW );
+ IActivationFactory *items_control_factory = &items_control_statics.IActivationFactory_iface;
++IActivationFactory *list_view_factory = &list_view_statics.IActivationFactory_iface;
++IActivationFactory *grid_view_factory = &grid_view_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/listview.c b/dlls/windows.ui.xaml/listview.c
+new file mode 100644
+index 0000000..3811c24
+--- /dev/null
++++ b/dlls/windows.ui.xaml/listview.c
+@@ -0,0 +1,298 @@
++/* WinRT Windows.UI.Xaml.Controls ListViewItem and GridViewItem implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#include "control.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* ListViewItem and GridViewItem are ContentControls (struct button, kinds BUTTON_LIST_ITEM and BUTTON_GRID_ITEM):
++ * the containers a ListView or GridView (items.c) puts its items in, or items an app adds itself. A click goes to
++ * the list, which selects the item or raises ItemClick. They draw Windows 10's default looks: a ListViewItem is at
++ * least 40 px high with 12 px padding, translucent grey under the pointer and while pressed, and the accent colour
++ * at 60% (80% under the pointer) when selected; a GridViewItem has a 4 px gap right and below, a grey frame under
++ * the pointer, and an accent frame with a check mark in the top right corner when selected. The item the keyboard
++ * is on gets a focus frame while its list has the keyboard focus. There are no swipe, drag or reorder visuals and
++ * no ItemContainerStyle or template. */
++
++void *item_default_iface( struct button *impl )
++{
++    return impl->kind == BUTTON_LIST_ITEM ? (void *)&impl->IListViewItem_iface : (void *)&impl->IGridViewItem_iface;
++}
++
++/* ---- drawing ---- */
++
++static Color theme_alpha( struct layout_context *ctx, BYTE alpha )
++{
++    Color c = { alpha, 0, 0, 0 };
++    if (ctx->dark) c.R = c.G = c.B = 255;
++    return c;
++}
++
++static Color accent_alpha( BYTE alpha )
++{
++    Color c = { alpha, 0x00, 0x78, 0xd7 };
++    return c;
++}
++
++void item_render_background( struct button *impl, struct layout_context *ctx )
++{
++    const struct layout_rect *b = &impl->element.bounds;
++    Color c;
++
++    if (impl->background && brush_get_color( impl->background, &c )) element_fill_argb( ctx, b, c );
++    if (impl->kind == BUTTON_LIST_ITEM)
++    {
++        /* SystemControlHighlightListAccentLow/Medium/High, and ListLow/ListMedium */
++        if (impl->is_selected) element_fill_argb( ctx, b, accent_alpha( impl->pressed ? 0xe6 : impl->pointer_over ? 0xcc : 0x99 ) );
++        else if (impl->pressed) element_fill_argb( ctx, b, theme_alpha( ctx, 0x33 ) );
++        else if (impl->pointer_over) element_fill_argb( ctx, b, theme_alpha( ctx, 0x19 ) );
++    }
++    else if (impl->pressed) element_fill_argb( ctx, b, theme_alpha( ctx, 0x33 ) );
++}
++
++static void frame( struct layout_context *ctx, const struct layout_rect *rect, float width, Color c )
++{
++    struct layout_rect side;
++
++    side = *rect;
++    side.height = min( width, rect->height );
++    element_fill_argb( ctx, &side, c );
++    side.y = rect->y + rect->height - side.height;
++    element_fill_argb( ctx, &side, c );
++    side = *rect;
++    side.width = min( width, rect->width );
++    element_fill_argb( ctx, &side, c );
++    side.x = rect->x + rect->width - side.width;
++    element_fill_argb( ctx, &side, c );
++}
++
++static void draw_check( struct layout_context *ctx, float x, float y )
++{
++    static const struct shape_point points[] = { {4, 10}, {8, 14}, {16, 6} };
++    Color white = { 0xff, 0xff, 0xff, 0xff };
++    ISolidColorBrush *solid;
++    IInspectable *object;
++    IBrush *brush;
++
++    if (!ctx->rt || FAILED(IActivationFactory_ActivateInstance( solid_color_brush_factory, &object ))) return;
++    if (SUCCEEDED(IInspectable_QueryInterface( object, &IID_ISolidColorBrush, (void **)&solid )))
++    {
++        ISolidColorBrush_put_Color( solid, white );
++        ISolidColorBrush_Release( solid );
++    }
++    if (SUCCEEDED(IInspectable_QueryInterface( object, &IID_IBrush, (void **)&brush )))
++    {
++        d2d_draw_lines( ctx, x, y, points, ARRAY_SIZE(points), FALSE, NULL, brush, 2.0 );
++        IBrush_Release( brush );
++    }
++    IInspectable_Release( object );
++}
++
++void item_render_overlay( struct button *impl, struct layout_context *ctx )
++{
++    const struct layout_rect *b = &impl->element.bounds;
++
++    if (impl->kind == BUTTON_GRID_ITEM)
++    {
++        if (impl->is_selected)
++        {
++            struct layout_rect corner = { b->x + b->width - 20, b->y, 20, 20 };
++
++            frame( ctx, b, 2, accent_alpha( impl->pointer_over ? 0xcc : 0xff ) );
++            if (b->width >= 24 && b->height >= 24)
++            {
++                element_fill_argb( ctx, &corner, accent_alpha( 0xff ) );
++                draw_check( ctx, corner.x, corner.y );
++            }
++        }
++        else if (impl->pointer_over) frame( ctx, b, 2, theme_alpha( ctx, 0x66 ) );
++    }
++    if (impl->is_current && impl->selector && element_focus_state( impl->selector ) == FocusState_Keyboard)
++        frame( ctx, b, 2, theme_alpha( ctx, 0xff ) );
++}
++
++/* ---- the list's side ---- */
++
++struct xaml_element *selector_item_from_object( IInspectable *object )
++{
++    struct xaml_element *element = object ? element_from_object( object ) : NULL;
++    struct button *impl;
++
++    if (!element || !element->ops->query_interface) return NULL;
++    if (FAILED(element->ops->query_interface( element, &IID_ISelectorItem, (void **)&impl ))) return NULL;
++    ISelectorItem_Release( (ISelectorItem *)impl );
++    return element;
++}
++
++static struct button *item_from_element( struct xaml_element *element )
++{
++    return CONTAINING_RECORD( element, struct button, element );
++}
++
++void selector_item_attach( struct xaml_element *item, struct xaml_element *selector )
++{
++    item_from_element( item )->selector = selector;
++}
++
++void selector_item_set_selected( struct xaml_element *item, BOOL selected )
++{
++    struct button *impl = item_from_element( item );
++    if (impl->is_selected == !!selected) return;
++    impl->is_selected = !!selected;
++    element_property_changed( impl->element.outer, L"IsSelected" );
++    window_invalidate();
++}
++
++BOOL selector_item_is_selected( struct xaml_element *item )
++{
++    return item_from_element( item )->is_selected;
++}
++
++void selector_item_set_current( struct xaml_element *item, BOOL current )
++{
++    struct button *impl = item_from_element( item );
++    if (impl->is_current == !!current) return;
++    impl->is_current = !!current;
++    window_invalidate();
++}
++
++void item_clicked( struct button *impl )
++{
++    TRACE( "%p, selector %p.\n", impl, impl->selector );
++    if (impl->selector) list_view_item_clicked( impl->selector, &impl->element );
++}
++
++/* ---- ISelectorItem ---- */
++
++DEFINE_IINSPECTABLE_( selector_item, ISelectorItem, struct button, impl_from_ISelectorItem, ISelectorItem_iface,
++                      impl->element.outer )
++
++static HRESULT WINAPI selector_item_get_IsSelected( ISelectorItem *iface, boolean *value )
++{
++    *value = impl_from_ISelectorItem( iface )->is_selected;
++    return S_OK;
++}
++
++static HRESULT WINAPI selector_item_put_IsSelected( ISelectorItem *iface, boolean value )
++{
++    struct button *impl = impl_from_ISelectorItem( iface );
++
++    TRACE( "iface %p, value %d.\n", iface, value );
++    if (impl->is_selected == !!value) return S_OK;
++    /* the list updates its selection, and the item */
++    if (impl->selector) list_view_item_selected( impl->selector, &impl->element, value );
++    else selector_item_set_selected( &impl->element, value );
++    return S_OK;
++}
++
++static const struct ISelectorItemVtbl selector_item_vtbl =
++{
++    selector_item_QueryInterface,
++    selector_item_AddRef,
++    selector_item_Release,
++    /* IInspectable methods */
++    selector_item_GetIids,
++    selector_item_GetRuntimeClassName,
++    selector_item_GetTrustLevel,
++    /* ISelectorItem methods */
++    selector_item_get_IsSelected,
++    selector_item_put_IsSelected,
++};
++
++/* ---- IListViewItem and IGridViewItem ---- */
++
++DEFINE_IINSPECTABLE_( list_view_item, IListViewItem, struct button, impl_from_IListViewItem, IListViewItem_iface,
++                      impl->element.outer )
++
++static HRESULT WINAPI list_view_item_get_TemplateSettings( IListViewItem *iface, IListViewItemTemplateSettings **value )
++{
++    FIXME( "iface %p: no TemplateSettings.\n", iface );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct IListViewItemVtbl list_view_item_vtbl =
++{
++    list_view_item_QueryInterface,
++    list_view_item_AddRef,
++    list_view_item_Release,
++    /* IInspectable methods */
++    list_view_item_GetIids,
++    list_view_item_GetRuntimeClassName,
++    list_view_item_GetTrustLevel,
++    /* IListViewItem methods */
++    list_view_item_get_TemplateSettings,
++};
++
++DEFINE_IINSPECTABLE_( grid_view_item, IGridViewItem, struct button, impl_from_IGridViewItem, IGridViewItem_iface,
++                      impl->element.outer )
++
++static HRESULT WINAPI grid_view_item_get_TemplateSettings( IGridViewItem *iface, IGridViewItemTemplateSettings **value )
++{
++    FIXME( "iface %p: no TemplateSettings.\n", iface );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct IGridViewItemVtbl grid_view_item_vtbl =
++{
++    grid_view_item_QueryInterface,
++    grid_view_item_AddRef,
++    grid_view_item_Release,
++    /* IInspectable methods */
++    grid_view_item_GetIids,
++    grid_view_item_GetRuntimeClassName,
++    grid_view_item_GetTrustLevel,
++    /* IGridViewItem methods */
++    grid_view_item_get_TemplateSettings,
++};
++
++HRESULT item_query_interface( struct button *impl, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_ISelectorItem )) *out = &impl->ISelectorItem_iface;
++    else if (impl->kind == BUTTON_LIST_ITEM && IsEqualGUID( iid, &IID_IListViewItem )) *out = &impl->IListViewItem_iface;
++    else if (impl->kind == BUTTON_GRID_ITEM && IsEqualGUID( iid, &IID_IGridViewItem )) *out = &impl->IGridViewItem_iface;
++    else return E_NOINTERFACE;
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++void item_init( struct button *impl )
++{
++    impl->ISelectorItem_iface.lpVtbl = &selector_item_vtbl;
++    impl->IListViewItem_iface.lpVtbl = &list_view_item_vtbl;
++    impl->IGridViewItem_iface.lpVtbl = &grid_view_item_vtbl;
++    impl->element.horizontal_alignment = HorizontalAlignment_Stretch;
++    impl->element.vertical_alignment = VerticalAlignment_Stretch;
++    memset( &impl->border_thickness, 0, sizeof(impl->border_thickness) );
++    memset( &impl->padding, 0, sizeof(impl->padding) );
++    impl->content_vertical = VerticalAlignment_Center;
++    impl->element.is_tab_stop = FALSE;
++    if (impl->kind == BUTTON_LIST_ITEM)
++    {
++        impl->padding.Left = impl->padding.Right = 12;
++        impl->content_horizontal = HorizontalAlignment_Left;
++    }
++    else
++    {
++        impl->element.margin.Right = impl->element.margin.Bottom = 4;
++        impl->content_horizontal = HorizontalAlignment_Center;
++    }
++}
+diff --git a/dlls/windows.ui.xaml/main.c b/dlls/windows.ui.xaml/main.c
+index 9197be0..ea96995 100644
+--- a/dlls/windows.ui.xaml/main.c
++++ b/dlls/windows.ui.xaml/main.c
+@@ -78,6 +78,18 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( property_changed_event_args_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ItemsControl ))
+         IActivationFactory_QueryInterface( items_control_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ListView ))
++        IActivationFactory_QueryInterface( list_view_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_GridView ))
++        IActivationFactory_QueryInterface( grid_view_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ListViewItem ))
++        IActivationFactory_QueryInterface( list_view_item_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_GridViewItem ))
++        IActivationFactory_QueryInterface( grid_view_item_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ItemsStackPanel ))
++        IActivationFactory_QueryInterface( items_stack_panel_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ItemsWrapGrid ))
++        IActivationFactory_QueryInterface( items_wrap_grid_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_RowDefinition ))
+         IActivationFactory_QueryInterface( row_definition_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ColumnDefinition ))
+diff --git a/dlls/windows.ui.xaml/panel.c b/dlls/windows.ui.xaml/panel.c
+index a13adae..f6bf7ca 100644
+--- a/dlls/windows.ui.xaml/panel.c
++++ b/dlls/windows.ui.xaml/panel.c
+@@ -23,12 +23,17 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(xaml);
+ 
+-/* StackPanel and Grid share one object type; kind says which. Children live in a UIElementCollection. */
++/* StackPanel, Grid, ItemsStackPanel and ItemsWrapGrid share one object type; kind says which. Children live in a
++ * UIElementCollection. ItemsStackPanel lays out like a StackPanel (without virtualization). ItemsWrapGrid gives
++ * every item the size of the first one (or ItemWidth / ItemHeight) and wraps them in rows (Orientation Horizontal)
++ * or columns (Vertical), at most MaximumRowsOrColumns per line. */
+ 
+ enum panel_kind
+ {
+     PANEL_STACK,
+     PANEL_GRID,
++    PANEL_ITEMS_STACK,
++    PANEL_WRAP,
+ };
+ 
+ struct panel
+@@ -37,6 +42,8 @@ struct panel
+     IPanel IPanel_iface;
+     IStackPanel IStackPanel_iface;
+     IGrid IGrid_iface;
++    IItemsStackPanel IItemsStackPanel_iface;
++    IItemsWrapGrid IItemsWrapGrid_iface;
+     enum panel_kind kind;
+     IInspectable *children;   /* IVector<UIElement *> */
+     IBrush *background;
+@@ -44,6 +51,11 @@ struct panel
+     IInspectable *rows, *columns;   /* IVector<RowDefinition *>, IVector<ColumnDefinition *> (Grid) */
+     float *track_content[2];        /* Grid: content size of each column [0] and row [1], from measure */
+     UINT32 track_count[2];
++    double item_width, item_height;   /* ItemsWrapGrid; NAN for the first item's size */
++    INT32 max_per_line;               /* ItemsWrapGrid.MaximumRowsOrColumns, or -1 */
++    float cell_width, cell_height;    /* ItemsWrapGrid: from measure */
++    Thickness group_padding;
++    double cache_length;
+ };
+ 
+ const struct vector_iids uielement_collection_iids =
+@@ -408,6 +420,65 @@ done:
+     free( rows );
+ }
+ 
++/* ItemsWrapGrid: equal cells, wrapped */
++
++static UINT32 wrap_per_line( struct panel *impl, float avail, float cell, UINT32 count )
++{
++    UINT32 n = count;
++    if (isfinite( avail ) && cell > 0) n = max( 1, (UINT32)floorf( (avail + 0.01f) / cell ) );
++    if (impl->max_per_line > 0) n = min( n, (UINT32)impl->max_per_line );
++    return max( 1, min( n, max( count, 1 ) ) );
++}
++
++static void wrap_measure( struct panel *impl, struct layout_context *ctx, float avail_width, float avail_height,
++                          float *width, float *height )
++{
++    BOOL horizontal = impl->orientation == Orientation_Horizontal;
++    UINT32 i, count = vector_size( impl->children ), per_line, lines;
++    float item_w = isnan( impl->item_width ) ? INFINITY : impl->item_width;
++    float item_h = isnan( impl->item_height ) ? INFINITY : impl->item_height;
++    struct xaml_element *child, *first = NULL;
++
++    *width = *height = 0;
++    impl->cell_width = impl->cell_height = 0;
++    for (i = 0; i < count; i++)
++    {
++        if (!(child = panel_child( impl, i ))) continue;
++        element_measure( child, ctx, item_w, item_h );
++        if (!first) first = child;
++    }
++    if (!first) return;
++    impl->cell_width = isnan( impl->item_width ) ? first->desired_width : impl->item_width;
++    impl->cell_height = isnan( impl->item_height ) ? first->desired_height : impl->item_height;
++    per_line = wrap_per_line( impl, horizontal ? avail_width : avail_height,
++                              horizontal ? impl->cell_width : impl->cell_height, count );
++    lines = (count + per_line - 1) / per_line;
++    *width = impl->cell_width * (horizontal ? per_line : lines);
++    *height = impl->cell_height * (horizontal ? lines : per_line);
++}
++
++static void wrap_arrange( struct panel *impl, struct layout_context *ctx )
++{
++    BOOL horizontal = impl->orientation == Orientation_Horizontal;
++    UINT32 i, count = vector_size( impl->children ), per_line;
++    const struct layout_rect *b = &impl->element.bounds;
++    struct xaml_element *child;
++
++    per_line = wrap_per_line( impl, horizontal ? b->width : b->height,
++                              horizontal ? impl->cell_width : impl->cell_height, count );
++    for (i = 0; i < count; i++)
++    {
++        UINT32 line = i / per_line, pos = i % per_line;
++        if (!(child = panel_child( impl, i ))) continue;
++        if (horizontal)
++            element_arrange( child, ctx, b->x + pos * impl->cell_width, b->y + line * impl->cell_height,
++                             impl->cell_width, impl->cell_height );
++        else
++            element_arrange( child, ctx, b->x + line * impl->cell_width, b->y + pos * impl->cell_height,
++                             impl->cell_width, impl->cell_height );
++    }
++}
++
+ /* element ops */
+ 
+ static HRESULT panel_query_interface( struct xaml_element *element, REFIID iid, void **out )
+@@ -417,6 +488,8 @@ static HRESULT panel_query_interface( struct xaml_element *element, REFIID iid,
+     if (IsEqualGUID( iid, &IID_IPanel )) *out = &impl->IPanel_iface;
+     else if (impl->kind == PANEL_STACK && IsEqualGUID( iid, &IID_IStackPanel )) *out = &impl->IStackPanel_iface;
+     else if (impl->kind == PANEL_GRID && IsEqualGUID( iid, &IID_IGrid )) *out = &impl->IGrid_iface;
++    else if (impl->kind == PANEL_ITEMS_STACK && IsEqualGUID( iid, &IID_IItemsStackPanel )) *out = &impl->IItemsStackPanel_iface;
++    else if (impl->kind == PANEL_WRAP && IsEqualGUID( iid, &IID_IItemsWrapGrid )) *out = &impl->IItemsWrapGrid_iface;
+     else return E_NOINTERFACE;
+     IInspectable_AddRef( (IInspectable *)*out );
+     return S_OK;
+@@ -427,7 +500,8 @@ static void panel_measure( struct xaml_element *element, struct layout_context *
+ {
+     struct panel *impl = impl_from_element( element );
+ 
+-    if (impl->kind == PANEL_STACK) stack_measure( impl, ctx, avail_width, avail_height, width, height );
++    if (impl->kind == PANEL_STACK || impl->kind == PANEL_ITEMS_STACK) stack_measure( impl, ctx, avail_width, avail_height, width, height );
++    else if (impl->kind == PANEL_WRAP) wrap_measure( impl, ctx, avail_width, avail_height, width, height );
+     else grid_measure( impl, ctx, avail_width, avail_height, width, height );
+ }
+ 
+@@ -435,7 +509,8 @@ static void panel_arrange( struct xaml_element *element, struct layout_context *
+ {
+     struct panel *impl = impl_from_element( element );
+ 
+-    if (impl->kind == PANEL_STACK) stack_arrange( impl, ctx );
++    if (impl->kind == PANEL_STACK || impl->kind == PANEL_ITEMS_STACK) stack_arrange( impl, ctx );
++    else if (impl->kind == PANEL_WRAP) wrap_arrange( impl, ctx );
+     else grid_arrange( impl, ctx );
+ }
+ 
+@@ -636,19 +711,243 @@ static const struct IGridVtbl grid_iface_vtbl =
+     grid_iface_get_ColumnDefinitions,
+ };
+ 
++/* IItemsStackPanel and IItemsWrapGrid */
++
++static INT32 last_index( struct panel *impl )
++{
++    return (INT32)vector_size( impl->children ) - 1;
++}
++
++#define ITEMS_PANEL_COMMON( name, Iface ) \
++static HRESULT WINAPI name##_get_GroupPadding( Iface *iface, Thickness *value ) \
++{ \
++    *value = impl_from_##Iface( iface )->group_padding; \
++    return S_OK; \
++} \
++static HRESULT WINAPI name##_put_GroupPadding( Iface *iface, Thickness value ) \
++{ \
++    impl_from_##Iface( iface )->group_padding = value; \
++    return S_OK; \
++} \
++static HRESULT WINAPI name##_get_Orientation( Iface *iface, Orientation *value ) \
++{ \
++    *value = impl_from_##Iface( iface )->orientation; \
++    return S_OK; \
++} \
++static HRESULT WINAPI name##_put_Orientation( Iface *iface, Orientation value ) \
++{ \
++    impl_from_##Iface( iface )->orientation = value; \
++    window_invalidate(); \
++    return S_OK; \
++} \
++static HRESULT WINAPI name##_get_FirstCacheIndex( Iface *iface, INT32 *value ) \
++{ \
++    *value = last_index( impl_from_##Iface( iface ) ) >= 0 ? 0 : -1; \
++    return S_OK; \
++} \
++static HRESULT WINAPI name##_get_FirstVisibleIndex( Iface *iface, INT32 *value ) \
++{ \
++    *value = last_index( impl_from_##Iface( iface ) ) >= 0 ? 0 : -1; \
++    return S_OK; \
++} \
++static HRESULT WINAPI name##_get_LastVisibleIndex( Iface *iface, INT32 *value ) \
++{ \
++    *value = last_index( impl_from_##Iface( iface ) ); \
++    return S_OK; \
++} \
++static HRESULT WINAPI name##_get_LastCacheIndex( Iface *iface, INT32 *value ) \
++{ \
++    *value = last_index( impl_from_##Iface( iface ) ); \
++    return S_OK; \
++} \
++static HRESULT WINAPI name##_get_ScrollingDirection( Iface *iface, PanelScrollingDirection *value ) \
++{ \
++    *value = PanelScrollingDirection_None; \
++    return S_OK; \
++} \
++static HRESULT WINAPI name##_get_GroupHeaderPlacement( Iface *iface, GroupHeaderPlacement *value ) \
++{ \
++    *value = GroupHeaderPlacement_Top; \
++    return S_OK; \
++} \
++static HRESULT WINAPI name##_put_GroupHeaderPlacement( Iface *iface, GroupHeaderPlacement value ) \
++{ \
++    FIXME( "iface %p, value %d: grouping isn't supported.\n", iface, value ); \
++    return S_OK; \
++} \
++static HRESULT WINAPI name##_get_CacheLength( Iface *iface, DOUBLE *value ) \
++{ \
++    *value = impl_from_##Iface( iface )->cache_length; \
++    return S_OK; \
++} \
++static HRESULT WINAPI name##_put_CacheLength( Iface *iface, DOUBLE value ) \
++{ \
++    impl_from_##Iface( iface )->cache_length = value; \
++    return S_OK; \
++}
++
++DEFINE_IINSPECTABLE_( items_stack, IItemsStackPanel, struct panel, impl_from_IItemsStackPanel, IItemsStackPanel_iface, impl->element.outer )
++ITEMS_PANEL_COMMON( items_stack, IItemsStackPanel )
++
++static HRESULT WINAPI items_stack_get_ItemsUpdatingScrollMode( IItemsStackPanel *iface, ItemsUpdatingScrollMode *value )
++{
++    *value = ItemsUpdatingScrollMode_KeepItemsInView;
++    return S_OK;
++}
++
++static HRESULT WINAPI items_stack_put_ItemsUpdatingScrollMode( IItemsStackPanel *iface, ItemsUpdatingScrollMode value )
++{
++    TRACE( "iface %p, value %d.\n", iface, value );
++    return S_OK;
++}
++
++static const struct IItemsStackPanelVtbl items_stack_vtbl =
++{
++    items_stack_QueryInterface,
++    items_stack_AddRef,
++    items_stack_Release,
++    /* IInspectable methods */
++    items_stack_GetIids,
++    items_stack_GetRuntimeClassName,
++    items_stack_GetTrustLevel,
++    /* IItemsStackPanel methods */
++    items_stack_get_GroupPadding,
++    items_stack_put_GroupPadding,
++    items_stack_get_Orientation,
++    items_stack_put_Orientation,
++    items_stack_get_FirstCacheIndex,
++    items_stack_get_FirstVisibleIndex,
++    items_stack_get_LastVisibleIndex,
++    items_stack_get_LastCacheIndex,
++    items_stack_get_ScrollingDirection,
++    items_stack_get_GroupHeaderPlacement,
++    items_stack_put_GroupHeaderPlacement,
++    items_stack_get_ItemsUpdatingScrollMode,
++    items_stack_put_ItemsUpdatingScrollMode,
++    items_stack_get_CacheLength,
++    items_stack_put_CacheLength,
++};
++
++DEFINE_IINSPECTABLE_( items_wrap, IItemsWrapGrid, struct panel, impl_from_IItemsWrapGrid, IItemsWrapGrid_iface, impl->element.outer )
++ITEMS_PANEL_COMMON( items_wrap, IItemsWrapGrid )
++
++static HRESULT WINAPI items_wrap_get_MaximumRowsOrColumns( IItemsWrapGrid *iface, INT32 *value )
++{
++    *value = impl_from_IItemsWrapGrid( iface )->max_per_line;
++    return S_OK;
++}
++
++static HRESULT WINAPI items_wrap_put_MaximumRowsOrColumns( IItemsWrapGrid *iface, INT32 value )
++{
++    impl_from_IItemsWrapGrid( iface )->max_per_line = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI items_wrap_get_ItemWidth( IItemsWrapGrid *iface, DOUBLE *value )
++{
++    *value = impl_from_IItemsWrapGrid( iface )->item_width;
++    return S_OK;
++}
++
++static HRESULT WINAPI items_wrap_put_ItemWidth( IItemsWrapGrid *iface, DOUBLE value )
++{
++    impl_from_IItemsWrapGrid( iface )->item_width = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI items_wrap_get_ItemHeight( IItemsWrapGrid *iface, DOUBLE *value )
++{
++    *value = impl_from_IItemsWrapGrid( iface )->item_height;
++    return S_OK;
++}
++
++static HRESULT WINAPI items_wrap_put_ItemHeight( IItemsWrapGrid *iface, DOUBLE value )
++{
++    impl_from_IItemsWrapGrid( iface )->item_height = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static const struct IItemsWrapGridVtbl items_wrap_vtbl =
++{
++    items_wrap_QueryInterface,
++    items_wrap_AddRef,
++    items_wrap_Release,
++    /* IInspectable methods */
++    items_wrap_GetIids,
++    items_wrap_GetRuntimeClassName,
++    items_wrap_GetTrustLevel,
++    /* IItemsWrapGrid methods */
++    items_wrap_get_GroupPadding,
++    items_wrap_put_GroupPadding,
++    items_wrap_get_Orientation,
++    items_wrap_put_Orientation,
++    items_wrap_get_MaximumRowsOrColumns,
++    items_wrap_put_MaximumRowsOrColumns,
++    items_wrap_get_ItemWidth,
++    items_wrap_put_ItemWidth,
++    items_wrap_get_ItemHeight,
++    items_wrap_put_ItemHeight,
++    items_wrap_get_FirstCacheIndex,
++    items_wrap_get_FirstVisibleIndex,
++    items_wrap_get_LastVisibleIndex,
++    items_wrap_get_LastCacheIndex,
++    items_wrap_get_ScrollingDirection,
++    items_wrap_get_GroupHeaderPlacement,
++    items_wrap_put_GroupHeaderPlacement,
++    items_wrap_get_CacheLength,
++    items_wrap_put_CacheLength,
++};
++
++/* ItemsWrapGrid properties set from markup */
++BOOL wrap_grid_set_markup( IInspectable *object, const WCHAR *name, const WCHAR *value, double number )
++{
++    struct xaml_element *element = element_from_object( object );
++    struct panel *impl;
++
++    if (!element || element->ops != &panel_ops) return FALSE;
++    impl = impl_from_element( element );
++    if (impl->kind != PANEL_WRAP && impl->kind != PANEL_ITEMS_STACK) return FALSE;
++    if (!wcscmp( name, L"Orientation" ))
++        impl->orientation = (value ? !wcsicmp( value, L"Horizontal" ) : number == Orientation_Horizontal)
++                            ? Orientation_Horizontal : Orientation_Vertical;
++    else if (value) return FALSE;   /* the numbers come converted */
++    else if (impl->kind == PANEL_WRAP && !wcscmp( name, L"MaximumRowsOrColumns" )) impl->max_per_line = number;
++    else if (impl->kind == PANEL_WRAP && !wcscmp( name, L"ItemWidth" )) impl->item_width = number;
++    else if (impl->kind == PANEL_WRAP && !wcscmp( name, L"ItemHeight" )) impl->item_height = number;
++    else if (!wcscmp( name, L"CacheLength" )) impl->cache_length = number;
++    else return FALSE;
++    window_invalidate();
++    return TRUE;
++}
++
+ static HRESULT panel_create( enum panel_kind kind, IInspectable *outer, IInspectable **inner, void **value )
+ {
+     struct panel *impl;
+     HRESULT hr;
++    static const WCHAR *names[] =
++    {
++        RuntimeClass_Windows_UI_Xaml_Controls_StackPanel,
++        RuntimeClass_Windows_UI_Xaml_Controls_Grid,
++        RuntimeClass_Windows_UI_Xaml_Controls_ItemsStackPanel,
++        RuntimeClass_Windows_UI_Xaml_Controls_ItemsWrapGrid,
++    };
++    void *iface;
+ 
+     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+-    element_init( &impl->element, &panel_ops, kind == PANEL_STACK ? RuntimeClass_Windows_UI_Xaml_Controls_StackPanel
+-                                                                   : RuntimeClass_Windows_UI_Xaml_Controls_Grid, outer );
++    element_init( &impl->element, &panel_ops, names[kind], outer );
+     impl->IPanel_iface.lpVtbl = &panel_iface_vtbl;
+     impl->IStackPanel_iface.lpVtbl = &stack_panel_iface_vtbl;
+     impl->IGrid_iface.lpVtbl = &grid_iface_vtbl;
++    impl->IItemsStackPanel_iface.lpVtbl = &items_stack_vtbl;
++    impl->IItemsWrapGrid_iface.lpVtbl = &items_wrap_vtbl;
+     impl->kind = kind;
+     impl->orientation = Orientation_Vertical;
++    impl->item_width = impl->item_height = NAN;
++    impl->max_per_line = -1;
++    impl->cache_length = 4.0;
+     if (FAILED(hr = vector_create( &uielement_collection_iids, &children_callbacks, &impl->element, &impl->children )))
+         goto failed;
+     if (kind == PANEL_GRID)
+@@ -657,8 +956,14 @@ static HRESULT panel_create( enum panel_kind kind, IInspectable *outer, IInspect
+         if (FAILED(hr = vector_create( &column_collection_iids, &definitions_callbacks, impl, &impl->columns ))) goto failed;
+     }
+     TRACE( "created %s %p, outer %p.\n", debugstr_w(impl->element.class_name), impl, outer );
+-    return element_compose( &impl->element, outer, inner,
+-                            kind == PANEL_STACK ? (void *)&impl->IStackPanel_iface : (void *)&impl->IGrid_iface, value );
++    switch (kind)
++    {
++    case PANEL_STACK: iface = &impl->IStackPanel_iface; break;
++    case PANEL_GRID: iface = &impl->IGrid_iface; break;
++    case PANEL_ITEMS_STACK: iface = &impl->IItemsStackPanel_iface; break;
++    default: iface = &impl->IItemsWrapGrid_iface; break;
++    }
++    return element_compose( &impl->element, outer, inner, iface, value );
+ 
+ failed:
+     if (impl->children) IInspectable_Release( impl->children );
+@@ -868,3 +1173,16 @@ static struct panel_statics grid_statics =
+ 
+ IActivationFactory *stack_panel_factory = &stack_statics.IActivationFactory_iface;
+ IActivationFactory *grid_factory = &grid_statics.IActivationFactory_iface;
++
++static struct panel_statics items_stack_statics =
++{
++    {&factory_vtbl}, {&stack_factory_vtbl}, {&grid_factory_iface_vtbl}, {&grid_statics_vtbl}, PANEL_ITEMS_STACK
++};
++
++static struct panel_statics items_wrap_statics =
++{
++    {&factory_vtbl}, {&stack_factory_vtbl}, {&grid_factory_iface_vtbl}, {&grid_statics_vtbl}, PANEL_WRAP
++};
++
++IActivationFactory *items_stack_panel_factory = &items_stack_statics.IActivationFactory_iface;
++IActivationFactory *items_wrap_grid_factory = &items_wrap_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index 3b01471..d4122a9 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -82,6 +82,25 @@ extern IActivationFactory *progress_bar_factory;
+ extern IActivationFactory *items_control_factory;
+ extern IActivationFactory *property_changed_event_args_factory;
+ IInspectable *items_control_items( IInspectable *object );   /* items.c: ItemsControl.Items, not referenced */
++extern IActivationFactory *list_view_factory;
++extern IActivationFactory *grid_view_factory;
++extern IActivationFactory *list_view_item_factory;
++extern IActivationFactory *grid_view_item_factory;
++extern IActivationFactory *items_stack_panel_factory;
++extern IActivationFactory *items_wrap_grid_factory;
++/* items.c: ListView and GridView */
++struct xaml_element;
++void list_view_item_clicked( struct xaml_element *owner, struct xaml_element *container );
++void list_view_item_selected( struct xaml_element *owner, struct xaml_element *container, BOOL selected );
++BOOL list_view_set_markup( IInspectable *object, const WCHAR *name, const WCHAR *value, double number );
++/* listview.c: ListViewItem and GridViewItem */
++struct xaml_element *selector_item_from_object( IInspectable *object );   /* NULL if it isn't one */
++void selector_item_attach( struct xaml_element *item, struct xaml_element *selector );
++void selector_item_set_selected( struct xaml_element *item, BOOL selected );
++BOOL selector_item_is_selected( struct xaml_element *item );
++void selector_item_set_current( struct xaml_element *item, BOOL current );
++/* panel.c: ItemsWrapGrid and ItemsStackPanel properties from markup */
++BOOL wrap_grid_set_markup( IInspectable *object, const WCHAR *name, const WCHAR *value, double number );
+ extern IActivationFactory *row_definition_factory;
+ extern IActivationFactory *column_definition_factory;
+ extern IActivationFactory *resource_dictionary_factory;
+@@ -430,6 +449,7 @@ void element_draw_shape( struct layout_context *ctx, const struct layout_rect *r
+                          BOOL ellipse, IBrush *fill, IBrush *stroke, const Thickness *thickness );
+ void element_draw_lines( struct layout_context *ctx, float x, float y, const struct shape_point *points, UINT32 count,
+                          BOOL closed, IBrush *fill, IBrush *stroke, double thickness );
++void element_fill_argb( struct layout_context *ctx, const struct layout_rect *rect, Color c );   /* with alpha */
+ void element_frame_color( struct layout_context *ctx, const struct layout_rect *rect, const Thickness *thickness,
+                           COLORREF color );
+ BOOL definition_get( IInspectable *object, GridLength *length, double *min, double *max );
+diff --git a/dlls/windows.ui.xaml/xbf.c b/dlls/windows.ui.xaml/xbf.c
+index 346be0d..668a0ba 100644
+--- a/dlls/windows.ui.xaml/xbf.c
++++ b/dlls/windows.ui.xaml/xbf.c
+@@ -2188,6 +2188,32 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+             return S_OK;
+     }
+ 
++    /* ListView and GridView, ItemsWrapGrid and ItemsStackPanel; numbers come as numbers, other strings as text */
++    {
++        const WCHAR *str = value->kind == XV_STRING ? value->s : NULL;
++        double d = 0;
++        BOOL have = TRUE;
++
++        if (value->kind == XV_ENUM) d = value->e.value;
++        else if (value->kind == XV_BOOL) d = value->b;
++        else if (value->kind == XV_SIGNED || value->kind == XV_FLOAT) to_double( value, &d );
++        else if (str && to_double( value, &d ) && wcsicmp( str, L"Auto" )) str = NULL;
++        else if (!str) have = FALSE;
++        if (have && (list_view_set_markup( target, prop->name, str, d ) || wrap_grid_set_markup( target, prop->name, str, d )))
++            return S_OK;
++    }
++    if (prop_is( prop, L"IsSelected" ))
++    {
++        ISelectorItem *selector_item;
++        boolean b;
++        if (QI( target, ISelectorItem, &selector_item ))
++        {
++            if (to_bool( value, &b )) ISelectorItem_put_IsSelected( selector_item, b );
++            ISelectorItem_Release( selector_item );
++            return S_OK;
++        }
++    }
++
+     /* ScrollViewer's properties, set on it or attached to another element */
+     if (!wcscmp( prop->owner, L"ScrollViewer" ) ||
+         ((element = element_from_object( target )) && element->class_name &&
+@@ -2900,6 +2926,12 @@ IInspectable *create_builtin( const WCHAR *name )
+         { L"ImageBrush", &image_brush_factory },
+         { L"BitmapImage", &bitmap_image_factory },
+         { L"ItemsControl", &items_control_factory },
++        { L"ListView", &list_view_factory },
++        { L"GridView", &grid_view_factory },
++        { L"ListViewItem", &list_view_item_factory },
++        { L"GridViewItem", &grid_view_item_factory },
++        { L"ItemsStackPanel", &items_stack_panel_factory },
++        { L"ItemsWrapGrid", &items_wrap_grid_factory },
+         { L"UserControl", &user_control_factory },
+     };
+     IInspectable *object;
+@@ -2997,6 +3029,8 @@ static void add_to_collection( IInspectable *collection, struct xvalue *value )
+ {
+     IVector_IInspectable *vector;
+ 
++    /* <x:String> and the like in an ItemsControl's Items: boxed, as PropertyValues */
++    if (collection && value->kind != XV_OBJECT && !bag_from_object( collection )) box_value( value );
+     if (!collection || value->kind != XV_OBJECT || !value->object) return;
+     if (bag_from_object( collection ))
+     {

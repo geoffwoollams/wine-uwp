@@ -2448,6 +2448,280 @@ done:
     IInspectable_Release(root);
 }
 
+static int selection_changed_count, last_added, last_removed;
+static HRESULT WINAPI selection_QueryInterface(ISelectionChangedEventHandler *iface, REFIID iid, void **out)
+{
+    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IAgileObject) ||
+        IsEqualGUID(iid, &IID_ISelectionChangedEventHandler)) { *out = iface; return S_OK; }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI selection_AddRef(ISelectionChangedEventHandler *iface) { return 2; }
+static ULONG WINAPI selection_Release(ISelectionChangedEventHandler *iface) { return 1; }
+static HRESULT WINAPI selection_Invoke(ISelectionChangedEventHandler *iface, IInspectable *sender, ISelectionChangedEventArgs *args)
+{
+    IVector_IInspectable *v;
+    UINT32 n;
+
+    selection_changed_count++;
+    last_added = last_removed = -1;
+    if (SUCCEEDED(ISelectionChangedEventArgs_get_AddedItems(args, &v))) { IVector_IInspectable_get_Size(v, &n); last_added = n; IVector_IInspectable_Release(v); }
+    if (SUCCEEDED(ISelectionChangedEventArgs_get_RemovedItems(args, &v))) { IVector_IInspectable_get_Size(v, &n); last_removed = n; IVector_IInspectable_Release(v); }
+    return S_OK;
+}
+static ISelectionChangedEventHandlerVtbl selection_vtbl = { selection_QueryInterface, selection_AddRef, selection_Release, selection_Invoke };
+static ISelectionChangedEventHandler on_selection_changed = { &selection_vtbl };
+
+static int item_click_count;
+static IInspectable *last_clicked;
+static HRESULT WINAPI item_click_QueryInterface(IItemClickEventHandler *iface, REFIID iid, void **out)
+{
+    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IAgileObject) ||
+        IsEqualGUID(iid, &IID_IItemClickEventHandler)) { *out = iface; return S_OK; }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI item_click_AddRef(IItemClickEventHandler *iface) { return 2; }
+static ULONG WINAPI item_click_Release(IItemClickEventHandler *iface) { return 1; }
+static HRESULT WINAPI item_click_Invoke(IItemClickEventHandler *iface, IInspectable *sender, IItemClickEventArgs *args)
+{
+    item_click_count++;
+    if (last_clicked) IInspectable_Release(last_clicked);
+    last_clicked = NULL;
+    IItemClickEventArgs_get_ClickedItem(args, &last_clicked);
+    return S_OK;
+}
+static IItemClickEventHandlerVtbl item_click_vtbl = { item_click_QueryInterface, item_click_AddRef, item_click_Release, item_click_Invoke };
+static IItemClickEventHandler on_item_click = { &item_click_vtbl };
+
+static const WCHAR list_xaml[] =
+    L"<Grid xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\"\n"
+    L"      xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\" Grid.RowSpan=\"2\" Margin=\"30,440,0,0\"\n"
+    L"      HorizontalAlignment=\"Left\" VerticalAlignment=\"Top\" Width=\"400\" Height=\"250\" Background=\"White\">\n"
+    L"  <ListView x:Name=\"Fruit\" Width=\"180\" Height=\"120\" HorizontalAlignment=\"Left\" VerticalAlignment=\"Top\"\n"
+    L"            SelectedIndex=\"1\">\n"
+    L"    <x:String>Alpha</x:String><x:String>Beta</x:String><x:String>Gamma</x:String>\n"
+    L"    <x:String>Delta</x:String><x:String>Epsilon</x:String><x:String>Zeta</x:String>\n"
+    L"  </ListView>\n"
+    L"  <ListView x:Name=\"Explicit\" Width=\"180\" Height=\"100\" Margin=\"0,130,0,0\" HorizontalAlignment=\"Left\"\n"
+    L"            VerticalAlignment=\"Top\" SelectionMode=\"Extended\">\n"
+    L"    <ListViewItem>One</ListViewItem>\n"
+    L"    <ListViewItem IsSelected=\"True\">Two</ListViewItem>\n"
+    L"  </ListView>\n"
+    L"  <GridView x:Name=\"Tiles\" Margin=\"200,0,0,0\" Width=\"200\" Height=\"200\" HorizontalAlignment=\"Left\"\n"
+    L"            VerticalAlignment=\"Top\" SelectionMode=\"Multiple\" IsItemClickEnabled=\"True\">\n"
+    L"    <Border x:Name=\"Tile0\" Width=\"40\" Height=\"40\" Background=\"Orange\"/>\n"
+    L"    <Border Width=\"40\" Height=\"40\" Background=\"Orange\"/>\n"
+    L"    <Border Width=\"40\" Height=\"40\" Background=\"Orange\"/>\n"
+    L"    <Border Width=\"40\" Height=\"40\" Background=\"Orange\"/>\n"
+    L"    <Border Width=\"40\" Height=\"40\" Background=\"Orange\"/>\n"
+    L"  </GridView>\n"
+    L"</Grid>\n";
+
+static const WCHAR *item_string(IInspectable *item, WCHAR *buf, int len)
+{
+    IPropertyValue *pv;
+    HSTRING str;
+
+    buf[0] = 0;
+    if (item && SUCCEEDED(IInspectable_QueryInterface(item, &IID_IPropertyValue, (void **)&pv)))
+    {
+        if (SUCCEEDED(IPropertyValue_GetString(pv, &str)))
+        {
+            lstrcpynW(buf, WindowsGetStringRawBuffer(str, NULL), len);
+            WindowsDeleteString(str);
+        }
+        IPropertyValue_Release(pv);
+    }
+    return buf;
+}
+
+static UINT32 selected_count(IListViewBase *base)
+{
+    IVector_IInspectable *v;
+    UINT32 n = 0;
+    if (SUCCEEDED(IListViewBase_get_SelectedItems(base, &v)))
+    {
+        IVector_IInspectable_get_Size(v, &n);
+        IVector_IInspectable_Release(v);
+    }
+    return n;
+}
+
+static void click_xy(int x, int y)
+{
+    SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(x, y));
+    SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(x, y));
+    SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(x, y));
+}
+
+static BOOL same_identity(IInspectable *a, IInspectable *b)
+{
+    IUnknown *ua = NULL, *ub = NULL;
+    BOOL same;
+    if (!a || !b) return FALSE;
+    IInspectable_QueryInterface(a, &IID_IUnknown, (void **)&ua);
+    IInspectable_QueryInterface(b, &IID_IUnknown, (void **)&ub);
+    same = ua && ua == ub;
+    if (ua) IUnknown_Release(ua);
+    if (ub) IUnknown_Release(ub);
+    return same;
+}
+
+static void check_lists(struct main_page *page)
+{
+    IFrameworkElement2 *page_grid = page_root(page);
+    IInspectable *root, *list_obj, *explicit_obj, *tiles_obj, *tile0, *item = NULL;
+    ISelector *list = NULL, *explicit = NULL;
+    IListViewBase *list_base = NULL, *explicit_base = NULL, *tiles_base = NULL;
+    IListView *lv = NULL;
+    IGridView *gv = NULL;
+    IVector_UIElement *children;
+    IUIElement *ui;
+    IPanel *panel;
+    EventRegistrationToken token;
+    ListViewSelectionMode mode;
+    BYTE state[256];
+    WCHAR buf[32];
+    INT32 index = -2;
+    HRESULT hr;
+    DWORD c;
+    int x = 30, y = 440;
+
+    root = xaml_load(list_xaml, &hr);
+    check(hr == S_OK && root, "XamlReader.Load of ListViews and a GridView, hr %#lx", hr);
+    if (!root || !page_grid) return;
+    IFrameworkElement2_QueryInterface(page_grid, &IID_IPanel, (void **)&panel);
+    IPanel_get_Children(panel, &children);
+    IInspectable_QueryInterface(root, &IID_IUIElement, (void **)&ui);
+    IVector_UIElement_Append(children, ui);
+    IUIElement_Release(ui);
+    pump(50);   /* the containers, and the items in them, come with the first layout */
+    list_obj = find_in(root, L"Fruit");
+    explicit_obj = find_in(root, L"Explicit");
+    tiles_obj = find_in(root, L"Tiles");
+    tile0 = find_in(root, L"Tile0");
+    if (list_obj)
+    {
+        IInspectable_QueryInterface(list_obj, &IID_ISelector, (void **)&list);
+        IInspectable_QueryInterface(list_obj, &IID_IListViewBase, (void **)&list_base);
+        IInspectable_QueryInterface(list_obj, &IID_IListView, (void **)&lv);
+    }
+    if (explicit_obj)
+    {
+        IInspectable_QueryInterface(explicit_obj, &IID_ISelector, (void **)&explicit);
+        IInspectable_QueryInterface(explicit_obj, &IID_IListViewBase, (void **)&explicit_base);
+    }
+    if (tiles_obj)
+    {
+        IInspectable_QueryInterface(tiles_obj, &IID_IListViewBase, (void **)&tiles_base);
+        IInspectable_QueryInterface(tiles_obj, &IID_IGridView, (void **)&gv);
+    }
+    check(list && list_base && lv && explicit && explicit_base && tiles_base && gv && tile0,
+          "ListView is an ISelector, IListViewBase and IListView; GridView an IGridView (%p %p %p %p %p %p %p %p)",
+          list, list_base, lv, explicit, explicit_base, tiles_base, gv, tile0);
+    if (!list || !list_base || !lv || !explicit || !explicit_base || !tiles_base || !gv || !tile0) goto done;
+    ISelector_add_SelectionChanged(list, &on_selection_changed, &token);
+    IListViewBase_add_ItemClick(tiles_base, &on_item_click, &token);
+    pump(50);
+    snapshot();
+
+    /* markup: SelectedIndex="1" before the items, IsSelected on a ListViewItem */
+    ISelector_get_SelectedIndex(list, &index);
+    check(index == 1, "SelectedIndex=\"1\" from markup selects Beta (%d)", index);
+    ISelector_get_SelectedItem(list, &item);
+    check(!wcscmp(item_string(item, buf, ARRAYSIZE(buf)), L"Beta"), "SelectedItem is the string Beta (%ls)", buf);
+    if (item) IInspectable_Release(item);
+    item = NULL;
+    c = px(x + 160, y + 60);
+    check(close_rgb(c, 102, 174, 231, 12), "the selected item is the accent colour at 60%% over white (%06lx)", c);
+    c = px(x + 160, y + 20);
+    check(close_rgb(c, 255, 255, 255, 4), "an unselected item isn't (%06lx)", c);
+    index = -2;
+    ISelector_get_SelectedIndex(explicit, &index);
+    check(index == 1 && selected_count(explicit_base) == 1, "<ListViewItem IsSelected=\"True\"> is selected (%d, %u)",
+          index, selected_count(explicit_base));
+    IListViewBase_get_SelectionMode(explicit_base, &mode);
+    check(mode == ListViewSelectionMode_Extended, "SelectionMode=\"Extended\" (%d)", mode);
+
+    /* a click selects (Single) */
+    click_xy(x + 160, y + 100);
+    index = -2;
+    ISelector_get_SelectedIndex(list, &index);
+    check(index == 2, "clicking Gamma selects it (%d)", index);
+    check(selection_changed_count == 1 && last_added == 1 && last_removed == 1,
+          "SelectionChanged once, one item added and one removed (%d, %d, %d)", selection_changed_count, last_added, last_removed);
+
+    /* the keyboard: the list has the focus now; Down selects and scrolls the next item into view */
+    key(VK_DOWN);
+    pump(20);
+    snapshot();
+    index = -2;
+    ISelector_get_SelectedIndex(list, &index);
+    check(index == 3, "Down selects Delta (%d)", index);
+    c = px(x + 160, y + 100);
+    check(close_rgb(c, 102, 174, 231, 12), "and scrolls it into view at the bottom of the list (%06lx)", c);
+    key(VK_END);
+    index = -2;
+    ISelector_get_SelectedIndex(list, &index);
+    check(index == 5 && selection_changed_count == 3, "End selects the last item (%d, %d changes)", index, selection_changed_count);
+    ISelector_put_SelectedItem(list, NULL);
+    index = -2;
+    ISelector_get_SelectedIndex(list, &index);
+    check(index == -1 && selected_count(list_base) == 0 && last_removed == 1, "SelectedItem = null clears the selection (%d)", index);
+
+    /* Extended: Ctrl+click adds to the selection */
+    GetKeyboardState(state);
+    state[VK_CONTROL] = 0x80;
+    SetKeyboardState(state);
+    click_xy(x + 160, y + 130 + 20);
+    state[VK_CONTROL] = 0;
+    SetKeyboardState(state);
+    check(selected_count(explicit_base) == 2, "Ctrl+click adds One to the Extended selection (%u)", selected_count(explicit_base));
+    click_xy(x + 160, y + 130 + 20);
+    check(selected_count(explicit_base) == 1, "a plain click selects just it (%u)", selected_count(explicit_base));
+
+    /* GridView: 44 px cells (40 + the 4 px item margin), four to a 200 px row */
+    snapshot();
+    c = px(x + 200 + 3 * 44 + 20, y + 20);
+    check(close_rgb(c, 255, 165, 0, 8), "the fourth tile is on the first row (%06lx)", c);
+    c = px(x + 200 + 20, y + 44 + 20);
+    check(close_rgb(c, 255, 165, 0, 8), "the fifth wraps to the second (%06lx)", c);
+    click_xy(x + 200 + 20, y + 20);
+    check(item_click_count == 1 && same_identity(last_clicked, tile0),
+          "IsItemClickEnabled: a click raises ItemClick with the Border as ClickedItem (%d, %p)", item_click_count, last_clicked);
+    click_xy(x + 200 + 20, y + 44 + 20);
+    check(selected_count(tiles_base) == 2, "SelectionMode=\"Multiple\": clicks add to the selection (%u)", selected_count(tiles_base));
+    snapshot();
+    c = px(x + 200 + 1, y + 30);
+    check(close_rgb(c, 0, 120, 215, 8), "a selected GridViewItem gets an accent frame (%06lx)", c);
+    click_xy(x + 200 + 20, y + 20);
+    check(selected_count(tiles_base) == 1 && item_click_count == 3, "and another click takes it out (%u, %d)",
+          selected_count(tiles_base), item_click_count);
+    IListViewBase_SelectAll(tiles_base);
+    check(selected_count(tiles_base) == 5, "SelectAll selects all five (%u)", selected_count(tiles_base));
+    pump(20);
+
+done:
+    if (last_clicked) IInspectable_Release(last_clicked);
+    last_clicked = NULL;
+    if (list) ISelector_Release(list);
+    if (explicit) ISelector_Release(explicit);
+    if (list_base) IListViewBase_Release(list_base);
+    if (explicit_base) IListViewBase_Release(explicit_base);
+    if (tiles_base) IListViewBase_Release(tiles_base);
+    if (lv) IListView_Release(lv);
+    if (gv) IGridView_Release(gv);
+    if (list_obj) IInspectable_Release(list_obj);
+    if (explicit_obj) IInspectable_Release(explicit_obj);
+    if (tiles_obj) IInspectable_Release(tiles_obj);
+    if (tile0) IInspectable_Release(tile0);
+    IVector_UIElement_Release(children);
+    IPanel_Release(panel);
+    IFrameworkElement2_Release(page_grid);
+    IInspectable_Release(root);
+}
+
 static void check_microsoft_xbf(const WCHAR *file, const WCHAR *component_class)
 {
     IActivationFactory *factory;
@@ -2563,6 +2837,7 @@ static void CALLBACK verify(HWND unused, UINT msg, UINT_PTR id, DWORD time)
     check_scroll_focus(the_page);
     check_textbox(the_page);
     check_images(the_page);
+    check_lists(the_page);
     check(!wcscmp(text_of(the_page->title, buf, ARRAYSIZE(buf)), L"Clicked!"), "OnClick changed Title (%ls)", buf);
     snapshot();
 
