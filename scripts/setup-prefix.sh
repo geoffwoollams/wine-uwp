@@ -52,8 +52,9 @@ fi
 [ -x "$WINE_ROOT/bin/wine" ] || die "patched Wine not found in $WINE_ROOT: run scripts/fetch-release.sh or scripts/build-wine.sh first"
 [ -f "$DXVK_DXGI" ] || die "patched dxgi.dll not found at $DXVK_DXGI: run scripts/fetch-release.sh or scripts/build-dxvk.sh first"
 IFS=$'\t' read -r PKG_NAME PKG_EXE < <(python3 -I "$REPO/scripts/uwptool.py" info "$PKG_DIR")
-# the manifest's Executable is a Windows path ("GearGame\Binaries\UWP64\GearGame.exe"); check it with / separators
-[ -f "$PKG_DIR/${PKG_EXE//\\//}" ] || die "$PKG_EXE (from AppxManifest.xml) not found in $PKG_DIR"
+# the manifest's Executable is a Windows path ("GearGame\Binaries\UWP64\GearGame.exe"), and its case need not match the
+# file's (Forza Motorsport 7 names ForzaMotorsport7.exe, the file is forzamotorsport7.exe): Windows and Wine ignore it
+python3 -I "$REPO/scripts/uwptool.py" resolve "$PKG_DIR" "$PKG_EXE" >/dev/null || die "$PKG_EXE (from AppxManifest.xml) not found in $PKG_DIR"
 read -r VKD3D_DIR WINEDLL_DIR < <(find_components) || die "d3d12/wintypes DLLs not found: run scripts/fetch-release.sh, or install $GE_PROTON_VERSION (see README) or set GE_PROTON=/path/to/$GE_PROTON_VERSION"
 info "Package $PKG_NAME ($PKG_EXE); components from $VKD3D_DIR"
 

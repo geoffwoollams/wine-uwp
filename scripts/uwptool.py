@@ -6,6 +6,7 @@
   uwptool.py registry PACKAGE_DIR APP_DIR print a REGEDIT4 file with the WinRT class registrations to import
   uwptool.py info PACKAGE_DIR              print the package name and the executable of its first application (name<TAB>exe)
   uwptool.py native-copy SRC DEST         copy a Wine PE DLL so Wine loads it as a native DLL (clears the builtin marker)
+  uwptool.py resolve PACKAGE_DIR PATH      print PATH inside the package with its real case (Windows ignores case), or fail
   uwptool.py appinfo PACKAGE_DIR           print the app's display name and its best icon file (name<TAB>icon path, or name<TAB>)
 """
 import base64
@@ -215,6 +216,11 @@ if __name__ == "__main__":
         info(sys.argv[2])
     elif len(sys.argv) == 4 and sys.argv[1] == "vclibs":
         vclibs(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) == 4 and sys.argv[1] == "resolve":
+        path = find_case_insensitive(sys.argv[2], sys.argv[3].replace("\\", "/"))
+        if not path or not os.path.isfile(path):
+            sys.exit(1)
+        print(path)
     elif len(sys.argv) == 3 and sys.argv[1] == "appinfo":
         appinfo(sys.argv[2])
     elif len(sys.argv) == 4 and sys.argv[1] == "native-copy":
