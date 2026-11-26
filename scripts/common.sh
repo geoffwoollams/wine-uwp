@@ -10,6 +10,7 @@ DATA="${UWP_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/wine-uwp}"
 PREFIX="${UWP_PREFIX:-$DATA/prefix}"                         # the Wine prefix the apps run in
 LOGS="${UWP_LOGS:-$DATA/logs}"
 APPS_DIR_NAME="UWP"                                          # apps are linked into C:\UWP\<package name> inside the prefix
+FRAMEWORKS="$DATA/frameworks"   # framework packages (VCLibs, .NET Native, WinUI ...), one copy for every app
 SOURCES="$DATA/apps"   # <package>.source: the package folder, its VCLibs package and its own prefix (empty: the shared one)
 
 WINE_TAG="wine-11.22"

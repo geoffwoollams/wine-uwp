@@ -1,20 +1,26 @@
 #!/bin/bash
 # Creates the shared Wine prefix (once) and links one unpacked UWP package into it. The package folder is never modified.
-# Usage: scripts/setup-prefix.sh /path/to/package-folder [--vclibs /path/to/Microsoft.VCLibs.140.00_..._x64.appx|folder] [--verify]
-#        [--shortcut | --no-shortcut] [--prefix DIR]
+# Usage: scripts/setup-prefix.sh /path/to/package-folder [--frameworks DIR] [--vclibs /path/to/Microsoft.VCLibs...appx|folder]
+#        [--verify] [--shortcut | --no-shortcut] [--prefix DIR]
 #        scripts/setup-prefix.sh --update-all
 # Run it again for each app; they share the prefix. It offers to add a launcher (a .desktop file with the app's icon) to
 # the applications menu and the desktop; --shortcut adds it without asking, --no-shortcut skips it.
 # --prefix DIR uses another Wine prefix for this app instead of the shared one (it is remembered for later runs).
+# --frameworks DIR imports the framework packages an app may depend on (Microsoft.VCLibs, Microsoft.NET.Native.*,
+# Microsoft.UI.Xaml ...) into the shared store ~/.local/share/wine-uwp/frameworks, once: DIR is an unpacked package folder,
+# an .appx/.msix, or a folder of them (copied from C:\Program Files\WindowsApps on Windows). --vclibs does the same for
+# one package, and framework .appx files in the app's redist folder are imported too. Each app gets the newest stored
+# version of every framework its manifest depends on, linked into its folder.
 # --update-all sets up every app already in the prefix again, from the folders they were set up from (without the file
 # check or the launcher question): what an upgraded Wine build needs, and what fetch-release.sh runs.
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
 
-PKG_DIR="" VCLIBS="" VERIFY=0 SHORTCUT=ask UPDATE_ALL=0 OWN_PREFIX=""
+PKG_DIR="" VCLIBS="" FRAMEWORK_SRC=() VERIFY=0 SHORTCUT=ask UPDATE_ALL=0 OWN_PREFIX=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --vclibs) VCLIBS="$2"; shift 2 ;;
+        --frameworks) FRAMEWORK_SRC+=("$2"); shift 2 ;;
         --verify) VERIFY=1; shift ;;      # check every file against AppxBlockMap.xml first
         --skip-verify) VERIFY=0; shift ;; # the default now; still accepted
         --shortcut) SHORTCUT=yes; shift ;;
@@ -69,18 +75,14 @@ if [ -n "$OWN_PREFIX" ]; then
     fi
 fi
 
-if [ -z "$VCLIBS" ]; then
-    VCLIBS="$(ls -1 "$PKG_DIR"/redist/Microsoft.VCLibs.140.00_*_x64_*.appx "$PKG_DIR"/redist/Microsoft.VCLibs.140.00_*_x64_*.Appx 2>/dev/null | head -1 || true)"
-    # none in this package: reuse the one another app here was set up with (Microsoft offers no download of the UWP one)
-    if [ -z "$VCLIBS" ]; then
-        for f in "$SOURCES"/*.source; do
-            [ -f "$f" ] || continue
-            vcl="$(sed -n 2p "$f")"
-            if [ -n "$vcl" ] && [ -e "$vcl" ]; then VCLIBS="$vcl"; info "Using the VC++ runtime package from another app: $VCLIBS"; break; fi
-        done
-    fi
-    [ -n "$VCLIBS" ] || echo "warning: no x64 Microsoft.VCLibs.140.00 package found in $PKG_DIR/redist or with the apps already set up; C++/CX apps need one: pass it with --vclibs (see README)" >&2
-fi
+# framework packages into the shared store: given ones, and any the package carries in redist/
+[ -n "$VCLIBS" ] && FRAMEWORK_SRC+=("$VCLIBS")
+[ -d "$PKG_DIR/redist" ] && FRAMEWORK_SRC+=("$PKG_DIR/redist")
+for src in "${FRAMEWORK_SRC[@]}"; do
+    [ -e "$src" ] || die "framework source $src not found"
+    info "Importing framework packages from $src"
+    python3 -I "$REPO/scripts/uwptool.py" import-frameworks "$src" "$FRAMEWORKS" | sed 's/^/  /'
+done
 
 if [ "$VERIFY" = 1 ]; then
     info "Verifying files against AppxBlockMap.xml (a few minutes for a large app)"
@@ -117,16 +119,23 @@ mkdir -p "$APP"
 find "$APP" -maxdepth 1 -type l -delete
 for f in "$PKG_DIR"/*; do
     name="$(basename "$f")"
-    [ -n "$VCLIBS" ] && case "${name,,}" in *_app.dll) continue ;; esac   # the VC++ runtime comes from the VCLibs package below
     ln -s "$f" "$APP/$name"
 done
-[ -n "$VCLIBS" ] && python3 -I "$REPO/scripts/uwptool.py" vclibs "$VCLIBS" "$APP"
+# the frameworks it depends on, from the store (an earlier version's copied VC++ runtime goes first)
+find "$APP" -maxdepth 1 -type f -iname '*_app.dll' -delete
+while IFS=$'\t' read -r state name version; do
+    case "$state" in
+        LINKED) info "Framework $name" ;;
+        MISSING) echo "warning: $PKG_NAME needs the framework package $name (version $version or later), which isn't imported:" \
+                      "copy it from C:\\Program Files\\WindowsApps on a Windows PC and pass it with --frameworks (see README)" >&2
+                 ;;
+    esac
+done < <(python3 -I "$REPO/scripts/uwptool.py" link-frameworks "$PKG_DIR" "$FRAMEWORKS" "$APP")
 mkdir -p "$SOURCES"
-printf '%s\n%s\n%s\n' "$PKG_DIR" "${VCLIBS:+$(cd "$(dirname "$VCLIBS")" && pwd)/$(basename "$VCLIBS")}" "$OWN_PREFIX" \
-    > "$SOURCES/$PKG_NAME.source"
+printf '%s\n%s\n%s\n' "$PKG_DIR" "" "$OWN_PREFIX" > "$SOURCES/$PKG_NAME.source"
 
 info "Registering WinRT classes"
-python3 -I "$REPO/scripts/uwptool.py" registry "$PKG_DIR" "C:\\$APPS_DIR_NAME\\$PKG_NAME" > "$PREFIX/drive_c/uwp-$PKG_NAME.reg"
+python3 -I "$REPO/scripts/uwptool.py" registry "$PKG_DIR" "C:\\$APPS_DIR_NAME\\$PKG_NAME" "$FRAMEWORKS" > "$PREFIX/drive_c/uwp-$PKG_NAME.reg"
 wine regedit /S "C:\\uwp-$PKG_NAME.reg"
 wineserver -w
 

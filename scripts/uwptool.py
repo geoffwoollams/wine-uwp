@@ -8,6 +8,11 @@
   uwptool.py native-copy SRC DEST         copy a Wine PE DLL so Wine loads it as a native DLL (clears the builtin marker)
   uwptool.py resolve PACKAGE_DIR PATH      print PATH inside the package with its real case (Windows ignores case), or fail
   uwptool.py appinfo PACKAGE_DIR           print the app's display name and its best icon file (name<TAB>icon path, or name<TAB>)
+  uwptool.py import-frameworks SOURCE STORE  copy framework packages (VCLibs, .NET Native, WinUI ...) into the shared store:
+                                           SOURCE is an unpacked package folder, an .appx/.msix, or a folder of either
+  uwptool.py link-frameworks PACKAGE_DIR STORE APP_DIR
+                                           link the DLLs of the frameworks the package depends on into APP_DIR, and print
+                                           the ones the store doesn't have (MISSING<TAB>name<TAB>min version)
 """
 import base64
 import hashlib
@@ -89,13 +94,131 @@ def vclibs(source, dest):
     print("copied %d VC++ runtime DLLs: %s" % (len(copied), " ".join(sorted(copied))))
 
 
+# ---- framework packages ----
+
+def manifest_identity(manifest):
+    ident = re.search(r"<Identity\b([^>]*)>", manifest)
+    if not ident:
+        return None
+    attrs = dict(re.findall(r'(\w+)="([^"]*)"', ident.group(1)))
+    framework = re.search(r"<Framework>\s*true\s*</Framework>", manifest, re.I) is not None
+    return attrs.get("Name"), attrs.get("Version", "0"), attrs.get("ProcessorArchitecture", "neutral").lower(), framework
+
+
+def version_key(version):
+    return tuple(int(p) if p.isdigit() else 0 for p in version.split("."))
+
+
+def import_one(source, store):
+    """Import one framework package (folder or .appx/.msix); returns its store folder name, or None."""
+    if os.path.isdir(source):
+        path = os.path.join(source, "AppxManifest.xml")
+        if not os.path.exists(path):
+            return None
+        manifest = open(path, encoding="utf-8", errors="replace").read()
+    else:
+        try:
+            with zipfile.ZipFile(source) as z:
+                manifest = z.read("AppxManifest.xml").decode("utf-8", "replace")
+        except (zipfile.BadZipFile, KeyError, OSError):
+            return None
+    ident = manifest_identity(manifest)
+    if not ident or not ident[3] or ident[2] not in ("x64", "neutral"):
+        return None   # not a framework, or the 32-bit one
+    name, version, arch, _ = ident
+    folder = "%s_%s_%s" % (name, version, arch)
+    dest = os.path.join(store, folder)
+    if os.path.exists(os.path.join(dest, "AppxManifest.xml")):
+        return folder
+    tmp = dest + ".tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    if os.path.isdir(source):
+        shutil.copytree(source, tmp, symlinks=False)
+    else:
+        with zipfile.ZipFile(source) as z:
+            for info in z.infolist():
+                target = os.path.normpath(os.path.join(tmp, info.filename.replace("%20", " ")))
+                if not target.startswith(os.path.normpath(tmp) + os.sep) or info.is_dir():
+                    continue   # nothing outside the folder
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with z.open(info) as src, open(target, "wb") as out:
+                    shutil.copyfileobj(src, out)
+    os.replace(tmp, dest)
+    return folder
+
+
+def import_frameworks(source, store):
+    os.makedirs(store, exist_ok=True)
+    candidates = [source]
+    if os.path.isdir(source) and not os.path.exists(os.path.join(source, "AppxManifest.xml")):
+        candidates = [os.path.join(source, n) for n in sorted(os.listdir(source))]
+    imported = []
+    for path in candidates:
+        if os.path.isdir(path) or path.lower().endswith((".appx", ".msix")):
+            folder = import_one(path, store)
+            if folder:
+                imported.append(folder)
+    for folder in imported:
+        print("framework %s" % folder)
+    if not imported and os.path.exists(source):
+        print("no x64 framework packages found in %s" % source, file=sys.stderr)
+
+
+def matched_frameworks(package_dir, store):
+    """[(name, min version, store folder or None)] for the package's dependencies"""
+    manifest = open(os.path.join(package_dir, "AppxManifest.xml"), encoding="utf-8").read()
+    have = os.listdir(store) if os.path.isdir(store) else []
+    result = []
+    for dep in re.findall(r"<PackageDependency\b([^>]*)>", manifest):
+        attrs = dict(re.findall(r'(\w+)="([^"]*)"', dep))
+        name, minimum = attrs.get("Name"), attrs.get("MinVersion", "0")
+        best = None
+        for folder in have:
+            if folder.endswith(".tmp") or not folder.startswith(name + "_"):
+                continue
+            rest = folder[len(name) + 1:].rsplit("_", 1)
+            if len(rest) != 2 or rest[0].count(".") != 3 or version_key(rest[0]) < version_key(minimum):
+                continue
+            if best is None or version_key(rest[0]) > version_key(best[1]):
+                best = (folder, rest[0])
+        result.append((name, minimum, best[0] if best else None))
+    return result
+
+
+def link_frameworks(package_dir, store, app_dir):
+    linked = []
+    for name, minimum, folder in matched_frameworks(package_dir, store):
+        if not folder:
+            print("MISSING\t%s\t%s" % (name, minimum))
+            continue
+        src = os.path.join(store, folder)
+        for entry in os.listdir(src):
+            if not entry.lower().endswith((".dll", ".winmd")):
+                continue
+            target = os.path.join(app_dir, entry)
+            # the VC++ runtime from VCLibs replaces copies the app may carry; the app's other files win
+            if os.path.lexists(target):
+                if not (name.startswith("Microsoft.VCLibs.") and os.path.islink(target)):
+                    continue
+                os.unlink(target)
+            os.symlink(os.path.join(src, entry), target)
+        linked.append(folder)
+    for folder in linked:
+        print("LINKED\t%s" % folder)
+
+
 def reg_key(cls):
     return "[HKEY_LOCAL_MACHINE\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\%s]" % cls
 
 
-def registry(game_dir, app_dir):
+def registry(game_dir, app_dir, store=None):
     out = ["REGEDIT4", ""]
     manifest = open(os.path.join(game_dir, "AppxManifest.xml"), encoding="utf-8").read()
+    # the frameworks' own classes too: their DLLs are linked into the app's folder
+    if store:
+        for _, _, folder in matched_frameworks(game_dir, store):
+            if folder:
+                manifest += open(os.path.join(store, folder, "AppxManifest.xml"), encoding="utf-8", errors="replace").read()
     for server in re.findall(r"<InProcessServer>(.*?)</InProcessServer>", manifest, re.S):
         dll = re.search(r"<Path>([^<]+)</Path>", server).group(1)
         for cls in re.findall(r'ActivatableClassId="([^"]+)"', server):
@@ -225,7 +348,11 @@ if __name__ == "__main__":
         appinfo(sys.argv[2])
     elif len(sys.argv) == 4 and sys.argv[1] == "native-copy":
         native_copy(sys.argv[2], sys.argv[3])
-    elif len(sys.argv) == 4 and sys.argv[1] == "registry":
-        registry(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) in (4, 5) and sys.argv[1] == "registry":
+        registry(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) == 5 else None)
+    elif len(sys.argv) == 4 and sys.argv[1] == "import-frameworks":
+        import_frameworks(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) == 5 and sys.argv[1] == "link-frameworks":
+        link_frameworks(sys.argv[2], sys.argv[3], sys.argv[4])
     else:
         sys.exit(__doc__)

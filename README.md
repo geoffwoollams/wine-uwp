@@ -54,12 +54,14 @@ You need the app as an **unpacked package folder**: the folder with `AppxManifes
 
 If you installed a game with **Lutris**, its game folder works too. Lutris puts the files in its own Wine prefix, for example `~/Games/<game>/drive_c/Games/<game name>/`. Pass the folder that holds `AppxManifest.xml` to `setup-prefix.sh`. Starting the game from Lutris still won't work, because Lutris runs it with a Wine that has no UWP support. Start it with `run-app.sh` or the launcher `setup-prefix.sh` offers to add. The game's files are only linked, never changed, so the Lutris install is unaffected.
 
-Apps built with C++/CX also need the **x64 `Microsoft.VCLibs.140.00`** framework package (the UWP one, not the `UWPDesktop` one), either as a `.appx` file or as the installed folder, for example `C:\Program Files\WindowsApps\Microsoft.VCLibs.140.00_14.0.33519.0_x64__8wekyb3d8bbwe` from a Windows install. If the package has a `redist/` folder containing that `.appx`, it is found automatically. Most games ship one there: Halo Wars 2 and Gears of War 4 both do. If an app has none, the package found for an app you set up earlier is used. Microsoft doesn't offer the UWP `Microsoft.VCLibs.140.00` as a download of its own: its download page has only the `UWPDesktop` package, which doesn't work here. The UWP package comes with the Windows 10 SDK and Visual Studio (`ExtensionSDKs\Microsoft.VCLibs\14.0\Appx\Retail\x64`), or is already installed on any Windows PC that has Store apps.
+Apps also need the **framework packages** their `AppxManifest.xml` lists as dependencies: the VC++ runtime (`Microsoft.VCLibs.140.00`) for C++/CX apps, and for some apps .NET Native (`Microsoft.NET.Native.Framework.2.2` and `Microsoft.NET.Native.Runtime.2.2`) or WinUI 2 (`Microsoft.UI.Xaml.2.8`). They are Microsoft's, so releases don't include them: you import your own copies once, and every app set up afterwards uses them.
+- **Where to get them:** a Windows 10/11 install has them in `C:\Program Files\WindowsApps` (folders such as `Microsoft.VCLibs.140.00_14.0.33519.0_x64__8wekyb3d8bbwe`). Copy the x64 ones you need into one folder and pass it with `--frameworks`; `.appx`/`.msix` files work too. Many games carry their VC++ package in a `redist/` folder (Halo Wars 2, Gears of War 4, Forza Motorsport 7), and those are imported automatically. Microsoft's own VCLibs download page only has the `UWPDesktop` package, which doesn't replace the UWP one; the UWP one also comes with the Windows 10 SDK (`ExtensionSDKs\Microsoft.VCLibs\14.0\Appx\Retail\x64`).
+- **Where they go:** one copy of each, in `~/.local/share/wine-uwp/frameworks`. Each app gets the newest stored version of every framework it depends on, linked into its folder; nothing is copied per app. Setup names any framework an app needs that isn't there yet.
 
 ```bash
 scripts/setup-prefix.sh "/path/to/package-folder"
-# or, with the VC++ package elsewhere:
-scripts/setup-prefix.sh "/path/to/package-folder" --vclibs /path/to/Microsoft.VCLibs.140.00_..._x64.appx
+# importing framework packages first (once):
+scripts/setup-prefix.sh "/path/to/package-folder" --frameworks /path/to/folder-of-framework-packages
 ```
 
 This creates the shared Wine prefix on first use, and links the package into it as `C:\UWP\<package name>`. The package folder is never modified. Run it again for each further app; they share the prefix. To give an app a prefix of its own instead, for example when it needs registry settings the others shouldn't see, add `--prefix /path/to/prefix`. That folder is remembered, so `run-app.sh`, launchers and later setups use it too. It can also be an existing prefix, such as one Lutris made, but wine-uwp's Wine upgrades it on first use and setup replaces its `dxgi`, D3D12 and WinRT DLLs, so the tool that made it may not run it properly afterwards. Add `--verify` to first check every file against the hashes in `AppxBlockMap.xml`, which catches a damaged or incomplete copy (a few minutes for a big app).
@@ -224,7 +226,7 @@ The archive contains the Wine install tree, DXVK's `dxgi.dll`, `d3d11.dll` and `
 
 ## Licences
 
-Everything in a release is free software, and a release contains no Microsoft software and no app files. The VC++ UWP runtime comes from your own `Microsoft.VCLibs` package at setup time and is never redistributed here.
+Everything in a release is free software, and a release contains no Microsoft software and no app files. Framework packages (the VC++ runtime, .NET Native, WinUI) come from your own copies at setup time and are never redistributed here.
 
 This repository is licensed under the **GNU LGPL 2.1 or later**, the same as Wine ([LICENCE](LICENCE)), except the DXVK patch, which is zlib like DXVK. You can use, change and share the patches, scripts and tests under those terms.
 
