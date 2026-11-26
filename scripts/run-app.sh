@@ -8,15 +8,16 @@ set -uo pipefail
 source "$(dirname "$0")/common.sh"
 [ -x "$WINE_ROOT/bin/wine" ] || die "patched Wine not found in $WINE_ROOT: run scripts/fetch-release.sh or scripts/build-wine.sh"
 shopt -s nullglob
-apps=("$PREFIX/drive_c/$APPS_DIR_NAME"/*/)
+mapfile -t apps < <(list_apps | sort -u)
 [ ${#apps[@]} -gt 0 ] || die "no app set up: run scripts/setup-prefix.sh /path/to/package-folder"
 NAME="${1:-}"
 if [ -z "$NAME" ]; then
-    [ ${#apps[@]} -eq 1 ] || die "several apps are set up, name one: $(for a in "${apps[@]}"; do basename "$a"; done | tr '\n' ' ')"
-    NAME="$(basename "${apps[0]}")"
+    [ ${#apps[@]} -eq 1 ] || die "several apps are set up, name one: ${apps[*]}"
+    NAME="${apps[0]}"
 else
     shift
 fi
+PREFIX="$(app_prefix "$NAME")"
 APP="$PREFIX/drive_c/$APPS_DIR_NAME/$NAME"
 [ -d "$APP" ] || die "app $NAME is not set up in $PREFIX"
 IFS=$'\t' read -r _ EXE < <(python3 -I "$REPO/scripts/uwptool.py" info "$APP")

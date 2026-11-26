@@ -8,8 +8,11 @@ DATA="${UWP_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/wine-uwp}"
 PREFIX="${UWP_PREFIX:-$DATA/prefix}"                         # the Wine prefix the apps run in
 LOGS="${UWP_LOGS:-$DATA/logs}"
 APPS_DIR_NAME="UWP"                                          # apps are linked into C:\UWP\<package name> inside the prefix
+SOURCES="$DATA/apps"   # <package>.source: the package folder, its VCLibs package and its own prefix (empty: the shared one)
 
 WINE_TAG="wine-11.22"
+UWP_VERSION="3.0"                                            # wine-uwp's own version: raise it for each GitHub release
+RELEASE_VERSION="${WINE_TAG#wine-}-uwp$UWP_VERSION"          # e.g. 11.22-uwp3.0: the release tag, and Wine's version as wine-11.22-uwp3.0
 WINE_GIT="https://gitlab.winehq.org/wine/wine.git"
 DXVK_COMMIT="f90f1bf180f41356695ddf3df6af62119fb64a3e"     # DXVK master the patch was made against (v3.1.1-235)
 DXVK_GIT="https://github.com/doitsujin/dxvk.git"
@@ -42,6 +45,24 @@ find_components() {
     if [ -f "$COMPONENTS/d3d12.dll" ] && [ -f "$COMPONENTS/wintypes.dll" ]; then echo "$COMPONENTS $COMPONENTS"; return 0; fi
     ge="$(find_ge_proton)" || return 1
     echo "$ge/files/lib/wine/vkd3d-proton/x86_64-windows $ge/files/lib/wine/x86_64-windows"
+}
+
+# The prefix an app was set up in: the one recorded for it with setup-prefix.sh --prefix, or the shared one.
+app_prefix() {
+    local p=""
+    [ -f "$SOURCES/$1.source" ] && p="$(sed -n 3p "$SOURCES/$1.source")"
+    echo "${p:-$PREFIX}"
+}
+
+# Every app set up: those in the shared prefix, and those recorded with a prefix of their own.
+list_apps() {
+    local a f p
+    for a in "$PREFIX/drive_c/$APPS_DIR_NAME"/*/; do [ -d "$a" ] && basename "$a"; done
+    for f in "$SOURCES"/*.source; do
+        [ -f "$f" ] || continue
+        p="$(sed -n 3p "$f")"
+        [ -n "$p" ] && [ -d "$p/drive_c/$APPS_DIR_NAME/$(basename "$f" .source)" ] && basename "$f" .source
+    done
 }
 
 wine_env() {

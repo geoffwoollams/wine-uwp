@@ -2,11 +2,13 @@
 # Packs a built tree (build-wine.sh, build-dxvk.sh and GE-Proton, or an unpacked release) into dist/ for a GitHub release:
 #   dist/wine-uwp-x86_64.tar.xz         patched Wine, dxgi.dll, the four component DLLs, licences and source information
 #   dist/wine-uwp-x86_64.tar.xz.sha256
-# Usage: scripts/package-release.sh [version]     (default: git describe)
+# Usage: scripts/package-release.sh [version]     (default: RELEASE_VERSION from common.sh, e.g. 11.22-uwp3.0)
 # Then: gh release create <version> dist/wine-uwp-x86_64.tar.xz dist/wine-uwp-x86_64.tar.xz.sha256 --notes-file dist/NOTES.md
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
-VERSION="${1:-$(git -C "$REPO" describe --tags --always --dirty 2>/dev/null || echo dev)}"
+VERSION="${1:-$RELEASE_VERSION}"
+built="$("$WINE_ROOT/bin/wine" --version 2>/dev/null || true)"
+[ "$built" = "wine-$RELEASE_VERSION" ] || die "the Wine build says it is $built, not wine-$RELEASE_VERSION: rebuild with scripts/build-wine.sh after changing UWP_VERSION"
 [ -x "$WINE_ROOT/bin/wine" ] || die "no Wine build in $WINE_ROOT: run scripts/build-wine.sh"
 [ -f "$DXVK_DXGI" ] || die "no dxgi.dll at $DXVK_DXGI: run scripts/build-dxvk.sh"
 [ -z "$(git -C "$REPO" status --porcelain patches docker scripts 2>/dev/null)" ] || die "uncommitted changes in patches/, docker/ or scripts/: the release's source must match a commit"

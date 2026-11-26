@@ -1,16 +1,17 @@
 #!/bin/bash
 # Creates the shared Wine prefix (once) and links one unpacked UWP package into it. The package folder is never modified.
 # Usage: scripts/setup-prefix.sh /path/to/package-folder [--vclibs /path/to/Microsoft.VCLibs.140.00_..._x64.appx|folder] [--verify]
-#        [--shortcut | --no-shortcut]
+#        [--shortcut | --no-shortcut] [--prefix DIR]
 #        scripts/setup-prefix.sh --update-all
 # Run it again for each app; they share the prefix. It offers to add a launcher (a .desktop file with the app's icon) to
 # the applications menu and the desktop; --shortcut adds it without asking, --no-shortcut skips it.
+# --prefix DIR uses another Wine prefix for this app instead of the shared one (it is remembered for later runs).
 # --update-all sets up every app already in the prefix again, from the folders they were set up from (without the file
 # check or the launcher question): what an upgraded Wine build needs, and what fetch-release.sh runs.
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
 
-PKG_DIR="" VCLIBS="" VERIFY=0 SHORTCUT=ask UPDATE_ALL=0
+PKG_DIR="" VCLIBS="" VERIFY=0 SHORTCUT=ask UPDATE_ALL=0 OWN_PREFIX=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --vclibs) VCLIBS="$2"; shift 2 ;;
@@ -19,19 +20,17 @@ while [ $# -gt 0 ]; do
         --shortcut) SHORTCUT=yes; shift ;;
         --no-shortcut) SHORTCUT=no; shift ;;
         --update-all) UPDATE_ALL=1; shift ;;
+        --prefix) mkdir -p "$2"; OWN_PREFIX="$(cd "$2" && pwd)"; shift 2 ;;
         -*) die "unknown option $1" ;;
         *) PKG_DIR="$(cd "$1" && pwd)"; shift ;;
     esac
 done
-SOURCES="$DATA/apps"   # <package name>.source: the package folder (line 1) and the VCLibs package (line 2) it was set up with
-
 if [ "$UPDATE_ALL" = 1 ]; then
-    shopt -s nullglob
-    apps=("$PREFIX/drive_c/$APPS_DIR_NAME"/*/)
-    [ ${#apps[@]} -gt 0 ] || { info "No apps set up in $PREFIX yet"; exit 0; }
+    mapfile -t names < <(list_apps | sort -u)
+    [ ${#names[@]} -gt 0 ] || { info "No apps set up yet"; exit 0; }
     failed=0
-    for app in "${apps[@]}"; do
-        name="$(basename "$app")" src="" vcl=""
+    for name in "${names[@]}"; do
+        app="$(app_prefix "$name")/drive_c/$APPS_DIR_NAME/$name" src="" vcl=""
         if [ -f "$SOURCES/$name.source" ]; then
             { read -r src; read -r vcl || true; } < "$SOURCES/$name.source"
         elif [ -L "$app/AppxManifest.xml" ]; then
@@ -59,6 +58,17 @@ python3 -I "$REPO/scripts/uwptool.py" resolve "$PKG_DIR" "$PKG_EXE" >/dev/null |
 read -r VKD3D_DIR WINEDLL_DIR < <(find_components) || die "d3d12/wintypes DLLs not found: run scripts/fetch-release.sh, or install $GE_PROTON_VERSION (see README) or set GE_PROTON=/path/to/$GE_PROTON_VERSION"
 info "Package $PKG_NAME ($PKG_EXE); components from $VKD3D_DIR"
 
+# its own prefix: the one given now, or the one recorded when it was set up before
+[ -z "$OWN_PREFIX" ] && [ -f "$SOURCES/$PKG_NAME.source" ] && OWN_PREFIX="$(sed -n 3p "$SOURCES/$PKG_NAME.source")"
+if [ -n "$OWN_PREFIX" ]; then
+    PREFIX="$OWN_PREFIX"
+    info "Using the prefix $PREFIX for this app"
+    if [ -f "$PREFIX/system.reg" ] && [ ! -f "$PREFIX/.wine-uwp" ]; then
+        echo "warning: $PREFIX was made by another Wine. wine-uwp's Wine upgrades it on first use and this replaces the" \
+             "dxgi, d3d12 and WinRT DLLs in its system32, so the tool that made it may not run it properly afterwards." >&2
+    fi
+fi
+
 if [ -z "$VCLIBS" ]; then
     VCLIBS="$(ls -1 "$PKG_DIR"/redist/Microsoft.VCLibs.140.00_*_x64_*.appx "$PKG_DIR"/redist/Microsoft.VCLibs.140.00_*_x64_*.Appx 2>/dev/null | head -1 || true)"
     # none in this package: reuse the one another app here was set up with (Microsoft offers no download of the UWP one)
@@ -84,6 +94,7 @@ if [ ! -f "$PREFIX/system.reg" ]; then
     mkdir -p "$PREFIX"
     wineboot -i >/dev/null 2>&1
     wineserver -w
+    touch "$PREFIX/.wine-uwp"   # made by wine-uwp
 fi
 SYS32="$PREFIX/drive_c/windows/system32"
 
@@ -107,7 +118,8 @@ for f in "$PKG_DIR"/*; do
 done
 [ -n "$VCLIBS" ] && python3 -I "$REPO/scripts/uwptool.py" vclibs "$VCLIBS" "$APP"
 mkdir -p "$SOURCES"
-printf '%s\n%s\n' "$PKG_DIR" "${VCLIBS:+$(cd "$(dirname "$VCLIBS")" && pwd)/$(basename "$VCLIBS")}" > "$SOURCES/$PKG_NAME.source"
+printf '%s\n%s\n%s\n' "$PKG_DIR" "${VCLIBS:+$(cd "$(dirname "$VCLIBS")" && pwd)/$(basename "$VCLIBS")}" "$OWN_PREFIX" \
+    > "$SOURCES/$PKG_NAME.source"
 
 info "Registering WinRT classes"
 python3 -I "$REPO/scripts/uwptool.py" registry "$PKG_DIR" "C:\\$APPS_DIR_NAME\\$PKG_NAME" > "$PREFIX/drive_c/uwp-$PKG_NAME.reg"

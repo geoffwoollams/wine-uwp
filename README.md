@@ -60,7 +60,7 @@ scripts/setup-prefix.sh "/path/to/package-folder"
 scripts/setup-prefix.sh "/path/to/package-folder" --vclibs /path/to/Microsoft.VCLibs.140.00_..._x64.appx
 ```
 
-This creates the shared Wine prefix on first use, and links the package into it as `C:\UWP\<package name>`. The package folder is never modified. Run it again for each further app; they share the prefix. Add `--verify` to first check every file against the hashes in `AppxBlockMap.xml`, which catches a damaged or incomplete copy (a few minutes for a big app).
+This creates the shared Wine prefix on first use, and links the package into it as `C:\UWP\<package name>`. The package folder is never modified. Run it again for each further app; they share the prefix. To give an app a prefix of its own instead, for example when it needs registry settings the others shouldn't see, add `--prefix /path/to/prefix`. That folder is remembered, so `run-app.sh`, launchers and later setups use it too. It can also be an existing prefix, such as one Lutris made, but wine-uwp's Wine upgrades it on first use and setup replaces its `dxgi`, D3D12 and WinRT DLLs, so the tool that made it may not run it properly afterwards. Add `--verify` to first check every file against the hashes in `AppxBlockMap.xml`, which catches a damaged or incomplete copy (a few minutes for a big app).
 
 At the end it asks whether to **add a launcher** for the app: a `.desktop` file in your applications menu (`~/.local/share/applications/wine-uwp-<package name>.desktop`) and a copy on your desktop, with the app's own icon taken from its package. Pass `--shortcut` to add it without asking, or `--no-shortcut` to skip the question, for example in scripts. To remove a launcher, delete those two files.
 
@@ -84,7 +84,7 @@ git pull
 scripts/fetch-release.sh
 ```
 
-After unpacking the new build, `fetch-release.sh` sets up every app already in the prefix again, with `setup-prefix.sh --update-all`. That copies in the new `dxgi.dll` and D3D12 DLLs, registers the WinRT classes the new build adds, and relinks each package from the folder it was set up from. It doesn't ask the launcher question; your saves, settings and launchers are kept. If you build from source instead, run it yourself after `build-wine.sh`:
+After unpacking the new build, `fetch-release.sh` sets up every app you have set up again (in the shared prefix or its own), with `setup-prefix.sh --update-all`. That copies in the new `dxgi.dll` and D3D12 DLLs, registers the WinRT classes the new build adds, and relinks each package from the folder it was set up from. It doesn't ask the launcher question; your saves, settings and launchers are kept. If you build from source instead, run it yourself after `build-wine.sh`:
 
 ```bash
 scripts/setup-prefix.sh --update-all
@@ -137,7 +137,7 @@ tests/xaml/run.sh
 | `WINE_APP_STORE_ID=...` | The Store ID reported for the app (it is not in the package manifest); apps that care need it set in [`apps/<package name>.conf`](apps/README.md) |
 | `WINE_REPORT_HOSTNAMES=1` | Report the PC's real IP addresses to the app (off by default) |
 | `WINEDEBUG=-all` | Turn off logging (default logs errors, fixmes and the WinRT channel) |
-| `UWP_PREFIX`, `UWP_DATA_DIR`, `UWP_LOGS`, `UWP_BUILD_DIR` | Move the prefix, data, logs or build folders |
+| `UWP_PREFIX`, `UWP_DATA_DIR`, `UWP_LOGS`, `UWP_BUILD_DIR` | Move the shared prefix, data, logs or build folders |
 | `UWP_RELEASE_REPO` | GitHub `owner/repo` that `fetch-release.sh` downloads from (default: this project) |
 | `GE_PROTON` | Path to GE-Proton 11-14 when building from source, if it isn't found automatically |
 
@@ -198,9 +198,12 @@ Each run writes `~/.local/share/wine-uwp/logs/run-<package>-<time>.log` (the las
 For maintainers. After building (see above) and committing, with GE-Proton 11-14 installed:
 
 ```bash
-scripts/package-release.sh v2.1
-gh release create v2.1 dist/wine-uwp-x86_64.tar.xz dist/wine-uwp-x86_64.tar.xz.sha256 --notes-file dist/NOTES.md
+scripts/build-wine.sh
+scripts/package-release.sh
+gh release create 11.22-uwp3.0 dist/wine-uwp-x86_64.tar.xz dist/wine-uwp-x86_64.tar.xz.sha256 --notes-file dist/NOTES.md
 ```
+
+**Version numbers** look like `11.22-uwp3.0`: the Wine release the patches are based on, then wine-uwp's own version. Raise `UWP_VERSION` in `scripts/common.sh` for each GitHub release (`3.0`, `3.1`, ...) and change `WINE_TAG` when moving to a newer Wine; `RELEASE_VERSION` is made from both. `build-wine.sh` tags its source checkout so that `wine --version` reports `wine-11.22-uwp3.0`, and `package-release.sh` refuses a build whose version doesn't match. The download keeps the same file name, `wine-uwp-x86_64.tar.xz`, in every release, which is what lets `fetch-release.sh` find the latest one.
 
 The archive contains the Wine install tree, `dxgi.dll`, the four component DLLs (`d3d12.dll`, `d3d12core.dll`, `wintypes.dll`, `windows.storage.dll`), the licence texts, `SOURCE.txt` (where to get every part's source) and a copy of `patches/`, `docker/` and `scripts/` (the recipe that built it). The script refuses to run with uncommitted changes in those folders, and refuses a Wine build containing add-on unlocking code.
 
