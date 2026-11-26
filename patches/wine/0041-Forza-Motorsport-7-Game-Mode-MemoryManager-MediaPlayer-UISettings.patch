@@ -1,0 +1,1397 @@
+Subject: kernelbase, twinapi.appcore, windows.media.playback.mediaplayer, windows.ui: Game Mode expanded resources,
+ MemoryManager, a MediaPlayer without playback, UISettings values (Forza Motorsport 7)
+
+diff --git a/dlls/apisetschema/apisetschema.spec b/dlls/apisetschema/apisetschema.spec
+index 1f40225..b0b4928 100644
+--- a/dlls/apisetschema/apisetschema.spec
++++ b/dlls/apisetschema/apisetschema.spec
+@@ -218,6 +218,7 @@ apiset api-ms-win-eventing-tdh-l1-1-2 = tdh.dll
+ apiset api-ms-win-eventlog-legacy-l1-1-0 = advapi32.dll
+ apiset api-ms-win-eventlog-private-l1-1-0 = advapi32.dll
+ apiset api-ms-win-gaming-deviceinformation-l1-1-0 = kernelbase.dll
++apiset api-ms-win-gaming-expandedresources-l1-1-0 = kernelbase.dll
+ apiset api-ms-win-gaming-tcui-l1-1-0 = gamingtcui.dll
+ apiset api-ms-win-gdi-dpiinfo-l1-1-0 = gdi32.dll
+ apiset api-ms-win-http-time-l1-1-0 = kernelbase.dll
+diff --git a/dlls/kernelbase/kernelbase.spec b/dlls/kernelbase/kernelbase.spec
+index b7873d5..791fe00 100644
+--- a/dlls/kernelbase/kernelbase.spec
++++ b/dlls/kernelbase/kernelbase.spec
+@@ -536,6 +536,7 @@
+ @ stdcall GetErrorMode()
+ @ stdcall GetExitCodeProcess(long ptr)
+ @ stdcall GetExitCodeThread(long ptr)
++@ stdcall GetExpandedResourceExclusiveCpuCount(ptr)
+ @ stub GetFallbackDisplayName
+ @ stdcall GetFileAttributesA(str)
+ @ stdcall GetFileAttributesExA(str long ptr)
+@@ -811,6 +812,7 @@
+ @ stdcall GlobalMemoryStatusEx(ptr)
+ # @ stub GuardCheckLongJumpTarget
+ # @ stub HasPolicyForegroundProcessingCompletedInternal
++@ stdcall HasExpandedResources(ptr)
+ @ stdcall HashData(ptr long ptr long)
+ @ stdcall HeapAlloc(long long long) ntdll.RtlAllocateHeap
+ @ stdcall HeapCompact(long long)
+@@ -1369,6 +1371,7 @@
+ @ stdcall RegisterTraceGuidsW(ptr ptr ptr long ptr wstr wstr ptr) ntdll.EtwRegisterTraceGuidsW
+ @ stdcall RegisterWaitForSingleObjectEx(long ptr ptr long long)
+ @ stdcall ReleaseActCtx(ptr)
++@ stdcall ReleaseExclusiveCpuSets()
+ @ stdcall ReleaseMutex(long)
+ @ stdcall ReleaseMutexWhenCallbackReturns(ptr long) ntdll.TpCallbackReleaseMutexOnCompletion
+ @ stdcall ReleaseSRWLockExclusive(ptr) ntdll.RtlReleaseSRWLockExclusive
+diff --git a/dlls/kernelbase/main.c b/dlls/kernelbase/main.c
+index 8c37e5d..8ccabe8 100644
+--- a/dlls/kernelbase/main.c
++++ b/dlls/kernelbase/main.c
+@@ -641,3 +641,33 @@ HRESULT WINAPI GetIntegratedDisplaySize( double *sz_inches )
+     FIXME( "%p stub.\n", sz_inches );
+     return E_NOTIMPL;
+ }
++
++/* Game Mode's expanded resources (expandedresources.h, api-ms-win-gaming-expandedresources-l1-1-0; gamemode.dll on
++ * Windows): on Xbox and in Windows' Game Mode a game can be given CPU cores of its own. Wine reserves none, which is
++ * what Windows reports when Game Mode hasn't granted any. Forza Motorsport 7 imports these. */
++
++HRESULT WINAPI HasExpandedResources( BOOL *has_expanded_resources );
++HRESULT WINAPI GetExpandedResourceExclusiveCpuCount( ULONG *count );
++HRESULT WINAPI ReleaseExclusiveCpuSets( void );
++
++HRESULT WINAPI HasExpandedResources( BOOL *has_expanded_resources )
++{
++    TRACE( "%p.\n", has_expanded_resources );
++    if (!has_expanded_resources) return E_INVALIDARG;
++    *has_expanded_resources = FALSE;
++    return S_OK;
++}
++
++HRESULT WINAPI GetExpandedResourceExclusiveCpuCount( ULONG *count )
++{
++    TRACE( "%p.\n", count );
++    if (!count) return E_INVALIDARG;
++    *count = 0;
++    return S_OK;
++}
++
++HRESULT WINAPI ReleaseExclusiveCpuSets( void )
++{
++    TRACE( "\n" );
++    return S_OK;
++}
+diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
+index 37c50a3..ff88e9f 100644
+--- a/dlls/twinapi.appcore/Makefile.in
++++ b/dlls/twinapi.appcore/Makefile.in
+@@ -28,6 +28,7 @@ SOURCES = \
+ 	display_request.c \
+ 	extended_execution.c \
+ 	game_save.c \
++	memory_manager.c \
+ 	message_dialog.c \
+ 	mouse.c \
+ 	hardware_identification.c \
+diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
+index 8b460fa..d408f99 100644
+--- a/dlls/twinapi.appcore/main.c
++++ b/dlls/twinapi.appcore/main.c
+@@ -110,6 +110,9 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( core_window_factory, &IID_IActivationFactory, (void **)factory );
+     }
+ 
++    else if (!wcscmp( buffer, L"Windows.System.MemoryManager" ))
++        IActivationFactory_QueryInterface( memory_manager_factory, &IID_IActivationFactory, (void **)factory );
++
+     else if (!wcscmp( buffer, L"Windows.Devices.Input.PointerDevice" ))
+         IActivationFactory_QueryInterface( pointer_device_factory, &IID_IActivationFactory, (void **)factory );
+ 
+diff --git a/dlls/twinapi.appcore/memory_manager.c b/dlls/twinapi.appcore/memory_manager.c
+new file mode 100644
+index 0000000..36a895a
+--- /dev/null
++++ b/dlls/twinapi.appcore/memory_manager.c
+@@ -0,0 +1,415 @@
++/* WinRT Windows.System.MemoryManager implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#include "psapi.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
++
++/* MemoryManager tells an app how much memory it uses and may use. On a PC nothing caps a UWP app below what the
++ * machine has, so the limit is the physical memory; usage is the process's private commit (PagefileUsage, which
++ * Windows also reports as PrivateUsage), as on Windows. The
++ * usage-change events are accepted and never raised, and the limit can't be changed. Forza Motorsport 7's hardware
++ * check reads it. */
++
++static UINT64 usage_limit(void)
++{
++    MEMORYSTATUSEX status = { sizeof(status) };
++
++    if (!GlobalMemoryStatusEx( &status )) return 0;
++    return status.ullTotalPhys;
++}
++
++static void process_counters( PROCESS_MEMORY_COUNTERS *counters )
++{
++    memset( counters, 0, sizeof(*counters) );
++    counters->cb = sizeof(*counters);
++    if (!K32GetProcessMemoryInfo( GetCurrentProcess(), counters, sizeof(*counters) ))
++        WARN( "K32GetProcessMemoryInfo failed, error %lu.\n", GetLastError() );
++}
++
++/* ---- AppMemoryReport and ProcessMemoryReport (snapshots) ---- */
++
++struct memory_report
++{
++    IAppMemoryReport IAppMemoryReport_iface;
++    IProcessMemoryReport IProcessMemoryReport_iface;
++    LONG ref;
++    PROCESS_MEMORY_COUNTERS counters;
++    UINT64 limit;
++};
++
++static struct memory_report *create_report(void)
++{
++    struct memory_report *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return NULL;
++    impl->ref = 1;
++    process_counters( &impl->counters );
++    impl->limit = usage_limit();
++    return impl;
++}
++
++static inline struct memory_report *impl_from_IAppMemoryReport( IAppMemoryReport *iface )
++{
++    return CONTAINING_RECORD( iface, struct memory_report, IAppMemoryReport_iface );
++}
++
++static HRESULT WINAPI app_report_QueryInterface( IAppMemoryReport *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IAppMemoryReport ))
++    {
++        *out = iface;
++        IAppMemoryReport_AddRef( iface );
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI app_report_AddRef( IAppMemoryReport *iface )
++{
++    return InterlockedIncrement( &impl_from_IAppMemoryReport( iface )->ref );
++}
++
++static ULONG WINAPI app_report_Release( IAppMemoryReport *iface )
++{
++    struct memory_report *impl = impl_from_IAppMemoryReport( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI app_report_GetIids( IAppMemoryReport *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI app_report_GetRuntimeClassName( IAppMemoryReport *iface, HSTRING *name )
++{
++    return WindowsCreateString( RuntimeClass_Windows_System_AppMemoryReport,
++                                wcslen( RuntimeClass_Windows_System_AppMemoryReport ), name );
++}
++
++static HRESULT WINAPI app_report_GetTrustLevel( IAppMemoryReport *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI app_report_get_PrivateCommitUsage( IAppMemoryReport *iface, UINT64 *value )
++{
++    *value = impl_from_IAppMemoryReport( iface )->counters.PagefileUsage;
++    return S_OK;
++}
++
++static HRESULT WINAPI app_report_get_PeakPrivateCommitUsage( IAppMemoryReport *iface, UINT64 *value )
++{
++    *value = impl_from_IAppMemoryReport( iface )->counters.PeakPagefileUsage;
++    return S_OK;
++}
++
++static HRESULT WINAPI app_report_get_TotalCommitUsage( IAppMemoryReport *iface, UINT64 *value )
++{
++    *value = impl_from_IAppMemoryReport( iface )->counters.PagefileUsage;
++    return S_OK;
++}
++
++static HRESULT WINAPI app_report_get_TotalCommitLimit( IAppMemoryReport *iface, UINT64 *value )
++{
++    *value = impl_from_IAppMemoryReport( iface )->limit;
++    return S_OK;
++}
++
++static const struct IAppMemoryReportVtbl app_report_vtbl =
++{
++    app_report_QueryInterface, app_report_AddRef, app_report_Release,
++    app_report_GetIids, app_report_GetRuntimeClassName, app_report_GetTrustLevel,
++    app_report_get_PrivateCommitUsage, app_report_get_PeakPrivateCommitUsage,
++    app_report_get_TotalCommitUsage, app_report_get_TotalCommitLimit,
++};
++
++static inline struct memory_report *impl_from_IProcessMemoryReport( IProcessMemoryReport *iface )
++{
++    return CONTAINING_RECORD( iface, struct memory_report, IProcessMemoryReport_iface );
++}
++
++static HRESULT WINAPI process_report_QueryInterface( IProcessMemoryReport *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IProcessMemoryReport ))
++    {
++        *out = iface;
++        IProcessMemoryReport_AddRef( iface );
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI process_report_AddRef( IProcessMemoryReport *iface )
++{
++    return InterlockedIncrement( &impl_from_IProcessMemoryReport( iface )->ref );
++}
++
++static ULONG WINAPI process_report_Release( IProcessMemoryReport *iface )
++{
++    struct memory_report *impl = impl_from_IProcessMemoryReport( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI process_report_GetIids( IProcessMemoryReport *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI process_report_GetRuntimeClassName( IProcessMemoryReport *iface, HSTRING *name )
++{
++    return WindowsCreateString( RuntimeClass_Windows_System_ProcessMemoryReport,
++                                wcslen( RuntimeClass_Windows_System_ProcessMemoryReport ), name );
++}
++
++static HRESULT WINAPI process_report_GetTrustLevel( IProcessMemoryReport *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI process_report_get_PrivateWorkingSetUsage( IProcessMemoryReport *iface, UINT64 *value )
++{
++    /* Wine doesn't split the working set into private and shared pages */
++    *value = impl_from_IProcessMemoryReport( iface )->counters.WorkingSetSize;
++    return S_OK;
++}
++
++static HRESULT WINAPI process_report_get_TotalWorkingSetUsage( IProcessMemoryReport *iface, UINT64 *value )
++{
++    *value = impl_from_IProcessMemoryReport( iface )->counters.WorkingSetSize;
++    return S_OK;
++}
++
++static const struct IProcessMemoryReportVtbl process_report_vtbl =
++{
++    process_report_QueryInterface, process_report_AddRef, process_report_Release,
++    process_report_GetIids, process_report_GetRuntimeClassName, process_report_GetTrustLevel,
++    process_report_get_PrivateWorkingSetUsage, process_report_get_TotalWorkingSetUsage,
++};
++
++/* ---- MemoryManager statics ---- */
++
++struct memory_manager
++{
++    IActivationFactory IActivationFactory_iface;
++    IMemoryManagerStatics IMemoryManagerStatics_iface;
++    IMemoryManagerStatics2 IMemoryManagerStatics2_iface;
++    IMemoryManagerStatics3 IMemoryManagerStatics3_iface;
++    IMemoryManagerStatics4 IMemoryManagerStatics4_iface;
++};
++
++static struct memory_manager memory_manager;
++static LONG next_token;
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &memory_manager.IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IMemoryManagerStatics ))
++        *out = &memory_manager.IMemoryManagerStatics_iface;
++    else if (IsEqualGUID( iid, &IID_IMemoryManagerStatics2 ))
++        *out = &memory_manager.IMemoryManagerStatics2_iface;
++    else if (IsEqualGUID( iid, &IID_IMemoryManagerStatics3 ))
++        *out = &memory_manager.IMemoryManagerStatics3_iface;
++    else if (IsEqualGUID( iid, &IID_IMemoryManagerStatics4 ))
++        *out = &memory_manager.IMemoryManagerStatics4_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance ) { return E_NOTIMPL; }
++
++static const IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface, factory_AddRef, factory_Release,
++    factory_GetIids, factory_GetRuntimeClassName, factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( statics, IMemoryManagerStatics, struct memory_manager, IActivationFactory_iface )
++
++static HRESULT WINAPI statics_get_AppMemoryUsage( IMemoryManagerStatics *iface, UINT64 *value )
++{
++    PROCESS_MEMORY_COUNTERS counters;
++
++    process_counters( &counters );
++    *value = counters.PagefileUsage;
++    TRACE( "iface %p -> %I64u.\n", iface, *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_get_AppMemoryUsageLimit( IMemoryManagerStatics *iface, UINT64 *value )
++{
++    *value = usage_limit();
++    TRACE( "iface %p -> %I64u.\n", iface, *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_get_AppMemoryUsageLevel( IMemoryManagerStatics *iface, AppMemoryUsageLevel *value )
++{
++    PROCESS_MEMORY_COUNTERS counters;
++    UINT64 limit = usage_limit();
++
++    process_counters( &counters );
++    if (!limit) *value = AppMemoryUsageLevel_Low;
++    else if (counters.PagefileUsage > limit) *value = AppMemoryUsageLevel_OverLimit;
++    else if (counters.PagefileUsage > limit / 10 * 8) *value = AppMemoryUsageLevel_High;
++    else if (counters.PagefileUsage > limit / 10 * 6) *value = AppMemoryUsageLevel_Medium;
++    else *value = AppMemoryUsageLevel_Low;
++    TRACE( "iface %p -> %d.\n", iface, *value );
++    return S_OK;
++}
++
++static HRESULT add_event( EventRegistrationToken *token )
++{
++    token->value = InterlockedIncrement( &next_token );
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_add_AppMemoryUsageIncreased( IMemoryManagerStatics *iface, IEventHandler_IInspectable *handler,
++                                                           EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p (never raised).\n", iface, handler );
++    return add_event( token );
++}
++
++static HRESULT WINAPI statics_remove_AppMemoryUsageIncreased( IMemoryManagerStatics *iface, EventRegistrationToken token )
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_add_AppMemoryUsageDecreased( IMemoryManagerStatics *iface, IEventHandler_IInspectable *handler,
++                                                           EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p (never raised).\n", iface, handler );
++    return add_event( token );
++}
++
++static HRESULT WINAPI statics_remove_AppMemoryUsageDecreased( IMemoryManagerStatics *iface, EventRegistrationToken token )
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_add_AppMemoryUsageLimitChanging( IMemoryManagerStatics *iface,
++                                                               IEventHandler_AppMemoryUsageLimitChangingEventArgs *handler,
++                                                               EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p (never raised).\n", iface, handler );
++    return add_event( token );
++}
++
++static HRESULT WINAPI statics_remove_AppMemoryUsageLimitChanging( IMemoryManagerStatics *iface, EventRegistrationToken token )
++{
++    return S_OK;
++}
++
++static const struct IMemoryManagerStaticsVtbl statics_vtbl =
++{
++    statics_QueryInterface, statics_AddRef, statics_Release,
++    statics_GetIids, statics_GetRuntimeClassName, statics_GetTrustLevel,
++    statics_get_AppMemoryUsage, statics_get_AppMemoryUsageLimit, statics_get_AppMemoryUsageLevel,
++    statics_add_AppMemoryUsageIncreased, statics_remove_AppMemoryUsageIncreased,
++    statics_add_AppMemoryUsageDecreased, statics_remove_AppMemoryUsageDecreased,
++    statics_add_AppMemoryUsageLimitChanging, statics_remove_AppMemoryUsageLimitChanging,
++};
++
++DEFINE_IINSPECTABLE( statics2, IMemoryManagerStatics2, struct memory_manager, IActivationFactory_iface )
++
++static HRESULT WINAPI statics2_GetAppMemoryReport( IMemoryManagerStatics2 *iface, IAppMemoryReport **value )
++{
++    struct memory_report *report;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!(report = create_report())) return E_OUTOFMEMORY;
++    report->IAppMemoryReport_iface.lpVtbl = &app_report_vtbl;
++    *value = &report->IAppMemoryReport_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI statics2_GetProcessMemoryReport( IMemoryManagerStatics2 *iface, IProcessMemoryReport **value )
++{
++    struct memory_report *report;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!(report = create_report())) return E_OUTOFMEMORY;
++    report->IProcessMemoryReport_iface.lpVtbl = &process_report_vtbl;
++    *value = &report->IProcessMemoryReport_iface;
++    return S_OK;
++}
++
++static const struct IMemoryManagerStatics2Vtbl statics2_vtbl =
++{
++    statics2_QueryInterface, statics2_AddRef, statics2_Release,
++    statics2_GetIids, statics2_GetRuntimeClassName, statics2_GetTrustLevel,
++    statics2_GetAppMemoryReport, statics2_GetProcessMemoryReport,
++};
++
++DEFINE_IINSPECTABLE( statics3, IMemoryManagerStatics3, struct memory_manager, IActivationFactory_iface )
++
++static HRESULT WINAPI statics3_TrySetAppMemoryUsageLimit( IMemoryManagerStatics3 *iface, UINT64 value, boolean *result )
++{
++    TRACE( "iface %p, value %I64u: the limit is fixed.\n", iface, value );
++    *result = FALSE;
++    return S_OK;
++}
++
++static const struct IMemoryManagerStatics3Vtbl statics3_vtbl =
++{
++    statics3_QueryInterface, statics3_AddRef, statics3_Release,
++    statics3_GetIids, statics3_GetRuntimeClassName, statics3_GetTrustLevel,
++    statics3_TrySetAppMemoryUsageLimit,
++};
++
++DEFINE_IINSPECTABLE( statics4, IMemoryManagerStatics4, struct memory_manager, IActivationFactory_iface )
++
++static HRESULT WINAPI statics4_get_ExpectedAppMemoryUsageLimit( IMemoryManagerStatics4 *iface, UINT64 *value )
++{
++    *value = usage_limit();
++    return S_OK;
++}
++
++static const struct IMemoryManagerStatics4Vtbl statics4_vtbl =
++{
++    statics4_QueryInterface, statics4_AddRef, statics4_Release,
++    statics4_GetIids, statics4_GetRuntimeClassName, statics4_GetTrustLevel,
++    statics4_get_ExpectedAppMemoryUsageLimit,
++};
++
++static struct memory_manager memory_manager =
++{
++    { &factory_vtbl },
++    { &statics_vtbl },
++    { &statics2_vtbl },
++    { &statics3_vtbl },
++    { &statics4_vtbl },
++};
++
++IActivationFactory *memory_manager_factory = &memory_manager.IActivationFactory_iface;
+diff --git a/dlls/twinapi.appcore/message_dialog.c b/dlls/twinapi.appcore/message_dialog.c
+index 607d1d6..b2c92d6 100644
+--- a/dlls/twinapi.appcore/message_dialog.c
++++ b/dlls/twinapi.appcore/message_dialog.c
+@@ -929,6 +929,7 @@ static DWORD WINAPI dialog_thread( void *arg )
+     AsyncStatus status;
+     HSTRING close = NULL;
+     UINT32 count = op->count, chosen, i;
++    WCHAR auto_choice[16];
+ 
+     SetThreadDescription( GetCurrentThread(), L"wine_uwp_message_dialog" );
+ 
+@@ -947,7 +948,14 @@ static DWORD WINAPI dialog_thread( void *arg )
+         WindowsDeleteString( label );
+     }
+ 
+-    chosen = run_dialog( op, labels, count );
++    /* for unattended test runs: WINE_MESSAGEDIALOG_AUTO=<n> picks command n without showing the dialog */
++    if (GetEnvironmentVariableW( L"WINE_MESSAGEDIALOG_AUTO", auto_choice, ARRAY_SIZE(auto_choice) ))
++    {
++        chosen = wcstoul( auto_choice, NULL, 10 );
++        if (chosen >= count) chosen = count - 1;
++        FIXME( "WINE_MESSAGEDIALOG_AUTO: choosing command %u (%s).\n", chosen, debugstr_w(labels[chosen]) );
++    }
++    else chosen = run_dialog( op, labels, count );
+     for (i = 0; i < count; i++) free( (void *)labels[i] );
+ 
+     if (chosen < count)
+diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
+index de1ebd7..e1ff0ba 100644
+--- a/dlls/twinapi.appcore/private.h
++++ b/dlls/twinapi.appcore/private.h
+@@ -34,6 +34,7 @@
+ #include "windows.foundation.h"
+ #define WIDL_using_Windows_Security_ExchangeActiveSyncProvisioning
+ #include "windows.security.exchangeactivesyncprovisioning.h"
++#define WIDL_using_Windows_System
+ #define WIDL_using_Windows_System_Profile
+ #include "windows.system.profile.h"
+ #define WIDL_using_Windows_System_UserProfile
+@@ -46,9 +47,9 @@
+ #define WIDL_using_Windows_Devices_Input
+ #define WIDL_using_Windows_UI_Popups
+ #define WIDL_using_Windows_Networking_XboxLive
+-#define WIDL_using_Windows_System
+ #include "windows.ui.viewmanagement.h"
+ #include "windows.ui.core.h"
++#include "windows.system.h"
+ #include "windows.ui.popups.h"
+ #include "windows.devices.input.h"
+ #include "windows.networking.xboxlive.h"
+@@ -75,6 +76,7 @@ extern IActivationFactory *ui_command_factory;   /* message_dialog.c */
+ extern IActivationFactory *xboxlive_device_address_factory;   /* xboxlive_address.c */
+ extern void mouse_device_raw_input( HRAWINPUT input );
+ extern IActivationFactory *pointer_device_factory;   /* mouse.c */
++extern IActivationFactory *memory_manager_factory;   /* memory_manager.c */
+ extern __x_ABI_CWindows_CDevices_CInput_CIPointerDevice *mouse_pointer_device( void );
+ extern IActivationFactory *core_window_factory;
+ extern IActivationFactory *current_app_factory;
+diff --git a/dlls/twinapi.appcore/twinapi.appcore.rgs b/dlls/twinapi.appcore/twinapi.appcore.rgs
+index adaec20..54f20b4 100644
+--- a/dlls/twinapi.appcore/twinapi.appcore.rgs
++++ b/dlls/twinapi.appcore/twinapi.appcore.rgs
+@@ -108,6 +108,10 @@ HKLM
+                     {
+                         val 'DllPath' = s '%MODULE%'
+                     }
++                    ForceRemove Windows.System.MemoryManager
++                    {
++                        val 'DllPath' = s '%MODULE%'
++                    }
+                     ForceRemove Windows.Devices.Input.PointerDevice
+                     {
+                         val 'DllPath' = s '%MODULE%'
+diff --git a/dlls/windows.media.playback.mediaplayer/main.c b/dlls/windows.media.playback.mediaplayer/main.c
+index 3c3c24d..4d0d966 100644
+--- a/dlls/windows.media.playback.mediaplayer/main.c
++++ b/dlls/windows.media.playback.mediaplayer/main.c
+@@ -32,6 +32,13 @@ struct media_player
+ 
+     ISystemMediaTransportControls *controls;
+     HWND window;
++
++    CRITICAL_SECTION cs;
++    struct { ITypedEventHandler_MediaPlayer_IInspectable *handler; INT64 token; } handlers[3][8];
++    INT64 next_token;
++    MediaPlayerState state;
++    boolean autoplay, looping, muted, has_source;
++    DOUBLE rate, volume;
+ };
+ 
+ static inline struct media_player *impl_from_IMediaPlayer( IMediaPlayer *iface )
+@@ -84,6 +91,12 @@ static ULONG WINAPI media_player_Release( IMediaPlayer *iface )
+ 
+     if (!ref)
+     {
++        UINT i, j;
++        for (i = 0; i < ARRAY_SIZE(impl->handlers); i++)
++            for (j = 0; j < ARRAY_SIZE(impl->handlers[i]); j++)
++                if (impl->handlers[i][j].handler) ITypedEventHandler_MediaPlayer_IInspectable_Release( impl->handlers[i][j].handler );
++        impl->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection( &impl->cs );
+         ISystemMediaTransportControls_Release( impl->controls );
+         DestroyWindow( impl->window );
+         free( impl );
+@@ -109,260 +122,366 @@ static HRESULT WINAPI media_player_GetTrustLevel( IMediaPlayer *iface, TrustLeve
+     return E_NOTIMPL;
+ }
+ 
++/* wine-uwp: a player without playback. It keeps its settings and event handlers, and once it has a source, Play
++ * reports the media as opened, playing and then ended at once (on a thread-pool thread, as Windows raises the events
++ * on threads of its own), so a game playing an intro video or a music track carries on instead of failing on
++ * E_NOTIMPL. Forza Motorsport 7 waits on MediaEnded. Nothing is decoded or shown. */
++
++enum player_event { EV_OPENED, EV_ENDED, EV_STATE, EV_COUNT };
++
++static HRESULT add_handler( struct media_player *impl, enum player_event ev, ITypedEventHandler_MediaPlayer_IInspectable *handler,
++                            EventRegistrationToken *token )
++{
++    UINT i;
++
++    if (!handler) return E_INVALIDARG;
++    EnterCriticalSection( &impl->cs );
++    for (i = 0; i < ARRAY_SIZE(impl->handlers[ev]); i++)
++    {
++        if (impl->handlers[ev][i].handler) continue;
++        ITypedEventHandler_MediaPlayer_IInspectable_AddRef( (impl->handlers[ev][i].handler = handler) );
++        impl->handlers[ev][i].token = token->value = ++impl->next_token;
++        LeaveCriticalSection( &impl->cs );
++        return S_OK;
++    }
++    LeaveCriticalSection( &impl->cs );
++    FIXME( "too many handlers for event %d.\n", ev );
++    token->value = 0;
++    return S_OK;
++}
++
++static HRESULT remove_handler( struct media_player *impl, enum player_event ev, EventRegistrationToken token )
++{
++    ITypedEventHandler_MediaPlayer_IInspectable *handler = NULL;
++    UINT i;
++
++    EnterCriticalSection( &impl->cs );
++    for (i = 0; i < ARRAY_SIZE(impl->handlers[ev]); i++)
++    {
++        if (!impl->handlers[ev][i].handler || impl->handlers[ev][i].token != token.value) continue;
++        handler = impl->handlers[ev][i].handler;
++        impl->handlers[ev][i].handler = NULL;
++        break;
++    }
++    LeaveCriticalSection( &impl->cs );
++    if (handler) ITypedEventHandler_MediaPlayer_IInspectable_Release( handler );
++    return S_OK;
++}
++
++static void raise_event( struct media_player *impl, enum player_event ev )
++{
++    ITypedEventHandler_MediaPlayer_IInspectable *handlers[ARRAY_SIZE(impl->handlers[0])];
++    UINT i, count = 0;
++
++    EnterCriticalSection( &impl->cs );
++    for (i = 0; i < ARRAY_SIZE(impl->handlers[ev]); i++)
++        if ((handlers[count] = impl->handlers[ev][i].handler))
++            ITypedEventHandler_MediaPlayer_IInspectable_AddRef( handlers[count++] );
++    LeaveCriticalSection( &impl->cs );
++
++    for (i = 0; i < count; i++)
++    {
++        ITypedEventHandler_MediaPlayer_IInspectable_Invoke( handlers[i], &impl->IMediaPlayer_iface, NULL );
++        ITypedEventHandler_MediaPlayer_IInspectable_Release( handlers[i] );
++    }
++}
++
++static void set_state( struct media_player *impl, MediaPlayerState state )
++{
++    impl->state = state;
++    raise_event( impl, EV_STATE );
++}
++
++static void CALLBACK play_callback( TP_CALLBACK_INSTANCE *instance, void *context )
++{
++    struct media_player *impl = context;
++
++    TRACE( "player %p: reporting the media as played.\n", impl );
++    if (impl->state == MediaPlayerState_Closed || impl->state == MediaPlayerState_Opening)
++    {
++        set_state( impl, MediaPlayerState_Opening );
++        raise_event( impl, EV_OPENED );
++    }
++    set_state( impl, MediaPlayerState_Playing );
++    /* looping media never ends */
++    if (!impl->looping)
++    {
++        raise_event( impl, EV_ENDED );
++        set_state( impl, MediaPlayerState_Paused );
++    }
++    IMediaPlayer_Release( &impl->IMediaPlayer_iface );
++}
++
++static void start_playing( struct media_player *impl )
++{
++    IMediaPlayer_AddRef( &impl->IMediaPlayer_iface );
++    if (!TrySubmitThreadpoolCallback( play_callback, impl, NULL ))
++        IMediaPlayer_Release( &impl->IMediaPlayer_iface );
++}
++
+ static HRESULT WINAPI media_player_get_AutoPlay( IMediaPlayer *iface, boolean *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    *value = impl_from_IMediaPlayer( iface )->autoplay;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_put_AutoPlay( IMediaPlayer *iface, boolean value )
+ {
+-    FIXME( "iface %p, value %d stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %d.\n", iface, value );
++    impl_from_IMediaPlayer( iface )->autoplay = value;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_get_NaturalDuration( IMediaPlayer *iface, TimeSpan *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    value->Duration = 0;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_get_Position( IMediaPlayer *iface, TimeSpan *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    value->Duration = 0;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_put_Position( IMediaPlayer *iface, TimeSpan value )
+ {
+-    FIXME( "iface %p, value %I64d stub!\n", iface, value.Duration );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %I64d.\n", iface, value.Duration );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_get_BufferingProgress( IMediaPlayer *iface, DOUBLE *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    *value = 1.0;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_get_CurrentState( IMediaPlayer *iface, MediaPlayerState *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    *value = impl_from_IMediaPlayer( iface )->state;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_get_CanSeek( IMediaPlayer *iface, boolean *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_get_CanPause( IMediaPlayer *iface, boolean *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    *value = TRUE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_get_IsLoopingEnabled( IMediaPlayer *iface, boolean *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    *value = impl_from_IMediaPlayer( iface )->looping;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_put_IsLoopingEnabled( IMediaPlayer *iface, boolean value )
+ {
+-    FIXME( "iface %p, value %d stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %d.\n", iface, value );
++    impl_from_IMediaPlayer( iface )->looping = value;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_get_IsProtected( IMediaPlayer *iface, boolean *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_get_IsMuted( IMediaPlayer *iface, boolean *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    *value = impl_from_IMediaPlayer( iface )->muted;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_put_IsMuted( IMediaPlayer *iface, boolean value )
+ {
+-    FIXME( "iface %p, value %d stub!\n", iface, value );
+-    return E_NOTIMPL;
++    impl_from_IMediaPlayer( iface )->muted = value;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_get_PlaybackRate( IMediaPlayer *iface, DOUBLE *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    *value = impl_from_IMediaPlayer( iface )->rate;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_put_PlaybackRate( IMediaPlayer *iface, DOUBLE value )
+ {
+-    FIXME( "iface %p, value %lf stub!\n", iface, value );
+-    return E_NOTIMPL;
++    impl_from_IMediaPlayer( iface )->rate = value;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_get_Volume( IMediaPlayer *iface, DOUBLE *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    *value = impl_from_IMediaPlayer( iface )->volume;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_put_Volume( IMediaPlayer *iface, DOUBLE value )
+ {
+-    FIXME( "iface %p, value %lf stub!\n", iface, value );
+-    return E_NOTIMPL;
++    impl_from_IMediaPlayer( iface )->volume = value;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_get_PlaybackMediaMarkers( IMediaPlayer *iface, IPlaybackMediaMarkerSequence **value )
+ {
+     FIXME( "iface %p, value %p stub!\n", iface, value );
++    *value = NULL;
+     return E_NOTIMPL;
+ }
+ 
+ static HRESULT WINAPI media_player_add_MediaOpened( IMediaPlayer *iface, ITypedEventHandler_MediaPlayer_IInspectable *value, EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, value %p, token %p stub!\n", iface, value, token );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p, token %p.\n", iface, value, token );
++    return add_handler( impl_from_IMediaPlayer( iface ), EV_OPENED, value, token );
+ }
+ 
+ static HRESULT WINAPI media_player_remove_MediaOpened( IMediaPlayer *iface, EventRegistrationToken token )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    return remove_handler( impl_from_IMediaPlayer( iface ), EV_OPENED, token );
+ }
+ 
+ static HRESULT WINAPI media_player_add_MediaEnded( IMediaPlayer *iface, ITypedEventHandler_MediaPlayer_IInspectable *value, EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, value %p, token %p stub!\n", iface, value, token );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p, token %p.\n", iface, value, token );
++    return add_handler( impl_from_IMediaPlayer( iface ), EV_ENDED, value, token );
+ }
+ 
+ static HRESULT WINAPI media_player_remove_MediaEnded( IMediaPlayer *iface, EventRegistrationToken token )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    return remove_handler( impl_from_IMediaPlayer( iface ), EV_ENDED, token );
++}
++
++static LONG unused_token;
++
++static HRESULT unused_event( EventRegistrationToken *token )
++{
++    token->value = InterlockedIncrement( &unused_token ) | 0x40000000;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_add_MediaFailed( IMediaPlayer *iface, ITypedEventHandler_MediaPlayer_MediaPlayerFailedEventArgs *value,
+                                                     EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, value %p, token %p stub!\n", iface, value, token );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p, token %p (never raised).\n", iface, value, token );
++    return unused_event( token );
+ }
+ 
+ static HRESULT WINAPI media_player_remove_MediaFailed( IMediaPlayer *iface, EventRegistrationToken token )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_add_CurrentStateChanged( IMediaPlayer *iface, ITypedEventHandler_MediaPlayer_IInspectable *value,
+                                                             EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, value %p, token %p stub!\n", iface, value, token );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p, token %p.\n", iface, value, token );
++    return add_handler( impl_from_IMediaPlayer( iface ), EV_STATE, value, token );
+ }
+ 
+ static HRESULT WINAPI media_player_remove_CurrentStateChanged( IMediaPlayer *iface, EventRegistrationToken token )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    return remove_handler( impl_from_IMediaPlayer( iface ), EV_STATE, token );
+ }
+ 
+ static HRESULT WINAPI media_player_add_PlaybackMediaMarkerReached( IMediaPlayer *iface, ITypedEventHandler_MediaPlayer_PlaybackMediaMarkerReachedEventArgs *value,
+                                                                    EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, value %p, token %p stub!\n", iface, value, token );
+-    return E_NOTIMPL;
++    return unused_event( token );
+ }
+ 
+ static HRESULT WINAPI media_player_remove_PlaybackMediaMarkerReached( IMediaPlayer *iface, EventRegistrationToken token )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_add_MediaPlayerRateChanged( IMediaPlayer *iface, ITypedEventHandler_MediaPlayer_MediaPlayerRateChangedEventArgs *value,
+                                                                EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, value %p, token %p stub!\n", iface, value, token );
+-    return E_NOTIMPL;
++    return unused_event( token );
+ }
+ 
+ static HRESULT WINAPI media_player_remove_MediaPlayerRateChanged( IMediaPlayer *iface, EventRegistrationToken token )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_add_VolumeChanged( IMediaPlayer *iface, ITypedEventHandler_MediaPlayer_IInspectable *value, EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, value %p, token %p stub!\n", iface, value, token );
+-    return E_NOTIMPL;
++    return unused_event( token );
+ }
+ 
+ static HRESULT WINAPI media_player_remove_VolumeChanged( IMediaPlayer *iface, EventRegistrationToken token )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_add_SeekCompleted( IMediaPlayer *iface, ITypedEventHandler_MediaPlayer_IInspectable *value, EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, value %p, token %p stub!\n", iface, value, token );
+-    return E_NOTIMPL;
++    return unused_event( token );
+ }
+ 
+ static HRESULT WINAPI media_player_remove_SeekCompleted( IMediaPlayer *iface, EventRegistrationToken token )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_add_BufferingStarted( IMediaPlayer *iface, ITypedEventHandler_MediaPlayer_IInspectable *value, EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, value %p, token %p stub!\n", iface, value, token );
+-    return E_NOTIMPL;
++    return unused_event( token );
+ }
+ 
+ static HRESULT WINAPI media_player_remove_BufferingStarted( IMediaPlayer *iface, EventRegistrationToken token )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_add_BufferingEnded( IMediaPlayer *iface, ITypedEventHandler_MediaPlayer_IInspectable *value, EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, value %p, token %p stub!\n", iface, value, token );
+-    return E_NOTIMPL;
++    return unused_event( token );
+ }
+ 
+ static HRESULT WINAPI media_player_remove_BufferingEnded( IMediaPlayer *iface, EventRegistrationToken token )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_Play( IMediaPlayer *iface )
+ {
+-    FIXME( "iface %p stub!\n", iface );
+-    return E_NOTIMPL;
++    struct media_player *impl = impl_from_IMediaPlayer( iface );
++
++    TRACE( "iface %p, source set %d.\n", iface, impl->has_source );
++    if (impl->has_source) start_playing( impl );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_Pause( IMediaPlayer *iface )
+ {
+-    FIXME( "iface %p stub!\n", iface );
+-    return E_NOTIMPL;
++    struct media_player *impl = impl_from_IMediaPlayer( iface );
++
++    TRACE( "iface %p.\n", iface );
++    if (impl->state == MediaPlayerState_Playing) set_state( impl, MediaPlayerState_Paused );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player_SetUriSource( IMediaPlayer *iface, IUriRuntimeClass *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct media_player *impl = impl_from_IMediaPlayer( iface );
++    HSTRING uri = NULL;
++
++    if (value) IUriRuntimeClass_get_RawUri( value, &uri );
++    FIXME( "iface %p, uri %s: no playback, the media will be reported as played.\n", iface, debugstr_hstring( uri ) );
++    WindowsDeleteString( uri );
++    impl->has_source = value != NULL;
++    impl->state = MediaPlayerState_Closed;
++    if (value && impl->autoplay) start_playing( impl );
++    return S_OK;
+ }
+ 
+ static const struct IMediaPlayerVtbl media_player_vtbl =
+@@ -591,6 +710,12 @@ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInsp
+     impl->IMediaPlayer_iface.lpVtbl = &media_player_vtbl;
+     impl->IMediaPlayer2_iface.lpVtbl = &media_player2_vtbl;
+     impl->ref = 1;
++    InitializeCriticalSectionEx( &impl->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    impl->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": media_player.cs");
++    impl->state = MediaPlayerState_Closed;
++    impl->autoplay = TRUE;   /* Windows' default */
++    impl->rate = 1.0;
++    impl->volume = 1.0;
+ 
+     *instance = (IInspectable *)&impl->IMediaPlayer_iface;
+     return S_OK;
+diff --git a/dlls/windows.ui/uisettings.c b/dlls/windows.ui/uisettings.c
+index ce96767..9e383c7 100644
+--- a/dlls/windows.ui/uisettings.c
++++ b/dlls/windows.ui/uisettings.c
+@@ -127,38 +127,48 @@ static HRESULT WINAPI uisettings_GetTrustLevel( IUISettings *iface, TrustLevel *
+ 
+ static HRESULT WINAPI uisettings_get_HandPreference( IUISettings *iface, enum HandPreference *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = GetSystemMetrics( SM_MENUDROPALIGNMENT ) ? HandPreference_LeftHanded : HandPreference_RightHanded;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uisettings_get_CursorSize( IUISettings *iface, struct Size *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    value->Width = GetSystemMetrics( SM_CXCURSOR );
++    value->Height = GetSystemMetrics( SM_CYCURSOR );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uisettings_get_ScrollBarSize( IUISettings *iface, struct Size *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    value->Width = GetSystemMetrics( SM_CXVSCROLL );
++    value->Height = GetSystemMetrics( SM_CYHSCROLL );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uisettings_get_ScrollBarArrowSize( IUISettings *iface, struct Size *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    value->Width = GetSystemMetrics( SM_CXHSCROLL );
++    value->Height = GetSystemMetrics( SM_CYVSCROLL );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uisettings_get_ScrollBarThumbBoxSize( IUISettings *iface, struct Size *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    value->Width = GetSystemMetrics( SM_CXHTHUMB );
++    value->Height = GetSystemMetrics( SM_CYVTHUMB );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uisettings_get_MessageDuration( IUISettings *iface, UINT32 *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = 5;   /* seconds; Windows' default, a setting Wine doesn't have */
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uisettings_get_AnimationsEnabled( IUISettings *iface, boolean *value )
+@@ -176,32 +186,43 @@ static HRESULT WINAPI uisettings_get_AnimationsEnabled( IUISettings *iface, bool
+ 
+ static HRESULT WINAPI uisettings_get_CaretBrowsingEnabled( IUISettings *iface, boolean *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uisettings_get_CaretBlinkRate( IUISettings *iface, UINT32 *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = GetCaretBlinkTime();
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uisettings_get_CaretWidth( IUISettings *iface, UINT32 *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    DWORD width = 1;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    SystemParametersInfoW( SPI_GETCARETWIDTH, 0, &width, 0 );
++    *value = width;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uisettings_get_DoubleClickTime( IUISettings *iface, UINT32 *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = GetDoubleClickTime();
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uisettings_get_MouseHoverTime( IUISettings *iface, UINT32 *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    UINT time = 400;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    SystemParametersInfoW( SPI_GETMOUSEHOVERTIME, 0, &time, 0 );
++    *value = time;
++    return S_OK;
+ }
+ 
+ static void colorref_to_winui_color( COLORREF colorref, Color *color )
+@@ -293,7 +314,7 @@ static HRESULT WINAPI uisettings2_add_TextScaleFactorChanged( IUISettings2 *ifac
+ static HRESULT WINAPI uisettings2_remove_TextScaleFactorChanged( IUISettings2 *iface, EventRegistrationToken cookie )
+ {
+     FIXME( "iface %p, cookie %#I64x stub!\n", iface, cookie.value );
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static const struct IUISettings2Vtbl uisettings2_vtbl =
+diff --git a/include/windows.system.idl b/include/windows.system.idl
+index 1ae89f8..4d84061 100644
+--- a/include/windows.system.idl
++++ b/include/windows.system.idl
+@@ -550,3 +550,169 @@ namespace Windows.System
+         /* [contract(Windows.Foundation.UniversalApiContract, 10.0)] interface Windows.System.IUserChangedEventArgs2; */
+     }
+ }
++
++/* wine-uwp, generated by scripts/winmd2idl.py: Windows.System.MemoryManager and its reports. */
++
++namespace Windows.System {
++    runtimeclass AppMemoryReport;
++    typedef enum AppMemoryUsageLevel AppMemoryUsageLevel;
++    runtimeclass AppMemoryUsageLimitChangingEventArgs;
++    interface IAppMemoryReport;
++    interface IAppMemoryUsageLimitChangingEventArgs;
++    interface IMemoryManagerStatics;
++    interface IMemoryManagerStatics2;
++    interface IMemoryManagerStatics3;
++    interface IMemoryManagerStatics4;
++    interface IProcessMemoryReport;
++    runtimeclass MemoryManager;
++    runtimeclass ProcessMemoryReport;
++}
++
++namespace Windows.System {
++    declare {
++        interface Windows.Foundation.EventHandler<Windows.System.AppMemoryUsageLimitChangingEventArgs *>;
++    }
++}
++
++namespace Windows.System {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum AppMemoryUsageLevel
++    {
++        Low = 0,
++        Medium = 1,
++        High = 2,
++        OverLimit = 3
++    };
++
++}
++
++namespace Windows.System {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.System.AppMemoryReport),
++        uuid(6d65339b-4d6f-45bc-9c5e-e49b3ff2758d)
++    ]
++    interface IAppMemoryReport : IInspectable
++    {
++        [propget] HRESULT PrivateCommitUsage([out, retval] UINT64 *value);
++        [propget] HRESULT PeakPrivateCommitUsage([out, retval] UINT64 *value);
++        [propget] HRESULT TotalCommitUsage([out, retval] UINT64 *value);
++        [propget] HRESULT TotalCommitLimit([out, retval] UINT64 *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.System.AppMemoryUsageLimitChangingEventArgs),
++        uuid(79f86664-feca-4da5-9e40-2bc63efdc979)
++    ]
++    interface IAppMemoryUsageLimitChangingEventArgs : IInspectable
++    {
++        [propget] HRESULT OldLimit([out, retval] UINT64 *value);
++        [propget] HRESULT NewLimit([out, retval] UINT64 *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.System.MemoryManager),
++        uuid(5c6c279c-d7ca-4779-9188-4057219ce64c)
++    ]
++    interface IMemoryManagerStatics : IInspectable
++    {
++        [propget] HRESULT AppMemoryUsage([out, retval] UINT64 *value);
++        [propget] HRESULT AppMemoryUsageLimit([out, retval] UINT64 *value);
++        [propget] HRESULT AppMemoryUsageLevel([out, retval] Windows.System.AppMemoryUsageLevel *value);
++        [eventadd] HRESULT AppMemoryUsageIncreased([in] Windows.Foundation.EventHandler<IInspectable *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT AppMemoryUsageIncreased([in] Windows.Foundation.EventRegistrationToken token);
++        [eventadd] HRESULT AppMemoryUsageDecreased([in] Windows.Foundation.EventHandler<IInspectable *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT AppMemoryUsageDecreased([in] Windows.Foundation.EventRegistrationToken token);
++        [eventadd] HRESULT AppMemoryUsageLimitChanging([in] Windows.Foundation.EventHandler<Windows.System.AppMemoryUsageLimitChangingEventArgs *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT AppMemoryUsageLimitChanging([in] Windows.Foundation.EventRegistrationToken token);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.System.MemoryManager),
++        uuid(6eee351f-6d62-423f-9479-b01f9c9f7669)
++    ]
++    interface IMemoryManagerStatics2 : IInspectable
++    {
++        HRESULT GetAppMemoryReport([out, retval] Windows.System.AppMemoryReport * *value);
++        HRESULT GetProcessMemoryReport([out, retval] Windows.System.ProcessMemoryReport * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 2.0),
++        exclusiveto(Windows.System.MemoryManager),
++        uuid(149b59ce-92ad-4e35-89eb-50dfb4c0d91c)
++    ]
++    interface IMemoryManagerStatics3 : IInspectable
++    {
++        HRESULT TrySetAppMemoryUsageLimit([in] UINT64 value, [out, retval] boolean *result);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 5.0),
++        exclusiveto(Windows.System.MemoryManager),
++        uuid(c5a94828-e84e-4886-8a0d-44b3190e3b72)
++    ]
++    interface IMemoryManagerStatics4 : IInspectable
++    {
++        [propget] HRESULT ExpectedAppMemoryUsageLimit([out, retval] UINT64 *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.System.ProcessMemoryReport),
++        uuid(087305a8-9b70-4782-8741-3a982b6ce5e4)
++    ]
++    interface IProcessMemoryReport : IInspectable
++    {
++        [propget] HRESULT PrivateWorkingSetUsage([out, retval] UINT64 *value);
++        [propget] HRESULT TotalWorkingSetUsage([out, retval] UINT64 *value);
++    }
++
++}
++
++namespace Windows.System {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.System.IMemoryManagerStatics, Windows.Foundation.UniversalApiContract, 1.0),
++        static(Windows.System.IMemoryManagerStatics2, Windows.Foundation.UniversalApiContract, 1.0),
++        static(Windows.System.IMemoryManagerStatics3, Windows.Foundation.UniversalApiContract, 2.0),
++        static(Windows.System.IMemoryManagerStatics4, Windows.Foundation.UniversalApiContract, 5.0)
++    ]
++    runtimeclass MemoryManager
++    {
++    }
++
++}
++
++namespace Windows.System {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass AppMemoryReport
++    {
++        [default] interface Windows.System.IAppMemoryReport;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass AppMemoryUsageLimitChangingEventArgs
++    {
++        [default] interface Windows.System.IAppMemoryUsageLimitChangingEventArgs;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass ProcessMemoryReport
++    {
++        [default] interface Windows.System.IProcessMemoryReport;
++    }
++
++}
