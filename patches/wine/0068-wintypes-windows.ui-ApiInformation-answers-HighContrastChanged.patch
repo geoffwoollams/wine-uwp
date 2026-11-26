@@ -1,0 +1,164 @@
+Subject: wintypes: ApiInformation answers instead of failing; windows.ui: HighContrastChanged registers
+
+diff --git a/dlls/windows.ui/accessibilitysettings.c b/dlls/windows.ui/accessibilitysettings.c
+index f1dfe58..ec312be 100644
+--- a/dlls/windows.ui/accessibilitysettings.c
++++ b/dlls/windows.ui/accessibilitysettings.c
+@@ -121,15 +121,18 @@ static HRESULT WINAPI accessibilitysettings_add_HighContrastChanged(IAccessibili
+                                                                     ITypedEventHandler_AccessibilitySettings_IInspectable *handler,
+                                                                     EventRegistrationToken *cookie)
+ {
+-    FIXME("iface %p, handler %p, cookie %p stub!\n", iface, handler, cookie);
+-    return E_NOTIMPL;
++    /* the high contrast setting never changes here, so the handler is never called */
++    FIXME("iface %p, handler %p, cookie %p semi-stub!\n", iface, handler, cookie);
++    if (!handler || !cookie) return E_POINTER;
++    cookie->value = 0x4c43;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI accessibilitysettings_remove_HighContrastChanged(IAccessibilitySettings *iface,
+                                                                        EventRegistrationToken cookie)
+ {
+-    FIXME("iface %p, cookie %I64x stub!\n", iface, cookie.value);
+-    return E_NOTIMPL;
++    TRACE("iface %p, cookie %I64x.\n", iface, cookie.value);
++    return S_OK;
+ }
+ 
+ static const struct IAccessibilitySettingsVtbl accessibilitysettings_vtbl =
+diff --git a/dlls/wintypes/main.c b/dlls/wintypes/main.c
+index 2c5d4c4..44af61b 100644
+--- a/dlls/wintypes/main.c
++++ b/dlls/wintypes/main.c
+@@ -19,6 +19,7 @@
+ #include "initguid.h"
+ #include "private.h"
+ #include "pathcch.h"
++#include "winreg.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(wintypes);
+ 
+@@ -43,6 +44,21 @@ static BOOLEAN is_api_contract_present( const HSTRING hname, unsigned int versio
+     return FALSE;
+ }
+ 
++/* A runtime class is present when it is registered; other kinds of type (interfaces,
++ * enums, structs) are not registered, so they are reported missing. */
++static BOOLEAN is_type_present( HSTRING hname )
++{
++    const WCHAR *name = WindowsGetStringRawBuffer( hname, NULL );
++    WCHAR path[512];
++    HKEY key;
++
++    if (!name || !*name || wcslen( name ) > 400) return FALSE;
++    swprintf( path, ARRAY_SIZE(path), L"Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\%s", name );
++    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, path, 0, KEY_READ, &key )) return FALSE;
++    RegCloseKey( key );
++    return TRUE;
++}
++
+ struct api_information_statics
+ {
+     IActivationFactory IActivationFactory_iface;
+@@ -146,12 +162,14 @@ DEFINE_IINSPECTABLE(api_information_statics, IApiInformationStatics, struct api_
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsTypePresent(
+         IApiInformationStatics *iface, HSTRING type_name, BOOLEAN *value)
+ {
+-    FIXME("iface %p, type_name %s, value %p stub!\n", iface, debugstr_hstring(type_name), value);
++    TRACE("iface %p, type_name %s, value %p.\n", iface, debugstr_hstring(type_name), value);
+ 
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    *value = is_type_present( type_name );
++    TRACE("-> %d\n", *value);
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsMethodPresent(
+@@ -178,7 +196,9 @@ static HRESULT STDMETHODCALLTYPE api_information_statics_IsMethodPresentWithArit
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    /* members are reported missing: callers check for optional APIs and fall back */
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsEventPresent(
+@@ -190,7 +210,9 @@ static HRESULT STDMETHODCALLTYPE api_information_statics_IsEventPresent(
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    /* members are reported missing: callers check for optional APIs and fall back */
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsPropertyPresent(
+@@ -202,7 +224,9 @@ static HRESULT STDMETHODCALLTYPE api_information_statics_IsPropertyPresent(
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    /* members are reported missing: callers check for optional APIs and fall back */
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsReadOnlyPropertyPresent(
+@@ -215,7 +239,9 @@ static HRESULT STDMETHODCALLTYPE api_information_statics_IsReadOnlyPropertyPrese
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    /* members are reported missing: callers check for optional APIs and fall back */
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsWriteablePropertyPresent(
+@@ -227,7 +253,9 @@ static HRESULT STDMETHODCALLTYPE api_information_statics_IsWriteablePropertyPres
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    /* members are reported missing: callers check for optional APIs and fall back */
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsEnumNamedValuePresent(
+@@ -239,7 +267,9 @@ static HRESULT STDMETHODCALLTYPE api_information_statics_IsEnumNamedValuePresent
+     if (!enum_type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    /* members are reported missing: callers check for optional APIs and fall back */
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsApiContractPresentByMajor(
+@@ -259,13 +289,15 @@ static HRESULT STDMETHODCALLTYPE api_information_statics_IsApiContractPresentByM
+         IApiInformationStatics *iface, HSTRING contract_name, UINT16 major_version,
+         UINT16 minor_version, BOOLEAN *value)
+ {
+-    FIXME("iface %p, contract_name %s, major_version %u, minor_version %u, value %p stub!\n", iface,
++    FIXME("iface %p, contract_name %s, major_version %u, minor_version %u, value %p semi-stub.\n", iface,
+             debugstr_hstring(contract_name), major_version, minor_version, value);
+ 
+     if (!contract_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    /* every minor version of a present major version is treated as present */
++    *value = is_api_contract_present( contract_name, major_version );
++    return S_OK;
+ }
+ 
+ static const struct IApiInformationStaticsVtbl api_information_statics_vtbl =

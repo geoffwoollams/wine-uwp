@@ -1,0 +1,283 @@
+Subject: twinapi.appcore: shims answer only their own interfaces; CoreDispatcher.RunIdleAsync; trace newlines
+
+diff --git a/dlls/twinapi.appcore/core_gen.c b/dlls/twinapi.appcore/core_gen.c
+index cd1b928..11d03d6 100644
+--- a/dlls/twinapi.appcore/core_gen.c
++++ b/dlls/twinapi.appcore/core_gen.c
+@@ -196,9 +196,41 @@ struct dispatch_item
+ {
+     struct dispatch_item *next;
+     IDispatchedHandler *callback;
++    IIdleDispatchedHandler *idle;    /* RunIdleAsync, instead of callback */
+     struct core_action *action;
+ };
+ 
++/* IdleDispatchedHandlerArgs: idle work runs once the queue is drained, so the dispatcher is idle */
++static HRESULT WINAPI idle_args_QueryInterface(IIdleDispatchedHandlerArgs *iface, REFIID iid, void **out)
++{
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IIdleDispatchedHandlerArgs))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI idle_args_AddRef(IIdleDispatchedHandlerArgs *iface) { return 2; }
++static ULONG WINAPI idle_args_Release(IIdleDispatchedHandlerArgs *iface) { return 1; }
++static HRESULT WINAPI idle_args_GetIids(IIdleDispatchedHandlerArgs *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI idle_args_GetRuntimeClassName(IIdleDispatchedHandlerArgs *iface, HSTRING *name)
++{ return WindowsCreateString(L"Windows.UI.Core.IdleDispatchedHandlerArgs", 41, name); }
++static HRESULT WINAPI idle_args_GetTrustLevel(IIdleDispatchedHandlerArgs *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI idle_args_get_IsDispatcherIdle(IIdleDispatchedHandlerArgs *iface, boolean *value)
++{
++    *value = TRUE;
++    return S_OK;
++}
++static const IIdleDispatchedHandlerArgsVtbl idle_args_vtbl =
++{
++    idle_args_QueryInterface, idle_args_AddRef, idle_args_Release,
++    idle_args_GetIids, idle_args_GetRuntimeClassName, idle_args_GetTrustLevel,
++    idle_args_get_IsDispatcherIdle,
++};
++static IIdleDispatchedHandlerArgs idle_args = { &idle_args_vtbl };
++
+ static inline struct core_action *impl_from_action(IAsyncAction *iface)
+ { return CONTAINING_RECORD(iface, struct core_action, IAsyncAction_iface); }
+ static inline struct core_action *impl_from_actioninfo(IAsyncInfo *iface)
+@@ -320,8 +352,16 @@ static void dispatcher_drain_queue(struct core_dispatcher *impl)
+         if ((item = impl->queue_head) && !(impl->queue_head = item->next)) impl->queue_tail = NULL;
+         LeaveCriticalSection(&impl->cs);
+         if (!item) break;
+-        IDispatchedHandler_Invoke(item->callback);
+-        IDispatchedHandler_Release(item->callback);
++        if (item->idle)
++        {
++            IIdleDispatchedHandler_Invoke(item->idle, &idle_args);
++            IIdleDispatchedHandler_Release(item->idle);
++        }
++        else
++        {
++            IDispatchedHandler_Invoke(item->callback);
++            IDispatchedHandler_Release(item->callback);
++        }
+         complete_core_action(item->action);
+         IAsyncAction_Release(&item->action->IAsyncAction_iface);
+         free(item);
+@@ -329,6 +369,8 @@ static void dispatcher_drain_queue(struct core_dispatcher *impl)
+ }
+ 
+ /* ===== core_dispatcher ===== */
++static const GUID IID_probe_d4bbc1c8 = {0xd4bbc1c8,0xf5bf,0x4647,{0x94,0x95,0x2e,0x5c,0x0f,0x20,0xf7,0x5d}};
++
+ static HRESULT core_dispatcher_qi(struct core_dispatcher *impl, REFIID iid, void **out)
+ {
+     TRACE("%p, %s, %p.\n", impl, debugstr_guid(iid), out);
+@@ -345,7 +387,9 @@ static HRESULT core_dispatcher_qi(struct core_dispatcher *impl, REFIID iid, void
+         ICoreAcceleratorKeys_AddRef(*out);
+         return S_OK;
+     }
+-    FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++    /* IL2CPP and .NET Native probe objects for interfaces they handle themselves; not worth a FIXME */
++    if (!IsEqualGUID(iid, &IID_probe_d4bbc1c8))
++        FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
+     *out = NULL;
+     return E_NOINTERFACE;
+ }
+@@ -597,7 +641,7 @@ static HRESULT WINAPI core_dispatcher_RunAsync(ICoreDispatcher *iface, __x_ABI_C
+     struct core_dispatcher *impl __attribute__((unused)) = impl_from_core_dispatcher(iface);
+     struct dispatch_item *item;
+     struct core_action *a;
+-    TRACE("iface %p, priority %d, callback %p, action %p.\\n", iface, priority, callback, action);
++    TRACE("iface %p, priority %d, callback %p, action %p.\n", iface, priority, callback, action);
+     if (!callback || !action) return E_POINTER;
+     if (!(a = create_core_action())) return E_OUTOFMEMORY;
+     if (!(item = calloc(1, sizeof(*item)))) { IAsyncAction_Release(&a->IAsyncAction_iface); return E_OUTOFMEMORY; }
+@@ -616,8 +660,26 @@ static HRESULT WINAPI core_dispatcher_RunAsync(ICoreDispatcher *iface, __x_ABI_C
+ 
+ static HRESULT WINAPI core_dispatcher_RunIdleAsync(ICoreDispatcher *iface, __x_ABI_CWindows_CUI_CCore_CIIdleDispatchedHandler *callback, __x_ABI_CWindows_CFoundation_CIAsyncAction **action)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    struct core_dispatcher *impl = impl_from_core_dispatcher(iface);
++    struct dispatch_item *item;
++    struct core_action *a;
++
++    TRACE("iface %p, callback %p, action %p.\n", iface, callback, action);
++    if (!callback || !action) return E_POINTER;
++    if (!(a = create_core_action())) return E_OUTOFMEMORY;
++    if (!(item = calloc(1, sizeof(*item)))) { IAsyncAction_Release(&a->IAsyncAction_iface); return E_OUTOFMEMORY; }
++    /* queued behind normal work: it runs when the dispatcher next drains its queue */
++    item->idle = callback;
++    IIdleDispatchedHandler_AddRef(callback);
++    item->action = a;
++    IAsyncAction_AddRef(&a->IAsyncAction_iface);
++    EnterCriticalSection(&impl->cs);
++    if (impl->queue_tail) impl->queue_tail->next = item; else impl->queue_head = item;
++    impl->queue_tail = item;
++    LeaveCriticalSection(&impl->cs);
++    PostThreadMessageW(impl->thread_id, WM_NULL, 0, 0);
++    *action = &a->IAsyncAction_iface;
++    return S_OK;
+ }
+ 
+ static const ICoreDispatcherVtbl core_dispatcher_vtbl =
+@@ -1787,7 +1849,7 @@ static HRESULT WINAPI core_app_Run(ICoreApplication *iface, __x_ABI_CWindows_CAp
+                 args->ref = 1;
+                 for (i = 0; i < view->activated_count; i++)
+                 {
+-                    TRACE("Raising Activated handler %p\\n", view->activated[i]);
++                    TRACE("Raising Activated handler %p\n", view->activated[i]);
+                     ITypedEventHandler_CoreApplicationView_IActivatedEventArgs_Invoke(view->activated[i],
+                             &view->ICoreApplicationView_iface, &args->IActivatedEventArgs_iface);
+                 }
+diff --git a/dlls/twinapi.appcore/hardware_identification.c b/dlls/twinapi.appcore/hardware_identification.c
+index 1279bbe..72400bd 100644
+--- a/dlls/twinapi.appcore/hardware_identification.c
++++ b/dlls/twinapi.appcore/hardware_identification.c
+@@ -7,7 +7,10 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
+ 
+-struct hw_obj { const void *const *lpVtbl; const char *name; };
++struct hw_obj { const void *const *lpVtbl; const char *name; const GUID *iid; };
++
++static const GUID iid_hardware_token = {0x28f6d4c0,0xfb12,0x40a4,{0x81,0x67,0x7f,0x4e,0x03,0xd2,0x72,0x4c}};
++static const GUID iid_hardware_statics = {0x971260e0,0xf170,0x4a42,{0xbd,0x55,0xa9,0x00,0xb2,0x12,0xda,0xe2}};
+ 
+ static const GUID IID_IBufferByteAccess_local =
+     { 0x905a0fef, 0xbc53, 0x11df, { 0x8c, 0x49, 0x00, 0x1e, 0x4f, 0xc6, 0x86, 0xda } };
+@@ -52,14 +55,15 @@ static HRESULT WINAPI token_slot8(struct hw_obj *iface, void **value) { FIXME( "
+ static HRESULT WINAPI hw_QueryInterface(struct hw_obj *iface, REFIID iid, void **out)
+ {
+     TRACE( "iface %p (%s), iid %s.\n", iface, iface->name, debugstr_guid( iid ) );
+-    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ))
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, iface->iid ))
+     {
+         *out = iface;
+         return S_OK;
+     }
+-    FIXME( "%s: assuming %s is the main interface.\n", iface->name, debugstr_guid( iid ) );
+-    *out = iface;
+-    return S_OK;
++    FIXME( "%s: %s not implemented, returning E_NOINTERFACE.\n", iface->name, debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
+ }
+ static ULONG WINAPI hw_AddRef(struct hw_obj *iface) { return 2; }
+ static ULONG WINAPI hw_Release(struct hw_obj *iface) { return 1; }
+@@ -69,7 +73,7 @@ static HRESULT WINAPI hw_GetTrustLevel(struct hw_obj *iface, TrustLevel *l) { *l
+ 
+ static const void *const token_vtbl[] = { hw_QueryInterface, hw_AddRef, hw_Release, hw_GetIids,
+     hw_GetRuntimeClassName, hw_GetTrustLevel, token_slot6, token_slot7, token_slot8 };
+-static struct hw_obj token_obj = { token_vtbl, "IHardwareToken" };
++static struct hw_obj token_obj = { token_vtbl, "IHardwareToken", &iid_hardware_token };
+ 
+ /* ---- statics (IHardwareIdentificationStatics): slot 6 GetPackageSpecificToken(IBuffer *nonce, IHardwareToken **) ---- */
+ static HRESULT WINAPI statics_slot6(struct hw_obj *iface, void *nonce, void **token)
+@@ -80,7 +84,7 @@ static HRESULT WINAPI statics_slot6(struct hw_obj *iface, void *nonce, void **to
+ }
+ static const void *const statics_vtbl[] = { hw_QueryInterface, hw_AddRef, hw_Release, hw_GetIids,
+     hw_GetRuntimeClassName, hw_GetTrustLevel, statics_slot6 };
+-static struct hw_obj statics_obj = { statics_vtbl, "IHardwareIdentificationStatics" };
++static struct hw_obj statics_obj = { statics_vtbl, "IHardwareIdentificationStatics", &iid_hardware_statics };
+ 
+ /* ---- factory ---- */
+ static HRESULT WINAPI hwf_QueryInterface(IActivationFactory *iface, REFIID iid, void **out)
+@@ -92,9 +96,10 @@ static HRESULT WINAPI hwf_QueryInterface(IActivationFactory *iface, REFIID iid,
+         *out = iface;
+         return S_OK;
+     }
+-    FIXME( "assuming %s is IHardwareIdentificationStatics.\n", debugstr_guid( iid ) );
+-    *out = &statics_obj;
+-    return S_OK;
++    if (IsEqualGUID( iid, &iid_hardware_statics )) { *out = &statics_obj; return S_OK; }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
+ }
+ static ULONG WINAPI hwf_AddRef(IActivationFactory *iface) { return 2; }
+ static ULONG WINAPI hwf_Release(IActivationFactory *iface) { return 1; }
+diff --git a/dlls/twinapi.appcore/thread_pool_timer.c b/dlls/twinapi.appcore/thread_pool_timer.c
+index db8367d..2e4328d 100644
+--- a/dlls/twinapi.appcore/thread_pool_timer.c
++++ b/dlls/twinapi.appcore/thread_pool_timer.c
+@@ -12,12 +12,21 @@ struct timer_obj
+     HANDLE queue_timer;
+ };
+ 
++static const GUID iid_timer = {0x594ebe78,0x55ea,0x4a88,{0xa5,0x0d,0x34,0x02,0xae,0x1f,0x9c,0xf2}};
++static const GUID iid_timer_statics = {0x1a8a9d02,0xe482,0x461b,{0xb8,0xc7,0x8e,0xfa,0xd1,0xcc,0xe5,0x90}};
++
+ struct handler_vtbl { HRESULT (WINAPI *QueryInterface)(void *, REFIID, void **); ULONG (WINAPI *AddRef)(void *);
+                       ULONG (WINAPI *Release)(void *); HRESULT (WINAPI *Invoke)(void *, void *); };
+ 
+ static HRESULT WINAPI timer_QI(struct timer_obj *t, REFIID iid, void **out)
+ {
+     TRACE("timer %p, iid %s.\n", t, debugstr_guid(iid));
++    if (!IsEqualGUID(iid, &IID_IUnknown) && !IsEqualGUID(iid, &IID_IInspectable) &&
++        !IsEqualGUID(iid, &IID_IAgileObject) && !IsEqualGUID(iid, &iid_timer))
++    {
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
+     *out = t;
+     InterlockedIncrement(&t->ref);
+     return S_OK;
+@@ -87,7 +96,14 @@ static HRESULT WINAPI st_slot6(void *i, void *h, INT64 period, void **out) { ret
+ static HRESULT WINAPI st_slot7(void *i, void *h, INT64 delay, void **out) { return create_timer(h, 0, delay, FALSE, out); }
+ static HRESULT WINAPI st_slot8(void *i, void *h, INT64 period, void *d, void **out) { return create_timer(h, period, 0, TRUE, out); }
+ static HRESULT WINAPI st_slot9(void *i, void *h, INT64 delay, void *d, void **out) { return create_timer(h, 0, delay, FALSE, out); }
+-static HRESULT WINAPI st_QI(void *i, REFIID iid, void **out) { *out = i; return S_OK; }
++static HRESULT WINAPI st_QI(void *i, REFIID iid, void **out)
++{
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &iid_timer_statics))
++    { *out = i; return S_OK; }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
+ static ULONG WINAPI st_AddRef(void *i) { return 2; }
+ static ULONG WINAPI st_Release(void *i) { return 1; }
+ static HRESULT WINAPI st_GetIids(void *i, ULONG *c, IID **ids) { return E_NOTIMPL; }
+@@ -103,9 +119,10 @@ static HRESULT WINAPI f_QI(IActivationFactory *iface, REFIID iid, void **out)
+     if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
+         IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IActivationFactory))
+     { *out = iface; return S_OK; }
+-    FIXME("assuming %s is IThreadPoolTimerStatics.\n", debugstr_guid(iid));
+-    *out = &statics_obj;
+-    return S_OK;
++    if (IsEqualGUID(iid, &iid_timer_statics)) { *out = &statics_obj; return S_OK; }
++    FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
+ }
+ static ULONG WINAPI f_AddRef(IActivationFactory *iface) { return 2; }
+ static ULONG WINAPI f_Release(IActivationFactory *iface) { return 1; }
+diff --git a/dlls/twinapi.appcore/user_statics.c b/dlls/twinapi.appcore/user_statics.c
+index f7b0f96..4ee4674 100644
+--- a/dlls/twinapi.appcore/user_statics.c
++++ b/dlls/twinapi.appcore/user_statics.c
+@@ -103,14 +103,17 @@ static const void *const statics_vtbl[] = { vi_QI, vi_AddRef, vi_Release, vi_Get
+     us_CreateWatcher, us_FindAllAsync, us_FindAllAsyncByType, us_FindAllAsyncByTypeAndStatus, us_GetFromId };
+ static struct { const void *const *lpVtbl; } statics_obj = { statics_vtbl };
+ 
++static const GUID iid_user_statics = {0x155eb23b,0x242a,0x45e0,{0xa2,0xe9,0x31,0x71,0xfc,0x6a,0x7f,0xdd}};
++
+ static HRESULT WINAPI uf_QI(IActivationFactory *iface, REFIID iid, void **out)
+ {
+     if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
+         IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IActivationFactory))
+     { *out = iface; return S_OK; }
+-    FIXME("assuming %s is IUserStatics.\n", debugstr_guid(iid));
+-    *out = &statics_obj;
+-    return S_OK;
++    if (IsEqualGUID(iid, &iid_user_statics)) { *out = &statics_obj; return S_OK; }
++    FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
+ }
+ static ULONG WINAPI uf_AddRef(IActivationFactory *iface) { return 2; }
+ static ULONG WINAPI uf_Release(IActivationFactory *iface) { return 1; }

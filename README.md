@@ -270,7 +270,10 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 CompositionTarget, Loaded/SizeChanged, 0061 delay-load failure handling and
                 SetProcessValidCallTargets (.NET Native's runtime), 0062 ExtendedExecution's
                 async operation interfaces, 0063 an offline WinRT HTTP filter (requests fail as
-                "name not resolved"), 0064 store objects' interfaces
+                "name not resolved"), 0064 store objects' interfaces, 0065 StorageFolder
+                CreateFolderAsync/GetFolderAsync, 0066 PlatformDiagnosticsAndUsageDataSettings, 0067
+                twinapi shims answering only their own interfaces and CoreDispatcher.RunIdleAsync, 0068
+                ApiInformation answers and HighContrastChanged
 patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings

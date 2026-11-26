@@ -1,0 +1,277 @@
+Subject: twinapi.appcore: PlatformDiagnosticsAndUsageDataSettings reports the Security collection level
+
+diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
+index 87486a8..989319f 100644
+--- a/dlls/twinapi.appcore/Makefile.in
++++ b/dlls/twinapi.appcore/Makefile.in
+@@ -14,6 +14,7 @@ SOURCES = \
+ 	causality.c \
+ 	core_gen.c \
+ 	data_transfer.c \
++	diagnostics_settings.c \
+ 	core_input_gen.c \
+ 	sink.c \
+ 	system_navigation.c \
+diff --git a/dlls/twinapi.appcore/classes.idl b/dlls/twinapi.appcore/classes.idl
+index f4a26fe..cdc7a8f 100644
+--- a/dlls/twinapi.appcore/classes.idl
++++ b/dlls/twinapi.appcore/classes.idl
+@@ -40,6 +40,7 @@ namespace Windows.Security.ExchangeActiveSyncProvisioning {
+ }
+ namespace Windows.System.Profile {
+     runtimeclass AnalyticsInfo;
++    runtimeclass PlatformDiagnosticsAndUsageDataSettings;
+ }
+ namespace Windows.System.UserProfile {
+     runtimeclass AdvertisingManager;
+diff --git a/dlls/twinapi.appcore/diagnostics_settings.c b/dlls/twinapi.appcore/diagnostics_settings.c
+new file mode 100644
+index 0000000..a1d3614
+--- /dev/null
++++ b/dlls/twinapi.appcore/diagnostics_settings.c
+@@ -0,0 +1,167 @@
++/* WinRT Windows.System.Profile.PlatformDiagnosticsAndUsageDataSettings
++ *
++ * Diagnostic data collection is reported at its lowest level (Security), the level
++ * Windows itself uses when the user turns optional telemetry off; it never changes.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
++
++struct diagnostics_settings
++{
++    IActivationFactory IActivationFactory_iface;
++    IPlatformDiagnosticsAndUsageDataSettingsStatics IPlatformDiagnosticsAndUsageDataSettingsStatics_iface;
++    LONG ref;
++};
++
++static inline struct diagnostics_settings *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct diagnostics_settings, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct diagnostics_settings *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        IInspectable_AddRef( (*out = &impl->IActivationFactory_iface) );
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_IPlatformDiagnosticsAndUsageDataSettingsStatics ))
++    {
++        IInspectable_AddRef( (*out = &impl->IPlatformDiagnosticsAndUsageDataSettingsStatics_iface) );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    struct diagnostics_settings *impl = impl_from_IActivationFactory( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    struct diagnostics_settings *impl = impl_from_IActivationFactory( iface );
++    return InterlockedDecrement( &impl->ref );
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    FIXME( "iface %p, class_name %p stub!\n", iface, class_name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    FIXME( "iface %p, instance %p stub!\n", iface, instance );
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( statics, IPlatformDiagnosticsAndUsageDataSettingsStatics, struct diagnostics_settings, IActivationFactory_iface );
++
++static HRESULT WINAPI statics_get_CollectionLevel( IPlatformDiagnosticsAndUsageDataSettingsStatics *iface, PlatformDataCollectionLevel *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = PlatformDataCollectionLevel_Security;
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_add_CollectionLevelChanged( IPlatformDiagnosticsAndUsageDataSettingsStatics *iface,
++                                                          IEventHandler_IInspectable *handler, EventRegistrationToken *token )
++{
++    /* the level never changes, so the handler is never called */
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
++    if (!handler || !token) return E_POINTER;
++    token->value = 0x6469;
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_remove_CollectionLevelChanged( IPlatformDiagnosticsAndUsageDataSettingsStatics *iface, EventRegistrationToken token )
++{
++    TRACE( "iface %p, token %#I64x.\n", iface, token.value );
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_CanCollectDiagnostics( IPlatformDiagnosticsAndUsageDataSettingsStatics *iface,
++                                                     PlatformDataCollectionLevel level, boolean *value )
++{
++    TRACE( "iface %p, level %d, value %p.\n", iface, level, value );
++    if (!value) return E_POINTER;
++    *value = level <= PlatformDataCollectionLevel_Security;
++    return S_OK;
++}
++
++static const struct IPlatformDiagnosticsAndUsageDataSettingsStaticsVtbl statics_vtbl =
++{
++    statics_QueryInterface,
++    statics_AddRef,
++    statics_Release,
++    /* IInspectable methods */
++    statics_GetIids,
++    statics_GetRuntimeClassName,
++    statics_GetTrustLevel,
++    /* IPlatformDiagnosticsAndUsageDataSettingsStatics methods */
++    statics_get_CollectionLevel,
++    statics_add_CollectionLevelChanged,
++    statics_remove_CollectionLevelChanged,
++    statics_CanCollectDiagnostics,
++};
++
++static struct diagnostics_settings diagnostics_settings =
++{
++    {&factory_vtbl},
++    {&statics_vtbl},
++    1,
++};
++
++IActivationFactory *diagnostics_settings_factory = &diagnostics_settings.IActivationFactory_iface;
+diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
+index 1cf715a..025c9c8 100644
+--- a/dlls/twinapi.appcore/main.c
++++ b/dlls/twinapi.appcore/main.c
+@@ -73,6 +73,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( client_device_information_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, RuntimeClass_Windows_System_Profile_AnalyticsInfo ))
+         IActivationFactory_QueryInterface( analytics_info_factory, &IID_IActivationFactory, (void **)factory );
++    else if (!wcscmp( buffer, RuntimeClass_Windows_System_Profile_PlatformDiagnosticsAndUsageDataSettings ))
++        IActivationFactory_QueryInterface( diagnostics_settings_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, RuntimeClass_Windows_System_UserProfile_AdvertisingManager ))
+         IActivationFactory_QueryInterface( advertising_manager_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, RuntimeClass_Windows_UI_ViewManagement_ApplicationView ))
+diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
+index 6383172..1081215 100644
+--- a/dlls/twinapi.appcore/private.h
++++ b/dlls/twinapi.appcore/private.h
+@@ -74,6 +74,7 @@ extern void core_cursor_init(void);
+ extern IActivationFactory *message_dialog_factory;
+ extern void message_dialog_init(void);
+ extern IActivationFactory *hardware_identification_factory;
++extern IActivationFactory *diagnostics_settings_factory;
+ extern IActivationFactory *web_token_manager_factory, *web_token_request_factory, *web_account_provider_factory, *user_picker_factory, *system_user_factory, *launcher_factory, *web_account_factory, *web_token_response_factory, *thread_pool_timer_factory, *user_statics_factory, *store_context_real_factory, *message_websocket_factory, *store_context_factory, *logging_options_factory, *logging_fields_factory, *push_manager_factory, *logging_channel_factory, *loggingchanneloptions_factory, *loggingactivity_factory, *loggingsession_factory;
+ extern IActivationFactory *async_causality_tracer_factory;   /* causality.c */
+ extern IActivationFactory *mouse_device_factory;   /* mouse.c */
+diff --git a/include/windows.system.profile.idl b/include/windows.system.profile.idl
+index be3cb80..98bfaf1 100644
+--- a/include/windows.system.profile.idl
++++ b/include/windows.system.profile.idl
+@@ -30,6 +30,9 @@ import "windows.system.idl";
+ 
+ namespace Windows.System.Profile {
+     typedef enum SystemIdentificationSource SystemIdentificationSource;
++    typedef enum PlatformDataCollectionLevel PlatformDataCollectionLevel;
++    interface IPlatformDiagnosticsAndUsageDataSettingsStatics;
++    runtimeclass PlatformDiagnosticsAndUsageDataSettings;
+     interface IAnalyticsInfoStatics;
+     interface IAnalyticsInfoStatics2;
+     interface IAnalyticsVersionInfo;
+@@ -136,4 +139,38 @@ namespace Windows.System.Profile {
+     {
+         [default] interface Windows.System.Profile.ISystemIdentificationInfo;
+     }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 2.0)
++    ]
++    enum PlatformDataCollectionLevel
++    {
++        Security = 0,
++        Basic    = 1,
++        Enhanced = 2,
++        Full     = 3
++    };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 2.0),
++        exclusiveto(Windows.System.Profile.PlatformDiagnosticsAndUsageDataSettings),
++        uuid(b6e24c1b-7b1c-4b32-8c62-a66597ce723a)
++    ]
++    interface IPlatformDiagnosticsAndUsageDataSettingsStatics : IInspectable
++    {
++        [propget] HRESULT CollectionLevel([out, retval] Windows.System.Profile.PlatformDataCollectionLevel *value);
++        [eventadd] HRESULT CollectionLevelChanged([in] Windows.Foundation.EventHandler<IInspectable *> *handler, [out, retval] EventRegistrationToken *token);
++        [eventremove] HRESULT CollectionLevelChanged([in] EventRegistrationToken token);
++        HRESULT CanCollectDiagnostics([in] Windows.System.Profile.PlatformDataCollectionLevel level, [out, retval] boolean *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 2.0),
++        marshaling_behavior(agile),
++        static(Windows.System.Profile.IPlatformDiagnosticsAndUsageDataSettingsStatics, Windows.Foundation.UniversalApiContract, 2.0),
++        threading(both)
++    ]
++    runtimeclass PlatformDiagnosticsAndUsageDataSettings
++    {
++    }
+ }
