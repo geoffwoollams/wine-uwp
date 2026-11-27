@@ -42,7 +42,11 @@ cd wine-uwp
 scripts/fetch-release.sh
 ```
 
-Then follow [Set up an app](#set-up-an-app).
+Then start an app straight from its package folder or `.appx`: the first time, it is set up for you (see [Set up an app](#set-up-an-app) for what that does and what apps need).
+
+```bash
+scripts/run-app.sh /path/to/MyGame.appx
+```
 
 ## Build from source instead
 
@@ -84,9 +88,10 @@ Play, either from the launcher or from a terminal:
 ```bash
 scripts/run-app.sh                       # pick from a numbered list (or start the only app set up)
 scripts/run-app.sh Microsoft.HoganThreshold
+scripts/run-app.sh /path/to/package-folder   # or an .appx: set up the first time, then started
 ```
 
-Without a package name and with several apps set up, `run-app.sh` lists them by name and package, one per line, and asks for a number.
+Given a package folder or package file, `run-app.sh` runs `setup-prefix.sh` on it first unless the app is already set up from that folder (a package file is unpacked into `~/.local/share/wine-uwp/packages/` once), so one command takes an app from download to running. Without a package name and with several apps set up, `run-app.sh` lists them by name and package, one per line, and asks for a number.
 
 **Controllers:** games see a controller when it looks like an Xbox (XInput) gamepad. Wine's SDL backend presents every controller SDL recognises that way, including PlayStation and Switch pads, because `setup-prefix.sh` turns off Wine's raw-HID handling for Sony (`054C`) and Nintendo (`057E`) devices in the prefix. To get a raw device back, set `Hidraw` to 1 under `HKLM\System\CurrentControlSet\Services\WineBus\Devices\<vendor id>`. Steam's controller handling also works, since it presents an Xbox pad. Controllers SDL doesn't recognise as gamepads reach games only as raw controllers, which most games ignore; an `SDL_GAMECONTROLLERCONFIG` mapping for the device fixes that.
 

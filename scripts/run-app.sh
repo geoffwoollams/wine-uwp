@@ -1,16 +1,35 @@
 #!/bin/bash
-# Starts a UWP app set up with setup-prefix.sh.
-# Usage: scripts/run-app.sh [package-name] [seconds]   (without a name, the only app set up starts, or a numbered list
-#        of them asks which; seconds is an optional time limit, for testing)
+# Starts a UWP app set up with setup-prefix.sh, or sets one up first.
+# Usage: scripts/run-app.sh [package-name | package-folder | package.appx] [seconds]
+#        Without a name, the only app set up starts, or a numbered list of them asks which. Given a package folder or
+#        an .appx/.msix (or bundle), the app is set up with setup-prefix.sh the first time (a package file is unpacked
+#        into ~/.local/share/wine-uwp/packages/), then started. seconds is an optional time limit, for testing.
 # Each run is logged to $LOGS/run-<time>.log (the last 8 are kept); a crash backtrace is saved next to it.
 # Environment: WINE_CORE_WINDOWED=1 keeps the app in a window; WINEDEBUG overrides the logging channels.
 set -uo pipefail
 source "$(dirname "$0")/common.sh"
 [ -x "$WINE_ROOT/bin/wine" ] || die "patched Wine not found in $WINE_ROOT: run scripts/fetch-release.sh or scripts/build-wine.sh"
 shopt -s nullglob
-mapfile -t apps < <(list_apps | sort -u)
-[ ${#apps[@]} -gt 0 ] || die "no app set up: run scripts/setup-prefix.sh /path/to/package-folder"
 NAME="${1:-}"
+# a package folder or file: set it up unless it already is, from that same folder
+if [ -n "$NAME" ] && { [ -f "$NAME" ] || [ -f "$NAME/AppxManifest.xml" ]; }; then
+    PKG_DIR="$(cd "$(dirname "$NAME")" && pwd)/$(basename "$NAME")"
+    if [ -f "$PKG_DIR" ]; then
+        PKG_DIR="$(python3 -I "$REPO/scripts/uwptool.py" extract-package "$PKG_DIR" "$PACKAGES")" || die "could not unpack $NAME"
+    fi
+    PKG_DIR="$(cd "$PKG_DIR" && pwd)"
+    IFS=$'\t' read -r PKG_NAME _ < <(python3 -I "$REPO/scripts/uwptool.py" info "$PKG_DIR") || die "$NAME is not a UWP package"
+    if [ "$(head -1 "$SOURCES/$PKG_NAME.source" 2>/dev/null)" != "$PKG_DIR" ] ||
+       [ ! -d "$(app_prefix "$PKG_NAME")/drive_c/$APPS_DIR_NAME/$PKG_NAME" ]; then
+        info "Setting up $PKG_NAME from $PKG_DIR"
+        "$REPO/scripts/setup-prefix.sh" "$PKG_DIR" || die "setting up $PKG_NAME failed"
+    fi
+    shift
+    set -- "$PKG_NAME" "$@"
+    NAME="$PKG_NAME"
+fi
+mapfile -t apps < <(list_apps | sort -u)
+[ ${#apps[@]} -gt 0 ] || die "no app set up: run scripts/run-app.sh /path/to/package-folder-or.appx"
 if [ -z "$NAME" ] && [ ${#apps[@]} -eq 1 ]; then
     NAME="${apps[0]}"
 elif [ -z "$NAME" ]; then
