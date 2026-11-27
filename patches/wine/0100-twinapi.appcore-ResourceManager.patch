@@ -1,0 +1,2100 @@
+Subject: twinapi.appcore: ResourceManager over the package's resources.pri; ResourceContext languages are iterable
+
+diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
+index 0e7f9d2..eea9c98 100644
+--- a/dlls/twinapi.appcore/Makefile.in
++++ b/dlls/twinapi.appcore/Makefile.in
+@@ -4,42 +4,43 @@ IMPORTS   = combase advapi32 user32 gdi32
+ 
+ SOURCES = \
+ 	advertising_manager.c \
+-	api_information.c \
+ 	analytics_info.c \
++	api_information.c \
+ 	app_icon.c \
+ 	application_view.c \
+-	classes.idl \
+ 	auth_probe.c \
++	causality.c \
++	classes.idl \
+ 	client_device_information.c \
+ 	clipboard.c \
+-	current_app.c \
+-	causality.c \
+ 	core_gen.c \
++	core_input_gen.c \
++	current_app.c \
+ 	data_transfer.c \
+ 	diagnostics_settings.c \
+-	core_input_gen.c \
+-	sink.c \
+-	spatial_audio.c \
+-	system_navigation.c \
+-	store.c \
+-	xbox_identity.c \
+-	xboxlive_address.c \
+-	user_gen.c \
+-	user_statics.c \
+-	strmap_gen.c \
+-	thread_pool_timer.c \
+-	twinapi.appcore.rc \
+ 	display_information.c \
+ 	display_request.c \
+ 	extended_execution.c \
+ 	game_save.c \
++	hardware_identification.c \
++	holographic.c \
++	input_capabilities.c \
++	main.c \
++	manifest.c \
+ 	memory_manager.c \
+ 	message_dialog.c \
+ 	mouse.c \
+ 	pointer_visualization.c \
+ 	resource_context.c \
+-	hardware_identification.c \
+-	holographic.c \
+-	input_capabilities.c \
+-	main.c \
+-	manifest.c
++	resource_manager.c \
++	sink.c \
++	spatial_audio.c \
++	store.c \
++	strmap_gen.c \
++	system_navigation.c \
++	thread_pool_timer.c \
++	twinapi.appcore.rc \
++	user_gen.c \
++	user_statics.c \
++	xbox_identity.c \
++	xboxlive_address.c
+diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
+index 9cfa93d..59fa302 100644
+--- a/dlls/twinapi.appcore/main.c
++++ b/dlls/twinapi.appcore/main.c
+@@ -156,6 +156,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( holographic_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, L"Windows.ApplicationModel.Resources.Core.ResourceContext" ))
+         IActivationFactory_QueryInterface( resource_context_factory, &IID_IActivationFactory, (void **)factory );
++    else if (!wcscmp( buffer, L"Windows.ApplicationModel.Resources.Core.ResourceManager" ))
++        IActivationFactory_QueryInterface( resource_manager_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, L"Windows.Media.Audio.SpatialAudioDeviceConfiguration" ))
+         IActivationFactory_QueryInterface( spatial_audio_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, L"Windows.Media.Audio.SpatialAudioFormatSubtype" ))
+diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
+index 694e474..adaf512 100644
+--- a/dlls/twinapi.appcore/private.h
++++ b/dlls/twinapi.appcore/private.h
+@@ -78,6 +78,7 @@ extern IActivationFactory *diagnostics_settings_factory;
+ extern IActivationFactory *clipboard_factory;
+ extern IActivationFactory *api_information_factory;
+ extern IActivationFactory *resource_context_factory;
++extern IActivationFactory *resource_manager_factory;
+ extern IActivationFactory *holographic_factory;
+ extern IActivationFactory *spatial_audio_factory;
+ extern IActivationFactory *spatial_audio_subtype_factory;
+diff --git a/dlls/twinapi.appcore/resource_context.c b/dlls/twinapi.appcore/resource_context.c
+index bf7726a..415ada4 100644
+--- a/dlls/twinapi.appcore/resource_context.c
++++ b/dlls/twinapi.appcore/resource_context.c
+@@ -31,16 +31,19 @@ static const GUID IID_IResourceContextStatics2_local = { 0x41f752ef, 0x12af, 0x4
+ /* IObservableMap<String, String>, IVectorView<String>, IIterable<String> (pinterface IIDs) */
+ static const GUID IID_IObservableMap_HSTRING_HSTRING_local = { 0x1e036276, 0x2f60, 0x55f6, { 0xb7, 0xf3, 0xf8, 0x60, 0x79, 0xe6, 0x90, 0x0b } };
+ static const GUID IID_IVectorView_HSTRING_local = { 0x2f13c006, 0xa03a, 0x5f69, { 0xb0, 0x90, 0x75, 0xa4, 0x3e, 0x33, 0x42, 0x3e } };
++static const GUID IID_IIterable_HSTRING_local = { 0xe2fcc7c1, 0x3bfc, 0x5a0b, { 0xb2, 0xb0, 0x72, 0xe7, 0x69, 0xd1, 0xcb, 0x7e } };
++static const GUID IID_IIterator_HSTRING_local = { 0x8c304ebb, 0x6615, 0x50a4, { 0x88, 0x29, 0x87, 0x9e, 0xcd, 0x44, 0x32, 0x36 } };
+ 
+ static void user_language( WCHAR *name, int size )
+ {
+     if (!GetUserDefaultLocaleName( name, size )) lstrcpynW( name, L"en-US", size );
+ }
+ 
+-/* ---- IVectorView<String>: the context's languages ---- */
++/* ---- IVectorView<String> and IIterable<String>: the context's languages ---- */
+ struct languages
+ {
+     const void *const *lpVtbl;
++    const void *const *iterable_vtbl;
+     LONG ref;
+     HSTRING language;
+ };
+@@ -49,13 +52,17 @@ static HRESULT WINAPI languages_QueryInterface( struct languages *impl, REFIID i
+ {
+     if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+         IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IVectorView_HSTRING_local ))
+-    {
+-        InterlockedIncrement( &impl->ref );
+         *out = impl;
+-        return S_OK;
++    else if (IsEqualGUID( iid, &IID_IIterable_HSTRING_local ))
++        *out = &impl->iterable_vtbl;
++    else
++    {
++        FIXME( "languages %s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
+     }
+-    *out = NULL;
+-    return E_NOINTERFACE;
++    InterlockedIncrement( &impl->ref );
++    return S_OK;
+ }
+ static ULONG WINAPI languages_AddRef( struct languages *impl ) { return InterlockedIncrement( &impl->ref ); }
+ static ULONG WINAPI languages_Release( struct languages *impl )
+@@ -100,6 +107,104 @@ static const void *const languages_vtbl[] =
+     languages_GetAt, languages_get_Size, languages_IndexOf, languages_GetMany,
+ };
+ 
++/* IIterator<String> over the one language */
++struct languages_iterator
++{
++    const void *const *lpVtbl;
++    LONG ref;
++    struct languages *languages;
++    BOOL done;
++};
++
++static HRESULT WINAPI lang_iter_QueryInterface( struct languages_iterator *impl, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IIterator_HSTRING_local ))
++    {
++        InterlockedIncrement( &impl->ref );
++        *out = impl;
++        return S_OK;
++    }
++    FIXME( "iterator %s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI lang_iter_AddRef( struct languages_iterator *impl ) { return InterlockedIncrement( &impl->ref ); }
++static ULONG WINAPI lang_iter_Release( struct languages_iterator *impl )
++{
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        languages_Release( impl->languages );
++        free( impl );
++    }
++    return ref;
++}
++static HRESULT WINAPI lang_iter_GetIids( struct languages_iterator *impl, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI lang_iter_GetRuntimeClassName( struct languages_iterator *impl, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI lang_iter_GetTrustLevel( struct languages_iterator *impl, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI lang_iter_get_Current( struct languages_iterator *impl, HSTRING *value )
++{
++    *value = NULL;
++    if (impl->done) return E_BOUNDS;
++    return WindowsDuplicateString( impl->languages->language, value );
++}
++static HRESULT WINAPI lang_iter_get_HasCurrent( struct languages_iterator *impl, boolean *value )
++{
++    *value = !impl->done;
++    return S_OK;
++}
++static HRESULT WINAPI lang_iter_MoveNext( struct languages_iterator *impl, boolean *value )
++{
++    impl->done = TRUE;
++    *value = FALSE;
++    return S_OK;
++}
++static HRESULT WINAPI lang_iter_GetMany( struct languages_iterator *impl, UINT32 size, HSTRING *items, UINT32 *count )
++{
++    *count = 0;
++    if (impl->done || !size) return S_OK;
++    *count = 1;
++    return WindowsDuplicateString( impl->languages->language, items );
++}
++static const void *const lang_iter_vtbl[] =
++{
++    lang_iter_QueryInterface, lang_iter_AddRef, lang_iter_Release,
++    lang_iter_GetIids, lang_iter_GetRuntimeClassName, lang_iter_GetTrustLevel,
++    lang_iter_get_Current, lang_iter_get_HasCurrent, lang_iter_MoveNext, lang_iter_GetMany,
++};
++
++static inline struct languages *languages_from_iterable( void *iface )
++{
++    return CONTAINING_RECORD( iface, struct languages, iterable_vtbl );
++}
++static HRESULT WINAPI lang_iterable_QueryInterface( void *iface, REFIID iid, void **out )
++{ return languages_QueryInterface( languages_from_iterable( iface ), iid, out ); }
++static ULONG WINAPI lang_iterable_AddRef( void *iface ) { return languages_AddRef( languages_from_iterable( iface ) ); }
++static ULONG WINAPI lang_iterable_Release( void *iface ) { return languages_Release( languages_from_iterable( iface ) ); }
++static HRESULT WINAPI lang_iterable_GetIids( void *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI lang_iterable_GetRuntimeClassName( void *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI lang_iterable_GetTrustLevel( void *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI lang_iterable_First( void *iface, void **value )
++{
++    struct languages *languages = languages_from_iterable( iface );
++    struct languages_iterator *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->lpVtbl = lang_iter_vtbl;
++    impl->ref = 1;
++    impl->languages = languages;
++    languages_AddRef( languages );
++    *value = impl;
++    return S_OK;
++}
++static const void *const lang_iterable_vtbl[] =
++{
++    lang_iterable_QueryInterface, lang_iterable_AddRef, lang_iterable_Release,
++    lang_iterable_GetIids, lang_iterable_GetRuntimeClassName, lang_iterable_GetTrustLevel,
++    lang_iterable_First,
++};
++
+ static HRESULT languages_create( void **out )
+ {
+     struct languages *impl;
+@@ -107,6 +212,7 @@ static HRESULT languages_create( void **out )
+ 
+     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+     impl->lpVtbl = languages_vtbl;
++    impl->iterable_vtbl = lang_iterable_vtbl;
+     impl->ref = 1;
+     user_language( name, ARRAY_SIZE(name) );
+     WindowsCreateString( name, wcslen( name ), &impl->language );
+diff --git a/dlls/twinapi.appcore/resource_manager.c b/dlls/twinapi.appcore/resource_manager.c
+new file mode 100644
+index 0000000..f3b4651
+--- /dev/null
++++ b/dlls/twinapi.appcore/resource_manager.c
+@@ -0,0 +1,1402 @@
++/* WinRT Windows.ApplicationModel.Resources.Core.ResourceManager
++ *
++ * The package's resources.pri, read directly: the resource maps are its named resources ("Resources/AppName",
++ * "MyLibrary.Resources.Strings/Message", "Files/Assets/Logo.png"), and a resource's value is its first candidate.
++ * Qualifiers (language, scale, contrast) are not matched yet: for a resource with candidates in several languages,
++ * the first is used. .NET Native looks up every resx string this way, through ResourceManager.Current.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#include "appmodel.h"
++#include "roapi.h"
++#include "initguid.h"
++#define WIDL_using_Windows_ApplicationModel_Resources_Core
++#include "windows.applicationmodel.resources.core.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
++
++/* ---- resources.pri ---- */
++
++#define SECTION_HEADER 32
++#define SECTION_FOOTER 8
++
++/* ResourceValueType, the type of a candidate's value */
++enum value_type { VALUE_STRING, VALUE_PATH, VALUE_EMBEDDED, VALUE_ASCII_STRING, VALUE_UTF8_STRING, VALUE_ASCII_PATH,
++                  VALUE_UTF8_PATH };
++
++struct pri_section
++{
++    const BYTE *data;   /* the content, after the section header */
++    UINT32 size;
++};
++
++struct pri_name
++{
++    WCHAR *path;        /* "Resources/AppName" */
++    UINT32 item;        /* its resource map item */
++};
++
++struct pri_file
++{
++    BYTE *data;
++    SIZE_T size;
++    struct pri_section *sections;
++    char (*ids)[16];
++    UINT16 count;
++    int map;            /* the resource map section */
++    struct pri_name *names;
++    UINT32 name_count;
++    WCHAR package[256]; /* the package's simple name, from the schema */
++    WCHAR root[MAX_PATH];
++};
++
++static struct pri_file *pri;
++static INIT_ONCE pri_once = INIT_ONCE_STATIC_INIT;
++
++static UINT16 get16( const BYTE *p ) { return p[0] | (p[1] << 8); }
++static UINT32 get32( const BYTE *p ) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((UINT32)p[3] << 24); }
++
++static BYTE *read_file( const WCHAR *path, SIZE_T *size )
++{
++    LARGE_INTEGER li;
++    HANDLE handle;
++    BYTE *data = NULL;
++    DWORD read;
++
++    handle = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++    if (handle == INVALID_HANDLE_VALUE) return NULL;
++    if (GetFileSizeEx( handle, &li ) && li.QuadPart < 256 * 1024 * 1024 && (data = malloc( li.QuadPart )) &&
++        (!ReadFile( handle, data, li.QuadPart, &read, NULL ) || read != li.QuadPart))
++    {
++        free( data );
++        data = NULL;
++    }
++    CloseHandle( handle );
++    *size = data ? li.QuadPart : 0;
++    return data;
++}
++
++static int find_section( struct pri_file *file, const char *prefix )
++{
++    UINT16 i;
++    for (i = 0; i < file->count; i++)
++        if (!memcmp( file->ids[i], prefix, strlen( prefix ) ) && file->sections[i].data) return i;
++    return -1;
++}
++
++/* an entry of the hierarchical schema: a scope or an item */
++struct schema_entry
++{
++    UINT16 parent, full_path_length, index;
++    BYTE flags;
++    UINT32 name_offset;
++};
++
++static BOOL entry_name( const struct pri_section *s, const struct schema_entry *e, UINT32 unicode, UINT32 ascii,
++                        WCHAR *buf, UINT32 len )
++{
++    UINT32 i;
++
++    if (!e->full_path_length)
++    {
++        buf[0] = 0;
++        return TRUE;
++    }
++    if (e->flags & 0x20)
++    {
++        for (i = 0; i + 1 < len && ascii + e->name_offset + i < s->size && s->data[ascii + e->name_offset + i]; i++)
++            buf[i] = s->data[ascii + e->name_offset + i];
++    }
++    else
++    {
++        for (i = 0; i + 1 < len && unicode + (e->name_offset + i) * 2 + 1 < s->size &&
++             get16( s->data + unicode + (e->name_offset + i) * 2 ); i++)
++            buf[i] = get16( s->data + unicode + (e->name_offset + i) * 2 );
++    }
++    buf[i] = 0;
++    return i + 1 < len;
++}
++
++/* every item of the hierarchical schema, with its full name, into file->names; and the package's name */
++static BOOL schema_read( struct pri_file *file, const struct pri_section *s, BOOL extended )
++{
++    UINT32 pos, scopes, items, count, unicode_length, ascii_length = 0, entries, unicode, ascii, i, depth;
++    UINT16 unique_length, name_length;
++    struct schema_entry *table;
++    BOOL extended_names = FALSE;
++    WCHAR path[1024], part[MAX_PATH];
++    UINT32 chain[64];
++
++    if (s->size < 8 || get16( s->data ) != 1) return FALSE;
++    unique_length = get16( s->data + 2 );
++    name_length = get16( s->data + 4 );
++    pos = 8;
++    if (extended)
++    {
++        if (pos + 16 > s->size) return FALSE;
++        extended_names = !memcmp( s->data + pos, "[def_hnamesx]", 13 );
++        pos += 16;
++    }
++    if (pos + 20 + (unique_length + name_length) * 2 > s->size) return FALSE;
++    scopes = get32( s->data + pos + 12 );
++    items = get32( s->data + pos + 16 );
++    /* the unique name ("ms-appx://Package.Name/") then the simple one ("Package.Name"), each with its 0 */
++    for (i = 0; i < name_length && i + 1 < ARRAY_SIZE(file->package); i++)
++        if (!(file->package[i] = get16( s->data + pos + 20 + (unique_length + i) * 2 ))) break;
++    file->package[i] = 0;
++    pos += 20 + (unique_length + name_length) * 2 + 2;
++    if (pos + 20 + (extended_names ? 4 : 0) > s->size) return FALSE;
++    unicode_length = get32( s->data + pos + 16 );
++    if (extended_names) ascii_length = get32( s->data + pos + 24 );
++    pos += 24 + (extended_names ? 4 : 0);
++    count = scopes + items;
++    entries = pos;
++    unicode = entries + count * 12 + scopes * 8 + items * 2;
++    ascii = unicode + unicode_length * 2;
++    if ((UINT64)ascii + ascii_length > s->size || !count) return FALSE;
++    if (!(table = calloc( count, sizeof(*table) ))) return FALSE;
++    if (!(file->names = calloc( items, sizeof(*file->names) )))
++    {
++        free( table );
++        return FALSE;
++    }
++    for (i = 0; i < count; i++)
++    {
++        const BYTE *p = s->data + entries + i * 12;
++        table[i].parent = get16( p );
++        table[i].full_path_length = get16( p + 2 );
++        table[i].flags = p[7];
++        table[i].name_offset = get16( p + 8 ) | ((p[7] & 0xf) << 16);
++        table[i].index = get16( p + 10 );
++    }
++    for (i = 0; i < count && file->name_count < items; i++)
++    {
++        UINT32 j, k = i;
++        BOOL ok = TRUE;
++
++        if (table[i].flags & 0x10) continue;   /* a scope */
++        /* up to the root, which is left out of names */
++        for (depth = 0; k && depth < ARRAY_SIZE(chain); depth++)
++        {
++            chain[depth] = k;
++            if (table[k].parent >= count || table[k].parent == k) break;
++            k = table[k].parent;
++        }
++        path[0] = 0;
++        for (j = depth; j > 0 && ok; j--)
++        {
++            if (!entry_name( s, &table[chain[j - 1]], unicode, ascii, part, ARRAY_SIZE(part) ) ||
++                wcslen( path ) + wcslen( part ) + 2 >= ARRAY_SIZE(path)) ok = FALSE;
++            else
++            {
++                if (path[0]) lstrcatW( path, L"/" );
++                lstrcatW( path, part );
++            }
++        }
++        if (!ok || !(file->names[file->name_count].path = wcsdup( path ))) continue;
++        file->names[file->name_count++].item = table[i].index;
++    }
++    free( table );
++    return TRUE;
++}
++
++static BOOL data_item( const struct pri_section *s, UINT32 index, const BYTE **data, UINT32 *size )
++{
++    UINT16 strings, blobs;
++    UINT32 start, offset;
++
++    if (s->size < 12) return FALSE;
++    strings = get16( s->data + 4 );
++    blobs = get16( s->data + 6 );
++    start = 12 + strings * 4 + blobs * 8;
++    if (index < strings)
++    {
++        offset = get16( s->data + 12 + index * 4 );
++        *size = get16( s->data + 12 + index * 4 + 2 );
++    }
++    else if (index < (UINT32)strings + blobs)
++    {
++        offset = get32( s->data + 12 + strings * 4 + (index - strings) * 8 );
++        *size = get32( s->data + 12 + strings * 4 + (index - strings) * 8 + 4 );
++    }
++    else return FALSE;
++    if ((UINT64)start + offset + *size > s->size) return FALSE;
++    *data = s->data + start + offset;
++    return TRUE;
++}
++
++/* the first candidate of an item of the resource map, and its value type */
++static BOOL map_find( struct pri_file *file, UINT32 item, const BYTE **data, UINT32 *size, UINT32 *type )
++{
++    const struct pri_section *s = &file->sections[file->map];
++    UINT16 env_length, schema_ref_length, types, map_count, group_count;
++    UINT32 info_count, candidates, data_length, large_length, pos, i, j, types_pos;
++    UINT32 first_item, group, group_size, first_info, info, string_data;
++    UINT32 maps, groups, infos, large_maps = 0, large_groups = 0, large_infos = 0, total_maps, total_groups;
++    const BYTE *large = NULL, *c;
++
++    if (s->size < 32) return FALSE;
++    env_length = get16( s->data );
++    schema_ref_length = get16( s->data + 6 );
++    types = get16( s->data + 10 );
++    map_count = get16( s->data + 12 );
++    group_count = get16( s->data + 14 );
++    info_count = get32( s->data + 16 );
++    candidates = get32( s->data + 20 );
++    data_length = get32( s->data + 24 );
++    large_length = get32( s->data + 28 );
++    types_pos = 32 + env_length + schema_ref_length;
++    pos = types_pos + types * 8;
++    maps = pos;
++    groups = maps + map_count * 4;
++    infos = groups + group_count * 4;
++    pos = infos + info_count * 4;
++    if (large_length)
++    {
++        large = s->data + pos;
++        if (pos + 12 > s->size) return FALSE;
++        large_maps = get32( large );
++        large_groups = get32( large + 4 );
++        large_infos = get32( large + 8 );
++    }
++    pos += large_length;
++    string_data = pos + candidates * 8;
++    if ((UINT64)string_data + data_length > s->size) return FALSE;
++    total_maps = map_count + large_maps;
++    total_groups = group_count + large_groups;
++    for (i = 0; i < total_maps; i++)
++    {
++        if (i < map_count)
++        {
++            first_item = get16( s->data + maps + i * 4 );
++            group = get16( s->data + maps + i * 4 + 2 );
++        }
++        else
++        {
++            first_item = get32( large + 12 + (i - map_count) * 8 );
++            group = get32( large + 12 + (i - map_count) * 8 + 4 );
++        }
++        if (group < group_count)
++        {
++            group_size = get16( s->data + groups + group * 4 );
++            first_info = get16( s->data + groups + group * 4 + 2 );
++        }
++        else if (group < total_groups)
++        {
++            const BYTE *g = large + 12 + large_maps * 8 + (group - group_count) * 8;
++            group_size = get32( g );
++            first_info = get32( g + 4 );
++        }
++        else
++        {
++            group_size = 1;
++            first_info = group - total_groups;
++        }
++        if (item < first_item || item >= first_item + group_size) continue;
++        j = first_info + (item - first_item);
++        if (j < info_count) info = get16( s->data + infos + j * 4 + 2 );
++        else if (j - info_count < large_infos) info = get32( large + 12 + large_maps * 8 + large_groups * 8 + (j - info_count) * 8 + 4 );
++        else return FALSE;
++        if (info >= candidates) return FALSE;
++        c = s->data + pos + info * 8;
++        *type = c[1] < types ? get32( s->data + types_pos + c[1] * 8 + 4 ) : VALUE_EMBEDDED;
++        if (c[0] == 1)
++        {
++            UINT16 source = get16( c + 2 ), location = get16( c + 4 ), section = get16( c + 6 );
++            if (source) FIXME( "item %u is in another file (%u).\n", item, source );
++            if (source || section >= file->count || !file->sections[section].data) return FALSE;
++            return data_item( &file->sections[section], location, data, size );
++        }
++        if (c[0] == 0)
++        {
++            UINT32 offset = get32( c + 4 );
++            *size = get16( c + 2 );
++            if ((UINT64)offset + *size > data_length) return FALSE;
++            *data = s->data + string_data + offset;
++            return TRUE;
++        }
++        return FALSE;
++    }
++    return FALSE;
++}
++
++static BOOL CALLBACK pri_load( INIT_ONCE *once, void *param, void **context )
++{
++    UINT32 toc, start, i, offset, length, len;
++    struct pri_file *file;
++    const BYTE *entry;
++    WCHAR path[MAX_PATH + 16], *p;
++    int schema;
++
++    if (!(file = calloc( 1, sizeof(*file) ))) return TRUE;
++    len = ARRAY_SIZE(file->root);
++    if (GetCurrentPackagePath( &len, file->root ))
++    {
++        GetModuleFileNameW( NULL, file->root, ARRAY_SIZE(file->root) );
++        if ((p = wcsrchr( file->root, '\\' ))) *p = 0;
++    }
++    swprintf( path, ARRAY_SIZE(path), L"%s\\resources.pri", file->root );
++    if (!(file->data = read_file( path, &file->size ))) goto fail;
++    if (file->size < 32 || memcmp( file->data, "mrm_pri", 7 )) goto fail;
++    toc = get32( file->data + 16 );
++    start = get32( file->data + 20 );
++    file->count = get16( file->data + 24 );
++    if ((UINT64)toc + file->count * 32 > file->size) goto fail;
++    if (!(file->sections = calloc( file->count, sizeof(*file->sections) )) ||
++        !(file->ids = calloc( file->count, sizeof(*file->ids) ))) goto fail;
++    for (i = 0; i < file->count; i++)
++    {
++        entry = file->data + toc + i * 32;
++        memcpy( file->ids[i], entry, 16 );
++        offset = start + get32( entry + 24 );
++        length = get32( entry + 28 );
++        if (length < SECTION_HEADER + SECTION_FOOTER || (UINT64)offset + length > file->size) continue;
++        file->sections[i].data = file->data + offset + SECTION_HEADER;
++        file->sections[i].size = length - SECTION_HEADER - SECTION_FOOTER;
++    }
++    if ((schema = find_section( file, "[mrm_hschemaex]" )) < 0 && (schema = find_section( file, "[mrm_hschema]" )) < 0)
++        goto fail;
++    if ((file->map = find_section( file, "[mrm_res_map2_]" )) < 0 && (file->map = find_section( file, "[mrm_res_map__]" )) < 0)
++        goto fail;
++    if (!schema_read( file, &file->sections[schema], !memcmp( file->ids[schema], "[mrm_hschemaex]", 15 ) )) goto fail;
++    TRACE( "%s: package %s, %u resources.\n", debugstr_w(path), debugstr_w(file->package), file->name_count );
++    pri = file;
++    return TRUE;
++
++fail:
++    WARN( "no usable %s.\n", debugstr_w(path) );
++    free( file->data );
++    free( file->sections );
++    free( file->ids );
++    free( file->names );
++    free( file );
++    return TRUE;
++}
++
++static struct pri_file *pri_get(void)
++{
++    InitOnceExecuteOnce( &pri_once, pri_load, NULL, NULL );
++    return pri;
++}
++
++/* the full name of a resource asked for in a map: "Strings/Hello", "/Resources/Hello" (from the root),
++ * "ms-resource:///Resources/Hello" or "ms-resource://Package.Name/Resources/Hello" */
++static WCHAR *resource_path( const WCHAR *prefix, const WCHAR *name )
++{
++    BOOL absolute = FALSE;
++    WCHAR *path;
++    SIZE_T len;
++
++    if (!name) name = L"";
++    if (!wcsnicmp( name, L"ms-resource:", 12 ))
++    {
++        name += 12;
++        absolute = TRUE;
++        if (name[0] == '/' && name[1] == '/')
++        {
++            name += 2;
++            while (*name && *name != '/') name++;   /* the package name */
++        }
++    }
++    if (*name == '/') absolute = TRUE;
++    while (*name == '/') name++;
++    if (absolute || !prefix || !prefix[0]) return wcsdup( name );
++    len = wcslen( prefix ) + wcslen( name ) + 2;
++    if (!(path = malloc( len * sizeof(WCHAR) ))) return NULL;
++    swprintf( path, len, L"%s/%s", prefix, name );
++    return path;
++}
++
++static const struct pri_name *pri_find( struct pri_file *file, const WCHAR *path )
++{
++    UINT32 i;
++
++    if (!file) return NULL;
++    for (i = 0; i < file->name_count; i++)
++        if (!wcsicmp( file->names[i].path, path )) return &file->names[i];
++    return NULL;
++}
++
++/* resw names a control's property "Hello.Text"; resources.pri has it as "Hello/Text" */
++static const struct pri_name *pri_find_resource( struct pri_file *file, const WCHAR *prefix, const WCHAR *name )
++{
++    const struct pri_name *found;
++    WCHAR *path, *p;
++
++    if (!(path = resource_path( prefix, name ))) return NULL;
++    if (!(found = pri_find( file, path )) && (p = wcsrchr( path, '.' )) && p > wcsrchr( path, '/' ))
++    {
++        *p = '/';
++        found = pri_find( file, path );
++    }
++    TRACE( "%s: %s.\n", debugstr_w(path), found ? "found" : "not found" );
++    free( path );
++    return found;
++}
++
++/* how many resources are below the prefix (all of them for "") */
++static UINT32 pri_count( struct pri_file *file, const WCHAR *prefix )
++{
++    UINT32 i, n = 0, len = wcslen( prefix );
++
++    if (!file) return 0;
++    if (!len) return file->name_count;
++    for (i = 0; i < file->name_count; i++)
++        if (!wcsnicmp( file->names[i].path, prefix, len ) && file->names[i].path[len] == '/') n++;
++    return n;
++}
++
++/* ---- ResourceCandidate ---- */
++
++struct candidate
++{
++    IResourceCandidate IResourceCandidate_iface;
++    IResourceCandidate2 IResourceCandidate2_iface;
++    IResourceCandidate3 IResourceCandidate3_iface;
++    LONG ref;
++    BYTE *data;
++    UINT32 size;
++    UINT32 type;
++};
++
++static inline struct candidate *impl_from_IResourceCandidate( IResourceCandidate *iface )
++{
++    return CONTAINING_RECORD( iface, struct candidate, IResourceCandidate_iface );
++}
++
++static HRESULT WINAPI candidate_QueryInterface( IResourceCandidate *iface, REFIID iid, void **out )
++{
++    struct candidate *impl = impl_from_IResourceCandidate( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IResourceCandidate ))
++        *out = &impl->IResourceCandidate_iface;
++    else if (IsEqualGUID( iid, &IID_IResourceCandidate2 ))
++        *out = &impl->IResourceCandidate2_iface;
++    else if (IsEqualGUID( iid, &IID_IResourceCandidate3 ))
++        *out = &impl->IResourceCandidate3_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI candidate_AddRef( IResourceCandidate *iface )
++{
++    return InterlockedIncrement( &impl_from_IResourceCandidate( iface )->ref );
++}
++
++static ULONG WINAPI candidate_Release( IResourceCandidate *iface )
++{
++    struct candidate *impl = impl_from_IResourceCandidate( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        free( impl->data );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI candidate_GetIids( IResourceCandidate *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI candidate_GetRuntimeClassName( IResourceCandidate *iface, HSTRING *name )
++{
++    static const WCHAR class_name[] = L"Windows.ApplicationModel.Resources.Core.ResourceCandidate";
++    return WindowsCreateString( class_name, wcslen( class_name ), name );
++}
++
++static HRESULT WINAPI candidate_GetTrustLevel( IResourceCandidate *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI candidate_get_Qualifiers( IResourceCandidate *iface, IVectorView_ResourceQualifier **value )
++{
++    FIXME( "iface %p, value %p stub!\n", iface, value );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI candidate_get_IsMatch( IResourceCandidate *iface, boolean *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = TRUE;
++    return S_OK;
++}
++
++static HRESULT WINAPI candidate_get_IsMatchAsDefault( IResourceCandidate *iface, boolean *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI candidate_get_IsDefault( IResourceCandidate *iface, boolean *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = TRUE;
++    return S_OK;
++}
++
++static HRESULT WINAPI candidate_get_ValueAsString( IResourceCandidate *iface, HSTRING *value )
++{
++    struct candidate *impl = impl_from_IResourceCandidate( iface );
++    const WCHAR *wstr = (const WCHAR *)impl->data;
++    struct pri_file *file = pri_get();
++    WCHAR *buf = NULL, *path;
++    UINT32 len;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    switch (impl->type)
++    {
++    case VALUE_STRING:
++    case VALUE_PATH:
++        len = impl->size / sizeof(WCHAR);
++        break;
++    case VALUE_ASCII_STRING:
++    case VALUE_UTF8_STRING:
++    case VALUE_ASCII_PATH:
++    case VALUE_UTF8_PATH:
++        len = MultiByteToWideChar( CP_UTF8, 0, (const char *)impl->data, impl->size, NULL, 0 );
++        if (!(buf = malloc( (len + 1) * sizeof(WCHAR) ))) return E_OUTOFMEMORY;
++        MultiByteToWideChar( CP_UTF8, 0, (const char *)impl->data, impl->size, buf, len );
++        wstr = buf;
++        break;
++    default:
++        WARN( "embedded data has no string value.\n" );
++        return HRESULT_FROM_WIN32( ERROR_MRM_RESOURCE_TYPE_MISMATCH );
++    }
++    while (len && !wstr[len - 1]) len--;
++
++    if ((impl->type == VALUE_PATH || impl->type == VALUE_ASCII_PATH || impl->type == VALUE_UTF8_PATH) && file)
++    {
++        /* a file: its full path in the package */
++        UINT32 full = wcslen( file->root ) + len + 2;
++        if (!(path = malloc( full * sizeof(WCHAR) )))
++        {
++            free( buf );
++            return E_OUTOFMEMORY;
++        }
++        swprintf( path, full, L"%s\\%.*s", file->root, len, wstr );
++        hr = WindowsCreateString( path, wcslen( path ), value );
++        free( path );
++    }
++    else hr = WindowsCreateString( wstr, len, value );
++    free( buf );
++    return hr;
++}
++
++static HRESULT WINAPI candidate_GetValueAsFileAsync( IResourceCandidate *iface, IAsyncOperation_StorageFile **operation )
++{
++    FIXME( "iface %p, operation %p stub!\n", iface, operation );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI candidate_GetQualifierValue( IResourceCandidate *iface, HSTRING name, HSTRING *value )
++{
++    FIXME( "iface %p, name %s, value %p: no qualifiers.\n", iface, debugstr_hstring(name), value );
++    *value = NULL;
++    return S_OK;
++}
++
++static const struct IResourceCandidateVtbl candidate_vtbl =
++{
++    candidate_QueryInterface,
++    candidate_AddRef,
++    candidate_Release,
++    candidate_GetIids,
++    candidate_GetRuntimeClassName,
++    candidate_GetTrustLevel,
++    candidate_get_Qualifiers,
++    candidate_get_IsMatch,
++    candidate_get_IsMatchAsDefault,
++    candidate_get_IsDefault,
++    candidate_get_ValueAsString,
++    candidate_GetValueAsFileAsync,
++    candidate_GetQualifierValue,
++};
++
++DEFINE_IINSPECTABLE( candidate2, IResourceCandidate2, struct candidate, IResourceCandidate_iface )
++
++static HRESULT WINAPI candidate2_GetValueAsStreamAsync( IResourceCandidate2 *iface, IAsyncOperation_IRandomAccessStream **operation )
++{
++    FIXME( "iface %p, operation %p stub!\n", iface, operation );
++    return E_NOTIMPL;
++}
++
++static const struct IResourceCandidate2Vtbl candidate2_vtbl =
++{
++    candidate2_QueryInterface,
++    candidate2_AddRef,
++    candidate2_Release,
++    candidate2_GetIids,
++    candidate2_GetRuntimeClassName,
++    candidate2_GetTrustLevel,
++    candidate2_GetValueAsStreamAsync,
++};
++
++DEFINE_IINSPECTABLE( candidate3, IResourceCandidate3, struct candidate, IResourceCandidate_iface )
++
++static HRESULT WINAPI candidate3_get_Kind( IResourceCandidate3 *iface, ResourceCandidateKind *value )
++{
++    struct candidate *impl = impl_from_IResourceCandidate3( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    switch (impl->type)
++    {
++    case VALUE_PATH: case VALUE_ASCII_PATH: case VALUE_UTF8_PATH: *value = ResourceCandidateKind_File; break;
++    case VALUE_EMBEDDED: *value = ResourceCandidateKind_EmbeddedData; break;
++    default: *value = ResourceCandidateKind_String; break;
++    }
++    return S_OK;
++}
++
++static const struct IResourceCandidate3Vtbl candidate3_vtbl =
++{
++    candidate3_QueryInterface,
++    candidate3_AddRef,
++    candidate3_Release,
++    candidate3_GetIids,
++    candidate3_GetRuntimeClassName,
++    candidate3_GetTrustLevel,
++    candidate3_get_Kind,
++};
++
++static HRESULT candidate_create( const struct pri_name *name, IResourceCandidate **out )
++{
++    struct pri_file *file = pri_get();
++    struct candidate *impl;
++    const BYTE *data;
++    UINT32 size, type;
++
++    *out = NULL;
++    if (!file || !name || !map_find( file, name->item, &data, &size, &type ))
++        return HRESULT_FROM_WIN32( ERROR_MRM_NAMED_RESOURCE_NOT_FOUND );
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IResourceCandidate_iface.lpVtbl = &candidate_vtbl;
++    impl->IResourceCandidate2_iface.lpVtbl = &candidate2_vtbl;
++    impl->IResourceCandidate3_iface.lpVtbl = &candidate3_vtbl;
++    impl->ref = 1;
++    impl->type = type;
++    impl->size = size;
++    if (!(impl->data = malloc( size ? size : 1 )))
++    {
++        free( impl );
++        return E_OUTOFMEMORY;
++    }
++    memcpy( impl->data, data, size );
++    TRACE( "%s: type %u, %u bytes.\n", debugstr_w(name->path), type, size );
++    *out = &impl->IResourceCandidate_iface;
++    return S_OK;
++}
++
++/* ---- NamedResource ---- */
++
++struct named_resource
++{
++    INamedResource INamedResource_iface;
++    LONG ref;
++    const struct pri_name *name;
++};
++
++static inline struct named_resource *impl_from_INamedResource( INamedResource *iface )
++{
++    return CONTAINING_RECORD( iface, struct named_resource, INamedResource_iface );
++}
++
++static HRESULT WINAPI named_QueryInterface( INamedResource *iface, REFIID iid, void **out )
++{
++    struct named_resource *impl = impl_from_INamedResource( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_INamedResource ))
++    {
++        *out = &impl->INamedResource_iface;
++        INamedResource_AddRef( &impl->INamedResource_iface );
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI named_AddRef( INamedResource *iface )
++{
++    return InterlockedIncrement( &impl_from_INamedResource( iface )->ref );
++}
++
++static ULONG WINAPI named_Release( INamedResource *iface )
++{
++    struct named_resource *impl = impl_from_INamedResource( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI named_GetIids( INamedResource *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI named_GetRuntimeClassName( INamedResource *iface, HSTRING *name )
++{
++    static const WCHAR class_name[] = L"Windows.ApplicationModel.Resources.Core.NamedResource";
++    return WindowsCreateString( class_name, wcslen( class_name ), name );
++}
++
++static HRESULT WINAPI named_GetTrustLevel( INamedResource *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI named_get_Uri( INamedResource *iface, IUriRuntimeClass **value )
++{
++    FIXME( "iface %p, value %p stub!\n", iface, value );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI named_get_Candidates( INamedResource *iface, IVectorView_ResourceCandidate **value )
++{
++    FIXME( "iface %p, value %p stub!\n", iface, value );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI named_Resolve( INamedResource *iface, IResourceCandidate **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return candidate_create( impl_from_INamedResource( iface )->name, value );
++}
++
++static HRESULT WINAPI named_ResolveForContext( INamedResource *iface, IResourceContext *context, IResourceCandidate **value )
++{
++    TRACE( "iface %p, context %p, value %p.\n", iface, context, value );
++    return candidate_create( impl_from_INamedResource( iface )->name, value );
++}
++
++static HRESULT WINAPI named_ResolveAll( INamedResource *iface, IVectorView_ResourceCandidate **value )
++{
++    FIXME( "iface %p, value %p stub!\n", iface, value );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI named_ResolveAllForContext( INamedResource *iface, IResourceContext *context,
++                                                  IVectorView_ResourceCandidate **value )
++{
++    FIXME( "iface %p, context %p, value %p stub!\n", iface, context, value );
++    return E_NOTIMPL;
++}
++
++static const struct INamedResourceVtbl named_vtbl =
++{
++    named_QueryInterface,
++    named_AddRef,
++    named_Release,
++    named_GetIids,
++    named_GetRuntimeClassName,
++    named_GetTrustLevel,
++    named_get_Uri,
++    named_get_Candidates,
++    named_Resolve,
++    named_ResolveForContext,
++    named_ResolveAll,
++    named_ResolveAllForContext,
++};
++
++static HRESULT named_resource_create( const struct pri_name *name, INamedResource **out )
++{
++    struct named_resource *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->INamedResource_iface.lpVtbl = &named_vtbl;
++    impl->ref = 1;
++    impl->name = name;
++    *out = &impl->INamedResource_iface;
++    return S_OK;
++}
++
++/* ---- ResourceMap: the package's resources, or a subtree of them ---- */
++
++struct resource_map
++{
++    IResourceMap IResourceMap_iface;
++    IMapView_HSTRING_NamedResource IMapView_HSTRING_NamedResource_iface;
++    IIterable_IKeyValuePair_HSTRING_NamedResource IIterable_IKeyValuePair_HSTRING_NamedResource_iface;
++    LONG ref;
++    WCHAR *prefix;      /* "" for the package's map, "Resources" for that subtree */
++};
++
++static HRESULT resource_map_create( const WCHAR *prefix, IResourceMap **out );
++
++static inline struct resource_map *impl_from_IResourceMap( IResourceMap *iface )
++{
++    return CONTAINING_RECORD( iface, struct resource_map, IResourceMap_iface );
++}
++
++static HRESULT WINAPI map_QueryInterface( IResourceMap *iface, REFIID iid, void **out )
++{
++    struct resource_map *impl = impl_from_IResourceMap( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IResourceMap ))
++        *out = &impl->IResourceMap_iface;
++    else if (IsEqualGUID( iid, &IID_IMapView_HSTRING_NamedResource ))
++        *out = &impl->IMapView_HSTRING_NamedResource_iface;
++    else if (IsEqualGUID( iid, &IID_IIterable_IKeyValuePair_HSTRING_NamedResource ))
++        *out = &impl->IIterable_IKeyValuePair_HSTRING_NamedResource_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI map_AddRef( IResourceMap *iface )
++{
++    return InterlockedIncrement( &impl_from_IResourceMap( iface )->ref );
++}
++
++static ULONG WINAPI map_Release( IResourceMap *iface )
++{
++    struct resource_map *impl = impl_from_IResourceMap( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        free( impl->prefix );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI map_GetIids( IResourceMap *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI map_GetRuntimeClassName( IResourceMap *iface, HSTRING *name )
++{
++    static const WCHAR class_name[] = L"Windows.ApplicationModel.Resources.Core.ResourceMap";
++    return WindowsCreateString( class_name, wcslen( class_name ), name );
++}
++
++static HRESULT WINAPI map_GetTrustLevel( IResourceMap *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI map_get_Uri( IResourceMap *iface, IUriRuntimeClass **value )
++{
++    struct resource_map *impl = impl_from_IResourceMap( iface );
++    static const WCHAR uri_class[] = L"Windows.Foundation.Uri";
++    struct pri_file *file = pri_get();
++    IUriRuntimeClassFactory *factory;
++    HSTRING_HEADER header;
++    WCHAR uri[1024];
++    HSTRING str;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    swprintf( uri, ARRAY_SIZE(uri), L"ms-resource://%s/%s", file ? file->package : L"", impl->prefix );
++    if (FAILED(hr = WindowsCreateStringReference( uri_class, wcslen( uri_class ), &header, &str ))) return hr;
++    if (FAILED(hr = RoGetActivationFactory( str, &IID_IUriRuntimeClassFactory, (void **)&factory ))) return hr;
++    if (SUCCEEDED(hr = WindowsCreateString( uri, wcslen( uri ), &str )))
++    {
++        hr = IUriRuntimeClassFactory_CreateUri( factory, str, value );
++        WindowsDeleteString( str );
++    }
++    IUriRuntimeClassFactory_Release( factory );
++    return hr;
++}
++
++static HRESULT WINAPI map_GetValue( IResourceMap *iface, HSTRING resource, IResourceCandidate **value )
++{
++    struct resource_map *impl = impl_from_IResourceMap( iface );
++    const struct pri_name *name;
++
++    TRACE( "iface %p, resource %s, value %p.\n", iface, debugstr_hstring(resource), value );
++
++    if (!value) return E_POINTER;
++    name = pri_find_resource( pri_get(), impl->prefix, WindowsGetStringRawBuffer( resource, NULL ) );
++    return candidate_create( name, value );
++}
++
++static HRESULT WINAPI map_GetValueForContext( IResourceMap *iface, HSTRING resource, IResourceContext *context,
++                                              IResourceCandidate **value )
++{
++    TRACE( "iface %p, resource %s, context %p, value %p.\n", iface, debugstr_hstring(resource), context, value );
++    return map_GetValue( iface, resource, value );
++}
++
++static HRESULT WINAPI map_GetSubtree( IResourceMap *iface, HSTRING reference, IResourceMap **value )
++{
++    struct resource_map *impl = impl_from_IResourceMap( iface );
++    WCHAR *path;
++    HRESULT hr;
++
++    TRACE( "iface %p, reference %s, value %p.\n", iface, debugstr_hstring(reference), value );
++
++    if (!value) return E_POINTER;
++    if (!(path = resource_path( impl->prefix, WindowsGetStringRawBuffer( reference, NULL ) ))) return E_OUTOFMEMORY;
++    if (!pri_count( pri_get(), path ))
++    {
++        WARN( "no resources under %s.\n", debugstr_w(path) );
++        free( path );
++        *value = NULL;
++        return HRESULT_FROM_WIN32( ERROR_MRM_MAP_NOT_FOUND );
++    }
++    hr = resource_map_create( path, value );
++    free( path );
++    return hr;
++}
++
++static const struct IResourceMapVtbl map_vtbl =
++{
++    map_QueryInterface,
++    map_AddRef,
++    map_Release,
++    map_GetIids,
++    map_GetRuntimeClassName,
++    map_GetTrustLevel,
++    map_get_Uri,
++    map_GetValue,
++    map_GetValueForContext,
++    map_GetSubtree,
++};
++
++DEFINE_IINSPECTABLE( map_view, IMapView_HSTRING_NamedResource, struct resource_map, IResourceMap_iface )
++
++static HRESULT WINAPI map_view_Lookup( IMapView_HSTRING_NamedResource *iface, HSTRING key, INamedResource **value )
++{
++    struct resource_map *impl = impl_from_IMapView_HSTRING_NamedResource( iface );
++    const struct pri_name *name;
++
++    TRACE( "iface %p, key %s, value %p.\n", iface, debugstr_hstring(key), value );
++
++    if (!(name = pri_find_resource( pri_get(), impl->prefix, WindowsGetStringRawBuffer( key, NULL ) )))
++    {
++        *value = NULL;
++        return E_BOUNDS;
++    }
++    return named_resource_create( name, value );
++}
++
++static HRESULT WINAPI map_view_get_Size( IMapView_HSTRING_NamedResource *iface, UINT32 *size )
++{
++    struct resource_map *impl = impl_from_IMapView_HSTRING_NamedResource( iface );
++    TRACE( "iface %p, size %p.\n", iface, size );
++    *size = pri_count( pri_get(), impl->prefix );
++    return S_OK;
++}
++
++static HRESULT WINAPI map_view_HasKey( IMapView_HSTRING_NamedResource *iface, HSTRING key, boolean *found )
++{
++    struct resource_map *impl = impl_from_IMapView_HSTRING_NamedResource( iface );
++    TRACE( "iface %p, key %s, found %p.\n", iface, debugstr_hstring(key), found );
++    *found = !!pri_find_resource( pri_get(), impl->prefix, WindowsGetStringRawBuffer( key, NULL ) );
++    return S_OK;
++}
++
++static HRESULT WINAPI map_view_Split( IMapView_HSTRING_NamedResource *iface, IMapView_HSTRING_NamedResource **first,
++                                      IMapView_HSTRING_NamedResource **second )
++{
++    TRACE( "iface %p, first %p, second %p.\n", iface, first, second );
++    *first = *second = NULL;
++    return S_OK;
++}
++
++static const struct IMapView_HSTRING_NamedResourceVtbl map_view_vtbl =
++{
++    map_view_QueryInterface,
++    map_view_AddRef,
++    map_view_Release,
++    map_view_GetIids,
++    map_view_GetRuntimeClassName,
++    map_view_GetTrustLevel,
++    map_view_Lookup,
++    map_view_get_Size,
++    map_view_HasKey,
++    map_view_Split,
++};
++
++DEFINE_IINSPECTABLE( map_iterable, IIterable_IKeyValuePair_HSTRING_NamedResource, struct resource_map, IResourceMap_iface )
++
++static HRESULT WINAPI map_iterable_First( IIterable_IKeyValuePair_HSTRING_NamedResource *iface,
++                                          IIterator_IKeyValuePair_HSTRING_NamedResource **value )
++{
++    FIXME( "iface %p, value %p stub!\n", iface, value );
++    return E_NOTIMPL;
++}
++
++static const struct IIterable_IKeyValuePair_HSTRING_NamedResourceVtbl map_iterable_vtbl =
++{
++    map_iterable_QueryInterface,
++    map_iterable_AddRef,
++    map_iterable_Release,
++    map_iterable_GetIids,
++    map_iterable_GetRuntimeClassName,
++    map_iterable_GetTrustLevel,
++    map_iterable_First,
++};
++
++static HRESULT resource_map_create( const WCHAR *prefix, IResourceMap **out )
++{
++    struct resource_map *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IResourceMap_iface.lpVtbl = &map_vtbl;
++    impl->IMapView_HSTRING_NamedResource_iface.lpVtbl = &map_view_vtbl;
++    impl->IIterable_IKeyValuePair_HSTRING_NamedResource_iface.lpVtbl = &map_iterable_vtbl;
++    impl->ref = 1;
++    if (!(impl->prefix = wcsdup( prefix )))
++    {
++        free( impl );
++        return E_OUTOFMEMORY;
++    }
++    *out = &impl->IResourceMap_iface;
++    return S_OK;
++}
++
++/* ---- AllResourceMaps: the package's map, under the package's name ---- */
++
++static HRESULT WINAPI all_maps_QueryInterface( IMapView_HSTRING_ResourceMap *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IMapView_HSTRING_ResourceMap ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI all_maps_AddRef( IMapView_HSTRING_ResourceMap *iface ) { return 2; }
++static ULONG WINAPI all_maps_Release( IMapView_HSTRING_ResourceMap *iface ) { return 1; }
++static HRESULT WINAPI all_maps_GetIids( IMapView_HSTRING_ResourceMap *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI all_maps_GetRuntimeClassName( IMapView_HSTRING_ResourceMap *iface, HSTRING *name ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI all_maps_GetTrustLevel( IMapView_HSTRING_ResourceMap *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static BOOL is_package_map( HSTRING key )
++{
++    struct pri_file *file = pri_get();
++    return file && !wcsicmp( WindowsGetStringRawBuffer( key, NULL ), file->package );
++}
++
++static HRESULT WINAPI all_maps_Lookup( IMapView_HSTRING_ResourceMap *iface, HSTRING key, IResourceMap **value )
++{
++    TRACE( "iface %p, key %s, value %p.\n", iface, debugstr_hstring(key), value );
++
++    if (!is_package_map( key ))
++    {
++        *value = NULL;
++        return E_BOUNDS;
++    }
++    return resource_map_create( L"", value );
++}
++
++static HRESULT WINAPI all_maps_get_Size( IMapView_HSTRING_ResourceMap *iface, UINT32 *size )
++{
++    TRACE( "iface %p, size %p.\n", iface, size );
++    *size = pri_get() ? 1 : 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI all_maps_HasKey( IMapView_HSTRING_ResourceMap *iface, HSTRING key, boolean *found )
++{
++    TRACE( "iface %p, key %s, found %p.\n", iface, debugstr_hstring(key), found );
++    *found = is_package_map( key );
++    return S_OK;
++}
++
++static HRESULT WINAPI all_maps_Split( IMapView_HSTRING_ResourceMap *iface, IMapView_HSTRING_ResourceMap **first,
++                                      IMapView_HSTRING_ResourceMap **second )
++{
++    *first = *second = NULL;
++    return S_OK;
++}
++
++static const struct IMapView_HSTRING_ResourceMapVtbl all_maps_vtbl =
++{
++    all_maps_QueryInterface,
++    all_maps_AddRef,
++    all_maps_Release,
++    all_maps_GetIids,
++    all_maps_GetRuntimeClassName,
++    all_maps_GetTrustLevel,
++    all_maps_Lookup,
++    all_maps_get_Size,
++    all_maps_HasKey,
++    all_maps_Split,
++};
++
++static IMapView_HSTRING_ResourceMap all_maps = { &all_maps_vtbl };
++
++/* ---- ResourceManager.Current, one per process ---- */
++
++struct resource_manager
++{
++    IActivationFactory IActivationFactory_iface;
++    IResourceManagerStatics IResourceManagerStatics_iface;
++    IResourceManager IResourceManager_iface;
++    IResourceManager2 IResourceManager2_iface;
++};
++
++static inline struct resource_manager *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct resource_manager, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct resource_manager *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IResourceManagerStatics ))
++        *out = &impl->IResourceManagerStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    FIXME( "iface %p, instance %p: not activatable.\n", iface, instance );
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( statics, IResourceManagerStatics, struct resource_manager, IActivationFactory_iface )
++
++static HRESULT WINAPI statics_get_Current( IResourceManagerStatics *iface, IResourceManager **value )
++{
++    struct resource_manager *impl = impl_from_IResourceManagerStatics( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    *value = &impl->IResourceManager_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_IsResourceReference( IResourceManagerStatics *iface, HSTRING reference, boolean *value )
++{
++    TRACE( "iface %p, reference %s, value %p.\n", iface, debugstr_hstring(reference), value );
++    *value = !wcsnicmp( WindowsGetStringRawBuffer( reference, NULL ), L"ms-resource:", 12 );
++    return S_OK;
++}
++
++static const struct IResourceManagerStaticsVtbl statics_vtbl =
++{
++    statics_QueryInterface,
++    statics_AddRef,
++    statics_Release,
++    statics_GetIids,
++    statics_GetRuntimeClassName,
++    statics_GetTrustLevel,
++    statics_get_Current,
++    statics_IsResourceReference,
++};
++
++static inline struct resource_manager *impl_from_IResourceManager( IResourceManager *iface )
++{
++    return CONTAINING_RECORD( iface, struct resource_manager, IResourceManager_iface );
++}
++
++static HRESULT WINAPI manager_QueryInterface( IResourceManager *iface, REFIID iid, void **out )
++{
++    struct resource_manager *impl = impl_from_IResourceManager( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IResourceManager ))
++        *out = &impl->IResourceManager_iface;
++    else if (IsEqualGUID( iid, &IID_IResourceManager2 ))
++        *out = &impl->IResourceManager2_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI manager_AddRef( IResourceManager *iface ) { return 2; }
++static ULONG WINAPI manager_Release( IResourceManager *iface ) { return 1; }
++static HRESULT WINAPI manager_GetIids( IResourceManager *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI manager_GetRuntimeClassName( IResourceManager *iface, HSTRING *name )
++{
++    static const WCHAR class_name[] = L"Windows.ApplicationModel.Resources.Core.ResourceManager";
++    return WindowsCreateString( class_name, wcslen( class_name ), name );
++}
++
++static HRESULT WINAPI manager_GetTrustLevel( IResourceManager *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI manager_get_MainResourceMap( IResourceManager *iface, IResourceMap **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    if (!pri_get())
++    {
++        *value = NULL;
++        return HRESULT_FROM_WIN32( ERROR_MRM_MAP_NOT_FOUND );
++    }
++    return resource_map_create( L"", value );
++}
++
++static HRESULT WINAPI manager_get_AllResourceMaps( IResourceManager *iface, IMapView_HSTRING_ResourceMap **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = &all_maps;
++    return S_OK;
++}
++
++static HRESULT WINAPI manager_get_DefaultContext( IResourceManager *iface, IResourceContext **value )
++{
++    IInspectable *context;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    if (FAILED(hr = IActivationFactory_ActivateInstance( resource_context_factory, &context ))) return hr;
++    hr = IInspectable_QueryInterface( context, &IID_IResourceContext, (void **)value );
++    IInspectable_Release( context );
++    return hr;
++}
++
++static HRESULT WINAPI manager_LoadPriFiles( IResourceManager *iface, IIterable_IStorageFile *files )
++{
++    FIXME( "iface %p, files %p: ignored.\n", iface, files );
++    return S_OK;
++}
++
++static HRESULT WINAPI manager_UnloadPriFiles( IResourceManager *iface, IIterable_IStorageFile *files )
++{
++    FIXME( "iface %p, files %p: ignored.\n", iface, files );
++    return S_OK;
++}
++
++static const struct IResourceManagerVtbl manager_vtbl =
++{
++    manager_QueryInterface,
++    manager_AddRef,
++    manager_Release,
++    manager_GetIids,
++    manager_GetRuntimeClassName,
++    manager_GetTrustLevel,
++    manager_get_MainResourceMap,
++    manager_get_AllResourceMaps,
++    manager_get_DefaultContext,
++    manager_LoadPriFiles,
++    manager_UnloadPriFiles,
++};
++
++DEFINE_IINSPECTABLE( manager2, IResourceManager2, struct resource_manager, IResourceManager_iface )
++
++static HRESULT WINAPI manager2_GetAllNamedResourcesForPackage( IResourceManager2 *iface, HSTRING package,
++                                                              ResourceLayoutInfo info, IVectorView_NamedResource **value )
++{
++    FIXME( "iface %p, package %s, value %p stub!\n", iface, debugstr_hstring(package), value );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI manager2_GetAllSubtreesForPackage( IResourceManager2 *iface, HSTRING package,
++                                                         ResourceLayoutInfo info, IVectorView_ResourceMap **value )
++{
++    FIXME( "iface %p, package %s, value %p stub!\n", iface, debugstr_hstring(package), value );
++    return E_NOTIMPL;
++}
++
++static const struct IResourceManager2Vtbl manager2_vtbl =
++{
++    manager2_QueryInterface,
++    manager2_AddRef,
++    manager2_Release,
++    manager2_GetIids,
++    manager2_GetRuntimeClassName,
++    manager2_GetTrustLevel,
++    manager2_GetAllNamedResourcesForPackage,
++    manager2_GetAllSubtreesForPackage,
++};
++
++static struct resource_manager resource_manager =
++{
++    {&factory_vtbl},
++    {&statics_vtbl},
++    {&manager_vtbl},
++    {&manager2_vtbl},
++};
++
++IActivationFactory *resource_manager_factory = &resource_manager.IActivationFactory_iface;
+diff --git a/dlls/twinapi.appcore/twinapi.appcore.rgs b/dlls/twinapi.appcore/twinapi.appcore.rgs
+index bec6981..20dbbf2 100644
+--- a/dlls/twinapi.appcore/twinapi.appcore.rgs
++++ b/dlls/twinapi.appcore/twinapi.appcore.rgs
+@@ -100,6 +100,10 @@ HKLM
+                     {
+                         val 'DllPath' = s '%MODULE%'
+                     }
++                    ForceRemove Windows.ApplicationModel.Resources.Core.ResourceManager
++                    {
++                        val 'DllPath' = s '%MODULE%'
++                    }
+                     ForceRemove Windows.Media.Audio.SpatialAudioDeviceConfiguration
+                     {
+                         val 'DllPath' = s '%MODULE%'
+diff --git a/include/Makefile.in b/include/Makefile.in
+index 2b09bf0..6fb7ec3 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -1025,6 +1025,7 @@ SOURCES = \
+ 	windows.applicationmodel.datatransfer.dragdrop.idl \
+ 	windows.applicationmodel.datatransfer.idl \
+ 	windows.applicationmodel.idl \
++	windows.applicationmodel.resources.core.idl \
+ 	windows.data.json.idl \
+ 	windows.data.xml.dom.idl \
+ 	windows.devices.bluetooth.advertisement.idl \
+diff --git a/include/windows.applicationmodel.resources.core.idl b/include/windows.applicationmodel.resources.core.idl
+new file mode 100644
+index 0000000..6c9aae6
+--- /dev/null
++++ b/include/windows.applicationmodel.resources.core.idl
+@@ -0,0 +1,402 @@
++/*
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifdef __WIDL__
++#pragma winrt ns_prefix
++#endif
++
++import "inspectable.idl";
++import "asyncinfo.idl";
++import "eventtoken.idl";
++import "windowscontracts.idl";
++import "windows.foundation.idl";
++import "windows.storage.idl";
++import "windows.storage.streams.idl";
++import "windows.ui.idl";
++
++namespace Windows.ApplicationModel.Resources.Core {
++    interface INamedResource;
++    interface IResourceCandidate;
++    interface IResourceCandidate2;
++    interface IResourceCandidate3;
++    interface IResourceContext;
++    interface IResourceContextStatics;
++    interface IResourceContextStatics2;
++    interface IResourceContextStatics3;
++    interface IResourceContextStatics4;
++    interface IResourceManager;
++    interface IResourceManager2;
++    interface IResourceManagerStatics;
++    interface IResourceMap;
++    interface IResourceQualifier;
++    runtimeclass NamedResource;
++    runtimeclass ResourceCandidate;
++    typedef enum ResourceCandidateKind ResourceCandidateKind;
++    runtimeclass ResourceContext;
++    typedef struct ResourceLayoutInfo ResourceLayoutInfo;
++    runtimeclass ResourceManager;
++    runtimeclass ResourceMap;
++    runtimeclass ResourceQualifier;
++    typedef enum ResourceQualifierPersistence ResourceQualifierPersistence;
++}
++
++namespace Windows.ApplicationModel.Resources.Core {
++    declare {
++        interface Windows.Foundation.Collections.IIterator<Windows.ApplicationModel.Resources.Core.ResourceQualifier *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.ApplicationModel.Resources.Core.ResourceQualifier *>;
++        interface Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Resources.Core.ResourceQualifier *>;
++        interface Windows.Foundation.IAsyncOperation<Windows.Storage.StorageFile *>;
++        interface Windows.Foundation.Collections.IKeyValuePair<HSTRING, HSTRING>;
++        interface Windows.Foundation.Collections.IIterator<Windows.Foundation.Collections.IKeyValuePair<HSTRING, HSTRING> *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.Foundation.Collections.IKeyValuePair<HSTRING, HSTRING> *>;
++        interface Windows.Foundation.Collections.IMapView<HSTRING, HSTRING>;
++        interface Windows.Foundation.Collections.IMap<HSTRING, HSTRING>;
++        interface Windows.Foundation.Collections.MapChangedEventHandler<HSTRING, HSTRING>;
++        interface Windows.Foundation.Collections.IMapChangedEventArgs<HSTRING>;
++        interface Windows.Foundation.Collections.IObservableMap<HSTRING, HSTRING>;
++        interface Windows.Foundation.Collections.IIterator<HSTRING>;
++        interface Windows.Foundation.Collections.IIterable<HSTRING>;
++        interface Windows.Foundation.Collections.IVectorView<HSTRING>;
++        interface Windows.Foundation.Collections.IIterator<Windows.ApplicationModel.Resources.Core.ResourceCandidate *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.ApplicationModel.Resources.Core.ResourceCandidate *>;
++        interface Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Resources.Core.ResourceCandidate *>;
++        interface Windows.Foundation.Collections.IKeyValuePair<HSTRING, Windows.ApplicationModel.Resources.Core.NamedResource *>;
++        interface Windows.Foundation.Collections.IIterator<Windows.Foundation.Collections.IKeyValuePair<HSTRING, Windows.ApplicationModel.Resources.Core.NamedResource *> *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.Foundation.Collections.IKeyValuePair<HSTRING, Windows.ApplicationModel.Resources.Core.NamedResource *> *>;
++        interface Windows.Foundation.Collections.IMapView<HSTRING, Windows.ApplicationModel.Resources.Core.NamedResource *>;
++        interface Windows.Foundation.Collections.IKeyValuePair<HSTRING, Windows.ApplicationModel.Resources.Core.ResourceMap *>;
++        interface Windows.Foundation.Collections.IIterator<Windows.Foundation.Collections.IKeyValuePair<HSTRING, Windows.ApplicationModel.Resources.Core.ResourceMap *> *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.Foundation.Collections.IKeyValuePair<HSTRING, Windows.ApplicationModel.Resources.Core.ResourceMap *> *>;
++        interface Windows.Foundation.Collections.IMapView<HSTRING, Windows.ApplicationModel.Resources.Core.ResourceMap *>;
++        interface Windows.Foundation.Collections.IIterator<Windows.Storage.IStorageFile *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.Storage.IStorageFile *>;
++        interface Windows.Foundation.Collections.IIterator<Windows.ApplicationModel.Resources.Core.NamedResource *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.ApplicationModel.Resources.Core.NamedResource *>;
++        interface Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Resources.Core.NamedResource *>;
++        interface Windows.Foundation.Collections.IIterator<Windows.ApplicationModel.Resources.Core.ResourceMap *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.ApplicationModel.Resources.Core.ResourceMap *>;
++        interface Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Resources.Core.ResourceMap *>;
++        interface Windows.Foundation.IAsyncOperation<Windows.Storage.Streams.IRandomAccessStream *>;
++    }
++}
++
++namespace Windows.ApplicationModel.Resources.Core {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 8.0)
++    ]
++    enum ResourceCandidateKind
++    {
++        String = 0,
++        File = 1,
++        EmbeddedData = 2
++    };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum ResourceQualifierPersistence
++    {
++        None = 0,
++        LocalMachine = 1
++    };
++
++}
++
++namespace Windows.ApplicationModel.Resources.Core {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    struct ResourceLayoutInfo
++    {
++        UINT32 MajorVersion;
++        UINT32 MinorVersion;
++        UINT32 ResourceSubtreeCount;
++        UINT32 NamedResourceCount;
++        INT32 Checksum;
++    };
++
++}
++
++namespace Windows.ApplicationModel.Resources.Core {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.ApplicationModel.Resources.Core.NamedResource),
++        uuid(1c98c219-0b13-4240-89a5-d495dc189a00)
++    ]
++    interface INamedResource : IInspectable
++    {
++        [propget] HRESULT Uri([out, retval] Windows.Foundation.Uri * *value);
++        [propget] HRESULT Candidates([out, retval] Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Resources.Core.ResourceCandidate *> * *value);
++        [overload("Resolve")] HRESULT Resolve([out, retval] Windows.ApplicationModel.Resources.Core.ResourceCandidate * *value);
++        [overload("Resolve")] HRESULT ResolveForContext([in] Windows.ApplicationModel.Resources.Core.ResourceContext * resourceContext, [out, retval] Windows.ApplicationModel.Resources.Core.ResourceCandidate * *value);
++        [overload("ResolveAll")] HRESULT ResolveAll([out, retval] Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Resources.Core.ResourceCandidate *> * *value);
++        [overload("ResolveAll")] HRESULT ResolveAllForContext([in] Windows.ApplicationModel.Resources.Core.ResourceContext * resourceContext, [out, retval] Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Resources.Core.ResourceCandidate *> * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.ApplicationModel.Resources.Core.ResourceCandidate),
++        uuid(af5207d9-c433-4764-b3fd-8fa6bfbcbadc)
++    ]
++    interface IResourceCandidate : IInspectable
++    {
++        [propget] HRESULT Qualifiers([out, retval] Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Resources.Core.ResourceQualifier *> * *value);
++        [propget] HRESULT IsMatch([out, retval] boolean *value);
++        [propget] HRESULT IsMatchAsDefault([out, retval] boolean *value);
++        [propget] HRESULT IsDefault([out, retval] boolean *value);
++        [propget] HRESULT ValueAsString([out, retval] HSTRING *value);
++        HRESULT GetValueAsFileAsync([out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.StorageFile *> * *value);
++        HRESULT GetQualifierValue([in] HSTRING qualifierName, [out, retval] HSTRING *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.ApplicationModel.Resources.Core.ResourceCandidate),
++        uuid(69e5b468-f6fc-4013-aaa2-d53f1757d3b5)
++    ]
++    interface IResourceCandidate2 : IInspectable
++    {
++        HRESULT GetValueAsStreamAsync([out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.Streams.IRandomAccessStream *> * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 8.0),
++        exclusiveto(Windows.ApplicationModel.Resources.Core.ResourceCandidate),
++        uuid(08ae97f8-517a-4674-958c-4a3c7cd2cc6b)
++    ]
++    interface IResourceCandidate3 : IInspectable
++    {
++        [propget] HRESULT Kind([out, retval] Windows.ApplicationModel.Resources.Core.ResourceCandidateKind *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.ApplicationModel.Resources.Core.ResourceContext),
++        uuid(2fa22f4b-707e-4b27-ad0d-d0d8cd468fd2)
++    ]
++    interface IResourceContext : IInspectable
++    {
++        [propget] HRESULT QualifierValues([out, retval] Windows.Foundation.Collections.IObservableMap<HSTRING, HSTRING> * *value);
++        [overload("Reset")] HRESULT Reset();
++        [overload("Reset")] HRESULT ResetQualifierValues([in] Windows.Foundation.Collections.IIterable<HSTRING> * qualifierNames);
++        HRESULT OverrideToMatch([in] Windows.Foundation.Collections.IIterable<Windows.ApplicationModel.Resources.Core.ResourceQualifier *> * result);
++        HRESULT Clone([out, retval] Windows.ApplicationModel.Resources.Core.ResourceContext * *value);
++        [propget] HRESULT Languages([out, retval] Windows.Foundation.Collections.IVectorView<HSTRING> * *value);
++        [propput] HRESULT Languages([in] Windows.Foundation.Collections.IVectorView<HSTRING> * value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.ApplicationModel.Resources.Core.ResourceContext),
++        uuid(98be9d6c-6338-4b31-99df-b2b442f17149)
++    ]
++    interface IResourceContextStatics : IInspectable
++    {
++        HRESULT CreateMatchingContext([in] Windows.Foundation.Collections.IIterable<Windows.ApplicationModel.Resources.Core.ResourceQualifier *> * result, [out, retval] Windows.ApplicationModel.Resources.Core.ResourceContext * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.ApplicationModel.Resources.Core.ResourceContext),
++        uuid(41f752ef-12af-41b9-ab36-b1eb4b512460)
++    ]
++    interface IResourceContextStatics2 : IInspectable
++    {
++        HRESULT GetForCurrentView([out, retval] Windows.ApplicationModel.Resources.Core.ResourceContext * *value);
++        [overload("SetGlobalQualifierValue")] HRESULT SetGlobalQualifierValue([in] HSTRING key, [in] HSTRING value);
++        [overload("ResetGlobalQualifierValues")] HRESULT ResetGlobalQualifierValues();
++        [overload("ResetGlobalQualifierValues")] HRESULT ResetGlobalQualifierValuesForSpecifiedQualifiers([in] Windows.Foundation.Collections.IIterable<HSTRING> * qualifierNames);
++        HRESULT GetForViewIndependentUse([out, retval] Windows.ApplicationModel.Resources.Core.ResourceContext * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.ApplicationModel.Resources.Core.ResourceContext),
++        uuid(20cf492c-af0f-450b-9da6-106dd0c29a39)
++    ]
++    interface IResourceContextStatics3 : IInspectable
++    {
++        [overload("SetGlobalQualifierValue")] HRESULT SetGlobalQualifierValueWithPersistence([in] HSTRING key, [in] HSTRING value, [in] Windows.ApplicationModel.Resources.Core.ResourceQualifierPersistence persistence);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 8.0),
++        exclusiveto(Windows.ApplicationModel.Resources.Core.ResourceContext),
++        uuid(22eb9ccd-fb31-4bfa-b86b-df9d9d7bdc39)
++    ]
++    interface IResourceContextStatics4 : IInspectable
++    {
++        HRESULT GetForUIContext([in] Windows.UI.UIContext * context_, [out, retval] Windows.ApplicationModel.Resources.Core.ResourceContext * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.ApplicationModel.Resources.Core.ResourceManager),
++        uuid(f744d97b-9988-44fb-abd6-5378844cfa8b)
++    ]
++    interface IResourceManager : IInspectable
++    {
++        [propget] HRESULT MainResourceMap([out, retval] Windows.ApplicationModel.Resources.Core.ResourceMap * *value);
++        [propget] HRESULT AllResourceMaps([out, retval] Windows.Foundation.Collections.IMapView<HSTRING, Windows.ApplicationModel.Resources.Core.ResourceMap *> * *value);
++        [propget] HRESULT DefaultContext([out, retval] Windows.ApplicationModel.Resources.Core.ResourceContext * *value);
++        HRESULT LoadPriFiles([in] Windows.Foundation.Collections.IIterable<Windows.Storage.IStorageFile *> * files);
++        HRESULT UnloadPriFiles([in] Windows.Foundation.Collections.IIterable<Windows.Storage.IStorageFile *> * files);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.ApplicationModel.Resources.Core.ResourceManager),
++        uuid(9d66fe6c-a4d7-4c23-9e85-675f304c252d)
++    ]
++    interface IResourceManager2 : IInspectable
++    {
++        HRESULT GetAllNamedResourcesForPackage([in] HSTRING packageName, [in] Windows.ApplicationModel.Resources.Core.ResourceLayoutInfo resourceLayoutInfo, [out, retval] Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Resources.Core.NamedResource *> * *value);
++        HRESULT GetAllSubtreesForPackage([in] HSTRING packageName, [in] Windows.ApplicationModel.Resources.Core.ResourceLayoutInfo resourceLayoutInfo, [out, retval] Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Resources.Core.ResourceMap *> * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.ApplicationModel.Resources.Core.ResourceManager),
++        uuid(1cc0fdfc-69ee-4e43-9901-47f12687baf7)
++    ]
++    interface IResourceManagerStatics : IInspectable
++    {
++        [propget] HRESULT Current([out, retval] Windows.ApplicationModel.Resources.Core.ResourceManager * *value);
++        HRESULT IsResourceReference([in] HSTRING resourceReference, [out, retval] boolean *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.ApplicationModel.Resources.Core.ResourceMap),
++        uuid(72284824-db8c-42f8-b08c-53ff357dad82)
++    ]
++    interface IResourceMap : IInspectable
++        requires Windows.Foundation.Collections.IMapView<HSTRING, Windows.ApplicationModel.Resources.Core.NamedResource *>, Windows.Foundation.Collections.IIterable<Windows.Foundation.Collections.IKeyValuePair<HSTRING, Windows.ApplicationModel.Resources.Core.NamedResource *> *>
++    {
++        [propget] HRESULT Uri([out, retval] Windows.Foundation.Uri * *value);
++        [overload("GetValue")] HRESULT GetValue([in] HSTRING resource, [out, retval] Windows.ApplicationModel.Resources.Core.ResourceCandidate * *value);
++        [overload("GetValue")] HRESULT GetValueForContext([in] HSTRING resource, [in] Windows.ApplicationModel.Resources.Core.ResourceContext * context_, [out, retval] Windows.ApplicationModel.Resources.Core.ResourceCandidate * *value);
++        HRESULT GetSubtree([in] HSTRING reference, [out, retval] Windows.ApplicationModel.Resources.Core.ResourceMap * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.ApplicationModel.Resources.Core.ResourceQualifier),
++        uuid(785da5b2-4afd-4376-a888-c5f9a6b7a05c)
++    ]
++    interface IResourceQualifier : IInspectable
++    {
++        [propget] HRESULT QualifierName([out, retval] HSTRING *value);
++        [propget] HRESULT QualifierValue([out, retval] HSTRING *value);
++        [propget] HRESULT IsDefault([out, retval] boolean *value);
++        [propget] HRESULT IsMatch([out, retval] boolean *value);
++        [propget] HRESULT Score([out, retval] DOUBLE *value);
++    }
++
++}
++
++namespace Windows.ApplicationModel.Resources.Core {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile)
++    ]
++    runtimeclass NamedResource
++    {
++        [default] interface Windows.ApplicationModel.Resources.Core.INamedResource;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile)
++    ]
++    runtimeclass ResourceCandidate
++    {
++        [default] interface Windows.ApplicationModel.Resources.Core.IResourceCandidate;
++        interface Windows.ApplicationModel.Resources.Core.IResourceCandidate2;
++        [contract(Windows.Foundation.UniversalApiContract, 8.0)] interface Windows.ApplicationModel.Resources.Core.IResourceCandidate3;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile)
++    ]
++    runtimeclass ResourceCandidateVectorView
++    {
++        [default] [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Resources.Core.ResourceCandidate *>;
++        [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Foundation.Collections.IIterable<Windows.ApplicationModel.Resources.Core.ResourceCandidate *>;
++    }
++
++    [
++        activatable(Windows.Foundation.UniversalApiContract, 1.0),
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.ApplicationModel.Resources.Core.IResourceContextStatics, Windows.Foundation.UniversalApiContract, 1.0),
++        static(Windows.ApplicationModel.Resources.Core.IResourceContextStatics2, Windows.Foundation.UniversalApiContract, 1.0),
++        static(Windows.ApplicationModel.Resources.Core.IResourceContextStatics3, Windows.Foundation.UniversalApiContract, 1.0),
++        static(Windows.ApplicationModel.Resources.Core.IResourceContextStatics4, Windows.Foundation.UniversalApiContract, 8.0),
++        threading(both)
++    ]
++    runtimeclass ResourceContext
++    {
++        [default] interface Windows.ApplicationModel.Resources.Core.IResourceContext;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.ApplicationModel.Resources.Core.IResourceManagerStatics, Windows.Foundation.UniversalApiContract, 1.0),
++        threading(both)
++    ]
++    runtimeclass ResourceManager
++    {
++        [default] interface Windows.ApplicationModel.Resources.Core.IResourceManager;
++        interface Windows.ApplicationModel.Resources.Core.IResourceManager2;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile)
++    ]
++    runtimeclass ResourceMap
++    {
++        [default] interface Windows.ApplicationModel.Resources.Core.IResourceMap;
++        [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Foundation.Collections.IMapView<HSTRING, Windows.ApplicationModel.Resources.Core.NamedResource *>;
++        [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Foundation.Collections.IIterable<Windows.Foundation.Collections.IKeyValuePair<HSTRING, Windows.ApplicationModel.Resources.Core.NamedResource *> *>;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile)
++    ]
++    runtimeclass ResourceQualifier
++    {
++        [default] interface Windows.ApplicationModel.Resources.Core.IResourceQualifier;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile)
++    ]
++    runtimeclass ResourceQualifierVectorView
++    {
++        [default] [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Resources.Core.ResourceQualifier *>;
++        [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Foundation.Collections.IIterable<Windows.ApplicationModel.Resources.Core.ResourceQualifier *>;
++    }
++
++}
++

@@ -22,7 +22,7 @@ UWP apps don't create a normal Win32 window. They ask Windows for a `CoreApplica
 | ✅ | Microsoft Minesweeper (`Microsoft.MicrosoftMinesweeper`, Unity, XAML, .NET Native) | Playable offline: menus and Classic games with mouse clicks, flags and local saves. Needs `mrt100.dll` (see [framework packages](#set-up-an-app)). After the tutorial, each start waits about 30 seconds on "Downloading Game Data" while its Xbox cloud saves fail as offline. No ads, achievements or cloud saves. |
 | ✅ | Microsoft Sudoku (`Microsoft.MicrosoftSudoku`, Unity 6, XAML, .NET Native) | Playable offline: the tutorial and puzzles with the mouse. Its Xbox cloud sync and ads fail as offline. |
 | ✅ | Minecraft for Windows 1.21.114 and 1.19.83 (`Microsoft.MinecraftUWP`, D3D11) | Starts and plays offline: menus, worlds. Xbox sign-in and online features fail as offline. |
-| ❌ | Microsoft Mahjong (`Microsoft.MicrosoftMahjong`, XAML, .NET Native) | Not working yet: it starts and asks whether to play offline, then crashes when you answer. |
+| ❌ | Microsoft Mahjong (`Microsoft.MicrosoftMahjong`, XAML, .NET Native) | Not working yet: it gets past the offline questions, then stays on its loading screen. |
 | ❓ | Microsoft Solitaire Collection, Wordament (`Microsoft.MicrosoftSolitaireCollection`, `Microsoft.Studios.Wordament`) | Not tested yet. |
 | ❌ | Forza Motorsport 7 (`Microsoft.ApolloBaseGame`, D3D12) | Not working: it starts and its hardware warning is answered, but it isn't playable yet. |
 | ❌ | Windows Calculator (`Microsoft.WindowsCalculator`, XAML, WinUI 2.8) | Not working: stops at startup. It needs XAML's dependency-property system and the WinUI 2 control library, which the partial XAML doesn't support yet. |
@@ -303,7 +303,8 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 1.19: PnpObject.CreateFromIdAsync, HolographicApplicationPreview, 0096-0098 for Microsoft
                 Mahjong (not working yet): XAML SizeHelper, PointHelper, Canvas and more FrameworkElement members,
                 SpatialAudio classes, device information, CoreTextEditContext2, 0099 game controllers: a
-                controller's User and its events (Minecraft stopped when a pad was connected)
+                controller's User and its events (Minecraft stopped when a pad was connected), 0100 ResourceManager over
+                the package's resources.pri (.NET Native's resx strings; Mahjong stopped after "Play Offline")
 patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings
