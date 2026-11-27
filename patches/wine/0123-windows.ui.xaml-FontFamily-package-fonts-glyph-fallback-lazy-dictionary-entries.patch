@@ -1,0 +1,1356 @@
+Subject: windows.ui.xaml: FontFamily, package fonts, glyph fallback and lazily loaded dictionary entries
+
+FontFamily is now a class (FontFamilyFactory.CreateInstanceWithName, XamlAutoFontFamily) and an inherited
+property: a FontFamily set on an element (from markup, a style setter, or Control/TextBlock/ContentPresenter's
+put_FontFamily) applies to its text and its children's, as in WinUI. <FontFamily> resources become FontFamily
+objects, and generic.xaml has WinUI's ContentControlThemeFontFamily and SymbolThemeFontFamily.
+
+A FontFamily source may name a font file in the package ("ms-appx:///Resources/Fonts/Icons.ttf#Icons"): the file
+is loaded into a DirectWrite font set the first time it is named. A comma-separated list falls back glyph by
+glyph: a text is laid out in the first family that has all its characters (or the first one installed), and
+characters it lacks go to the first family of the list that has them. Private Use Area characters that none of
+them has go to Segoe Fluent Icons or Segoe MDL2 Assets, if installed.
+
+Compiled resource dictionaries can refer to entries further on (WinUI loads them lazily): a {StaticResource}
+or {ThemeResource} lookup that finds nothing while a dictionary loads now loads the entry it asks for first.
+
+Xbox Accessories draws its icons ("[]" boxes before) from its own XboxFluent2.ttf through these, and its styles'
+font, size and margin setters now apply.
+
+diff --git a/dlls/windows.ui.xaml/Makefile.in b/dlls/windows.ui.xaml/Makefile.in
+index 0accff2..9377610 100644
+--- a/dlls/windows.ui.xaml/Makefile.in
++++ b/dlls/windows.ui.xaml/Makefile.in
+@@ -20,6 +20,7 @@ SOURCES = \
+ 	dialog.c \
+ 	element.c \
+ 	flyout.c \
++	font_family.c \
+ 	focus.c \
+ 	helpers.c \
+ 	image.c \
+diff --git a/dlls/windows.ui.xaml/button.c b/dlls/windows.ui.xaml/button.c
+index 0d05b62..d01d83b 100644
+--- a/dlls/windows.ui.xaml/button.c
++++ b/dlls/windows.ui.xaml/button.c
+@@ -176,7 +176,7 @@ static void button_measure( struct xaml_element *element, struct layout_context
+     const Thickness *b = &impl->border_thickness, *p = &impl->padding;
+     float extra_width = b->Left + b->Right + p->Left + p->Right, extra_height = b->Top + b->Bottom + p->Top + p->Bottom;
+     struct xaml_element *child, *root;
+-    struct text_format format;
++    struct text_format format = {0};
+ 
+     if (impl->kind == BUTTON_DIALOG)
+     {
+@@ -381,7 +381,7 @@ static void draw_check_mark( struct layout_context *ctx, const struct layout_rec
+ static void render_content( struct button *impl, struct layout_context *ctx, COLORREF text )
+ {
+     struct xaml_element *child = button_content_element( impl );
+-    struct text_format format;
++    struct text_format format = {0};
+     struct layout_rect inner;
+     COLORREF saved;
+ 
+@@ -1279,16 +1279,13 @@ static HRESULT WINAPI control_ApplyTemplate( IControl *iface, boolean *value )
+ 
+ static HRESULT WINAPI control_get_FontFamily(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIFontFamily **value)
+ {
+-    TRACE( "iface %p: default.\n", iface );
+-    if (!value) return E_POINTER;
+-    *value = NULL;
+-    return S_OK;
++    return element_get_font_family( &impl_from_IControl( iface )->element, value );
+ }
+ 
+ static HRESULT WINAPI control_put_FontFamily(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIFontFamily *value)
+ {
+-    FIXME( "iface %p: ignored.\n", iface );
+-    return S_OK;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return element_put_font_family( &impl_from_IControl( iface )->element, value );
+ }
+ 
+ static HRESULT WINAPI control_get_FontStretch(IControl *iface, __x_ABI_CWindows_CUI_CText_CFontStretch *value)
+diff --git a/dlls/windows.ui.xaml/classes.idl b/dlls/windows.ui.xaml/classes.idl
+index fb6515b..4a48126 100644
+--- a/dlls/windows.ui.xaml/classes.idl
++++ b/dlls/windows.ui.xaml/classes.idl
+@@ -115,6 +115,7 @@ namespace Windows.UI.Xaml.Media {
+     runtimeclass ImageBrush;
+     runtimeclass CompositeTransform;
+     runtimeclass EllipseGeometry;
++    runtimeclass FontFamily;
+     runtimeclass GradientStop;
+     runtimeclass LineGeometry;
+     runtimeclass LinearGradientBrush;
+diff --git a/dlls/windows.ui.xaml/commandbar.c b/dlls/windows.ui.xaml/commandbar.c
+index bf6996d..c8eceb4 100644
+--- a/dlls/windows.ui.xaml/commandbar.c
++++ b/dlls/windows.ui.xaml/commandbar.c
+@@ -329,7 +329,7 @@ void bar_measure( struct button *impl, struct layout_context *ctx, float avail_w
+ {
+     struct command_bar *bar = impl->bar;
+     struct xaml_element *icon = icon_element( impl );
+-    struct text_format format;
++    struct text_format format = {0};
+     float w = 0, h = 0;
+     struct button *item;
+     UINT32 i;
+@@ -432,7 +432,7 @@ static void render_bar_button( struct button *impl, struct layout_context *ctx )
+     Color accent = { 0xff, 0x00, 0x78, 0xd7 }, c;
+     COLORREF fg = ctx->foreground, saved = ctx->foreground;
+     BYTE saved_alpha = ctx->foreground_alpha;
+-    struct text_format format;
++    struct text_format format = {0};
+     struct layout_rect text;
+ 
+     if (impl->background && brush_get_color( impl->background, &c )) element_fill_argb( ctx, b, c );
+diff --git a/dlls/windows.ui.xaml/content.c b/dlls/windows.ui.xaml/content.c
+index e99a486..5fe7e69 100644
+--- a/dlls/windows.ui.xaml/content.c
++++ b/dlls/windows.ui.xaml/content.c
+@@ -1058,16 +1058,13 @@ static HRESULT WINAPI control_ApplyTemplate( IControl *iface, boolean *value )
+ 
+ static HRESULT WINAPI control_get_FontFamily(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIFontFamily **value)
+ {
+-    TRACE( "iface %p: default.\n", iface );
+-    if (!value) return E_POINTER;
+-    *value = NULL;
+-    return S_OK;
++    return element_get_font_family( &impl_from_IControl( iface )->element, value );
+ }
+ 
+ static HRESULT WINAPI control_put_FontFamily(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIFontFamily *value)
+ {
+-    FIXME( "iface %p: ignored.\n", iface );
+-    return S_OK;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return element_put_font_family( &impl_from_IControl( iface )->element, value );
+ }
+ 
+ static HRESULT WINAPI control_get_FontWeight(IControl *iface, __x_ABI_CWindows_CUI_CText_CFontWeight *value)
+diff --git a/dlls/windows.ui.xaml/element.c b/dlls/windows.ui.xaml/element.c
+index 6cd5a97..9f9b1ce 100644
+--- a/dlls/windows.ui.xaml/element.c
++++ b/dlls/windows.ui.xaml/element.c
+@@ -106,6 +106,7 @@ static ULONG WINAPI inner_Release( IInspectable *iface )
+         event_list_clear( &impl->loaded );
+         event_list_clear( &impl->unloaded );
+         event_list_clear( &impl->size_changed );
++        free( impl->font_family );
+         impl->ops->destroy( impl );
+     }
+     return ref;
+@@ -1623,6 +1624,7 @@ void element_measure( struct xaml_element *element, struct layout_context *ctx,
+ {
+     const Thickness *m = &element->margin;
+     float width, height, content_width, content_height;
++    const WCHAR *saved_family;
+ 
+     element_apply_default_style( element );
+     if (element->theme_dirty)
+@@ -1641,7 +1643,10 @@ void element_measure( struct xaml_element *element, struct layout_context *ctx,
+     content_height = max( 0.0f, avail_height - m->Top - m->Bottom );
+     if (!isnan( element->width )) content_width = element->width;
+     if (!isnan( element->height )) content_height = element->height;
++    saved_family = ctx->font_family;
++    if (element->font_family) ctx->font_family = element->font_family;
+     element->ops->measure( element, ctx, content_width, content_height, &width, &height );
++    ctx->font_family = saved_family;
+     if (!isnan( element->width )) width = element->width;
+     if (!isnan( element->height )) height = element->height;
+ 
+@@ -1975,6 +1980,7 @@ void element_render( struct xaml_element *element, struct layout_context *ctx )
+     BOOL dark = ctx->dark, clipped = FALSE, transformed = FALSE;
+     COLORREF foreground = ctx->foreground;
+     BYTE foreground_alpha = ctx->foreground_alpha;
++    const WCHAR *font_family = ctx->font_family;
+     float saved_transform[6], m[6];
+     struct layout_rect clip;
+     void *saved_rt;
+@@ -2031,7 +2037,9 @@ void element_render( struct xaml_element *element, struct layout_context *ctx )
+             ctx->foreground_alpha = 255;
+         }
+     }
++    if (element->font_family) ctx->font_family = element->font_family;
+     element->ops->render( element, ctx );
++    ctx->font_family = font_family;
+     if (element_focus_state( element ) == FocusState_Keyboard)
+     {
+         /* Windows 10's focus visual: a 2 px outer line in the base high colour and a 1 px inner line in the page
+@@ -2427,7 +2435,15 @@ void text_measure( struct layout_context *ctx, const struct text_format *format,
+     HFONT font, old;
+     TEXTMETRICW tm;
+ 
++    struct text_format inherited;
++
+     /* DirectWrite when it is there, so that measuring matches drawing */
++    if (!format->family && ctx->font_family)
++    {
++        inherited = *format;
++        inherited.family = ctx->font_family;
++        format = &inherited;
++    }
+     if (dwrite_measure( format, text, avail_width, width, height )) return;
+     font = text_create_font( ctx, format );
+     old = SelectObject( ctx->hdc, font );
+diff --git a/dlls/windows.ui.xaml/font_family.c b/dlls/windows.ui.xaml/font_family.c
+new file mode 100644
+index 0000000..73adaae
+--- /dev/null
++++ b/dlls/windows.ui.xaml/font_family.c
+@@ -0,0 +1,312 @@
++/* WinRT Windows.UI.Xaml.Media.FontFamily implementation, and font family names for text
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* A FontFamily is its Source: a family name, a comma-separated list of them to try in turn ("Segoe Fluent Icons,
++ * Segoe MDL2 Assets"), or a font file in the package with the family in it ("ms-appx:///Assets/Font.ttf#Name").
++ * Elements keep the FontFamily set on them and their text inherits it, as in WinUI; render.c picks the family a
++ * text is drawn in, loading the package's font files. */
++
++void element_set_font_family( struct xaml_element *element, const WCHAR *source )
++{
++    TRACE( "%s %p: %s.\n", debugstr_w(element->class_name), element, debugstr_w(source) );
++    free( element->font_family );
++    element->font_family = source && *source ? wcsdup( source ) : NULL;
++    window_invalidate();
++}
++
++/* an element's FontFamily property: what was set on it, or the default (WinUI never returns null) */
++HRESULT element_get_font_family( struct xaml_element *element, IFontFamily **value )
++{
++    if (!value) return E_POINTER;
++    return font_family_create( element->font_family ? element->font_family : L"XamlAutoFontFamily", value );
++}
++
++HRESULT element_put_font_family( struct xaml_element *element, IFontFamily *value )
++{
++    HSTRING source = NULL;
++
++    if (value && FAILED(IFontFamily_get_Source( value, &source ))) source = NULL;
++    element_set_font_family( element, WindowsGetStringRawBuffer( source, NULL ) );
++    WindowsDeleteString( source );
++    return S_OK;
++}
++
++struct font_family
++{
++    IInspectable IInspectable_inner;
++    IFontFamily IFontFamily_iface;
++    IInspectable *outer;
++    LONG ref;
++    HSTRING source;
++};
++
++static inline struct font_family *impl_from_IInspectable( IInspectable *iface )
++{
++    return CONTAINING_RECORD( iface, struct font_family, IInspectable_inner );
++}
++
++static HRESULT WINAPI inner_QueryInterface( IInspectable *iface, REFIID iid, void **out )
++{
++    struct font_family *impl = impl_from_IInspectable( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ))
++        *out = &impl->IInspectable_inner;
++    else if (IsEqualGUID( iid, &IID_IFontFamily ))
++        *out = &impl->IFontFamily_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI inner_AddRef( IInspectable *iface )
++{
++    return InterlockedIncrement( &impl_from_IInspectable( iface )->ref );
++}
++
++static ULONG WINAPI inner_Release( IInspectable *iface )
++{
++    struct font_family *impl = impl_from_IInspectable( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        WindowsDeleteString( impl->source );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI inner_GetIids( IInspectable *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI inner_GetRuntimeClassName( IInspectable *iface, HSTRING *class_name )
++{
++    const WCHAR *name = RuntimeClass_Windows_UI_Xaml_Media_FontFamily;
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI inner_GetTrustLevel( IInspectable *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static const struct IInspectableVtbl inner_vtbl =
++{
++    inner_QueryInterface,
++    inner_AddRef,
++    inner_Release,
++    /* IInspectable methods */
++    inner_GetIids,
++    inner_GetRuntimeClassName,
++    inner_GetTrustLevel,
++};
++
++DEFINE_IINSPECTABLE_( family, IFontFamily, struct font_family, impl_from_IFontFamily, IFontFamily_iface, impl->outer )
++
++static HRESULT WINAPI family_get_Source( IFontFamily *iface, HSTRING *value )
++{
++    if (!value) return E_POINTER;
++    return WindowsDuplicateString( impl_from_IFontFamily( iface )->source, value );
++}
++
++static const struct IFontFamilyVtbl family_vtbl =
++{
++    family_QueryInterface,
++    family_AddRef,
++    family_Release,
++    /* IInspectable methods */
++    family_GetIids,
++    family_GetRuntimeClassName,
++    family_GetTrustLevel,
++    /* IFontFamily methods */
++    family_get_Source,
++};
++
++static HRESULT family_create( HSTRING name, IInspectable *outer, IInspectable **inner, IFontFamily **value )
++{
++    struct font_family *impl;
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (inner) *inner = NULL;
++    if (outer && !inner) return E_INVALIDARG;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IInspectable_inner.lpVtbl = &inner_vtbl;
++    impl->IFontFamily_iface.lpVtbl = &family_vtbl;
++    impl->ref = 1;
++    impl->outer = outer ? outer : &impl->IInspectable_inner;
++    WindowsDuplicateString( name, &impl->source );
++    *value = &impl->IFontFamily_iface;
++    if (outer)
++    {
++        *inner = &impl->IInspectable_inner;
++        IInspectable_AddRef( outer );
++    }
++    return S_OK;
++}
++
++HRESULT font_family_create( const WCHAR *name, IFontFamily **value )
++{
++    HSTRING str;
++    HRESULT hr;
++
++    if (FAILED(hr = WindowsCreateString( name, wcslen( name ), &str ))) return hr;
++    hr = family_create( str, NULL, NULL, value );
++    WindowsDeleteString( str );
++    return hr;
++}
++
++struct family_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IFontFamilyFactory IFontFamilyFactory_iface;
++    IFontFamilyStatics2 IFontFamilyStatics2_iface;
++};
++
++static inline struct family_statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct family_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct family_statics *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IFontFamilyFactory ))
++        *out = &impl->IFontFamilyFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IFontFamilyStatics2 ))
++        *out = &impl->IFontFamilyStatics2_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    return 2;
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    return 1;
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    /* FontFamily needs a name */
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( family_factory, IFontFamilyFactory, struct family_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI family_factory_CreateInstanceWithName( IFontFamilyFactory *iface, HSTRING name, IInspectable *outer,
++                                                             IInspectable **inner, IFontFamily **value )
++{
++    TRACE( "iface %p, name %s, outer %p.\n", iface, debugstr_hstring(name), outer );
++    return family_create( name, outer, inner, value );
++}
++
++static const struct IFontFamilyFactoryVtbl family_factory_vtbl =
++{
++    family_factory_QueryInterface,
++    family_factory_AddRef,
++    family_factory_Release,
++    /* IInspectable methods */
++    family_factory_GetIids,
++    family_factory_GetRuntimeClassName,
++    family_factory_GetTrustLevel,
++    /* IFontFamilyFactory methods */
++    family_factory_CreateInstanceWithName,
++};
++
++DEFINE_IINSPECTABLE( family_statics2, IFontFamilyStatics2, struct family_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI family_statics2_get_XamlAutoFontFamily( IFontFamilyStatics2 *iface, IFontFamily **value )
++{
++    return font_family_create( L"XamlAutoFontFamily", value );
++}
++
++static const struct IFontFamilyStatics2Vtbl family_statics2_vtbl =
++{
++    family_statics2_QueryInterface,
++    family_statics2_AddRef,
++    family_statics2_Release,
++    /* IInspectable methods */
++    family_statics2_GetIids,
++    family_statics2_GetRuntimeClassName,
++    family_statics2_GetTrustLevel,
++    /* IFontFamilyStatics2 methods */
++    family_statics2_get_XamlAutoFontFamily,
++};
++
++static struct family_statics family_statics = { {&factory_vtbl}, {&family_factory_vtbl}, {&family_statics2_vtbl} };
++
++IActivationFactory *font_family_factory = &family_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/generic.xaml b/dlls/windows.ui.xaml/generic.xaml
+index 464dfc4..b8cfb9f 100644
+--- a/dlls/windows.ui.xaml/generic.xaml
++++ b/dlls/windows.ui.xaml/generic.xaml
+@@ -337,6 +337,12 @@
+         </ResourceDictionary>
+     </ResourceDictionary.ThemeDictionaries>
+ 
++    <!-- WinUI's theme fonts: text in the default font, symbols in the icon fonts Windows has -->
++    <FontFamily x:Key="ContentControlThemeFontFamily">XamlAutoFontFamily</FontFamily>
++    <FontFamily x:Key="PhoneFontFamilyNormal">Segoe UI</FontFamily>
++    <FontFamily x:Key="PhoneFontFamilySemiLight">Segoe UI Semilight</FontFamily>
++    <FontFamily x:Key="SymbolThemeFontFamily">Segoe Fluent Icons,Segoe MDL2 Assets</FontFamily>
++
+     <Style x:Key="BaseTextBlockStyle" TargetType="TextBlock">
+         <Setter Property="FontSize" Value="14"/>
+         <Setter Property="FontWeight" Value="SemiBold"/>
+diff --git a/dlls/windows.ui.xaml/icon.c b/dlls/windows.ui.xaml/icon.c
+index ac2c119..cd22a33 100644
+--- a/dlls/windows.ui.xaml/icon.c
++++ b/dlls/windows.ui.xaml/icon.c
+@@ -349,7 +349,8 @@ static void icon_render( struct xaml_element *element, struct layout_context *ct
+         return;
+     }
+     text = WindowsGetStringRawBuffer( impl->glyph, &len );
+-    family = impl->family[0] ? impl->family : MDL2;
++    /* its own FontFamily (or one set from markup), else the icon font */
++    family = impl->family[0] ? impl->family : element->font_family ? element->font_family : MDL2;
+     if (len) d2d_draw_glyphs( ctx, family, impl->font_size, impl->weight.Weight, text, len, &element->bounds, color );
+ }
+ 
+diff --git a/dlls/windows.ui.xaml/main.c b/dlls/windows.ui.xaml/main.c
+index 897b247..e214a0c 100644
+--- a/dlls/windows.ui.xaml/main.c
++++ b/dlls/windows.ui.xaml/main.c
+@@ -126,6 +126,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( page_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Frame ))
+         IActivationFactory_QueryInterface( frame_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_FontFamily ))
++        IActivationFactory_QueryInterface( font_family_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Flyout ))
+         IActivationFactory_QueryInterface( flyout_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_VisualTreeHelper ))
+diff --git a/dlls/windows.ui.xaml/presenter.c b/dlls/windows.ui.xaml/presenter.c
+index f4365db..c3ab5a0 100644
+--- a/dlls/windows.ui.xaml/presenter.c
++++ b/dlls/windows.ui.xaml/presenter.c
+@@ -91,7 +91,7 @@ static void presenter_measure( struct xaml_element *element, struct layout_conte
+     struct presenter *impl = impl_from_element( element );
+     const Thickness *b = &impl->border_thickness, *p = &impl->padding;
+     float extra_width = b->Left + b->Right + p->Left + p->Right, extra_height = b->Top + b->Bottom + p->Top + p->Bottom;
+-    struct text_format format;
++    struct text_format format = {0};
+ 
+     *width = *height = 0;
+     if (impl->child)
+@@ -145,7 +145,7 @@ static void presenter_render( struct xaml_element *element, struct layout_contex
+     COLORREF saved = ctx->foreground;
+     BYTE saved_alpha = ctx->foreground_alpha;
+     struct layout_rect inner, rect;
+-    struct text_format format;
++    struct text_format format = {0};
+     float w, h;
+     Color c = { ctx->foreground_alpha, GetRValue( ctx->foreground ), GetGValue( ctx->foreground ), GetBValue( ctx->foreground ) };
+ 
+@@ -396,14 +396,13 @@ static HRESULT WINAPI content_presenter_put_ContentTransitions(IContentPresenter
+ 
+ static HRESULT WINAPI content_presenter_get_FontFamily(IContentPresenter *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIFontFamily **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return element_get_font_family( &impl_from_IContentPresenter( iface )->element, value );
+ }
+ 
+ static HRESULT WINAPI content_presenter_put_FontFamily(IContentPresenter *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIFontFamily *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return element_put_font_family( &impl_from_IContentPresenter( iface )->element, value );
+ }
+ 
+ static HRESULT WINAPI content_presenter_get_FontWeight(IContentPresenter *iface, __x_ABI_CWindows_CUI_CText_CFontWeight *value)
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index 136a109..cfc08e6 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -130,6 +130,11 @@ extern IActivationFactory *page_factory;
+ extern IActivationFactory *frame_factory;
+ extern IActivationFactory *dispatcher_timer_factory;
+ extern IActivationFactory *flyout_factory;
++extern IActivationFactory *font_family_factory;
++HRESULT font_family_create( const WCHAR *name, IFontFamily **value );
++void element_set_font_family( struct xaml_element *element, const WCHAR *source );
++HRESULT element_get_font_family( struct xaml_element *element, IFontFamily **value );
++HRESULT element_put_font_family( struct xaml_element *element, IFontFamily *value );
+ extern IActivationFactory *visual_tree_helper_factory;
+ BOOL flyout_set_markup( IInspectable *target, const WCHAR *name, IInspectable *object, const WCHAR *str, INT32 number );
+ extern IActivationFactory *automation_properties_factory;
+@@ -326,6 +331,7 @@ struct layout_context
+     float scale;         /* physical pixels per view pixel */
+     BOOL dark;           /* application theme */
+     COLORREF foreground; /* inherited text colour */
++    const WCHAR *font_family;   /* inherited FontFamily source, NULL for the default */
+     BYTE foreground_alpha;
+     struct xaml_element *opacity_element;   /* being drawn into its own bitmap for its Opacity < 1 */
+     void *rt;            /* render.c: the Direct2D render target, or NULL to draw with GDI */
+@@ -426,6 +432,7 @@ struct xaml_element
+ 
+     /* layout results */
+     float desired_width, desired_height;  /* including margin */
++    WCHAR *font_family;                   /* FontFamily set on it, inherited by its text; NULL: its parent's */
+     struct layout_rect bounds;            /* arranged, excluding margin, window coordinates */
+ };
+ 
+@@ -569,6 +576,7 @@ struct text_format
+     BOOL italic;
+     BOOL wrap;
+     TextAlignment alignment;
++    const WCHAR *family;  /* FontFamily source, NULL for the inherited one */
+ };
+ void text_measure( struct layout_context *ctx, const struct text_format *format, HSTRING text, float avail_width,
+                    float *width, float *height );
+diff --git a/dlls/windows.ui.xaml/range.c b/dlls/windows.ui.xaml/range.c
+index b6141ad..122db95 100644
+--- a/dlls/windows.ui.xaml/range.c
++++ b/dlls/windows.ui.xaml/range.c
+@@ -226,7 +226,7 @@ static HSTRING content_text( IInspectable *content, const WCHAR *fallback )
+ 
+ static float header_height( struct button *impl, struct layout_context *ctx, float *width )
+ {
+-    struct text_format format;
++    struct text_format format = {0};
+     float w = 0, h = 0;
+     HSTRING text;
+ 
+@@ -243,7 +243,7 @@ static float header_height( struct button *impl, struct layout_context *ctx, flo
+ void range_measure( struct button *impl, struct layout_context *ctx, float avail_width, float avail_height,
+                     float *width, float *height )
+ {
+-    struct text_format format;
++    struct text_format format = {0};
+     float w = 0, h = 0, hw;
+     HSTRING text;
+ 
+@@ -379,7 +379,7 @@ static void render_switch( struct button *impl, struct layout_context *ctx )
+     const WCHAR *state = state_suffix( impl ), *on = impl->is_on ? L"On" : L"Off";
+     struct look fill = {0}, stroke = {0}, knob = {0}, text = { ctx->foreground, TRUE }, header = { ctx->foreground, TRUE };
+     struct layout_rect track, dot, rect;
+-    struct text_format format;
++    struct text_format format = {0};
+     float top = header_height( impl, ctx, NULL ), w, h;
+     HSTRING str;
+ 
+diff --git a/dlls/windows.ui.xaml/render.c b/dlls/windows.ui.xaml/render.c
+index cfa1d87..7879ad7 100644
+--- a/dlls/windows.ui.xaml/render.c
++++ b/dlls/windows.ui.xaml/render.c
+@@ -22,7 +22,7 @@
+ /* before private.h: d2d1.h brings urlmon's IBinding, which Windows.UI.Xaml.Data's IBinding macro would rename */
+ #define COBJMACROS
+ #include "d2d1.h"
+-#include "dwrite.h"
++#include "dwrite_3.h"
+ #include "private.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(xaml);
+@@ -36,6 +36,9 @@ WINE_DEFAULT_DEBUG_CHANNEL(xaml);
+ /* no import library has it */
+ static const GUID iid_dwrite_factory = { 0xb859ee5a, 0xd838, 0x4b5b, { 0xa2, 0xe8, 0x1a, 0xdc, 0x7d, 0x93, 0xdb, 0x48 } };
+ 
++static const GUID iid_dwrite_factory3 = { 0x9a1b41c3, 0xd3bb, 0x466a, { 0x87, 0xfc, 0xfe, 0x67, 0x55, 0x6a, 0x3b, 0x65 } };
++static const GUID iid_font_set_builder1 = { 0x3ff7715f, 0x3cdc, 0x4dc6, { 0x9b, 0x72, 0xec, 0x56, 0x21, 0xdc, 0xca, 0xfd } };
++
+ static ID2D1Factory *factory;
+ static IDWriteFactory *dwrite;
+ static ID2D1DCRenderTarget *dc_target;
+@@ -412,6 +415,254 @@ void d2d_draw_lines( struct layout_context *ctx, float x, float y, const struct
+     ID2D1PathGeometry_Release( geometry );
+ }
+ 
++/* ---- font families: the system's, and fonts in the app's package that markup names ---- */
++
++/* A FontFamily source is a family, a font file in the package with the family in it
++ * ("ms-appx:///Resources/Fonts/Icons.ttf#Icons"), or a comma-separated list of these, which WinUI uses glyph by
++ * glyph. Here a text takes the first family of the list that has all its characters (so "Segoe UI, Icons" draws
++ * words in Segoe UI and icon glyphs in Icons), else the first family that is there, else Segoe UI. */
++
++#define MAX_APP_FONTS 16
++static IDWriteFontCollection *app_fonts;
++static IDWriteFontFile *app_font_files[MAX_APP_FONTS];
++static WCHAR *app_font_uris[MAX_APP_FONTS];
++static UINT32 app_font_count;
++
++static void app_fonts_rebuild(void)
++{
++    IDWriteFontCollection1 *collection = NULL;
++    IDWriteFontSetBuilder1 *builder1;
++    IDWriteFontSetBuilder *builder;
++    IDWriteFactory3 *factory3;
++    IDWriteFontSet *set;
++    UINT32 i;
++
++    if (FAILED(IDWriteFactory_QueryInterface( dwrite, &iid_dwrite_factory3, (void **)&factory3 ))) return;
++    if (SUCCEEDED(IDWriteFactory3_CreateFontSetBuilder( factory3, &builder )))
++    {
++        if (SUCCEEDED(IDWriteFontSetBuilder_QueryInterface( builder, &iid_font_set_builder1, (void **)&builder1 )))
++        {
++            for (i = 0; i < app_font_count; i++)
++                if (app_font_files[i] && FAILED(IDWriteFontSetBuilder1_AddFontFile( builder1, app_font_files[i] )))
++                    WARN( "could not use %s.\n", debugstr_w(app_font_uris[i]) );
++            if (SUCCEEDED(IDWriteFontSetBuilder1_CreateFontSet( builder1, &set )))
++            {
++                IDWriteFactory3_CreateFontCollectionFromFontSet( factory3, set, &collection );
++                IDWriteFontSet_Release( set );
++            }
++            IDWriteFontSetBuilder1_Release( builder1 );
++        }
++        IDWriteFontSetBuilder_Release( builder );
++    }
++    IDWriteFactory3_Release( factory3 );
++    if (!collection) return;
++    if (app_fonts) IDWriteFontCollection_Release( app_fonts );
++    app_fonts = (IDWriteFontCollection *)collection;
++}
++
++static void app_font_load( const WCHAR *uri )
++{
++    WCHAR path[MAX_PATH];
++    IDWriteFontFile *file = NULL;
++    UINT32 i;
++
++    for (i = 0; i < app_font_count; i++) if (!wcsicmp( app_font_uris[i], uri )) return;
++    if (app_font_count == MAX_APP_FONTS) return;
++    if (!resolve_app_uri( uri, path, ARRAY_SIZE(path) ) ||
++        FAILED(IDWriteFactory_CreateFontFileReference( dwrite, path, NULL, &file )))
++    {
++        WARN( "no font file %s.\n", debugstr_w(uri) );
++        file = NULL;
++    }
++    else TRACE( "%s is %s.\n", debugstr_w(uri), debugstr_w(path) );
++    app_font_uris[app_font_count] = wcsdup( uri );
++    app_font_files[app_font_count++] = file;   /* remembered even when missing, so it isn't looked for again */
++    if (file) app_fonts_rebuild();
++}
++
++static IDWriteFont *find_font( IDWriteFontCollection *collection, const WCHAR *family, UINT16 weight )
++{
++    IDWriteFontFamily *font_family;
++    IDWriteFont *font = NULL;
++    BOOL exists = FALSE;
++    UINT32 index;
++
++    if (!collection || FAILED(IDWriteFontCollection_FindFamilyName( collection, family, &index, &exists )) || !exists)
++        return NULL;
++    if (FAILED(IDWriteFontCollection_GetFontFamily( collection, index, &font_family ))) return NULL;
++    IDWriteFontFamily_GetFirstMatchingFont( font_family, weight ? weight : 400, DWRITE_FONT_STRETCH_NORMAL,
++                                            DWRITE_FONT_STYLE_NORMAL, &font );
++    IDWriteFontFamily_Release( font_family );
++    return font;
++}
++
++static BOOL font_covers( IDWriteFont *font, const WCHAR *text, UINT32 len )
++{
++    BOOL exists;
++    UINT32 i, ch;
++
++    for (i = 0; i < len; i++)
++    {
++        ch = text[i];
++        if (ch <= ' ' || ch == 0xa0 || ch == 0x200b || ch == 0xfeff) continue;
++        if (IS_HIGH_SURROGATE( ch ) && i + 1 < len && IS_LOW_SURROGATE( text[i + 1] ))
++        {
++            ch = 0x10000 + ((ch - 0xd800) << 10) + (text[i + 1] - 0xdc00);
++            i++;
++        }
++        if (FAILED(IDWriteFont_HasCharacter( font, ch, &exists )) || !exists) return FALSE;
++    }
++    return TRUE;
++}
++
++/* the next entry of a FontFamily list: its family name, and the collections to look in, in order (a font file's
++ * family in the package's fonts first, which it loads) */
++static const WCHAR *next_family( const WCHAR *p, WCHAR *name, SIZE_T size, IDWriteFontCollection *system,
++                                 IDWriteFontCollection **collections )
++{
++    const WCHAR *end;
++    WCHAR *n, *start, *hash;
++
++    *name = 0;
++    if (!(end = wcschr( p, ',' ))) end = p + wcslen( p );
++    lstrcpynW( name, p, min( (SIZE_T)(end - p + 1), size ) );
++    for (start = name; *start == ' ' || *start == '\t'; start++) ;
++    memmove( name, start, (wcslen( start ) + 1) * sizeof(WCHAR) );
++    for (n = name + wcslen( name ); n > name && (n[-1] == ' ' || n[-1] == '\t'); n--) n[-1] = 0;
++    if ((hash = wcschr( name, '#' )))
++    {
++        *hash = 0;
++        if (*name) app_font_load( name );
++        memmove( name, hash + 1, (wcslen( hash + 1 ) + 1) * sizeof(WCHAR) );
++        collections[0] = app_fonts;
++        collections[1] = system;
++    }
++    else
++    {
++        collections[0] = system;
++        collections[1] = app_fonts;
++    }
++    return *end ? end + 1 : end;
++}
++
++/* the system font fallback's last resort for icon glyphs (the Private Use Area) that the text's fonts lack */
++static const WCHAR icon_fallback[] = L"Segoe Fluent Icons, Segoe MDL2 Assets";
++
++/* WinUI's FontFamily lists fall back glyph by glyph: the characters the chosen family lacks go to the first family
++ * of the list that has them, then (for icon glyphs) to the icon fonts */
++static void apply_fallback( IDWriteTextLayout *layout, const WCHAR *source, const WCHAR *text, UINT32 len,
++                            UINT16 weight, const WCHAR *primary_name, IDWriteFontCollection *primary_collection )
++{
++    IDWriteFontCollection *system = NULL, *collections[2], *run_collection = NULL;
++    struct { WCHAR name[MAX_PATH]; IDWriteFontCollection *collection; IDWriteFont *font; } entries[6];
++    UINT32 count = 0, i, j, k, run_start = 0, run_entry = ~0u, pass;
++    IDWriteFont *primary;
++    const WCHAR *p;
++    BOOL exists, icons = FALSE;
++
++    if (!len) return;
++    for (i = 0; i < len; i++) if (text[i] >= 0xe000 && text[i] <= 0xf8ff) icons = TRUE;
++    if (!icons && (!source || !wcschr( source, ',' ))) return;
++    IDWriteFactory_GetSystemFontCollection( dwrite, &system, FALSE );
++    if (!(primary = find_font( primary_collection ? primary_collection : system, primary_name, weight )))
++    {
++        if (system) IDWriteFontCollection_Release( system );
++        return;
++    }
++    for (pass = 0; pass < 2; pass++)
++    for (p = pass ? (icons ? icon_fallback : L"") : (source ? source : L""); *p && count < ARRAY_SIZE(entries);)
++    {
++        p = next_family( p, entries[count].name, ARRAY_SIZE(entries[count].name), system, collections );
++        if (!entries[count].name[0]) continue;
++        for (k = 0; k < 2; k++)
++            if ((entries[count].font = find_font( collections[k], entries[count].name, weight )))
++            {
++                entries[count].collection = collections[k];
++                count++;
++                break;
++            }
++    }
++    for (i = 0; i <= len; i++)
++    {
++        UINT32 entry = ~0u;
++        if (i < len && text[i] > ' ' && !IS_HIGH_SURROGATE( text[i] ) && !IS_LOW_SURROGATE( text[i] ) &&
++            !(SUCCEEDED(IDWriteFont_HasCharacter( primary, text[i], &exists )) && exists))
++        {
++            for (j = 0; j < count; j++)
++                if (SUCCEEDED(IDWriteFont_HasCharacter( entries[j].font, text[i], &exists )) && exists) break;
++            if (j < count) entry = j;
++        }
++        if (entry == run_entry) continue;
++        if (run_entry != ~0u)
++        {
++            DWRITE_TEXT_RANGE range = { run_start, i - run_start };
++            run_collection = entries[run_entry].collection == system ? NULL : entries[run_entry].collection;
++            TRACE( "%s for %s.\n", debugstr_w(entries[run_entry].name), debugstr_wn(text + run_start, i - run_start) );
++            IDWriteTextLayout_SetFontCollection( layout, run_collection, range );
++            IDWriteTextLayout_SetFontFamilyName( layout, entries[run_entry].name, range );
++        }
++        run_entry = entry;
++        run_start = i;
++    }
++    for (j = 0; j < count; j++) IDWriteFont_Release( entries[j].font );
++    IDWriteFont_Release( primary );
++    if (system) IDWriteFontCollection_Release( system );
++}
++
++/* the family to draw text in and its collection (referenced; NULL for the system's) */
++static IDWriteFontCollection *pick_family( const WCHAR *source, const WCHAR *text, UINT32 len, UINT16 weight,
++                                           WCHAR *out, SIZE_T size )
++{
++    IDWriteFontCollection *system = NULL, *collections[2], *fallback = NULL;
++    BOOL have_fallback = FALSE;
++    WCHAR entry[MAX_PATH + 64], fallback_name[LF_FACESIZE * 2], *name;
++    const WCHAR *p;
++    IDWriteFont *font;
++    UINT32 i;
++
++    lstrcpynW( out, L"Segoe UI", size );
++    if (!source || !*source || !wcsicmp( source, L"XamlAutoFontFamily" ) || !dwrite) return NULL;
++    IDWriteFactory_GetSystemFontCollection( dwrite, &system, FALSE );
++    for (p = source; *p;)
++    {
++        p = next_family( p, entry, ARRAY_SIZE(entry), system, collections );
++        name = entry;
++        if (!*name) continue;
++        for (i = 0; i < 2; i++)
++        {
++            if (!(font = find_font( collections[i], name, weight ))) continue;
++            if (font_covers( font, text, len ))
++            {
++                IDWriteFontCollection *result = collections[i] == system ? NULL : collections[i];
++                TRACE( "%s for %s: %s.\n", debugstr_w(source), debugstr_wn(text, len), debugstr_w(name) );
++                IDWriteFont_Release( font );
++                lstrcpynW( out, name, size );
++                if (result) IDWriteFontCollection_AddRef( result );
++                if (system) IDWriteFontCollection_Release( system );
++                return result;
++            }
++            IDWriteFont_Release( font );
++            if (!have_fallback)
++            {
++                have_fallback = TRUE;
++                lstrcpynW( fallback_name, name, ARRAY_SIZE(fallback_name) );
++                fallback = collections[i];
++            }
++            break;
++        }
++    }
++    TRACE( "%s for %s: %s.\n", debugstr_w(source), debugstr_wn(text, len),
++           have_fallback ? debugstr_w(fallback_name) : "none there" );
++    if (have_fallback)
++    {
++        lstrcpynW( out, fallback_name, size );
++        if (fallback && fallback != system) IDWriteFontCollection_AddRef( fallback );
++        else fallback = NULL;
++    }
++    if (system) IDWriteFontCollection_Release( system );
++    return have_fallback ? fallback : NULL;
++}
++
+ /* ---- text ---- */
+ 
+ static IDWriteTextLayout *text_layout( const struct text_format *format, HSTRING text, float width, float height )
+@@ -421,12 +672,20 @@ static IDWriteTextLayout *text_layout( const struct text_format *format, HSTRING
+     IDWriteTextFormat *text_format;
+     IDWriteTextLayout *layout = NULL;
+     DWRITE_TEXT_ALIGNMENT alignment;
++    WCHAR family[LF_FACESIZE * 2];
++    IDWriteFontCollection *collection;
++    HRESULT hr;
+ 
+     if (!init() || !dwrite) return NULL;
+-    if (FAILED(IDWriteFactory_CreateTextFormat( dwrite, L"Segoe UI", NULL, format->weight ? format->weight : 400,
+-                                                format->italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL,
+-                                                DWRITE_FONT_STRETCH_NORMAL, format->font_size, L"", &text_format )))
++    collection = pick_family( format->family, str, len, format->weight, family, ARRAY_SIZE(family) );
++    hr = IDWriteFactory_CreateTextFormat( dwrite, family, collection, format->weight ? format->weight : 400,
++                                          format->italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL,
++                                          DWRITE_FONT_STRETCH_NORMAL, format->font_size, L"", &text_format );
++    if (FAILED(hr))
++    {
++        if (collection) IDWriteFontCollection_Release( collection );
+         return NULL;
++    }
+     IDWriteTextFormat_SetWordWrapping( text_format, format->wrap ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP );
+     switch (format->alignment)
+     {
+@@ -437,6 +696,8 @@ static IDWriteTextLayout *text_layout( const struct text_format *format, HSTRING
+     IDWriteTextFormat_SetTextAlignment( text_format, alignment );
+     IDWriteFactory_CreateTextLayout( dwrite, len ? str : L"", len, text_format, width, height, &layout );
+     IDWriteTextFormat_Release( text_format );
++    if (layout) apply_fallback( layout, format->family, str, len, format->weight, family, collection );
++    if (collection) IDWriteFontCollection_Release( collection );
+     return layout;
+ }
+ 
+@@ -521,7 +782,15 @@ BOOL d2d_draw_text( struct layout_context *ctx, const struct text_format *format
+     ID2D1Brush *brush;
+     D2D1_POINT_2F origin = { rect->x, rect->y };
+ 
++    struct text_format inherited;
++
+     if (!WindowsGetStringLen( text )) return TRUE;
++    if (!format->family && ctx->font_family)
++    {
++        inherited = *format;
++        inherited.family = ctx->font_family;
++        format = &inherited;
++    }
+     if (!(layout = text_layout( format, text, max( rect->width, 1.0f ), max( rect->height, 1.0f ) ))) return FALSE;
+     if ((brush = solid( ctx, color )))
+     {
+@@ -552,12 +821,17 @@ BOOL d2d_draw_glyphs( struct layout_context *ctx, const WCHAR *family, double si
+     IDWriteTextFormat *format;
+     IDWriteTextLayout *layout = NULL;
+     D2D1_POINT_2F origin = { rect->x, rect->y };
++    IDWriteFontCollection *collection;
++    WCHAR name[LF_FACESIZE * 2];
+     ID2D1Brush *brush;
++    HRESULT hr;
+ 
+     if (!ctx->rt || !init() || !dwrite) return FALSE;
+-    if (FAILED(IDWriteFactory_CreateTextFormat( dwrite, family, NULL, weight ? weight : 400, DWRITE_FONT_STYLE_NORMAL,
+-                                                DWRITE_FONT_STRETCH_NORMAL, size, L"", &format )))
+-        return FALSE;
++    collection = pick_family( family, text, len, weight, name, ARRAY_SIZE(name) );
++    hr = IDWriteFactory_CreateTextFormat( dwrite, name, collection, weight ? weight : 400, DWRITE_FONT_STYLE_NORMAL,
++                                          DWRITE_FONT_STRETCH_NORMAL, size, L"", &format );
++    if (collection) IDWriteFontCollection_Release( collection );
++    if (FAILED(hr)) return FALSE;
+     IDWriteTextFormat_SetWordWrapping( format, DWRITE_WORD_WRAPPING_NO_WRAP );
+     IDWriteTextFormat_SetTextAlignment( format, DWRITE_TEXT_ALIGNMENT_CENTER );
+     IDWriteTextFormat_SetParagraphAlignment( format, DWRITE_PARAGRAPH_ALIGNMENT_CENTER );
+diff --git a/dlls/windows.ui.xaml/text_block.c b/dlls/windows.ui.xaml/text_block.c
+index 3b2bf83..4f6af8c 100644
+--- a/dlls/windows.ui.xaml/text_block.c
++++ b/dlls/windows.ui.xaml/text_block.c
+@@ -167,14 +167,13 @@ static HRESULT WINAPI text_block_iface_put_Padding( ITextBlock *iface, Thickness
+ 
+ static HRESULT WINAPI text_block_iface_get_FontFamily(ITextBlock *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIFontFamily **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return element_get_font_family( &impl_from_ITextBlock( iface )->element, value );
+ }
+ 
+ static HRESULT WINAPI text_block_iface_put_FontFamily(ITextBlock *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIFontFamily *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return element_put_font_family( &impl_from_ITextBlock( iface )->element, value );
+ }
+ 
+ static HRESULT WINAPI text_block_iface_get_FontStretch(ITextBlock *iface, __x_ABI_CWindows_CUI_CText_CFontStretch *value)
+@@ -416,7 +415,7 @@ static void text_block_measure( struct xaml_element *element, struct layout_cont
+ {
+     struct text_block *impl = impl_from_element( element );
+     const Thickness *p = &impl->padding;
+-    struct text_format format;
++    struct text_format format = {0};
+ 
+     text_block_format( impl, &format );
+     text_measure( ctx, &format, impl->text, max( 0.0f, avail_width - p->Left - p->Right ), width, height );
+@@ -429,7 +428,7 @@ static void text_block_render( struct xaml_element *element, struct layout_conte
+     struct text_block *impl = impl_from_element( element );
+     const Thickness *p = &impl->padding;
+     struct layout_rect rect = element->bounds;
+-    struct text_format format;
++    struct text_format format = {0};
+     Color c = { ctx->foreground_alpha, GetRValue( ctx->foreground ), GetGValue( ctx->foreground ), GetBValue( ctx->foreground ) };
+ 
+     if (impl->foreground && (!brush_get_color( impl->foreground, &c ) || !c.A)) return;
+diff --git a/dlls/windows.ui.xaml/textbox.c b/dlls/windows.ui.xaml/textbox.c
+index 5e4e0f4..a0acab1 100644
+--- a/dlls/windows.ui.xaml/textbox.c
++++ b/dlls/windows.ui.xaml/textbox.c
+@@ -449,7 +449,7 @@ void textbox_measure( struct button *impl, struct layout_context *ctx, float ava
+     const Thickness *b = &impl->border_thickness;
+     float extra_w = b->Left + b->Right + TEXT_PADDING_LEFT + TEXT_PADDING_RIGHT;
+     float extra_h = b->Top + b->Bottom + TEXT_PADDING_TOP + TEXT_PADDING_BOTTOM;
+-    struct text_format format;
++    struct text_format format = {0};
+     float tw = 0, th = 0, lw, lh;
+     HSTRING str, line;
+ 
+@@ -486,7 +486,7 @@ static void edit_rects( struct button *impl, struct layout_context *ctx, struct
+ 
+ static float layout_width( struct text_edit *e, const struct layout_rect *text )
+ {
+-    struct text_format format;
++    struct text_format format = {0};
+     edit_format( e, &format );
+     return format.wrap ? text->width : 1e6f;
+ }
+@@ -494,7 +494,7 @@ static float layout_width( struct text_edit *e, const struct layout_rect *text )
+ /* the caret's place in the text area's coordinates, before scrolling */
+ static BOOL caret_pos( struct text_edit *e, const struct layout_rect *text, UINT32 index, float *x, float *y, float *h )
+ {
+-    struct text_format format;
++    struct text_format format = {0};
+     HSTRING str = display_text( e );
+     BOOL ret;
+ 
+@@ -513,7 +513,7 @@ static BOOL caret_pos( struct text_edit *e, const struct layout_rect *text, UINT
+ 
+ static UINT32 hit_index( struct text_edit *e, const struct layout_rect *text, float x, float y )
+ {
+-    struct text_format format;
++    struct text_format format = {0};
+     HSTRING str = display_text( e );
+     UINT32 index = 0;
+ 
+@@ -535,7 +535,7 @@ void textbox_render( struct button *impl, struct layout_context *ctx )
+     struct text_edit *e = edit_of( impl );
+     BOOL focused = element_focus_state( &impl->element ) != FocusState_Unfocused;
+     struct layout_rect box, text, r;
+-    struct text_format format;
++    struct text_format format = {0};
+     struct look background, border, fg, placeholder;
+     COLORREF accent = RGB(0, 120, 215);
+     float cx, cy, ch, x1, y1, h1;
+diff --git a/dlls/windows.ui.xaml/xbf.c b/dlls/windows.ui.xaml/xbf.c
+index a6dec64..8174f6e 100644
+--- a/dlls/windows.ui.xaml/xbf.c
++++ b/dlls/windows.ui.xaml/xbf.c
+@@ -1931,6 +1931,11 @@ static void convert_to_type( const struct xtype *type, struct xvalue *v )
+         if ((brush = to_brush( v ))) object = (IInspectable *)brush;
+     }
+     else if (!wcscmp( type->name, L"String" ) && v->kind == XV_STRING) object = box_string( v->s );
++    else if (!wcscmp( type->name, L"FontFamily" ) && v->kind == XV_STRING)
++    {
++        IFontFamily *family;
++        if (SUCCEEDED(font_family_create( v->s, &family ))) object = (IInspectable *)family;
++    }
+     else if (v->kind == XV_OBJECT) return;
+     else
+     {
+@@ -2177,6 +2182,22 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+         }
+     }
+ 
++    /* FontFamily, on any element: its text and its children's inherit it */
++    if (prop_is( prop, L"FontFamily" ) && (element = element_from_object( target )) &&
++        (value->kind == XV_STRING || value->kind == XV_OBJECT || value->kind == XV_NULL))
++    {
++        IFontFamily *family;
++        if (value->kind == XV_STRING) element_set_font_family( element, value->s );
++        else if (value->kind == XV_OBJECT && value->object &&
++                 SUCCEEDED(IInspectable_QueryInterface( value->object, &IID_IFontFamily, (void **)&family )))
++        {
++            element_put_font_family( element, family );
++            IFontFamily_Release( family );
++        }
++        else element_set_font_family( element, NULL );
++        return S_OK;
++    }
++
+     /* Flyout: its Content and Placement */
+     if ((value->kind == XV_OBJECT || value->kind == XV_STRING || value->kind == XV_ENUM) &&
+         flyout_set_markup( target, prop->name, value->kind == XV_OBJECT ? value->object : NULL,
+@@ -2922,6 +2943,8 @@ static IInspectable *get_property( IInspectable *target, const struct xprop *pro
+ }
+ 
+ /* find a resource: in dictionaries on the stack (innermost first), then the application's, then the theme's */
++static BOOL load_pending_resource( const WCHAR *key );
++
+ static IInspectable *lookup_resource( struct writer *w, const WCHAR *key, BOOL theme, BOOL quiet )
+ {
+     IInspectable *value = NULL, *dict;
+@@ -2935,6 +2958,8 @@ static IInspectable *lookup_resource( struct writer *w, const WCHAR *key, BOOL t
+     }
+     if (!value && w->templated_parent && element_from_object( w->templated_parent ))
+         value = element_lookup_resource( element_from_object( w->templated_parent ), key );
++    /* one further on in a dictionary being loaded */
++    if (!value && load_pending_resource( key )) return lookup_resource( w, key, theme, quiet );
+     if (!value && (dict = application_resources())) value = resource_dictionary_lookup( dict, key );
+     if (!value) value = generic_resource_lookup( key );
+     if (!value) value = theme_resource_lookup( key );
+@@ -3112,6 +3137,78 @@ static void add_to_collection( IInspectable *collection, struct xvalue *value )
+     FIXME( "adding to collection %p is not supported.\n", collection );
+ }
+ 
++/* A resource dictionary being loaded. A compiled dictionary's entries may refer to entries further on (WinUI loads
++ * them lazily), so a lookup that finds nothing loads the entry it asks for there and then; the loop then skips it. */
++struct pending_dictionary
++{
++    struct pending_dictionary *outer;
++    struct writer *w;
++    UINT32 stream;
++    struct custom_data *data;
++    IInspectable *target;
++    BYTE *state;   /* per entry: 0 not loaded, 1 loading, 2 loaded */
++};
++
++static struct pending_dictionary *pending_dictionaries;   /* the innermost first (UI thread) */
++
++static void resource_key( const struct resource_entry *entry, WCHAR *key, SIZE_T size )
++{
++    if (entry->implicit) implicit_key( entry->key, key, size );
++    else lstrcpynW( key, entry->key, size );
++}
++
++static void load_dictionary_entry( struct pending_dictionary *p, UINT32 i )
++{
++    struct writer *w = p->w, *sub;
++    struct xvalue value;
++    WCHAR key[100];
++
++    if (p->state[i]) return;
++    p->state[i] = 1;
++    if (!(sub = calloc( 1, sizeof(*sub) ))) { w->failed = TRUE; return; }
++    resource_key( &p->data->resources[i], key, ARRAY_SIZE(key) );
++    sub->xbf = w->xbf;
++    sub->root_used = TRUE;
++    sub->connector = w->connector;
++    sub->templated_parent = w->templated_parent;
++    sub->names_owner = w->names_owner;
++    /* resources may refer to other ones: the sub-writer sees this writer's stack, without owning it */
++    memcpy( sub->stack, w->stack, w->sp * sizeof(*w->stack) );
++    sub->sp = w->sp;
++    run_stream( sub, p->stream, p->data->resources[i].offset, RUN_OBJECT );
++    if (sub->sp > w->sp)
++    {
++        pop( sub, &value );
++        if (value.kind != XV_OBJECT) box_value( &value );
++        if (value.kind == XV_OBJECT && value.object && p->target)
++            resource_dictionary_insert( p->target, key, value.object );
++        xvalue_clear( &value );
++    }
++    while (sub->sp > w->sp) { pop( sub, &value ); xvalue_clear( &value ); }
++    free( sub );
++    p->state[i] = 2;
++}
++
++/* a lookup found nothing: load the entry of that key of a dictionary being loaded, if there is one */
++static BOOL load_pending_resource( const WCHAR *key )
++{
++    struct pending_dictionary *p;
++    WCHAR name[100];
++    UINT32 i;
++
++    for (p = pending_dictionaries; p; p = p->outer)
++        for (i = 0; i < p->data->resource_count; i++)
++        {
++            if (p->state[i]) continue;
++            resource_key( &p->data->resources[i], name, ARRAY_SIZE(name) );
++            if (wcscmp( name, key )) continue;
++            TRACE( "%s, ahead of its turn.\n", debugstr_w(key) );
++            load_dictionary_entry( p, i );
++            return TRUE;
++        }
++    return FALSE;
++}
++
+ static void run_custom_data( struct writer *w, UINT32 stream, struct custom_data *data )
+ {
+     IInspectable *target = top_object( w );
+@@ -3124,30 +3221,14 @@ static void run_custom_data( struct writer *w, UINT32 stream, struct custom_data
+     {
+     case 371: case 7: case 10: case 12:
+         TRACE( "resource dictionary with %u resources in stream %u.\n", data->resource_count, stream );
+-        for (i = 0; i < data->resource_count; i++)
+         {
+-            WCHAR key[100];
+-            if (data->resources[i].implicit) implicit_key( data->resources[i].key, key, ARRAY_SIZE(key) );
+-            else lstrcpynW( key, data->resources[i].key, ARRAY_SIZE(key) );
+-            memset( sub, 0, sizeof(*sub) );
+-            sub->xbf = w->xbf;
+-            sub->root_used = TRUE;
+-            sub->connector = w->connector;
+-            sub->templated_parent = w->templated_parent;
+-            sub->names_owner = w->names_owner;
+-            /* resources may refer to earlier ones: the sub-writer sees this writer's stack, without owning it */
+-            memcpy( sub->stack, w->stack, w->sp * sizeof(*w->stack) );
+-            sub->sp = w->sp;
+-            run_stream( sub, stream, data->resources[i].offset, RUN_OBJECT );
+-            if (sub->sp > w->sp)
+-            {
+-                pop( sub, &value );
+-                if (value.kind != XV_OBJECT) box_value( &value );
+-                if (value.kind == XV_OBJECT && value.object && target)
+-                    resource_dictionary_insert( target, key, value.object );
+-                xvalue_clear( &value );
+-            }
+-            while (sub->sp > w->sp) { pop( sub, &value ); xvalue_clear( &value ); }
++            struct pending_dictionary pending = { pending_dictionaries, w, stream, data, target };
++
++            if (!(pending.state = calloc( data->resource_count + 1, 1 ))) { w->failed = TRUE; break; }
++            pending_dictionaries = &pending;
++            for (i = 0; i < data->resource_count; i++) load_dictionary_entry( &pending, i );
++            pending_dictionaries = pending.outer;
++            free( pending.state );
+         }
+         break;
+     case 745: case 6: case 9:
+@@ -4285,6 +4366,14 @@ static BOOL text_value_element( struct xml_node *node, struct xvalue *out )
+         out->s = wcsdup( text );
+         return TRUE;
+     }
++    if (!wcscmp( node->name, L"FontFamily" ))
++    {
++        IFontFamily *family;
++        if (FAILED(font_family_create( text, &family ))) return TRUE;
++        out->kind = XV_OBJECT;
++        out->object = (IInspectable *)family;
++        return TRUE;
++    }
+     return FALSE;
+ }
+ 
+diff --git a/include/windows.ui.xaml.idl b/include/windows.ui.xaml.idl
+index 3248696..7bb71ce 100644
+--- a/include/windows.ui.xaml.idl
++++ b/include/windows.ui.xaml.idl
+@@ -629,6 +629,8 @@ namespace Windows.UI.Xaml.Media {
+     interface IBrushStatics;
+     interface ICacheMode;
+     interface IFontFamily;
++    interface IFontFamilyFactory;
++    interface IFontFamilyStatics2;
+     interface IGeneralTransform;
+     interface IProjection;
+     interface IRectangleGeometry;
+@@ -5202,7 +5204,11 @@ namespace Windows.UI.Xaml.Media {
+     }
+ 
+     [
+-        contract(Windows.Foundation.UniversalApiContract, 1.0)
++        composable(Windows.UI.Xaml.Media.IFontFamilyFactory, public, Windows.Foundation.UniversalApiContract, 1.0),
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.UI.Xaml.Media.IFontFamilyStatics2, Windows.Foundation.UniversalApiContract, 2.0),
++        threading(both)
+     ]
+     runtimeclass FontFamily
+     {
+@@ -15521,3 +15527,34 @@ namespace Windows.UI.Xaml.Controls.Primitives {
+ 
+ }
+ 
++
++/* Xbox Accessories, generated by scripts/winmd2idl.py: Media.FontFamily's factory and statics. */
++
++namespace Windows.UI.Xaml.Media {
++    interface IFontFamilyFactory;
++    interface IFontFamilyStatics2;
++}
++
++namespace Windows.UI.Xaml.Media {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Media.FontFamily),
++        uuid(d5603377-3dae-4dcd-af09-f9498e9ec659)
++    ]
++    interface IFontFamilyFactory : IInspectable
++    {
++        HRESULT CreateInstanceWithName([in] HSTRING familyName, [in] IInspectable * baseInterface, [out] IInspectable * *innerInterface, [out, retval] Windows.UI.Xaml.Media.FontFamily * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 2.0),
++        exclusiveto(Windows.UI.Xaml.Media.FontFamily),
++        uuid(52ad7af9-37e6-4297-a238-97fb6a408d9e)
++    ]
++    interface IFontFamilyStatics2 : IInspectable
++    {
++        [propget] HRESULT XamlAutoFontFamily([out, retval] Windows.UI.Xaml.Media.FontFamily * *value);
++    }
++
++}
++
