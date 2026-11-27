@@ -1,0 +1,20 @@
+Subject: windows.networking.connectivity: WINE_UWP_OFFLINE=1 reports no internet connection
+
+diff --git a/dlls/windows.networking.connectivity/network_information.c b/dlls/windows.networking.connectivity/network_information.c
+index d34fbfd..1325ed1 100644
+--- a/dlls/windows.networking.connectivity/network_information.c
++++ b/dlls/windows.networking.connectivity/network_information.c
+@@ -434,6 +434,13 @@ static HRESULT WINAPI network_information_statics_GetInternetConnectionProfile(
+     TRACE( "iface %p, value %p\n", iface, value );
+ 
+     *value = NULL;
++    /* WINE_UWP_OFFLINE=1: no internet connection, as Windows reports offline. For apps that otherwise keep trying
++     * their online services (Xbox cloud saves) and asking the player about each failure. */
++    if (GetEnvironmentVariableW( L"WINE_UWP_OFFLINE", NULL, 0 ))
++    {
++        FIXME( "WINE_UWP_OFFLINE set: no internet connection.\n" );
++        return S_OK;
++    }
+     if (FAILED(hr = CoCreateInstance( &CLSID_NetworkListManager, NULL, CLSCTX_INPROC_SERVER, &IID_INetworkListManager, (void **)&network_list_manager ))) return hr;
+     if (!(impl = calloc( 1, sizeof( *impl ) )))
+     {

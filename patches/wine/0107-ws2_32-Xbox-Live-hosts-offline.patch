@@ -1,0 +1,71 @@
+Subject: ws2_32: Xbox Live hosts don't resolve in packaged apps
+
+diff --git a/dlls/ws2_32/protocol.c b/dlls/ws2_32/protocol.c
+index 78dc0c7..d439744 100644
+--- a/dlls/ws2_32/protocol.c
++++ b/dlls/ws2_32/protocol.c
+@@ -23,6 +23,7 @@
+  */
+ 
+ #include "ws2_32_private.h"
++#include "appmodel.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(winsock);
+ WINE_DECLARE_DEBUG_CHANNEL(winediag);
+@@ -45,6 +46,30 @@ static char *get_fqdn(void)
+     return ret;
+ }
+ 
++/* A UWP app (a process with package identity) is signed in to Xbox Live only offline, with a placeholder token, so
++ * Xbox Live hosts must look unreachable: requests made through the app's own network code (Unity's, for one) would
++ * otherwise reach the services, be refused with 401 and be taken for an expired sign-in rather than no connection. */
++static BOOL is_offline_host( const char *name )
++{
++    static const char suffix[] = ".xboxlive.com";
++    static int packaged = -1;
++    size_t len;
++
++    if (!name) return FALSE;
++    len = strlen( name );
++    if (len && name[len - 1] == '.') len--;   /* a fully qualified "host.xboxlive.com." */
++    if (!(len == sizeof(suffix) - 2 && !_strnicmp( name, suffix + 1, len )) &&
++        !(len >= sizeof(suffix) - 1 && !_strnicmp( name + len - (sizeof(suffix) - 1), suffix, sizeof(suffix) - 1 )))
++        return FALSE;
++    if (packaged == -1)
++    {
++        UINT32 size = 0;
++        packaged = GetCurrentPackageFamilyName( &size, NULL ) != APPMODEL_ERROR_NO_PACKAGE;
++    }
++    if (packaged) TRACE( "%s: Xbox Live is offline for packaged apps.\n", debugstr_a(name) );
++    return packaged;
++}
++
+ /* call Unix getaddrinfo, allocating a large enough buffer */
+ static int do_getaddrinfo( const char *node, const char *service,
+                            const struct addrinfo *hints, struct addrinfo **info )
+@@ -203,6 +228,12 @@ int WINAPI getaddrinfo( const char *node, const char *service,
+         return WSAHOST_NOT_FOUND;
+     }
+ 
++    if (is_offline_host( node ))
++    {
++        SetLastError( WSAHOST_NOT_FOUND );
++        return WSAHOST_NOT_FOUND;
++    }
++
+     if (node)
+     {
+         if (!node[0])
+@@ -980,6 +1011,12 @@ struct hostent * WINAPI gethostbyname( const char *name )
+         return NULL;
+     }
+ 
++    if (is_offline_host( name ))
++    {
++        SetLastError( WSAHOST_NOT_FOUND );
++        return NULL;
++    }
++
+     if ((ret = WS_CALL( gethostname, &params )))
+     {
+         SetLastError( ret );

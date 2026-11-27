@@ -23,7 +23,8 @@ UWP apps don't create a normal Win32 window. They ask Windows for a `CoreApplica
 | ✅ | Microsoft Sudoku (`Microsoft.MicrosoftSudoku`, Unity 6, XAML, .NET Native) | Playable offline: the tutorial and puzzles with the mouse. Its Xbox cloud sync and ads fail as offline. |
 | ✅ | Minecraft for Windows 1.21.114 and 1.19.83 (`Microsoft.MinecraftUWP`, D3D11) | Starts and plays offline: menus, worlds. Xbox sign-in and online features fail as offline. |
 | ✅ | Microsoft Mahjong (`Microsoft.MicrosoftMahjong`, XAML, .NET Native) | Playable offline: answer "OK" and "Play Offline" at the download questions, then menus and games with the mouse and keyboard. Its Xbox sign-in, downloads and ads fail as offline. |
-| ❓ | Microsoft Solitaire Collection, Wordament (`Microsoft.MicrosoftSolitaireCollection`, `Microsoft.Studios.Wordament`) | Not tested yet. |
+| ✅ | Microsoft Ultimate Word Games / Wordament (`Microsoft.Studios.Wordament`, Unity, XAML, .NET Native) | Playable offline. Its [`apps/` file](apps/Microsoft.Studios.Wordament.conf) reports no internet connection, so it doesn't keep asking about Xbox cloud saves. |
+| ❌ | Microsoft Solitaire Collection (`Microsoft.MicrosoftSolitaireCollection`, XAML, WinUI 2.8) | Not working: a blank window. Its interface is all XAML with WinUI 2 controls, which the partial XAML doesn't support yet (like Calculator). |
 | ❌ | Forza Motorsport 7 (`Microsoft.ApolloBaseGame`, D3D12) | Not working: it starts and its hardware warning is answered, but it isn't playable yet. |
 | ❌ | Windows Calculator (`Microsoft.WindowsCalculator`, XAML, WinUI 2.8) | Not working: stops at startup. It needs XAML's dependency-property system and the WinUI 2 control library, which the partial XAML doesn't support yet. |
 | ❌ | Windows Notepad, Paint (`Microsoft.WindowsNotepad`, `Microsoft.Paint`) | Not supported: Windows App SDK (WinUI 3) desktop apps, not UWP; nothing here supports them. |
@@ -172,6 +173,7 @@ tests/xaml/run.sh
 | `WINE_CORE_SCALE=1.5` | Report a display scale (like Windows' 150% setting); leave unset for 100% |
 | `WINE_APP_STORE_ID=...` | The Store ID reported for the app (it is not in the package manifest); apps that care need it set in [`apps/<package name>.conf`](apps/README.md) |
 | `WINE_MESSAGEDIALOG_AUTO=Continue` | Answer an app's pop-up dialogs without showing them: the first button whose label starts with this text (or a button number). Set for Gears of War 4 and Forza Motorsport 7 in their `apps/` files, to get past their hardware warnings; `WINE_MESSAGEDIALOG_AUTO=` (empty) shows them again |
+| `WINE_UWP_OFFLINE=1` | Report no internet connection to the app (`NetworkInformation`), as Windows does offline. Set for apps that otherwise keep retrying their online services; Xbox Live itself always looks unreachable to apps |
 | `WINE_REPORT_HOSTNAMES=1` | Report the PC's real IP addresses to the app (off by default) |
 | `WINEDEBUG=-all` | Turn off logging (default logs errors, fixmes and the WinRT channel) |
 | `UWP_PREFIX`, `UWP_DATA_DIR`, `UWP_LOGS`, `UWP_BUILD_DIR` | Move the shared prefix, data, logs or build folders |
@@ -311,7 +313,9 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 controller's User and its events (Minecraft stopped when a pad was connected), 0100 ResourceManager over
                 the package's resources.pri (.NET Native's resx strings; Mahjong stopped after "Play Offline"), 0101
                 relative paths in StorageFolder.GetFileAsync and the like, 0102-0105 for Mahjong: AppInfo,
-                DateTimeFormatter, KeyRoutedEventArgs.OriginalKey, and a title bar for apps launched windowed
+                DateTimeFormatter, KeyRoutedEventArgs.OriginalKey, and a title bar for apps launched windowed, 0106-0108
+                for Wordament: Store and user vectors answer only their own interfaces, Xbox Live hosts don't
+                resolve in apps (their placeholder token was refused with 401), WINE_UWP_OFFLINE
 patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings

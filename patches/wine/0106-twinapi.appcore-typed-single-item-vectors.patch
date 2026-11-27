@@ -1,0 +1,163 @@
+Subject: twinapi.appcore: single-item vectors answer only their own IVectorView and IIterable
+
+diff --git a/dlls/twinapi.appcore/auth_probe.c b/dlls/twinapi.appcore/auth_probe.c
+index 6fbeb3a..fbf5ae7 100644
+--- a/dlls/twinapi.appcore/auth_probe.c
++++ b/dlls/twinapi.appcore/auth_probe.c
+@@ -1,7 +1,7 @@
+ /* Generic probing factories for classes we do not implement yet: log IIDs and slot calls. */
+ #include "private.h"
+ #include "xbox_identity.h"
+-extern HRESULT single_vector_create( void *item, void **out );
++extern HRESULT single_vector_create( void *item, const GUID *view_iid, const GUID *iterable_iid, void **out );
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
+ 
+@@ -213,7 +213,12 @@ static HRESULT create_success_result(struct treq *request, void **out)
+          * handle the way they would on a PC without a connection. */
+         map_put(props, L"Signature", L"AAAAAQHZ4ozDAAAAb2ZmbGluZS1zaWduYXR1cmU=");
+     }
+-    if (FAILED(hr = single_vector_create(response, &vec))) return hr;
++    {
++        /* IVectorView<WebTokenResponse> and IIterable<WebTokenResponse> */
++        static const GUID view = {0x199e065c,0x8195,0x55da,{0x9c,0x10,0x8a,0xea,0xf9,0xac,0x10,0x62}};
++        static const GUID iterable = {0x7e5bb7ec,0xbbd7,0x5575,{0x9a,0x61,0xf5,0x81,0x5f,0xa2,0x2a,0x0e}};
++        if (FAILED(hr = single_vector_create(response, &view, &iterable, &vec))) return hr;
++    }
+     if (!(res = calloc(1, sizeof(*res)))) return E_OUTOFMEMORY;
+     res->lpVtbl = tres_vtbl;
+     res->responses = vec;
+diff --git a/dlls/twinapi.appcore/store.c b/dlls/twinapi.appcore/store.c
+index 57546b4..6adb0f7 100644
+--- a/dlls/twinapi.appcore/store.c
++++ b/dlls/twinapi.appcore/store.c
+@@ -9,7 +9,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
+ extern HRESULT completed_ptr_operation( void *ptr, void **out );
+ extern HRESULT completed_int_operation( INT32 result, void **out );
+ extern HRESULT failed_operation( HRESULT hr, void **out );
+-extern HRESULT single_vector_create( void *item, void **out );
++extern HRESULT single_vector_create( void *item, const GUID *view_iid, const GUID *iterable_iid, void **out );
+ extern void *offline_user(void);
+ 
+ struct obj { const void *const *lpVtbl; };
+@@ -88,7 +88,18 @@ static HRESULT WINAPI o_GetTrustLevel(void *o, TrustLevel *l) { *l = BaseTrust;
+ static HRESULT str_out(const WCHAR *s, HSTRING *out) { return WindowsCreateString(s, wcslen(s), out); }
+ 
+ /* ---------------- empty / filled collections ---------------- */
+-static HRESULT empty_vec(void **out) { return single_vector_create(NULL, out); }
++/* empty IVectorView<T> / IIterable<T>, by their pinterface IIDs */
++static const GUID iid_strings_view = {0x2f13c006,0xa03a,0x5f69,{0xb0,0x90,0x75,0xa4,0x3e,0x33,0x42,0x3e}};
++static const GUID iid_strings_iterable = {0xe2fcc7c1,0x3bfc,0x5a0b,{0xb2,0xb0,0x72,0xe7,0x69,0xd1,0xcb,0x7e}};
++static const GUID iid_images_view = {0x7e1ceace,0x82bd,0x5db3,{0x8f,0x35,0x9b,0xf0,0xc8,0x8e,0xf8,0x39}};
++static const GUID iid_images_iterable = {0xb2da6de8,0xad55,0x56ce,{0x87,0x54,0x2c,0x96,0xf4,0xfe,0x1c,0x2e}};
++static const GUID iid_videos_view = {0x6e31fca5,0x119e,0x5799,{0xa5,0x1b,0xcd,0x6a,0xdd,0xec,0xd8,0x70}};
++static const GUID iid_videos_iterable = {0x46be61e4,0x7173,0x565e,{0xae,0xd5,0x4a,0x21,0x52,0xf1,0xce,0x69}};
++static const GUID iid_skus_view = {0x407c4593,0x063d,0x5c9b,{0xb8,0xe0,0x94,0x9f,0xe1,0x38,0x79,0x63}};
++static const GUID iid_skus_iterable = {0x522d34ef,0x4b5a,0x5b44,{0xa0,0x46,0x7a,0x16,0x05,0x1d,0x01,0x1e}};
++static const GUID iid_updates_view = {0x971c3ea6,0x4388,0x5a38,{0xae,0x13,0x49,0x29,0xb6,0xd6,0xd7,0x80}};
++static const GUID iid_updates_iterable = {0x6b076c51,0x849e,0x5ec5,{0xae,0xd5,0x9b,0x05,0x85,0x59,0x19,0x02}};
++static HRESULT empty_vec(const GUID *view, const GUID *iterable, void **out) { return single_vector_create(NULL, view, iterable, out); }
+ 
+ /* IMapView<HSTRING, V*> : slots 6 Lookup, 7 Size, 8 HasKey, 9 Split ; iterable slot 6 First */
+ struct pmap { const void *const *lpVtbl; struct pmap *twin; UINT32 count; HSTRING *keys; void **vals; int qi; };
+@@ -182,7 +193,10 @@ static HRESULT WINAPI pr_Title(void *o, HSTRING *v) { return str_out(prod(o)->na
+ static HRESULT WINAPI pr_Description(void *o, HSTRING *v) { return str_out(L"", v); }
+ static HRESULT WINAPI pr_ProductKind(void *o, HSTRING *v) { return str_out(prod(o)->kind[0] ? prod(o)->kind : L"Durable", v); }
+ static HRESULT WINAPI pr_HasDigitalDownload(void *o, boolean *v) { *v = TRUE; return S_OK; }
+-static HRESULT WINAPI pr_EmptyVec(void *o, void **v) { return empty_vec(v); }
++static HRESULT WINAPI pr_Keywords(void *o, void **v) { return empty_vec(&iid_strings_view, &iid_strings_iterable, v); }
++static HRESULT WINAPI pr_Images(void *o, void **v) { return empty_vec(&iid_images_view, &iid_images_iterable, v); }
++static HRESULT WINAPI pr_Videos(void *o, void **v) { return empty_vec(&iid_videos_view, &iid_videos_iterable, v); }
++static HRESULT WINAPI pr_Skus(void *o, void **v) { return empty_vec(&iid_skus_view, &iid_skus_iterable, v); }
+ static HRESULT WINAPI pr_IsInUserCollection(void *o, boolean *v) { *v = TRUE; return S_OK; }
+ static HRESULT WINAPI pr_Price(void *o, void **v) { FIXME("StoreProduct::Price -> NULL\n"); *v = NULL; return S_OK; }
+ static HRESULT WINAPI pr_Json(void *o, HSTRING *v) { return str_out(L"{}", v); }
+@@ -190,7 +204,7 @@ static HRESULT WINAPI pr_LinkUri(void *o, void **v) { *v = NULL; return S_OK; }
+ static HRESULT WINAPI pr_IsAnySkuAvailable(void *o, void **op) { return completed_int_operation(1, op); }
+ STUB(product, 21) STUB(product, 22) STUB(product, 23)
+ const void *const product_vtbl[] = { BASE, pr_StoreId, pr_Language, pr_Title, pr_Description, pr_ProductKind,
+-    pr_HasDigitalDownload, pr_EmptyVec, pr_EmptyVec, pr_EmptyVec, pr_EmptyVec, pr_IsInUserCollection, pr_Price, pr_Json,
++    pr_HasDigitalDownload, pr_Keywords, pr_Images, pr_Videos, pr_Skus, pr_IsInUserCollection, pr_Price, pr_Json,
+     pr_LinkUri, pr_IsAnySkuAvailable, product_stub21, product_stub22, product_stub23 };
+ 
+ /* StoreLicense: 6 SkuStoreId, 7 IsActive, 8 ExpirationDate, 9 ExtendedJsonData, 10 InAppOfferToken */
+@@ -286,7 +300,7 @@ static HRESULT WINAPI sc_AppProduct(void *o, void **op) { return completed_ptr_o
+ static HRESULT WINAPI sc_Products2(void *o, void *kinds, void *ids, void **op) { FIXME("StoreContext::GetStoreProductsAsync\n"); return completed_ptr_operation(&query_result_obj, op); }
+ static HRESULT WINAPI sc_Query1(void *o, void *kinds, void **op) { FIXME("StoreContext::query(kinds)\n"); return completed_ptr_operation(&query_result_obj, op); }
+ static HRESULT WINAPI sc_Query2(void *o, void *kinds, void *max, void **op) { FIXME("StoreContext::query(kinds,max)\n"); return completed_ptr_operation(&query_result_obj, op); }
+-static HRESULT WINAPI sc_Updates(void *o, void **op) { void *v; HRESULT hr = empty_vec(&v); if (FAILED(hr)) return hr; return completed_ptr_operation(v, op); }
++static HRESULT WINAPI sc_Updates(void *o, void **op) { void *v; HRESULT hr = empty_vec(&iid_updates_view, &iid_updates_iterable, &v); if (FAILED(hr)) return hr; return completed_ptr_operation(v, op); }
+ STUB(store_context, 18) STUB(store_context, 19) STUB(store_context, 20) STUB(store_context, 21) STUB(store_context, 22)
+ STUB(store_context, 24) STUB(store_context, 25) STUB(store_context, 26) STUB(store_context, 27) STUB(store_context, 28)
+ STUB(store_context, 29) STUB(store_context, 30) STUB(store_context, 31) STUB(store_context, 32)
+diff --git a/dlls/twinapi.appcore/user_statics.c b/dlls/twinapi.appcore/user_statics.c
+index 4ee4674..340c193 100644
+--- a/dlls/twinapi.appcore/user_statics.c
++++ b/dlls/twinapi.appcore/user_statics.c
+@@ -51,34 +51,43 @@ static HRESULT WINAPI vv_First(struct uvec *v, void **iter)
+     *iter = it;
+     return S_OK;
+ }
+-/* One object serves both IVectorView (slots 6-9) and IIterable (slot 6 'First'): decide at QI time is not possible without
+- * the IIDs, so IIterable::First is also exposed as slot 6 of a second vtable returned for the 2nd distinct IID asked. */
++/* IVectorView<T> (slots 6-9) and IIterable<T> (slot 6 First) of one or no item, on two vtables of one object. Only the
++ * two pinterface IIDs given at creation are answered: IL2CPP probes objects for unrelated interfaces, and a vtable
++ * handed out for one of those is called with the wrong methods. */
+ static HRESULT WINAPI vv_QI(void *i, REFIID iid, void **out);
+ static const void *const vview_vtbl[] = { vv_QI, vi_AddRef, vi_Release, vi_GetIids, vi_GetRuntimeClassName, vi_GetTrustLevel,
+     vv_GetAt, vv_get_Size, vv_IndexOf, vv_GetMany };
+ static const void *const viter_vtbl[] = { vv_QI, vi_AddRef, vi_Release, vi_GetIids, vi_GetRuntimeClassName, vi_GetTrustLevel,
+     vv_First };
+-struct svec { struct uvec view; struct uvec iterable; int qi_count; };
++struct svec { struct uvec view; struct uvec iterable; const GUID *view_iid, *iterable_iid; };
+ static HRESULT WINAPI vv_QI(void *i, REFIID iid, void **out)
+ {
++    struct uvec *u = i;
++    struct svec *sv = u->lpVtbl == viter_vtbl ? CONTAINING_RECORD(u, struct svec, iterable)
++                                              : CONTAINING_RECORD(u, struct svec, view);
++
+     if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) || IsEqualGUID(iid, &IID_IAgileObject))
+-    { *out = i; return S_OK; }
++        *out = i;
++    else if (IsEqualGUID(iid, sv->view_iid)) *out = &sv->view;
++    else if (IsEqualGUID(iid, sv->iterable_iid)) *out = &sv->iterable;
++    else
+     {
+-        struct uvec *u = i;
+-        struct svec *sv = CONTAINING_RECORD(u->lpVtbl == viter_vtbl ? u : u, struct svec, view);
+-        if (u->lpVtbl == viter_vtbl) sv = CONTAINING_RECORD(u, struct svec, iterable);
+-        FIXME("single-item vector QI %s (#%d)\n", debugstr_guid(iid), sv->qi_count);
+-        *out = sv->qi_count++ ? (void *)&sv->iterable : (void *)&sv->view;
+-        return S_OK;
++        TRACE("single-item vector: %s not supported.\n", debugstr_guid(iid));
++        *out = NULL;
++        return E_NOINTERFACE;
+     }
++    return S_OK;
+ }
+ 
+-HRESULT single_vector_create( void *item, void **out )
++/* item may be NULL for an empty vector; view_iid and iterable_iid are IVectorView<T> and IIterable<T> */
++HRESULT single_vector_create( void *item, const GUID *view_iid, const GUID *iterable_iid, void **out )
+ {
+     struct svec *sv = calloc(1, sizeof(*sv));
+     if (!sv) return E_OUTOFMEMORY;
+     sv->view.lpVtbl = vview_vtbl; sv->view.item = item;
+     sv->iterable.lpVtbl = viter_vtbl; sv->iterable.item = item;
++    sv->view_iid = view_iid;
++    sv->iterable_iid = iterable_iid;
+     *out = &sv->view;
+     return S_OK;
+ }
+@@ -87,7 +96,10 @@ HRESULT single_vector_create( void *item, void **out )
+ static HRESULT user_list_op(void **op)
+ {
+     void *v;
+-    HRESULT hr = single_vector_create(offline_user(), &v);
++    /* IVectorView<User> and IIterable<User> */
++    static const GUID view = {0x8cbd762a,0x1222,0x5ee5,{0xb7,0x45,0x48,0x9e,0x7a,0x42,0xc6,0xec}};
++    static const GUID iterable = {0xd1bacd1f,0x0376,0x5823,{0x8c,0x29,0x1d,0x45,0xb9,0xf4,0xc1,0x91}};
++    HRESULT hr = single_vector_create(offline_user(), &view, &iterable, &v);
+     if (FAILED(hr)) return hr;
+     return completed_ptr_operation(v, op);
+ }
