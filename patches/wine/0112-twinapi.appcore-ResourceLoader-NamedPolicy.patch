@@ -1,0 +1,643 @@
+Subject: twinapi.appcore: ResourceLoader, NamedPolicy, ApplicationView interop statics, launch args User and SplashScreen
+
+diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
+index eea9c98..a1ba7f3 100644
+--- a/dlls/twinapi.appcore/Makefile.in
++++ b/dlls/twinapi.appcore/Makefile.in
+@@ -32,6 +32,7 @@ SOURCES = \
+ 	mouse.c \
+ 	pointer_visualization.c \
+ 	resource_context.c \
++	resource_loader.c \
+ 	resource_manager.c \
+ 	sink.c \
+ 	spatial_audio.c \
+@@ -41,6 +42,7 @@ SOURCES = \
+ 	thread_pool_timer.c \
+ 	twinapi.appcore.rc \
+ 	user_gen.c \
++	named_policy.c \
+ 	user_statics.c \
+ 	xbox_identity.c \
+ 	xboxlive_address.c
+diff --git a/dlls/twinapi.appcore/application_view.c b/dlls/twinapi.appcore/application_view.c
+index 2af715b..aa0a209 100644
+--- a/dlls/twinapi.appcore/application_view.c
++++ b/dlls/twinapi.appcore/application_view.c
+@@ -28,6 +28,7 @@ struct factory
+     IApplicationViewStatics IApplicationViewStatics_iface;
+     IApplicationViewStatics2 IApplicationViewStatics2_iface;
+     IApplicationViewStatics3 IApplicationViewStatics3_iface;
++    IApplicationViewInteropStatics IApplicationViewInteropStatics_iface;
+     LONG ref;
+ };
+ 
+@@ -466,6 +467,12 @@ static HRESULT WINAPI activation_factory_QueryInterface(IActivationFactory *ifac
+         *out = &impl->IApplicationViewStatics3_iface;
+         return S_OK;
+     }
++    else if (IsEqualGUID(iid, &IID_IApplicationViewInteropStatics))
++    {
++        IApplicationViewInteropStatics_AddRef(&impl->IApplicationViewInteropStatics_iface);
++        *out = &impl->IApplicationViewInteropStatics_iface;
++        return S_OK;
++    }
+ 
+     FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
+     *out = NULL;
+@@ -646,12 +653,38 @@ static const struct IApplicationViewStatics3Vtbl statics3_vtbl =
+     statics3_put_PreferredLaunchViewSize,
+ };
+ 
++DEFINE_IINSPECTABLE(interop_statics, IApplicationViewInteropStatics, struct factory, IActivationFactory_iface)
++
++/* one view per app: the id the activation args report (ApplicationViewActivatedEventArgs) */
++static HRESULT WINAPI interop_statics_GetApplicationViewIdForWindow(IApplicationViewInteropStatics *iface,
++                                                                    ICoreWindow *window, INT32 *id)
++{
++    TRACE("iface %p, window %p, id %p.\n", iface, window, id);
++    if (!window) return E_INVALIDARG;
++    *id = 1;
++    return S_OK;
++}
++
++static const struct IApplicationViewInteropStaticsVtbl interop_statics_vtbl =
++{
++    interop_statics_QueryInterface,
++    interop_statics_AddRef,
++    interop_statics_Release,
++    /* IInspectable methods */
++    interop_statics_GetIids,
++    interop_statics_GetRuntimeClassName,
++    interop_statics_GetTrustLevel,
++    /* IApplicationViewInteropStatics methods */
++    interop_statics_GetApplicationViewIdForWindow,
++};
++
+ static struct factory factory =
+ {
+     {&activation_factory_vtbl},
+     {&statics_vtbl},
+     {&statics2_vtbl},
+     {&statics3_vtbl},
++    {&interop_statics_vtbl},
+     1,
+ };
+ 
+diff --git a/dlls/twinapi.appcore/core_gen.c b/dlls/twinapi.appcore/core_gen.c
+index 5977f89..b020e56 100644
+--- a/dlls/twinapi.appcore/core_gen.c
++++ b/dlls/twinapi.appcore/core_gen.c
+@@ -87,6 +87,8 @@ static const GUID IID_ILaunchActivatedEventArgs2_local =
+     { 0x0fd37ebc, 0x9dc9, 0x46b5, { 0x9a, 0xce, 0xbd, 0x95, 0xd4, 0x56, 0x53, 0x45 } };
+ static const GUID IID_IApplicationViewActivatedEventArgs_local =
+     { 0x930cef4b, 0xb829, 0x40fc, { 0x88, 0xf4, 0x85, 0x13, 0xe8, 0xa6, 0x47, 0x38 } };
++static const GUID IID_IActivatedEventArgsWithUser_local =
++    { 0x1cf09b9e, 0x9962, 0x4936, { 0x80, 0xff, 0xaf, 0xc8, 0xe8, 0xae, 0x5c, 0x8c } };
+ static const GUID IID_IViewSwitcherProvider_local =
+     { 0x33f288a6, 0x5c2c, 0x4d27, { 0xba, 0xc7, 0x75, 0x36, 0x08, 0x8f, 0x12, 0x19 } };
+ 
+@@ -99,24 +101,10 @@ struct core_args
+     const void *const *launch2_vtbl;     /* ILaunchActivatedEventArgs2: TileActivatedInfo */
+     const void *const *view_vtbl;        /* IApplicationViewActivatedEventArgs: CurrentlyShownApplicationViewId */
+     const void *const *switcher_vtbl;    /* IViewSwitcherProvider: ViewSwitcher */
++    const void *const *user_vtbl;        /* IActivatedEventArgsWithUser: User */
+ };
+ 
+ 
+-#define CPS(n) static HRESULT WINAPI core_probe_slot##n(void *iface, void *a, void *b) \
+-    { FIXME("activation probe slot %d (a=%p b=%p)\n", n, a, b); return E_NOTIMPL; }
+-static HRESULT WINAPI core_probe_slot6(void *iface, void **value)
+-{ FIXME("activation probe slot 6 (getter) -> NULL\n"); *value = NULL; return S_OK; }
+-CPS(7) CPS(8) CPS(9) CPS(10) CPS(11)
+-static HRESULT WINAPI core_probe_QI(void *iface, REFIID iid, void **out) { *out = iface; return S_OK; }
+-static ULONG WINAPI core_probe_AddRef(void *iface) { return 2; }
+-static ULONG WINAPI core_probe_Release(void *iface) { return 1; }
+-static HRESULT WINAPI core_probe_GetIids(void *iface, ULONG *c, IID **i) { return E_NOTIMPL; }
+-static HRESULT WINAPI core_probe_GetRuntimeClassName(void *iface, HSTRING *n) { return E_NOTIMPL; }
+-static HRESULT WINAPI core_probe_GetTrustLevel(void *iface, TrustLevel *l) { *l = BaseTrust; return S_OK; }
+-const void *const core_probe_vtbl[] = { core_probe_QI, core_probe_AddRef, core_probe_Release, core_probe_GetIids,
+-    core_probe_GetRuntimeClassName, core_probe_GetTrustLevel,
+-    core_probe_slot6, core_probe_slot7, core_probe_slot8, core_probe_slot9, core_probe_slot10, core_probe_slot11 };
+-
+ static HRESULT core_args_qi(struct core_args *impl, REFIID iid, void **out)
+ {
+     TRACE("%p, %s, %p.\n", impl, debugstr_guid(iid), out);
+@@ -139,6 +127,7 @@ static HRESULT core_args_qi(struct core_args *impl, REFIID iid, void **out)
+         else if (IsEqualGUID(iid, &IID_ILaunchActivatedEventArgs2_local)) *out = &impl->launch2_vtbl;
+         else if (IsEqualGUID(iid, &IID_IApplicationViewActivatedEventArgs_local)) *out = &impl->view_vtbl;
+         else if (IsEqualGUID(iid, &IID_IViewSwitcherProvider_local)) *out = &impl->switcher_vtbl;
++        else if (IsEqualGUID(iid, &IID_IActivatedEventArgsWithUser_local)) *out = &impl->user_vtbl;
+         else *out = NULL;
+         if (*out)
+         {
+@@ -146,17 +135,9 @@ static HRESULT core_args_qi(struct core_args *impl, REFIID iid, void **out)
+             return S_OK;
+         }
+     }
+-    {
+-        /* Unknown interface: hand out a logging probe object so the call pattern shows up in the log. */
+-        struct core_probe { const void *const *lpVtbl; GUID iid; } *p;
+-        extern const void *const core_probe_vtbl[];
+-        FIXME("probing unknown activation args interface %s.\n", debugstr_guid(iid));
+-        if (!(p = calloc(1, sizeof(*p)))) return E_OUTOFMEMORY;
+-        p->lpVtbl = core_probe_vtbl;
+-        p->iid = *iid;
+-        *out = p;
+-        return S_OK;
+-    }
++    FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
+ }
+ static ULONG core_args_addref(struct core_args *impl) { return InterlockedIncrement(&impl->ref); }
+ static ULONG core_args_release(struct core_args *impl)
+@@ -1262,10 +1243,83 @@ static HRESULT WINAPI core_args_get_PreviousExecutionState(IActivatedEventArgs *
+     return S_OK;
+ }
+ 
++/* SplashScreen: there is no splash screen; Dismissed (on Windows: once the app's first frame shows) is raised
++ * after the Activated handlers return. Apps wait for it to start loading. */
++static const GUID IID_ISplashScreen_local =
++    { 0xca4d975c, 0xd4d6, 0x43f0, { 0x97, 0xc0, 0x08, 0x33, 0xc6, 0x39, 0x1c, 0x24 } };
++static HRESULT WINAPI splash_QueryInterface(void *iface, REFIID iid, void **out)
++{
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_ISplashScreen_local))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI splash_AddRef(void *iface) { return 2; }
++static ULONG WINAPI splash_Release(void *iface) { return 1; }
++static HRESULT WINAPI splash_GetRuntimeClassName(void *iface, HSTRING *n)
++{
++    static const WCHAR name[] = L"Windows.ApplicationModel.Activation.SplashScreen";
++    return WindowsCreateString(name, wcslen(name), n);
++}
++static HRESULT WINAPI splash_get_ImageLocation(void *iface, __x_ABI_CWindows_CFoundation_CRect *value)
++{
++    memset(value, 0, sizeof(*value));
++    return S_OK;
++}
++static IUnknown *splash_handlers[8];
++static HRESULT WINAPI splash_add_Dismissed(void *iface, IUnknown *handler, EventRegistrationToken *token)
++{
++    UINT32 i;
++    for (i = 0; i < ARRAY_SIZE(splash_handlers); i++)
++    {
++        if (splash_handlers[i]) continue;
++        splash_handlers[i] = handler;
++        IUnknown_AddRef(handler);
++        token->value = i + 1;
++        return S_OK;
++    }
++    return E_OUTOFMEMORY;
++}
++static HRESULT WINAPI splash_remove_Dismissed(void *iface, EventRegistrationToken token)
++{
++    if (token.value >= 1 && token.value <= ARRAY_SIZE(splash_handlers) && splash_handlers[token.value - 1])
++    {
++        IUnknown_Release(splash_handlers[token.value - 1]);
++        splash_handlers[token.value - 1] = NULL;
++    }
++    return S_OK;
++}
++static HRESULT WINAPI splash_GetIids(void *iface, ULONG *c, IID **i) { return E_NOTIMPL; }
++static HRESULT WINAPI splash_GetTrustLevel(void *iface, TrustLevel *l) { *l = BaseTrust; return S_OK; }
++static const void *const splash_vtbl[] = { splash_QueryInterface, splash_AddRef, splash_Release, splash_GetIids,
++    splash_GetRuntimeClassName, splash_GetTrustLevel, splash_get_ImageLocation, splash_add_Dismissed,
++    splash_remove_Dismissed };
++static struct { const void *const *lpVtbl; } splash_screen = { splash_vtbl };
++
++/* TypedEventHandler<SplashScreen, IInspectable>: Invoke is slot 3 */
++static void splash_raise_dismissed(void)
++{
++    typedef HRESULT (WINAPI *invoke_func)(IUnknown *, void *, IInspectable *);
++    UINT32 i;
++
++    for (i = 0; i < ARRAY_SIZE(splash_handlers); i++)
++    {
++        IUnknown *handler = splash_handlers[i];
++        if (!handler) continue;
++        splash_handlers[i] = NULL;
++        TRACE("raising SplashScreen.Dismissed, handler %p\n", handler);
++        ((invoke_func)((void **)handler->lpVtbl)[3])(handler, &splash_screen, NULL);
++        IUnknown_Release(handler);
++    }
++}
++
+ static HRESULT WINAPI core_args_get_SplashScreen(IActivatedEventArgs *iface, __x_ABI_CWindows_CApplicationModel_CActivation_CISplashScreen **value)
+ {
+-    struct core_args *impl __attribute__((unused)) = impl_from_core_args(iface);
+-    *value = NULL;
++    *value = (void *)&splash_screen;
+     return S_OK;
+ }
+ 
+@@ -1312,6 +1366,8 @@ ARGS_IFACE(prelaunch, prelaunch_vtbl, boolean, *value = FALSE)
+ ARGS_IFACE(launch2, launch2_vtbl, IInspectable *, *value = NULL)
+ ARGS_IFACE(view_args, view_vtbl, INT32, *value = 1)
+ ARGS_IFACE(switcher, switcher_vtbl, IInspectable *, *value = NULL)
++extern void *offline_user(void);
++ARGS_IFACE(user_args, user_vtbl, void *, *value = offline_user())
+ 
+ 
+ /* ---- ICoreWindow2 on core_window ---- */
+@@ -1938,6 +1994,7 @@ static HRESULT WINAPI core_app_Run(ICoreApplication *iface, __x_ABI_CWindows_CAp
+                 args->launch2_vtbl = launch2_vtbl;
+                 args->view_vtbl = view_args_vtbl;
+                 args->switcher_vtbl = switcher_vtbl;
++                args->user_vtbl = user_args_vtbl;
+                 args->ref = 1;
+                 for (i = 0; i < view->activated_count; i++)
+                 {
+@@ -1946,6 +2003,7 @@ static HRESULT WINAPI core_app_Run(ICoreApplication *iface, __x_ABI_CWindows_CAp
+                             &view->ICoreApplicationView_iface, &args->IActivatedEventArgs_iface);
+                 }
+                 IActivatedEventArgs_Release(&args->IActivatedEventArgs_iface);
++                splash_raise_dismissed();
+             }
+         }
+         if (SUCCEEDED(hr))
+diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
+index 59fa302..c262aad 100644
+--- a/dlls/twinapi.appcore/main.c
++++ b/dlls/twinapi.appcore/main.c
+@@ -156,6 +156,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( holographic_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, L"Windows.ApplicationModel.Resources.Core.ResourceContext" ))
+         IActivationFactory_QueryInterface( resource_context_factory, &IID_IActivationFactory, (void **)factory );
++    else if (!wcscmp( buffer, L"Windows.ApplicationModel.Resources.ResourceLoader" ))
++        IActivationFactory_QueryInterface( resource_loader_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, L"Windows.ApplicationModel.Resources.Core.ResourceManager" ))
+         IActivationFactory_QueryInterface( resource_manager_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, L"Windows.Media.Audio.SpatialAudioDeviceConfiguration" ))
+@@ -173,6 +175,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( web_account_provider_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, L"Windows.System.UserPicker" ))
+         IActivationFactory_QueryInterface( user_picker_factory, &IID_IActivationFactory, (void **)factory );
++    else if (!wcscmp( buffer, L"Windows.Management.Policies.NamedPolicy" ))
++        IActivationFactory_QueryInterface( named_policy_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, L"Windows.System.User" ))
+         IActivationFactory_QueryInterface( user_statics_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, L"Windows.System.Launcher" ))
+diff --git a/dlls/twinapi.appcore/named_policy.c b/dlls/twinapi.appcore/named_policy.c
+new file mode 100644
+index 0000000..c848851
+--- /dev/null
++++ b/dlls/twinapi.appcore/named_policy.c
+@@ -0,0 +1,108 @@
++/* Windows.Management.Policies.NamedPolicy: no device management, so every policy is unmanaged and unset */
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
++
++/* NamedPolicyData (hand-declared INamedPolicyData) */
++struct policy_data { const void *const *lpVtbl; LONG ref; HSTRING area, name; };
++
++static const GUID iid_named_policy_data = {0x38dcb198,0x95ac,0x4077,{0xa6,0x43,0x80,0x78,0xca,0xe2,0x64,0x00}};
++static const GUID iid_named_policy_statics = {0x7f793be7,0x76c4,0x4058,{0x8c,0xad,0x67,0x66,0x2c,0xd0,0x5f,0x0d}};
++
++static HRESULT WINAPI pd_QI(struct policy_data *p, REFIID iid, void **out)
++{
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &iid_named_policy_data))
++    {
++        InterlockedIncrement(&p->ref);
++        *out = p;
++        return S_OK;
++    }
++    TRACE("%s not implemented.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI pd_AddRef(struct policy_data *p) { return InterlockedIncrement(&p->ref); }
++static ULONG WINAPI pd_Release(struct policy_data *p)
++{
++    ULONG ref = InterlockedDecrement(&p->ref);
++    if (!ref)
++    {
++        WindowsDeleteString(p->area);
++        WindowsDeleteString(p->name);
++        free(p);
++    }
++    return ref;
++}
++static HRESULT WINAPI pd_GetIids(void *p, ULONG *c, IID **i) { return E_NOTIMPL; }
++static HRESULT WINAPI pd_GetRuntimeClassName(void *p, HSTRING *n)
++{
++    static const WCHAR name[] = L"Windows.Management.Policies.NamedPolicyData";
++    return WindowsCreateString(name, wcslen(name), n);
++}
++static HRESULT WINAPI pd_GetTrustLevel(void *p, TrustLevel *l) { *l = BaseTrust; return S_OK; }
++static HRESULT WINAPI pd_get_Area(struct policy_data *p, HSTRING *v) { return WindowsDuplicateString(p->area, v); }
++static HRESULT WINAPI pd_get_Name(struct policy_data *p, HSTRING *v) { return WindowsDuplicateString(p->name, v); }
++static HRESULT WINAPI pd_get_Kind(void *p, INT32 *v) { *v = 0; /* Invalid: not set */ return S_OK; }
++static HRESULT WINAPI pd_get_IsManaged(void *p, boolean *v) { *v = FALSE; return S_OK; }
++static HRESULT WINAPI pd_get_IsUserPolicy(void *p, boolean *v) { *v = FALSE; return S_OK; }
++static HRESULT WINAPI pd_get_User(void *p, void **v) { *v = NULL; return S_OK; }
++static HRESULT WINAPI pd_GetBoolean(void *p, boolean *v) { *v = FALSE; return S_OK; }
++static HRESULT WINAPI pd_GetBinary(void *p, void **v) { *v = NULL; return S_OK; }
++static HRESULT WINAPI pd_GetInt32(void *p, INT32 *v) { *v = 0; return S_OK; }
++static HRESULT WINAPI pd_GetInt64(void *p, INT64 *v) { *v = 0; return S_OK; }
++static HRESULT WINAPI pd_GetString(void *p, HSTRING *v) { *v = NULL; return S_OK; }
++static HRESULT WINAPI pd_add_Changed(void *p, void *handler, EventRegistrationToken *token) { token->value = 1; return S_OK; }
++static HRESULT WINAPI pd_remove_Changed(void *p, EventRegistrationToken token) { return S_OK; }
++static const void *const policy_data_vtbl[] = { pd_QI, pd_AddRef, pd_Release, pd_GetIids, pd_GetRuntimeClassName,
++    pd_GetTrustLevel, pd_get_Area, pd_get_Name, pd_get_Kind, pd_get_IsManaged, pd_get_IsUserPolicy, pd_get_User,
++    pd_GetBoolean, pd_GetBinary, pd_GetInt32, pd_GetInt64, pd_GetString, pd_add_Changed, pd_remove_Changed };
++
++static HRESULT policy_create(HSTRING area, HSTRING name, void **out)
++{
++    struct policy_data *p;
++
++    TRACE("%s/%s: not managed.\n", debugstr_hstring(area), debugstr_hstring(name));
++    if (!(p = calloc(1, sizeof(*p)))) return E_OUTOFMEMORY;
++    p->lpVtbl = policy_data_vtbl;
++    p->ref = 1;
++    WindowsDuplicateString(area, &p->area);
++    WindowsDuplicateString(name, &p->name);
++    *out = p;
++    return S_OK;
++}
++
++/* INamedPolicyStatics */
++static HRESULT WINAPI ps_QI(void *i, REFIID iid, void **out);
++static const IActivationFactoryVtbl npf_vtbl;
++static IActivationFactory npf_obj = { &npf_vtbl };
++static ULONG WINAPI ps_AddRef(void *i) { return 2; }
++static ULONG WINAPI ps_Release(void *i) { return 1; }
++static HRESULT WINAPI ps_GetPolicyFromPath(void *i, HSTRING area, HSTRING name, void **value)
++{ return policy_create(area, name, value); }
++static HRESULT WINAPI ps_GetPolicyFromPathForUser(void *i, void *user, HSTRING area, HSTRING name, void **value)
++{ return policy_create(area, name, value); }
++static const void *const statics_vtbl[] = { ps_QI, ps_AddRef, ps_Release, pd_GetIids, pd_GetRuntimeClassName,
++    pd_GetTrustLevel, ps_GetPolicyFromPath, ps_GetPolicyFromPathForUser };
++static struct { const void *const *lpVtbl; } statics_obj = { statics_vtbl };
++
++static HRESULT WINAPI npf_QI(IActivationFactory *iface, REFIID iid, void **out)
++{
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IActivationFactory))
++    { *out = iface; return S_OK; }
++    if (IsEqualGUID(iid, &iid_named_policy_statics)) { *out = &statics_obj; return S_OK; }
++    FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static HRESULT WINAPI ps_QI(void *i, REFIID iid, void **out) { return npf_QI(&npf_obj, iid, out); }
++static ULONG WINAPI npf_AddRef(IActivationFactory *iface) { return 2; }
++static ULONG WINAPI npf_Release(IActivationFactory *iface) { return 1; }
++static HRESULT WINAPI npf_GetIids(IActivationFactory *iface, ULONG *c, IID **i) { return E_NOTIMPL; }
++static HRESULT WINAPI npf_GetRuntimeClassName(IActivationFactory *iface, HSTRING *n) { return E_NOTIMPL; }
++static HRESULT WINAPI npf_GetTrustLevel(IActivationFactory *iface, TrustLevel *l) { *l = BaseTrust; return S_OK; }
++static HRESULT WINAPI npf_ActivateInstance(IActivationFactory *iface, IInspectable **i) { return E_NOTIMPL; }
++static const IActivationFactoryVtbl npf_vtbl = { npf_QI, npf_AddRef, npf_Release, npf_GetIids, npf_GetRuntimeClassName,
++    npf_GetTrustLevel, npf_ActivateInstance };
++IActivationFactory *named_policy_factory = &npf_obj;
+diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
+index adaf512..d8a5b1e 100644
+--- a/dlls/twinapi.appcore/private.h
++++ b/dlls/twinapi.appcore/private.h
+@@ -79,10 +79,11 @@ extern IActivationFactory *clipboard_factory;
+ extern IActivationFactory *api_information_factory;
+ extern IActivationFactory *resource_context_factory;
+ extern IActivationFactory *resource_manager_factory;
++extern IActivationFactory *resource_loader_factory;
+ extern IActivationFactory *holographic_factory;
+ extern IActivationFactory *spatial_audio_factory;
+ extern IActivationFactory *spatial_audio_subtype_factory;
+-extern IActivationFactory *web_token_manager_factory, *web_token_request_factory, *web_account_provider_factory, *user_picker_factory, *system_user_factory, *launcher_factory, *web_account_factory, *web_token_response_factory, *thread_pool_timer_factory, *user_statics_factory, *store_context_real_factory, *message_websocket_factory, *store_context_factory, *logging_options_factory, *logging_fields_factory, *push_manager_factory, *logging_channel_factory, *loggingchanneloptions_factory, *loggingactivity_factory, *loggingsession_factory;
++extern IActivationFactory *web_token_manager_factory, *web_token_request_factory, *web_account_provider_factory, *user_picker_factory, *system_user_factory, *launcher_factory, *web_account_factory, *web_token_response_factory, *thread_pool_timer_factory, *user_statics_factory, *named_policy_factory, *store_context_real_factory, *message_websocket_factory, *store_context_factory, *logging_options_factory, *logging_fields_factory, *push_manager_factory, *logging_channel_factory, *loggingchanneloptions_factory, *loggingactivity_factory, *loggingsession_factory;
+ extern IActivationFactory *async_causality_tracer_factory;   /* causality.c */
+ extern IActivationFactory *mouse_device_factory;   /* mouse.c */
+ extern IActivationFactory *ui_command_factory;   /* message_dialog.c */
+diff --git a/dlls/twinapi.appcore/resource_loader.c b/dlls/twinapi.appcore/resource_loader.c
+new file mode 100644
+index 0000000..5030170
+--- /dev/null
++++ b/dlls/twinapi.appcore/resource_loader.c
+@@ -0,0 +1,167 @@
++/* Windows.ApplicationModel.Resources.ResourceLoader: strings from the package's resources.pri (hand-declared
++ * interfaces). A loader named "X" reads "X/<key>"; the default one reads "Resources/<key>". */
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
++
++HRESULT pri_lookup_string( const WCHAR *prefix, const WCHAR *name, HSTRING *value );
++
++static const GUID iid_resource_loader = {0x08524908,0x16ef,0x45ad,{0xa6,0x02,0x29,0x36,0x37,0xd7,0xe6,0x1a}};
++static const GUID iid_resource_loader2 = {0x10eb6ec6,0x8138,0x48c1,{0xbc,0x65,0xe1,0xf1,0x42,0x07,0x36,0x7c}};
++static const GUID iid_resource_loader_factory = {0xc33a3603,0x69dc,0x4285,{0xa0,0x77,0xd5,0xc0,0xe4,0x7c,0xcb,0xe8}};
++static const GUID iid_resource_loader_statics = {0xbf777ce1,0x19c8,0x49c2,{0x95,0x3c,0x47,0xe9,0x22,0x7b,0x33,0x4e}};
++static const GUID iid_resource_loader_statics2 = {0x0cc04141,0x6466,0x4989,{0x94,0x94,0x0b,0x82,0xdf,0xc5,0x3f,0x1f}};
++static const GUID iid_resource_loader_statics3 = {0x64609dfb,0x64ac,0x491b,{0x81,0x00,0x0e,0x55,0x8d,0x61,0xc1,0xd0}};
++
++struct loader
++{
++    const void *const *loader_vtbl;    /* IResourceLoader */
++    const void *const *loader2_vtbl;   /* IResourceLoader2 */
++    LONG ref;
++    WCHAR *name;
++};
++
++static struct loader *loader_from(void *iface) { return CONTAINING_RECORD(iface, struct loader, loader_vtbl); }
++static struct loader *loader_from2(void *iface) { return CONTAINING_RECORD(iface, struct loader, loader2_vtbl); }
++
++static HRESULT loader_qi(struct loader *l, REFIID iid, void **out)
++{
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &iid_resource_loader))
++        *out = &l->loader_vtbl;
++    else if (IsEqualGUID(iid, &iid_resource_loader2))
++        *out = &l->loader2_vtbl;
++    else
++    {
++        TRACE("%s not implemented.\n", debugstr_guid(iid));
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    InterlockedIncrement(&l->ref);
++    return S_OK;
++}
++static ULONG loader_release(struct loader *l)
++{
++    ULONG ref = InterlockedDecrement(&l->ref);
++    if (!ref)
++    {
++        free(l->name);
++        free(l);
++    }
++    return ref;
++}
++
++static HRESULT WINAPI rl_QI(void *i, REFIID iid, void **out) { return loader_qi(loader_from(i), iid, out); }
++static ULONG WINAPI rl_AddRef(void *i) { return InterlockedIncrement(&loader_from(i)->ref); }
++static ULONG WINAPI rl_Release(void *i) { return loader_release(loader_from(i)); }
++static HRESULT WINAPI rl_GetIids(void *i, ULONG *c, IID **ids) { return E_NOTIMPL; }
++static HRESULT WINAPI rl_GetRuntimeClassName(void *i, HSTRING *n)
++{
++    static const WCHAR name[] = L"Windows.ApplicationModel.Resources.ResourceLoader";
++    return WindowsCreateString(name, wcslen(name), n);
++}
++static HRESULT WINAPI rl_GetTrustLevel(void *i, TrustLevel *l) { *l = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI rl_GetString(void *i, HSTRING resource, HSTRING *value)
++{
++    struct loader *l = loader_from(i);
++    HRESULT hr = pri_lookup_string(l->name, WindowsGetStringRawBuffer(resource, NULL), value);
++    TRACE("%s/%s -> %s.\n", debugstr_w(l->name), debugstr_hstring(resource), debugstr_hstring(*value));
++    return hr;
++}
++static const void *const loader_vtbl[] = { rl_QI, rl_AddRef, rl_Release, rl_GetIids, rl_GetRuntimeClassName,
++    rl_GetTrustLevel, rl_GetString };
++
++static HRESULT WINAPI rl2_QI(void *i, REFIID iid, void **out) { return loader_qi(loader_from2(i), iid, out); }
++static ULONG WINAPI rl2_AddRef(void *i) { return InterlockedIncrement(&loader_from2(i)->ref); }
++static ULONG WINAPI rl2_Release(void *i) { return loader_release(loader_from2(i)); }
++
++static HRESULT string_for_uri(IUriRuntimeClass *uri, HSTRING *value)
++{
++    HSTRING raw = NULL;
++    HRESULT hr;
++
++    *value = NULL;
++    if (!uri) return E_INVALIDARG;
++    IUriRuntimeClass_get_RawUri(uri, &raw);
++    hr = pri_lookup_string(NULL, WindowsGetStringRawBuffer(raw, NULL), value);
++    TRACE("%s -> %s.\n", debugstr_hstring(raw), debugstr_hstring(*value));
++    WindowsDeleteString(raw);
++    return hr;
++}
++static HRESULT WINAPI rl2_GetStringForUri(void *i, IUriRuntimeClass *uri, HSTRING *value) { return string_for_uri(uri, value); }
++static const void *const loader2_vtbl[] = { rl2_QI, rl2_AddRef, rl2_Release, rl_GetIids, rl_GetRuntimeClassName,
++    rl_GetTrustLevel, rl2_GetStringForUri };
++
++static HRESULT loader_create(HSTRING name, void **out)
++{
++    const WCHAR *str = name ? WindowsGetStringRawBuffer(name, NULL) : NULL;
++    struct loader *l;
++
++    if (!(l = calloc(1, sizeof(*l)))) return E_OUTOFMEMORY;
++    l->loader_vtbl = loader_vtbl;
++    l->loader2_vtbl = loader2_vtbl;
++    l->ref = 1;
++    l->name = wcsdup(str && *str ? str : L"Resources");
++    TRACE("loader %p for %s.\n", l, debugstr_w(l->name));
++    *out = &l->loader_vtbl;
++    return S_OK;
++}
++
++/* the factory, with IResourceLoaderFactory and IResourceLoaderStatics/2/3 on separate static objects */
++static HRESULT WINAPI rlf_QI(IActivationFactory *iface, REFIID iid, void **out);
++static ULONG WINAPI rlf_AddRef(IActivationFactory *iface) { return 2; }
++static ULONG WINAPI rlf_Release(IActivationFactory *iface) { return 1; }
++static HRESULT WINAPI rlf_GetIids(IActivationFactory *iface, ULONG *c, IID **i) { return E_NOTIMPL; }
++static HRESULT WINAPI rlf_GetRuntimeClassName(IActivationFactory *iface, HSTRING *n) { return E_NOTIMPL; }
++static HRESULT WINAPI rlf_GetTrustLevel(IActivationFactory *iface, TrustLevel *l) { *l = BaseTrust; return S_OK; }
++static HRESULT WINAPI rlf_ActivateInstance(IActivationFactory *iface, IInspectable **out) { return loader_create(NULL, (void **)out); }
++static const IActivationFactoryVtbl rlf_vtbl = { rlf_QI, rlf_AddRef, rlf_Release, rlf_GetIids, rlf_GetRuntimeClassName,
++    rlf_GetTrustLevel, rlf_ActivateInstance };
++static IActivationFactory rlf_obj = { &rlf_vtbl };
++
++static HRESULT WINAPI st_QI(void *i, REFIID iid, void **out) { return rlf_QI(&rlf_obj, iid, out); }
++static ULONG WINAPI st_AddRef(void *i) { return 2; }
++static ULONG WINAPI st_Release(void *i) { return 1; }
++
++static HRESULT WINAPI fac_CreateResourceLoaderByName(void *i, HSTRING name, void **value) { return loader_create(name, value); }
++static const void *const factory_vtbl[] = { st_QI, st_AddRef, st_Release, rl_GetIids, rl_GetRuntimeClassName,
++    rl_GetTrustLevel, fac_CreateResourceLoaderByName };
++static struct { const void *const *lpVtbl; } factory_obj = { factory_vtbl };
++
++static HRESULT WINAPI st_GetStringForReference(void *i, IUriRuntimeClass *uri, HSTRING *value) { return string_for_uri(uri, value); }
++static const void *const statics_vtbl[] = { st_QI, st_AddRef, st_Release, rl_GetIids, rl_GetRuntimeClassName,
++    rl_GetTrustLevel, st_GetStringForReference };
++static struct { const void *const *lpVtbl; } statics_obj = { statics_vtbl };
++
++static HRESULT WINAPI st2_GetForCurrentView(void *i, void **value) { return loader_create(NULL, value); }
++static HRESULT WINAPI st2_GetForCurrentViewWithName(void *i, HSTRING name, void **value) { return loader_create(name, value); }
++static const void *const statics2_vtbl[] = { st_QI, st_AddRef, st_Release, rl_GetIids, rl_GetRuntimeClassName,
++    rl_GetTrustLevel, st2_GetForCurrentView, st2_GetForCurrentViewWithName, st2_GetForCurrentView,
++    st2_GetForCurrentViewWithName };
++static struct { const void *const *lpVtbl; } statics2_obj = { statics2_vtbl };
++
++static HRESULT WINAPI st3_GetForUIContext(void *i, void *context, void **value) { return loader_create(NULL, value); }
++static const void *const statics3_vtbl[] = { st_QI, st_AddRef, st_Release, rl_GetIids, rl_GetRuntimeClassName,
++    rl_GetTrustLevel, st3_GetForUIContext };
++static struct { const void *const *lpVtbl; } statics3_obj = { statics3_vtbl };
++
++static HRESULT WINAPI rlf_QI(IActivationFactory *iface, REFIID iid, void **out)
++{
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IActivationFactory))
++        *out = &rlf_obj;
++    else if (IsEqualGUID(iid, &iid_resource_loader_factory)) *out = &factory_obj;
++    else if (IsEqualGUID(iid, &iid_resource_loader_statics)) *out = &statics_obj;
++    else if (IsEqualGUID(iid, &iid_resource_loader_statics2)) *out = &statics2_obj;
++    else if (IsEqualGUID(iid, &iid_resource_loader_statics3)) *out = &statics3_obj;
++    else
++    {
++        FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++IActivationFactory *resource_loader_factory = &rlf_obj;
+diff --git a/dlls/twinapi.appcore/resource_manager.c b/dlls/twinapi.appcore/resource_manager.c
+index f3b4651..9629708 100644
+--- a/dlls/twinapi.appcore/resource_manager.c
++++ b/dlls/twinapi.appcore/resource_manager.c
+@@ -1400,3 +1400,21 @@ static struct resource_manager resource_manager =
+ };
+ 
+ IActivationFactory *resource_manager_factory = &resource_manager.IActivationFactory_iface;
++
++/* ResourceLoader (resource_loader.c): a string of resources.pri, "" when there isn't one */
++HRESULT pri_lookup_string( const WCHAR *prefix, const WCHAR *name, HSTRING *value )
++{
++    IResourceCandidate *candidate;
++    HRESULT hr;
++
++    *value = NULL;
++    if (FAILED(candidate_create( pri_find_resource( pri_get(), prefix, name ), &candidate )))
++    {
++        WARN( "%s/%s not found.\n", debugstr_w(prefix), debugstr_w(name) );
++        return S_OK;
++    }
++    hr = IResourceCandidate_get_ValueAsString( candidate, value );
++    IResourceCandidate_Release( candidate );
++    if (FAILED(hr)) *value = NULL;
++    return S_OK;
++}
+diff --git a/dlls/twinapi.appcore/twinapi.appcore.rgs b/dlls/twinapi.appcore/twinapi.appcore.rgs
+index 20dbbf2..c00527e 100644
+--- a/dlls/twinapi.appcore/twinapi.appcore.rgs
++++ b/dlls/twinapi.appcore/twinapi.appcore.rgs
+@@ -100,6 +100,10 @@ HKLM
+                     {
+                         val 'DllPath' = s '%MODULE%'
+                     }
++                    ForceRemove Windows.ApplicationModel.Resources.ResourceLoader
++                    {
++                        val 'DllPath' = s '%MODULE%'
++                    }
+                     ForceRemove Windows.ApplicationModel.Resources.Core.ResourceManager
+                     {
+                         val 'DllPath' = s '%MODULE%'
+@@ -120,6 +124,10 @@ HKLM
+                     {
+                         val 'DllPath' = s '%MODULE%'
+                     }
++                    ForceRemove Windows.Management.Policies.NamedPolicy
++                    {
++                        val 'DllPath' = s '%MODULE%'
++                    }
+                     ForceRemove Windows.System.User
+                     {
+                         val 'DllPath' = s '%MODULE%'

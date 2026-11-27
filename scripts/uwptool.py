@@ -31,10 +31,11 @@ import zipfile
 
 BLOCKMAP_NS = ("{http://schemas.microsoft.com/appx/2015/blockmap}", "{http://schemas.microsoft.com/appx/2010/blockmap}")
 
-# Classes provided by the wintypes/windows.storage DLLs (from GE-Proton) copied into the prefix (overriding Wine's own). The classes the patched Wine
-# implements are registered by Wine itself (wineboot), from twinapi.appcore.rgs and the dlls' classes.idl.
+# Classes provided by DLLs from GE-Proton copied into the prefix: windows.storage overrides Wine's own, wintypes is copied as
+# uwp-wintypes.dll for its DataReader alone. The classes the patched Wine implements are registered by Wine itself
+# (wineboot), from twinapi.appcore.rgs and the dlls' classes.idl.
 WINE_CLASSES = {
-    "wintypes.dll": ["Windows.Storage.Streams.DataReader"],
+    "uwp-wintypes.dll": ["Windows.Storage.Streams.DataReader"],
     "windows.storage.dll": ["Windows.Storage.Streams.InMemoryRandomAccessStream"],
 }
 

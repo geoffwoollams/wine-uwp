@@ -52,7 +52,16 @@ APP="$PREFIX/drive_c/$APPS_DIR_NAME/$NAME"
 IFS=$'\t' read -r _ EXE < <(python3 -I "$REPO/scripts/uwptool.py" info "$APP")
 
 wine_env
-export WINEDLLOVERRIDES="${UWP_DLLOVERRIDES:-mscoree,mshtml=d;dxgi=n;d3d11=n;d3d10core=n;d3d12=n;d3d12core=n;wintypes=n;windows.storage=n}"
+# A prefix set up by an older version has GE-Proton's wintypes as a native wintypes.dll: keep it for its DataReader only,
+# under the name setup-prefix.sh now uses, and put ours back (ours boxes values the way .NET apps need)
+SYS32="$PREFIX/drive_c/windows/system32"
+if [ ! -f "$SYS32/uwp-wintypes.dll" ] && [ -f "$SYS32/wintypes.dll" ] && ! head -c 96 "$SYS32/wintypes.dll" | grep -qa "Wine builtin DLL"; then
+    mv "$SYS32/wintypes.dll" "$SYS32/uwp-wintypes.dll"
+    cp "$WINE_ROOT/lib/wine/x86_64-windows/wintypes.dll" "$SYS32/wintypes.dll"
+    WINEDEBUG=-all wine reg add 'HKLM\Software\Microsoft\WindowsRuntime\ActivatableClassId\Windows.Storage.Streams.DataReader' \
+        /v DllPath /d 'C:\windows\system32\uwp-wintypes.dll' /f >/dev/null 2>&1
+fi
+export WINEDLLOVERRIDES="${UWP_DLLOVERRIDES:-mscoree,mshtml=d;dxgi=n;d3d11=n;d3d10core=n;d3d12=n;d3d12core=n;windows.storage=n}"
 export WINEDEBUG="${WINEDEBUG:-err+all,fixme+all,+twinapi}"
 export DXVK_LOG_LEVEL="${DXVK_LOG_LEVEL:-warn}" DXVK_LOG_PATH="$LOGS"
 [ -f "$REPO/apps/$NAME.conf" ] && source "$REPO/apps/$NAME.conf"

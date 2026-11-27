@@ -1,0 +1,534 @@
+Subject: windows.globalization: Fonts.LanguageFontGroup
+
+diff --git a/dlls/windows.globalization/Makefile.in b/dlls/windows.globalization/Makefile.in
+index e77294f..f7042be 100644
+--- a/dlls/windows.globalization/Makefile.in
++++ b/dlls/windows.globalization/Makefile.in
+@@ -4,5 +4,6 @@ IMPORTS = combase uuid
+ SOURCES = \
+ 	classes.idl \
+ 	datetime_formatter.c \
++	fonts.c \
+ 	geographic_region.c \
+ 	main.c
+diff --git a/dlls/windows.globalization/classes.idl b/dlls/windows.globalization/classes.idl
+index ed5b89c..687f875 100644
+--- a/dlls/windows.globalization/classes.idl
++++ b/dlls/windows.globalization/classes.idl
+@@ -30,6 +30,7 @@ import "windows.system.idl";
+ import "windows.globalization.idl";
+ import "windows.system.userprofile.idl";
+ import "windows.globalization.datetimeformatting.idl";
++import "windows.globalization.fonts.idl";
+ 
+ namespace Windows.System.UserProfile {
+     runtimeclass GlobalizationPreferences;
+@@ -42,3 +43,6 @@ namespace Windows.Globalization {
+ namespace Windows.Globalization.DateTimeFormatting {
+     runtimeclass DateTimeFormatter;
+ }
++namespace Windows.Globalization.Fonts {
++    runtimeclass LanguageFontGroup;
++}
+diff --git a/dlls/windows.globalization/fonts.c b/dlls/windows.globalization/fonts.c
+new file mode 100644
+index 0000000..365181c
+--- /dev/null
++++ b/dlls/windows.globalization/fonts.c
+@@ -0,0 +1,342 @@
++/* Windows.Globalization.Fonts: the fonts Windows recommends for a language
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#define WIDL_using_Windows_UI_Text
++#define WIDL_using_Windows_Globalization_Fonts
++#include "initguid.h"
++#include "windows.globalization.fonts.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(locale);
++
++/* The Western defaults of Windows 10: what apps get for Latin-script languages. Other scripts get the same
++ * families; DirectWrite's fallback picks glyphs for them. */
++struct font_info
++{
++    const WCHAR *family;
++    UINT16 weight;
++    double scale;
++};
++
++enum font_kind
++{
++    FONT_UI_TEXT, FONT_UI_HEADING, FONT_UI_TITLE, FONT_UI_CAPTION, FONT_UI_NOTIFICATION_HEADING,
++    FONT_TRADITIONAL_DOCUMENT, FONT_MODERN_DOCUMENT, FONT_DOCUMENT_HEADING, FONT_FIXED_WIDTH,
++    FONT_DOCUMENT_ALTERNATE1, FONT_DOCUMENT_ALTERNATE2, FONT_COUNT
++};
++
++static const struct font_info fonts[FONT_COUNT] =
++{
++    { L"Segoe UI", 400, 100.0 },
++    { L"Segoe UI Light", 300, 100.0 },
++    { L"Segoe UI Light", 300, 100.0 },
++    { L"Segoe UI", 400, 100.0 },
++    { L"Segoe UI", 600, 100.0 },
++    { L"Sylfaen", 400, 100.0 },
++    { L"Calibri", 400, 100.0 },
++    { L"Cambria", 400, 100.0 },
++    { L"Consolas", 400, 100.0 },
++    { L"Cambria", 400, 100.0 },
++    { L"Calibri", 400, 100.0 },
++};
++
++struct language_font
++{
++    ILanguageFont ILanguageFont_iface;
++    LONG ref;
++    const struct font_info *info;
++};
++
++static inline struct language_font *impl_from_ILanguageFont( ILanguageFont *iface )
++{
++    return CONTAINING_RECORD( iface, struct language_font, ILanguageFont_iface );
++}
++
++static HRESULT WINAPI font_QueryInterface( ILanguageFont *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_ILanguageFont ))
++    {
++        ILanguageFont_AddRef( (*out = iface) );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI font_AddRef( ILanguageFont *iface )
++{
++    return InterlockedIncrement( &impl_from_ILanguageFont( iface )->ref );
++}
++
++static ULONG WINAPI font_Release( ILanguageFont *iface )
++{
++    struct language_font *impl = impl_from_ILanguageFont( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI font_GetIids( ILanguageFont *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI font_GetRuntimeClassName( ILanguageFont *iface, HSTRING *name )
++{
++    static const WCHAR class_name[] = L"Windows.Globalization.Fonts.LanguageFont";
++    return WindowsCreateString( class_name, wcslen( class_name ), name );
++}
++
++static HRESULT WINAPI font_GetTrustLevel( ILanguageFont *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI font_get_FontFamily( ILanguageFont *iface, HSTRING *value )
++{
++    const struct font_info *info = impl_from_ILanguageFont( iface )->info;
++    return WindowsCreateString( info->family, wcslen( info->family ), value );
++}
++
++static HRESULT WINAPI font_get_FontWeight( ILanguageFont *iface, FontWeight *value )
++{
++    value->Weight = impl_from_ILanguageFont( iface )->info->weight;
++    return S_OK;
++}
++
++static HRESULT WINAPI font_get_FontStretch( ILanguageFont *iface, FontStretch *value )
++{
++    *value = FontStretch_Normal;
++    return S_OK;
++}
++
++static HRESULT WINAPI font_get_FontStyle( ILanguageFont *iface, FontStyle *value )
++{
++    *value = FontStyle_Normal;
++    return S_OK;
++}
++
++static HRESULT WINAPI font_get_ScaleFactor( ILanguageFont *iface, DOUBLE *value )
++{
++    *value = impl_from_ILanguageFont( iface )->info->scale;
++    return S_OK;
++}
++
++static const struct ILanguageFontVtbl font_vtbl =
++{
++    font_QueryInterface,
++    font_AddRef,
++    font_Release,
++    /* IInspectable methods */
++    font_GetIids,
++    font_GetRuntimeClassName,
++    font_GetTrustLevel,
++    /* ILanguageFont methods */
++    font_get_FontFamily,
++    font_get_FontWeight,
++    font_get_FontStretch,
++    font_get_FontStyle,
++    font_get_ScaleFactor,
++};
++
++static HRESULT font_create( enum font_kind kind, ILanguageFont **out )
++{
++    struct language_font *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->ILanguageFont_iface.lpVtbl = &font_vtbl;
++    impl->ref = 1;
++    impl->info = &fonts[kind];
++    *out = &impl->ILanguageFont_iface;
++    return S_OK;
++}
++
++struct font_group
++{
++    ILanguageFontGroup ILanguageFontGroup_iface;
++    LONG ref;
++};
++
++static inline struct font_group *impl_from_ILanguageFontGroup( ILanguageFontGroup *iface )
++{
++    return CONTAINING_RECORD( iface, struct font_group, ILanguageFontGroup_iface );
++}
++
++static HRESULT WINAPI group_QueryInterface( ILanguageFontGroup *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_ILanguageFontGroup ))
++    {
++        ILanguageFontGroup_AddRef( (*out = iface) );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI group_AddRef( ILanguageFontGroup *iface )
++{
++    return InterlockedIncrement( &impl_from_ILanguageFontGroup( iface )->ref );
++}
++
++static ULONG WINAPI group_Release( ILanguageFontGroup *iface )
++{
++    struct font_group *impl = impl_from_ILanguageFontGroup( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI group_GetIids( ILanguageFontGroup *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI group_GetRuntimeClassName( ILanguageFontGroup *iface, HSTRING *name )
++{
++    static const WCHAR class_name[] = L"Windows.Globalization.Fonts.LanguageFontGroup";
++    return WindowsCreateString( class_name, wcslen( class_name ), name );
++}
++
++static HRESULT WINAPI group_GetTrustLevel( ILanguageFontGroup *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++#define GROUP_FONT( name, kind ) \
++static HRESULT WINAPI group_get_##name( ILanguageFontGroup *iface, ILanguageFont **value ) \
++{ \
++    return font_create( kind, value ); \
++}
++GROUP_FONT( UITextFont, FONT_UI_TEXT )
++GROUP_FONT( UIHeadingFont, FONT_UI_HEADING )
++GROUP_FONT( UITitleFont, FONT_UI_TITLE )
++GROUP_FONT( UICaptionFont, FONT_UI_CAPTION )
++GROUP_FONT( UINotificationHeadingFont, FONT_UI_NOTIFICATION_HEADING )
++GROUP_FONT( TraditionalDocumentFont, FONT_TRADITIONAL_DOCUMENT )
++GROUP_FONT( ModernDocumentFont, FONT_MODERN_DOCUMENT )
++GROUP_FONT( DocumentHeadingFont, FONT_DOCUMENT_HEADING )
++GROUP_FONT( FixedWidthTextFont, FONT_FIXED_WIDTH )
++GROUP_FONT( DocumentAlternate1Font, FONT_DOCUMENT_ALTERNATE1 )
++GROUP_FONT( DocumentAlternate2Font, FONT_DOCUMENT_ALTERNATE2 )
++
++static const struct ILanguageFontGroupVtbl group_vtbl =
++{
++    group_QueryInterface,
++    group_AddRef,
++    group_Release,
++    /* IInspectable methods */
++    group_GetIids,
++    group_GetRuntimeClassName,
++    group_GetTrustLevel,
++    /* ILanguageFontGroup methods */
++    group_get_UITextFont,
++    group_get_UIHeadingFont,
++    group_get_UITitleFont,
++    group_get_UICaptionFont,
++    group_get_UINotificationHeadingFont,
++    group_get_TraditionalDocumentFont,
++    group_get_ModernDocumentFont,
++    group_get_DocumentHeadingFont,
++    group_get_FixedWidthTextFont,
++    group_get_DocumentAlternate1Font,
++    group_get_DocumentAlternate2Font,
++};
++
++struct font_group_factory
++{
++    IActivationFactory IActivationFactory_iface;
++    ILanguageFontGroupFactory ILanguageFontGroupFactory_iface;
++};
++
++static inline struct font_group_factory *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct font_group_factory, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct font_group_factory *impl = impl_from_IActivationFactory( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_ILanguageFontGroupFactory ))
++        *out = &impl->ILanguageFontGroupFactory_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance ) { return E_NOTIMPL; }
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( group_factory, ILanguageFontGroupFactory, struct font_group_factory, IActivationFactory_iface )
++
++static HRESULT WINAPI group_factory_CreateLanguageFontGroup( ILanguageFontGroupFactory *iface, HSTRING tag,
++                                                             ILanguageFontGroup **value )
++{
++    struct font_group *impl;
++
++    TRACE( "tag %s.\n", debugstr_hstring(tag) );
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->ILanguageFontGroup_iface.lpVtbl = &group_vtbl;
++    impl->ref = 1;
++    *value = &impl->ILanguageFontGroup_iface;
++    return S_OK;
++}
++
++static const struct ILanguageFontGroupFactoryVtbl group_factory_vtbl =
++{
++    group_factory_QueryInterface,
++    group_factory_AddRef,
++    group_factory_Release,
++    /* IInspectable methods */
++    group_factory_GetIids,
++    group_factory_GetRuntimeClassName,
++    group_factory_GetTrustLevel,
++    /* ILanguageFontGroupFactory methods */
++    group_factory_CreateLanguageFontGroup,
++};
++
++static struct font_group_factory font_group_factory =
++{
++    {&factory_vtbl},
++    {&group_factory_vtbl},
++};
++
++IActivationFactory *language_font_group_factory = &font_group_factory.IActivationFactory_iface;
+diff --git a/dlls/windows.globalization/main.c b/dlls/windows.globalization/main.c
+index 9d3702e..4a16fdf 100644
+--- a/dlls/windows.globalization/main.c
++++ b/dlls/windows.globalization/main.c
+@@ -1134,6 +1134,11 @@ HRESULT WINAPI DllGetActivationFactory(HSTRING classid, IActivationFactory **fac
+         *factory = geographic_region_factory;
+         IUnknown_AddRef(*factory);
+     }
++    else if (!wcscmp(name, L"Windows.Globalization.Fonts.LanguageFontGroup"))
++    {
++        *factory = language_font_group_factory;
++        IUnknown_AddRef(*factory);
++    }
+     else if (!wcscmp(name, L"Windows.Globalization.DateTimeFormatting.DateTimeFormatter"))
+     {
+         *factory = datetime_formatter_factory;
+diff --git a/dlls/windows.globalization/private.h b/dlls/windows.globalization/private.h
+index a453947..06e190c 100644
+--- a/dlls/windows.globalization/private.h
++++ b/dlls/windows.globalization/private.h
+@@ -39,6 +39,7 @@
+ 
+ extern IActivationFactory *geographic_region_factory;
+ extern IActivationFactory *datetime_formatter_factory;
++extern IActivationFactory *language_font_group_factory;
+ 
+ #include "wine/debug.h"
+ #include "wine/list.h"
+diff --git a/include/Makefile.in b/include/Makefile.in
+index 424bfab..b81d916 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -1048,6 +1048,7 @@ SOURCES = \
+ 	windows.gaming.input.idl \
+ 	windows.gaming.ui.idl \
+ 	windows.globalization.datetimeformatting.idl \
++	windows.globalization.fonts.idl \
+ 	windows.globalization.idl \
+ 	windows.graphics.capture.idl \
+ 	windows.graphics.capture.interop.idl \
+diff --git a/include/windows.globalization.fonts.idl b/include/windows.globalization.fonts.idl
+new file mode 100644
+index 0000000..3358403
+--- /dev/null
++++ b/include/windows.globalization.fonts.idl
+@@ -0,0 +1,108 @@
++/*
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifdef __WIDL__
++#pragma winrt ns_prefix
++#endif
++
++import "inspectable.idl";
++import "asyncinfo.idl";
++import "eventtoken.idl";
++import "windowscontracts.idl";
++import "windows.foundation.idl";
++import "windows.ui.xaml.idl";
++namespace Windows.Globalization.Fonts {
++    interface ILanguageFont;
++    interface ILanguageFontGroup;
++    interface ILanguageFontGroupFactory;
++    runtimeclass LanguageFont;
++    runtimeclass LanguageFontGroup;
++}
++
++namespace Windows.Globalization.Fonts {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Globalization.Fonts.LanguageFont),
++        uuid(b12e5c3a-b76d-459b-beeb-901151cd77d1)
++    ]
++    interface ILanguageFont : IInspectable
++    {
++        [propget] HRESULT FontFamily([out, retval] HSTRING *value);
++        [propget] HRESULT FontWeight([out, retval] Windows.UI.Text.FontWeight *value);
++        [propget] HRESULT FontStretch([out, retval] Windows.UI.Text.FontStretch *value);
++        [propget] HRESULT FontStyle([out, retval] Windows.UI.Text.FontStyle *value);
++        [propget] HRESULT ScaleFactor([out, retval] DOUBLE *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Globalization.Fonts.LanguageFontGroup),
++        uuid(f33a7fc3-3a5c-4aea-b9ff-b39fb242f7f6)
++    ]
++    interface ILanguageFontGroup : IInspectable
++    {
++        [propget] HRESULT UITextFont([out, retval] Windows.Globalization.Fonts.LanguageFont * *value);
++        [propget] HRESULT UIHeadingFont([out, retval] Windows.Globalization.Fonts.LanguageFont * *value);
++        [propget] HRESULT UITitleFont([out, retval] Windows.Globalization.Fonts.LanguageFont * *value);
++        [propget] HRESULT UICaptionFont([out, retval] Windows.Globalization.Fonts.LanguageFont * *value);
++        [propget] HRESULT UINotificationHeadingFont([out, retval] Windows.Globalization.Fonts.LanguageFont * *value);
++        [propget] HRESULT TraditionalDocumentFont([out, retval] Windows.Globalization.Fonts.LanguageFont * *value);
++        [propget] HRESULT ModernDocumentFont([out, retval] Windows.Globalization.Fonts.LanguageFont * *value);
++        [propget] HRESULT DocumentHeadingFont([out, retval] Windows.Globalization.Fonts.LanguageFont * *value);
++        [propget] HRESULT FixedWidthTextFont([out, retval] Windows.Globalization.Fonts.LanguageFont * *value);
++        [propget] HRESULT DocumentAlternate1Font([out, retval] Windows.Globalization.Fonts.LanguageFont * *value);
++        [propget] HRESULT DocumentAlternate2Font([out, retval] Windows.Globalization.Fonts.LanguageFont * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Globalization.Fonts.LanguageFontGroup),
++        uuid(fcaeac67-4e77-49c7-b856-dde934fc735b)
++    ]
++    interface ILanguageFontGroupFactory : IInspectable
++    {
++        HRESULT CreateLanguageFontGroup([in] HSTRING languageTag, [out, retval] Windows.Globalization.Fonts.LanguageFontGroup * *value);
++    }
++
++}
++
++namespace Windows.Globalization.Fonts {
++    [
++        activatable(Windows.Globalization.Fonts.ILanguageFontGroupFactory, Windows.Foundation.UniversalApiContract, 1.0),
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        threading(mta)
++    ]
++    runtimeclass LanguageFontGroup
++    {
++        [default] interface Windows.Globalization.Fonts.ILanguageFontGroup;
++    }
++
++}
++
++namespace Windows.Globalization.Fonts {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass LanguageFont
++    {
++        [default] interface Windows.Globalization.Fonts.ILanguageFont;
++    }
++
++}
++

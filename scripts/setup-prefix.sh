@@ -107,9 +107,11 @@ SYS32="$PREFIX/drive_c/windows/system32"
 
 info "Installing vkd3d-proton (D3D12), DXVK dxgi and the WinRT DLLs"
 cp "$VKD3D_DIR/d3d12.dll" "$VKD3D_DIR/d3d12core.dll" "$SYS32/"
-for dll in wintypes windows.storage; do   # Wine PE builds: copied so they load as native DLLs, overriding ours
-    python3 -I "$REPO/scripts/uwptool.py" native-copy "$WINEDLL_DIR/$dll.dll" "$SYS32/$dll.dll"
-done
+# Wine PE builds from GE-Proton: windows.storage overrides ours as a native DLL; GE-Proton's wintypes only serves its
+# DataReader, registered to it under another name (uwptool.py WINE_CLASSES), so everything else uses our wintypes
+python3 -I "$REPO/scripts/uwptool.py" native-copy "$WINEDLL_DIR/windows.storage.dll" "$SYS32/windows.storage.dll"
+python3 -I "$REPO/scripts/uwptool.py" native-copy "$WINEDLL_DIR/wintypes.dll" "$SYS32/uwp-wintypes.dll"
+cp "$WINE_ROOT/lib/wine/x86_64-windows/wintypes.dll" "$SYS32/wintypes.dll"   # replaces the native copy older setups made
 cp "$DXVK_DXGI" "$SYS32/dxgi.dll"
 # D3D11 (Unity) and Direct2D (XAML) need DXVK's d3d11 and d3d10core with its dxgi; older releases don't have them
 for dll in "$DXVK_D3D11" "$DXVK_D3D10CORE"; do

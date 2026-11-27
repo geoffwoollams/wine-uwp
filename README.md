@@ -26,7 +26,7 @@ UWP apps don't create a normal Win32 window. They ask Windows for a `CoreApplica
 | ✅ | Microsoft Ultimate Word Games / Wordament (`Microsoft.Studios.Wordament`, Unity, XAML, .NET Native) | Playable offline. Its [`apps/` file](apps/Microsoft.Studios.Wordament.conf) reports no internet connection, so it doesn't keep asking about Xbox cloud saves. |
 | ❌ | Microsoft Solitaire Collection (`Microsoft.MicrosoftSolitaireCollection`, XAML, WinUI 2.8) | Not working: a blank window. Its interface is all XAML with WinUI 2 controls, which the partial XAML doesn't support yet (like Calculator). |
 | ❌ | Forza Motorsport 7 (`Microsoft.ApolloBaseGame`, D3D12) | Not working: it starts and its hardware warning is answered, but it isn't playable yet. |
-| ❌ | Windows Calculator (`Microsoft.WindowsCalculator`, XAML, WinUI 2.8) | Not working: stops at startup. It needs XAML's dependency-property system and the WinUI 2 control library, which the partial XAML doesn't support yet. |
+| ❌ | Windows Calculator (`Microsoft.WindowsCalculator`, XAML, WinUI 2.8) | Not working yet: it now gets through start-up and into its main page, then stops because WinUI 2 controls (NavigationView and others) can't yet derive from the XAML Control and ContentControl classes. Work in progress. |
 
 Other native C++ UWP apps may work; many will need WinRT classes this project doesn't have yet. XAML apps (built with `Windows.UI.Xaml` pages and markup) have partial support: simple ones start and work, real Store apps will often still stop or look wrong; see [XAML apps](#xaml-apps). Reports and patches are welcome.
 
@@ -315,7 +315,10 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 DateTimeFormatter, KeyRoutedEventArgs.OriginalKey, and a title bar for apps launched windowed, 0106-0108
                 for Wordament: Store and user vectors answer only their own interfaces, Xbox Live hosts don't
                 resolve in apps (their placeholder token was refused with 401), WINE_UWP_OFFLINE, 0109
-                CoreWindow.Activated raised again once the app has subscribed (the first click was ignored)
+                CoreWindow.Activated raised again once the app has subscribed (the first click was ignored), 0110-0113
+                towards Calculator: real DependencyProperty/PropertyMetadata/DependencyObject (app-registered
+                properties, change callbacks, Grid and Canvas properties), App.xaml loaded for C# apps, PropertyValue
+                class names (.NET unboxing), ResourceLoader, NamedPolicy, SplashScreen, LanguageFontGroup
 patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings

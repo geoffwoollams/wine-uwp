@@ -1,0 +1,1946 @@
+Subject: windows.ui.xaml: DependencyProperty, PropertyMetadata and DependencyObject; IApplication2/3; load App.xaml for C# apps
+
+diff --git a/dlls/windows.ui.xaml/Makefile.in b/dlls/windows.ui.xaml/Makefile.in
+index 81815c5..e35889e 100644
+--- a/dlls/windows.ui.xaml/Makefile.in
++++ b/dlls/windows.ui.xaml/Makefile.in
+@@ -15,6 +15,7 @@ SOURCES = \
+ 	color_helper.c \
+ 	content.c \
+ 	definitions.c \
++	dependency.c \
+ 	dialog.c \
+ 	element.c \
+ 	focus.c \
+diff --git a/dlls/windows.ui.xaml/application.c b/dlls/windows.ui.xaml/application.c
+index 5732310..a7ef396 100644
+--- a/dlls/windows.ui.xaml/application.c
++++ b/dlls/windows.ui.xaml/application.c
+@@ -29,6 +29,9 @@ struct application
+ {
+     IApplication IApplication_iface;
+     IApplicationOverrides IApplicationOverrides_iface;
++    IApplication2 IApplication2_iface;
++    IApplication3 IApplication3_iface;
++    IApplicationOverrides2 IApplicationOverrides2_iface;
+     IInspectable IInspectable_inner;  /* non-delegating */
+     IInspectable *outer;              /* the app's object, or our own inner interface */
+     LONG ref;
+@@ -36,6 +39,11 @@ struct application
+     BOOL theme_set;                   /* RequestedTheme was set; otherwise the theme follows the system's */
+     IResourceDictionary *resources;
+     struct event_list suspending, resuming, unhandled_exception;
++    struct event_list leaving_background, entered_background;
++    FocusVisualKind focus_visual_kind;
++    ApplicationRequiresPointerMode requires_pointer_mode;
++    ApplicationHighContrastAdjustment high_contrast_adjustment;
++    BOOL component_loaded;            /* App.xaml was loaded (C++ apps do it in InitializeComponent) */
+ };
+ 
+ static struct application *current_app;
+@@ -172,6 +180,12 @@ static HRESULT WINAPI inner_QueryInterface( IInspectable *iface, REFIID iid, voi
+         *out = &impl->IApplication_iface;
+     else if (IsEqualGUID( iid, &IID_IApplicationOverrides ))
+         *out = &impl->IApplicationOverrides_iface;
++    else if (IsEqualGUID( iid, &IID_IApplication2 ))
++        *out = &impl->IApplication2_iface;
++    else if (IsEqualGUID( iid, &IID_IApplication3 ))
++        *out = &impl->IApplication3_iface;
++    else if (IsEqualGUID( iid, &IID_IApplicationOverrides2 ))
++        *out = &impl->IApplicationOverrides2_iface;
+     else
+     {
+         FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
+@@ -436,6 +450,124 @@ static const struct IApplicationOverridesVtbl overrides_vtbl =
+     overrides_OnWindowCreated,
+ };
+ 
++DEFINE_IINSPECTABLE_( application2, IApplication2, struct application, impl_from_IApplication2, IApplication2_iface, impl->outer )
++
++static HRESULT WINAPI application2_get_FocusVisualKind( IApplication2 *iface, FocusVisualKind *value )
++{
++    *value = impl_from_IApplication2( iface )->focus_visual_kind;
++    return S_OK;
++}
++
++static HRESULT WINAPI application2_put_FocusVisualKind( IApplication2 *iface, FocusVisualKind value )
++{
++    TRACE( "iface %p, value %d.\n", iface, value );
++    impl_from_IApplication2( iface )->focus_visual_kind = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI application2_get_RequiresPointerMode( IApplication2 *iface, ApplicationRequiresPointerMode *value )
++{
++    *value = impl_from_IApplication2( iface )->requires_pointer_mode;
++    return S_OK;
++}
++
++static HRESULT WINAPI application2_put_RequiresPointerMode( IApplication2 *iface, ApplicationRequiresPointerMode value )
++{
++    impl_from_IApplication2( iface )->requires_pointer_mode = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI application2_add_LeavingBackground( IApplication2 *iface, ILeavingBackgroundEventHandler *handler,
++                                                          EventRegistrationToken *token )
++{
++    return event_list_add( &impl_from_IApplication2( iface )->leaving_background, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI application2_remove_LeavingBackground( IApplication2 *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IApplication2( iface )->leaving_background, token );
++}
++
++static HRESULT WINAPI application2_add_EnteredBackground( IApplication2 *iface, IEnteredBackgroundEventHandler *handler,
++                                                          EventRegistrationToken *token )
++{
++    return event_list_add( &impl_from_IApplication2( iface )->entered_background, (IUnknown *)handler, token );
++}
++
++static HRESULT WINAPI application2_remove_EnteredBackground( IApplication2 *iface, EventRegistrationToken token )
++{
++    return event_list_remove( &impl_from_IApplication2( iface )->entered_background, token );
++}
++
++static const struct IApplication2Vtbl application2_vtbl =
++{
++    application2_QueryInterface,
++    application2_AddRef,
++    application2_Release,
++    /* IInspectable methods */
++    application2_GetIids,
++    application2_GetRuntimeClassName,
++    application2_GetTrustLevel,
++    /* IApplication2 methods */
++    application2_get_FocusVisualKind,
++    application2_put_FocusVisualKind,
++    application2_get_RequiresPointerMode,
++    application2_put_RequiresPointerMode,
++    application2_add_LeavingBackground,
++    application2_remove_LeavingBackground,
++    application2_add_EnteredBackground,
++    application2_remove_EnteredBackground,
++};
++
++DEFINE_IINSPECTABLE_( application3, IApplication3, struct application, impl_from_IApplication3, IApplication3_iface, impl->outer )
++
++static HRESULT WINAPI application3_get_HighContrastAdjustment( IApplication3 *iface, ApplicationHighContrastAdjustment *value )
++{
++    *value = impl_from_IApplication3( iface )->high_contrast_adjustment;
++    return S_OK;
++}
++
++static HRESULT WINAPI application3_put_HighContrastAdjustment( IApplication3 *iface, ApplicationHighContrastAdjustment value )
++{
++    impl_from_IApplication3( iface )->high_contrast_adjustment = value;
++    return S_OK;
++}
++
++static const struct IApplication3Vtbl application3_vtbl =
++{
++    application3_QueryInterface,
++    application3_AddRef,
++    application3_Release,
++    /* IInspectable methods */
++    application3_GetIids,
++    application3_GetRuntimeClassName,
++    application3_GetTrustLevel,
++    /* IApplication3 methods */
++    application3_get_HighContrastAdjustment,
++    application3_put_HighContrastAdjustment,
++};
++
++DEFINE_IINSPECTABLE_( overrides2, IApplicationOverrides2, struct application, impl_from_IApplicationOverrides2,
++                      IApplicationOverrides2_iface, impl->outer )
++
++static HRESULT WINAPI overrides2_OnBackgroundActivated( IApplicationOverrides2 *iface, IBackgroundActivatedEventArgs *args )
++{
++    return S_OK;
++}
++
++static const struct IApplicationOverrides2Vtbl overrides2_vtbl =
++{
++    overrides2_QueryInterface,
++    overrides2_AddRef,
++    overrides2_Release,
++    /* IInspectable methods */
++    overrides2_GetIids,
++    overrides2_GetRuntimeClassName,
++    overrides2_GetTrustLevel,
++    /* IApplicationOverrides2 methods */
++    overrides2_OnBackgroundActivated,
++};
++
+ static HRESULT application_create( IInspectable *outer, IInspectable **inner, IApplication **value )
+ {
+     struct application *impl;
+@@ -443,10 +575,14 @@ static HRESULT application_create( IInspectable *outer, IInspectable **inner, IA
+     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+     impl->IApplication_iface.lpVtbl = &application_vtbl;
+     impl->IApplicationOverrides_iface.lpVtbl = &overrides_vtbl;
++    impl->IApplication2_iface.lpVtbl = &application2_vtbl;
++    impl->IApplication3_iface.lpVtbl = &application3_vtbl;
++    impl->IApplicationOverrides2_iface.lpVtbl = &overrides2_vtbl;
+     impl->IInspectable_inner.lpVtbl = &inner_vtbl;
+     impl->outer = outer ? outer : &impl->IInspectable_inner;
+     impl->ref = 1;
+     impl->theme = system_theme();
++    impl->high_contrast_adjustment = ApplicationHighContrastAdjustment_Auto;
+ 
+     if (current_app) FIXME( "an Application already exists, replacing %p.\n", current_app );
+     current_app = impl;
+@@ -673,6 +809,7 @@ static HRESULT WINAPI view_Initialize( IFrameworkView *iface, ICoreApplicationVi
+     struct framework_view *impl = impl_from_IFrameworkView( iface );
+     struct activated_handler *handler;
+     struct init_params *params;
++    IXamlMetadataProvider *provider;
+     HRESULT hr;
+ 
+     TRACE( "iface %p, view %p.\n", iface, view );
+@@ -696,6 +833,21 @@ static HRESULT WINAPI view_Initialize( IFrameworkView *iface, ICoreApplicationVi
+     IApplicationInitializationCallbackParams_Release( &params->iface );
+     if (FAILED(hr)) ERR( "ApplicationInitializationCallback failed, hr %#lx.\n", hr );
+     if (!current_app) ERR( "the callback did not create an Application.\n" );
++    else if (SUCCEEDED(hr) && !current_app->component_loaded && (provider = app_metadata_provider()))
++    {
++        /* C# apps don't load App.xaml in InitializeComponent: the framework does, once the App exists (for apps
++         * built by the XAML compiler, which always gives the App an IXamlMetadataProvider) */
++        static const WCHAR app_xaml[] = L"ms-appx:///App.xaml";
++        HSTRING_HEADER header;
++        HSTRING uri;
++        HRESULT load_hr;
++
++        IXamlMetadataProvider_Release( provider );
++        current_app->component_loaded = TRUE;
++        WindowsCreateStringReference( app_xaml, wcslen( app_xaml ), &header, &uri );
++        load_hr = load_component( current_app->outer, uri );
++        TRACE( "loaded App.xaml for the app, hr %#lx.\n", load_hr );
++    }
+     return hr;
+ }
+ 
+@@ -997,6 +1149,15 @@ static HRESULT WINAPI statics_LoadComponent( IApplicationStatics *iface, IInspec
+     if (!component || !locator) return E_INVALIDARG;
+     IUriRuntimeClass_get_RawUri( locator, &uri );
+     TRACE( "iface %p, component %p, locator %s.\n", iface, component, debugstr_hstring(uri) );
++    if (current_app && !current_app->component_loaded)
++    {
++        IUnknown *a = NULL, *b = NULL;
++        IInspectable_QueryInterface( component, &IID_IUnknown, (void **)&a );
++        IInspectable_QueryInterface( current_app->outer, &IID_IUnknown, (void **)&b );
++        if (a && a == b) current_app->component_loaded = TRUE;
++        if (a) IUnknown_Release( a );
++        if (b) IUnknown_Release( b );
++    }
+     hr = load_component( component, uri );
+     WindowsDeleteString( uri );
+     return hr;
+diff --git a/dlls/windows.ui.xaml/classes.idl b/dlls/windows.ui.xaml/classes.idl
+index 5db74ba..cf7b596 100644
+--- a/dlls/windows.ui.xaml/classes.idl
++++ b/dlls/windows.ui.xaml/classes.idl
+@@ -30,7 +30,10 @@ namespace Windows.UI {
+ 
+ namespace Windows.UI.Xaml {
+     runtimeclass Application;
++    runtimeclass DependencyObject;
++    runtimeclass DependencyProperty;
+     runtimeclass PointHelper;
++    runtimeclass PropertyMetadata;
+     runtimeclass SizeHelper;
+     runtimeclass ResourceDictionary;
+     runtimeclass Window;
+diff --git a/dlls/windows.ui.xaml/dependency.c b/dlls/windows.ui.xaml/dependency.c
+new file mode 100644
+index 0000000..6f9b436
+--- /dev/null
++++ b/dlls/windows.ui.xaml/dependency.c
+@@ -0,0 +1,1377 @@
++/* Windows.UI.Xaml DependencyProperty, PropertyMetadata and DependencyObject
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#include "wine/rbtree.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* Two kinds of DependencyProperty: the ones apps register (DependencyProperty.Register/RegisterAttached), whose
++ * values live in a per-object store here, and built-in ones handed out by our classes' statics, which name a
++ * property our elements keep in typed fields and reach through the markup setters (markup_get_value and
++ * markup_set_value). Store values are keyed by the object's own IDependencyObject pointer: our objects have
++ * exactly one, and an aggregating app object forwards to it. */
++
++struct dependency_property
++{
++    IDependencyProperty IDependencyProperty_iface;
++    struct dependency_property *next;
++    WCHAR *name;
++    WCHAR *owner;          /* the owner type's full name (built-ins: short name) */
++    WCHAR *type;           /* the property type's name */
++    IPropertyMetadata *metadata;
++    BOOL attached;
++    BOOL builtin;
++};
++
++static struct dependency_property *properties;
++static CRITICAL_SECTION dp_cs;
++static CRITICAL_SECTION_DEBUG dp_cs_debug =
++{
++    0, 0, &dp_cs,
++    { &dp_cs_debug.ProcessLocksList, &dp_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": dp_cs") }
++};
++static CRITICAL_SECTION dp_cs = { &dp_cs_debug, -1, 0, 0, 0, 0 };
++
++/* ---- the UnsetValue sentinel ---- */
++
++static HRESULT WINAPI unset_QueryInterface( IInspectable *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI unset_AddRef( IInspectable *iface ) { return 2; }
++static ULONG WINAPI unset_Release( IInspectable *iface ) { return 1; }
++static HRESULT WINAPI unset_GetIids( IInspectable *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI unset_GetRuntimeClassName( IInspectable *iface, HSTRING *name )
++{
++    static const WCHAR class_name[] = L"Windows.UI.Xaml.UnsetValue";
++    return WindowsCreateString( class_name, wcslen( class_name ), name );
++}
++static HRESULT WINAPI unset_GetTrustLevel( IInspectable *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static const struct IInspectableVtbl unset_vtbl =
++{
++    unset_QueryInterface, unset_AddRef, unset_Release,
++    unset_GetIids, unset_GetRuntimeClassName, unset_GetTrustLevel,
++};
++static IInspectable unset_value = { &unset_vtbl };
++
++IInspectable *dp_unset_value(void)
++{
++    return &unset_value;
++}
++
++/* ---- PropertyMetadata ---- */
++
++struct property_metadata
++{
++    IPropertyMetadata IPropertyMetadata_iface;
++    LONG ref;
++    IInspectable *default_value;
++    ICreateDefaultValueCallback *create_default;
++    IPropertyChangedCallback *changed;
++};
++
++static inline struct property_metadata *impl_from_IPropertyMetadata( IPropertyMetadata *iface )
++{
++    return CONTAINING_RECORD( iface, struct property_metadata, IPropertyMetadata_iface );
++}
++
++static HRESULT WINAPI metadata_QueryInterface( IPropertyMetadata *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IPropertyMetadata ))
++    {
++        IPropertyMetadata_AddRef( (*out = iface) );
++        return S_OK;
++    }
++    TRACE( "%s not implemented.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI metadata_AddRef( IPropertyMetadata *iface )
++{
++    return InterlockedIncrement( &impl_from_IPropertyMetadata( iface )->ref );
++}
++
++static ULONG WINAPI metadata_Release( IPropertyMetadata *iface )
++{
++    struct property_metadata *impl = impl_from_IPropertyMetadata( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        if (impl->default_value) IInspectable_Release( impl->default_value );
++        if (impl->create_default) ICreateDefaultValueCallback_Release( impl->create_default );
++        if (impl->changed) IPropertyChangedCallback_Release( impl->changed );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI metadata_GetIids( IPropertyMetadata *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI metadata_GetRuntimeClassName( IPropertyMetadata *iface, HSTRING *name )
++{
++    static const WCHAR class_name[] = L"Windows.UI.Xaml.PropertyMetadata";
++    return WindowsCreateString( class_name, wcslen( class_name ), name );
++}
++
++static HRESULT WINAPI metadata_GetTrustLevel( IPropertyMetadata *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI metadata_get_DefaultValue( IPropertyMetadata *iface, IInspectable **value )
++{
++    struct property_metadata *impl = impl_from_IPropertyMetadata( iface );
++    if ((*value = impl->default_value)) IInspectable_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI metadata_get_CreateDefaultValueCallback( IPropertyMetadata *iface, ICreateDefaultValueCallback **value )
++{
++    struct property_metadata *impl = impl_from_IPropertyMetadata( iface );
++    if ((*value = impl->create_default)) ICreateDefaultValueCallback_AddRef( *value );
++    return S_OK;
++}
++
++static const struct IPropertyMetadataVtbl metadata_vtbl =
++{
++    metadata_QueryInterface,
++    metadata_AddRef,
++    metadata_Release,
++    /* IInspectable methods */
++    metadata_GetIids,
++    metadata_GetRuntimeClassName,
++    metadata_GetTrustLevel,
++    /* IPropertyMetadata methods */
++    metadata_get_DefaultValue,
++    metadata_get_CreateDefaultValueCallback,
++};
++
++static HRESULT metadata_create( IInspectable *default_value, ICreateDefaultValueCallback *create_default,
++                                IPropertyChangedCallback *changed, IPropertyMetadata **out )
++{
++    struct property_metadata *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IPropertyMetadata_iface.lpVtbl = &metadata_vtbl;
++    impl->ref = 1;
++    if ((impl->default_value = default_value)) IInspectable_AddRef( default_value );
++    if ((impl->create_default = create_default)) ICreateDefaultValueCallback_AddRef( create_default );
++    if ((impl->changed = changed)) IPropertyChangedCallback_AddRef( changed );
++    *out = &impl->IPropertyMetadata_iface;
++    return S_OK;
++}
++
++static struct property_metadata *metadata_from_iface( IPropertyMetadata *iface )
++{
++    if (!iface || iface->lpVtbl != &metadata_vtbl) return NULL;
++    return impl_from_IPropertyMetadata( iface );
++}
++
++struct metadata_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IPropertyMetadataFactory IPropertyMetadataFactory_iface;
++    IPropertyMetadataStatics IPropertyMetadataStatics_iface;
++};
++
++static inline struct metadata_statics *impl_from_metadata_factory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct metadata_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI metadata_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct metadata_statics *impl = impl_from_metadata_factory( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IPropertyMetadataFactory ))
++        *out = &impl->IPropertyMetadataFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IPropertyMetadataStatics ))
++        *out = &impl->IPropertyMetadataStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI metadata_factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI metadata_factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI metadata_factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI metadata_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI metadata_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI metadata_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl metadata_factory_vtbl =
++{
++    metadata_factory_QueryInterface,
++    metadata_factory_AddRef,
++    metadata_factory_Release,
++    /* IInspectable methods */
++    metadata_factory_GetIids,
++    metadata_factory_GetRuntimeClassName,
++    metadata_factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    metadata_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( metadata_composable, IPropertyMetadataFactory, struct metadata_statics, IActivationFactory_iface )
++
++/* aggregation isn't supported: nothing overrides PropertyMetadata, so the object is its own inner */
++static HRESULT composed_metadata( IInspectable *default_value, IPropertyChangedCallback *changed, IInspectable *outer,
++                                  IInspectable **inner, IPropertyMetadata **value )
++{
++    HRESULT hr;
++
++    if (outer) FIXME( "aggregating PropertyMetadata isn't supported.\n" );
++    if (FAILED(hr = metadata_create( default_value, NULL, changed, value ))) return hr;
++    if (inner)
++    {
++        *inner = (IInspectable *)*value;
++        IInspectable_AddRef( *inner );
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI metadata_composable_CreateInstanceWithDefaultValue( IPropertyMetadataFactory *iface, IInspectable *default_value,
++                                                                           IInspectable *outer, IInspectable **inner,
++                                                                           IPropertyMetadata **value )
++{
++    TRACE( "default %p, outer %p.\n", default_value, outer );
++    return composed_metadata( default_value, NULL, outer, inner, value );
++}
++
++static HRESULT WINAPI metadata_composable_CreateInstanceWithDefaultValueAndCallback( IPropertyMetadataFactory *iface,
++                                                                                      IInspectable *default_value,
++                                                                                      IPropertyChangedCallback *changed,
++                                                                                      IInspectable *outer, IInspectable **inner,
++                                                                                      IPropertyMetadata **value )
++{
++    TRACE( "default %p, callback %p, outer %p.\n", default_value, changed, outer );
++    return composed_metadata( default_value, changed, outer, inner, value );
++}
++
++static const struct IPropertyMetadataFactoryVtbl metadata_composable_vtbl =
++{
++    metadata_composable_QueryInterface,
++    metadata_composable_AddRef,
++    metadata_composable_Release,
++    /* IInspectable methods */
++    metadata_composable_GetIids,
++    metadata_composable_GetRuntimeClassName,
++    metadata_composable_GetTrustLevel,
++    /* IPropertyMetadataFactory methods */
++    metadata_composable_CreateInstanceWithDefaultValue,
++    metadata_composable_CreateInstanceWithDefaultValueAndCallback,
++};
++
++DEFINE_IINSPECTABLE( metadata_statics, IPropertyMetadataStatics, struct metadata_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI metadata_statics_CreateWithDefaultValue( IPropertyMetadataStatics *iface, IInspectable *default_value,
++                                                               IPropertyMetadata **result )
++{
++    return metadata_create( default_value, NULL, NULL, result );
++}
++
++static HRESULT WINAPI metadata_statics_CreateWithDefaultValueAndCallback( IPropertyMetadataStatics *iface, IInspectable *default_value,
++                                                                          IPropertyChangedCallback *changed, IPropertyMetadata **result )
++{
++    return metadata_create( default_value, NULL, changed, result );
++}
++
++static HRESULT WINAPI metadata_statics_CreateWithFactory( IPropertyMetadataStatics *iface, ICreateDefaultValueCallback *create,
++                                                          IPropertyMetadata **result )
++{
++    return metadata_create( NULL, create, NULL, result );
++}
++
++static HRESULT WINAPI metadata_statics_CreateWithFactoryAndCallback( IPropertyMetadataStatics *iface, ICreateDefaultValueCallback *create,
++                                                                     IPropertyChangedCallback *changed, IPropertyMetadata **result )
++{
++    return metadata_create( NULL, create, changed, result );
++}
++
++static const struct IPropertyMetadataStaticsVtbl metadata_statics_vtbl =
++{
++    metadata_statics_QueryInterface,
++    metadata_statics_AddRef,
++    metadata_statics_Release,
++    /* IInspectable methods */
++    metadata_statics_GetIids,
++    metadata_statics_GetRuntimeClassName,
++    metadata_statics_GetTrustLevel,
++    /* IPropertyMetadataStatics methods */
++    metadata_statics_CreateWithDefaultValue,
++    metadata_statics_CreateWithDefaultValueAndCallback,
++    metadata_statics_CreateWithFactory,
++    metadata_statics_CreateWithFactoryAndCallback,
++};
++
++static struct metadata_statics metadata_statics =
++{
++    {&metadata_factory_vtbl},
++    {&metadata_composable_vtbl},
++    {&metadata_statics_vtbl},
++};
++
++IActivationFactory *property_metadata_factory = &metadata_statics.IActivationFactory_iface;
++
++/* ---- DependencyProperty ---- */
++
++static inline struct dependency_property *impl_from_IDependencyProperty( IDependencyProperty *iface )
++{
++    return CONTAINING_RECORD( iface, struct dependency_property, IDependencyProperty_iface );
++}
++
++static HRESULT WINAPI dp_QueryInterface( IDependencyProperty *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IDependencyProperty ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    TRACE( "%s not implemented.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++/* registered properties live as long as the process */
++static ULONG WINAPI dp_AddRef( IDependencyProperty *iface ) { return 2; }
++static ULONG WINAPI dp_Release( IDependencyProperty *iface ) { return 1; }
++static HRESULT WINAPI dp_GetIids( IDependencyProperty *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI dp_GetRuntimeClassName( IDependencyProperty *iface, HSTRING *name )
++{
++    static const WCHAR class_name[] = L"Windows.UI.Xaml.DependencyProperty";
++    return WindowsCreateString( class_name, wcslen( class_name ), name );
++}
++
++static HRESULT WINAPI dp_GetTrustLevel( IDependencyProperty *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI dp_GetMetadata( IDependencyProperty *iface, TypeName type, IPropertyMetadata **result )
++{
++    struct dependency_property *impl = impl_from_IDependencyProperty( iface );
++
++    TRACE( "%s.%s, type %s.\n", debugstr_w(impl->owner), debugstr_w(impl->name), debugstr_hstring(type.Name) );
++    if (!impl->metadata) metadata_create( NULL, NULL, NULL, &impl->metadata );
++    if ((*result = impl->metadata)) IPropertyMetadata_AddRef( *result );
++    return S_OK;
++}
++
++static const struct IDependencyPropertyVtbl dp_vtbl =
++{
++    dp_QueryInterface,
++    dp_AddRef,
++    dp_Release,
++    /* IInspectable methods */
++    dp_GetIids,
++    dp_GetRuntimeClassName,
++    dp_GetTrustLevel,
++    /* IDependencyProperty methods */
++    dp_GetMetadata,
++};
++
++static struct dependency_property *dp_from_iface( IDependencyProperty *iface )
++{
++    if (!iface || iface->lpVtbl != &dp_vtbl) return NULL;
++    return impl_from_IDependencyProperty( iface );
++}
++
++static WCHAR *hstring_dup( HSTRING str )
++{
++    return wcsdup( WindowsGetStringRawBuffer( str, NULL ) );
++}
++
++static struct dependency_property *dp_new( const WCHAR *owner, const WCHAR *name, const WCHAR *type,
++                                           IPropertyMetadata *metadata, BOOL attached, BOOL builtin )
++{
++    struct dependency_property *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return NULL;
++    impl->IDependencyProperty_iface.lpVtbl = &dp_vtbl;
++    impl->name = wcsdup( name );
++    impl->owner = wcsdup( owner );
++    impl->type = wcsdup( type ? type : L"" );
++    if ((impl->metadata = metadata)) IPropertyMetadata_AddRef( metadata );
++    impl->attached = attached;
++    impl->builtin = builtin;
++    EnterCriticalSection( &dp_cs );
++    impl->next = properties;
++    properties = impl;
++    LeaveCriticalSection( &dp_cs );
++    return impl;
++}
++
++/* a built-in property, the same object each time; not referenced (it is never freed) */
++IDependencyProperty *dp_builtin( const WCHAR *owner, const WCHAR *name )
++{
++    struct dependency_property *impl;
++
++    EnterCriticalSection( &dp_cs );
++    for (impl = properties; impl; impl = impl->next)
++        if (impl->builtin && !wcscmp( impl->owner, owner ) && !wcscmp( impl->name, name )) break;
++    LeaveCriticalSection( &dp_cs );
++    if (!impl && !(impl = dp_new( owner, name, NULL, NULL, FALSE, TRUE ))) return NULL;
++    return &impl->IDependencyProperty_iface;
++}
++
++/* the property's name and, for built-ins, its owner's short name; NULL if it isn't ours */
++const WCHAR *dp_name( IDependencyProperty *iface, const WCHAR **owner, BOOL *builtin )
++{
++    struct dependency_property *impl = dp_from_iface( iface );
++    if (!impl) return NULL;
++    if (owner) *owner = impl->owner;
++    if (builtin) *builtin = impl->builtin;
++    return impl->name;
++}
++
++struct dp_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IDependencyPropertyStatics IDependencyPropertyStatics_iface;
++};
++
++static inline struct dp_statics *impl_from_dp_factory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct dp_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI dp_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct dp_statics *impl = impl_from_dp_factory( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IDependencyPropertyStatics ))
++        *out = &impl->IDependencyPropertyStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI dp_factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI dp_factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI dp_factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI dp_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI dp_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI dp_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance ) { return E_NOTIMPL; }
++
++static const struct IActivationFactoryVtbl dp_factory_vtbl =
++{
++    dp_factory_QueryInterface,
++    dp_factory_AddRef,
++    dp_factory_Release,
++    /* IInspectable methods */
++    dp_factory_GetIids,
++    dp_factory_GetRuntimeClassName,
++    dp_factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    dp_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( dp_statics, IDependencyPropertyStatics, struct dp_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI dp_statics_get_UnsetValue( IDependencyPropertyStatics *iface, IInspectable **value )
++{
++    *value = &unset_value;
++    return S_OK;
++}
++
++static HRESULT register_property( HSTRING name, TypeName type, TypeName owner, IPropertyMetadata *metadata,
++                                  BOOL attached, IDependencyProperty **result )
++{
++    struct dependency_property *impl;
++    WCHAR *owner_name, *type_name;
++
++    TRACE( "%s %s.%s, type %s, metadata %p.\n", attached ? "attached" : "property", debugstr_hstring(owner.Name),
++           debugstr_hstring(name), debugstr_hstring(type.Name), metadata );
++    if (!name || !WindowsGetStringLen( name )) return E_INVALIDARG;
++    owner_name = hstring_dup( owner.Name );
++    type_name = hstring_dup( type.Name );
++    impl = dp_new( owner_name, WindowsGetStringRawBuffer( name, NULL ), type_name, metadata, attached, FALSE );
++    free( owner_name );
++    free( type_name );
++    if (!impl) return E_OUTOFMEMORY;
++    *result = &impl->IDependencyProperty_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI dp_statics_Register( IDependencyPropertyStatics *iface, HSTRING name, TypeName type, TypeName owner,
++                                           IPropertyMetadata *metadata, IDependencyProperty **result )
++{
++    return register_property( name, type, owner, metadata, FALSE, result );
++}
++
++static HRESULT WINAPI dp_statics_RegisterAttached( IDependencyPropertyStatics *iface, HSTRING name, TypeName type,
++                                                   TypeName owner, IPropertyMetadata *metadata, IDependencyProperty **result )
++{
++    return register_property( name, type, owner, metadata, TRUE, result );
++}
++
++static const struct IDependencyPropertyStaticsVtbl dp_statics_vtbl =
++{
++    dp_statics_QueryInterface,
++    dp_statics_AddRef,
++    dp_statics_Release,
++    /* IInspectable methods */
++    dp_statics_GetIids,
++    dp_statics_GetRuntimeClassName,
++    dp_statics_GetTrustLevel,
++    /* IDependencyPropertyStatics methods */
++    dp_statics_get_UnsetValue,
++    dp_statics_Register,
++    dp_statics_RegisterAttached,
++};
++
++static struct dp_statics dp_statics =
++{
++    {&dp_factory_vtbl},
++    {&dp_statics_vtbl},
++};
++
++IActivationFactory *dependency_property_factory = &dp_statics.IActivationFactory_iface;
++
++/* ---- DependencyPropertyChangedEventArgs ---- */
++
++struct changed_args
++{
++    IDependencyPropertyChangedEventArgs IDependencyPropertyChangedEventArgs_iface;
++    LONG ref;
++    IDependencyProperty *dp;
++    IInspectable *old_value;
++    IInspectable *new_value;
++};
++
++static inline struct changed_args *impl_from_IDependencyPropertyChangedEventArgs( IDependencyPropertyChangedEventArgs *iface )
++{
++    return CONTAINING_RECORD( iface, struct changed_args, IDependencyPropertyChangedEventArgs_iface );
++}
++
++static HRESULT WINAPI changed_args_QueryInterface( IDependencyPropertyChangedEventArgs *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IDependencyPropertyChangedEventArgs ))
++    {
++        IDependencyPropertyChangedEventArgs_AddRef( (*out = iface) );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI changed_args_AddRef( IDependencyPropertyChangedEventArgs *iface )
++{
++    return InterlockedIncrement( &impl_from_IDependencyPropertyChangedEventArgs( iface )->ref );
++}
++
++static ULONG WINAPI changed_args_Release( IDependencyPropertyChangedEventArgs *iface )
++{
++    struct changed_args *impl = impl_from_IDependencyPropertyChangedEventArgs( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        if (impl->old_value) IInspectable_Release( impl->old_value );
++        if (impl->new_value) IInspectable_Release( impl->new_value );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI changed_args_GetIids( IDependencyPropertyChangedEventArgs *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI changed_args_GetRuntimeClassName( IDependencyPropertyChangedEventArgs *iface, HSTRING *name )
++{
++    static const WCHAR class_name[] = L"Windows.UI.Xaml.DependencyPropertyChangedEventArgs";
++    return WindowsCreateString( class_name, wcslen( class_name ), name );
++}
++
++static HRESULT WINAPI changed_args_GetTrustLevel( IDependencyPropertyChangedEventArgs *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI changed_args_get_Property( IDependencyPropertyChangedEventArgs *iface, IDependencyProperty **value )
++{
++    *value = impl_from_IDependencyPropertyChangedEventArgs( iface )->dp;
++    return S_OK;
++}
++
++static HRESULT WINAPI changed_args_get_OldValue( IDependencyPropertyChangedEventArgs *iface, IInspectable **value )
++{
++    if ((*value = impl_from_IDependencyPropertyChangedEventArgs( iface )->old_value)) IInspectable_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI changed_args_get_NewValue( IDependencyPropertyChangedEventArgs *iface, IInspectable **value )
++{
++    if ((*value = impl_from_IDependencyPropertyChangedEventArgs( iface )->new_value)) IInspectable_AddRef( *value );
++    return S_OK;
++}
++
++static const struct IDependencyPropertyChangedEventArgsVtbl changed_args_vtbl =
++{
++    changed_args_QueryInterface,
++    changed_args_AddRef,
++    changed_args_Release,
++    /* IInspectable methods */
++    changed_args_GetIids,
++    changed_args_GetRuntimeClassName,
++    changed_args_GetTrustLevel,
++    /* IDependencyPropertyChangedEventArgs methods */
++    changed_args_get_Property,
++    changed_args_get_OldValue,
++    changed_args_get_NewValue,
++};
++
++/* ---- the value store ---- */
++
++struct dp_value
++{
++    IDependencyProperty *dp;
++    IInspectable *value;
++    BOOL local;           /* FALSE: a cached default from a CreateDefaultValueCallback */
++};
++
++struct dp_callback
++{
++    IDependencyProperty *dp;
++    IDependencyPropertyChangedCallback *callback;
++    INT64 token;
++};
++
++struct dp_object
++{
++    struct rb_entry entry;
++    IDependencyObject *key;
++    struct dp_value *values;
++    UINT32 value_count;
++    struct dp_callback *callbacks;
++    UINT32 callback_count;
++};
++
++static int dp_object_compare( const void *key, const struct rb_entry *entry )
++{
++    const struct dp_object *obj = RB_ENTRY_VALUE( entry, const struct dp_object, entry );
++    const char *a = key, *b = (const char *)obj->key;
++    return a < b ? -1 : a > b ? 1 : 0;
++}
++
++static struct rb_tree dp_objects = { dp_object_compare };
++static INT64 next_token = 1;
++
++static struct dp_object *dp_object_get( IDependencyObject *key, BOOL create )
++{
++    struct rb_entry *entry;
++    struct dp_object *obj;
++
++    if ((entry = rb_get( &dp_objects, key ))) return RB_ENTRY_VALUE( entry, struct dp_object, entry );
++    if (!create || !(obj = calloc( 1, sizeof(*obj) ))) return NULL;
++    obj->key = key;
++    rb_put( &dp_objects, key, &obj->entry );
++    return obj;
++}
++
++static struct dp_value *dp_object_find( struct dp_object *obj, IDependencyProperty *dp )
++{
++    UINT32 i;
++    if (!obj) return NULL;
++    for (i = 0; i < obj->value_count; i++) if (obj->values[i].dp == dp) return &obj->values[i];
++    return NULL;
++}
++
++/* the object is going away: drop its values and callbacks */
++void dp_store_free( IDependencyObject *key )
++{
++    struct dp_object *obj;
++    UINT32 i;
++
++    EnterCriticalSection( &dp_cs );
++    if (!(obj = dp_object_get( key, FALSE )))
++    {
++        LeaveCriticalSection( &dp_cs );
++        return;
++    }
++    rb_remove( &dp_objects, &obj->entry );
++    LeaveCriticalSection( &dp_cs );
++    for (i = 0; i < obj->value_count; i++) if (obj->values[i].value) IInspectable_Release( obj->values[i].value );
++    for (i = 0; i < obj->callback_count; i++) IDependencyPropertyChangedCallback_Release( obj->callbacks[i].callback );
++    free( obj->values );
++    free( obj->callbacks );
++    free( obj );
++}
++
++static BOOL values_equal( IInspectable *a, IInspectable *b )
++{
++    IPropertyValue *pa, *pb;
++    PropertyType ta, tb;
++    BOOL ret = FALSE;
++
++    if (a == b) return TRUE;
++    if (!a || !b) return FALSE;
++    if (FAILED(IInspectable_QueryInterface( a, &IID_IPropertyValue, (void **)&pa ))) return FALSE;
++    if (FAILED(IInspectable_QueryInterface( b, &IID_IPropertyValue, (void **)&pb )))
++    {
++        IPropertyValue_Release( pa );
++        return FALSE;
++    }
++    IPropertyValue_get_Type( pa, &ta );
++    IPropertyValue_get_Type( pb, &tb );
++    if (ta == tb)
++    {
++        switch (ta)
++        {
++        case PropertyType_Boolean:
++        {
++            boolean x, y;
++            ret = SUCCEEDED(IPropertyValue_GetBoolean( pa, &x )) && SUCCEEDED(IPropertyValue_GetBoolean( pb, &y )) && x == y;
++            break;
++        }
++        case PropertyType_Int32:
++        case PropertyType_UInt32:
++        case PropertyType_Int64:
++        case PropertyType_UInt8:
++        case PropertyType_Int16:
++        case PropertyType_UInt16:
++        {
++            INT64 x, y;
++            ret = SUCCEEDED(IPropertyValue_GetInt64( pa, &x )) && SUCCEEDED(IPropertyValue_GetInt64( pb, &y )) && x == y;
++            break;
++        }
++        case PropertyType_Double:
++        case PropertyType_Single:
++        {
++            DOUBLE x, y;
++            ret = SUCCEEDED(IPropertyValue_GetDouble( pa, &x )) && SUCCEEDED(IPropertyValue_GetDouble( pb, &y )) && x == y;
++            break;
++        }
++        case PropertyType_String:
++        {
++            HSTRING x = NULL, y = NULL;
++            INT32 cmp = 1;
++            if (SUCCEEDED(IPropertyValue_GetString( pa, &x )) && SUCCEEDED(IPropertyValue_GetString( pb, &y )))
++                WindowsCompareStringOrdinal( x, y, &cmp );
++            WindowsDeleteString( x );
++            WindowsDeleteString( y );
++            ret = !cmp;
++            break;
++        }
++        default:
++            break;
++        }
++    }
++    IPropertyValue_Release( pa );
++    IPropertyValue_Release( pb );
++    return ret;
++}
++
++/* a registered property's default for the object: from the metadata, or its factory (cached per object) */
++static HRESULT dp_default_value( IDependencyObject *key, struct dependency_property *impl, IInspectable **out )
++{
++    struct property_metadata *metadata = metadata_from_iface( impl->metadata );
++    struct dp_object *obj;
++    struct dp_value *v;
++    IInspectable *value = NULL;
++    HRESULT hr;
++
++    *out = NULL;
++    if (!metadata)
++    {
++        if (impl->metadata) return IPropertyMetadata_get_DefaultValue( impl->metadata, out );
++        return S_OK;
++    }
++    if (!metadata->create_default)
++    {
++        if ((*out = metadata->default_value)) IInspectable_AddRef( *out );
++        return S_OK;
++    }
++    EnterCriticalSection( &dp_cs );
++    if ((v = dp_object_find( dp_object_get( key, FALSE ), &impl->IDependencyProperty_iface )))
++    {
++        if ((*out = v->value)) IInspectable_AddRef( *out );
++        LeaveCriticalSection( &dp_cs );
++        return S_OK;
++    }
++    LeaveCriticalSection( &dp_cs );
++    if (FAILED(hr = ICreateDefaultValueCallback_Invoke( metadata->create_default, &value ))) return hr;
++    EnterCriticalSection( &dp_cs );
++    if ((obj = dp_object_get( key, TRUE )) && !dp_object_find( obj, &impl->IDependencyProperty_iface ))
++    {
++        struct dp_value *values = realloc( obj->values, (obj->value_count + 1) * sizeof(*values) );
++        if (values)
++        {
++            obj->values = values;
++            values[obj->value_count].dp = &impl->IDependencyProperty_iface;
++            values[obj->value_count].value = value;
++            values[obj->value_count++].local = FALSE;
++            if (value) IInspectable_AddRef( value );
++        }
++    }
++    LeaveCriticalSection( &dp_cs );
++    *out = value;
++    return S_OK;
++}
++
++static void raise_changed( IDependencyObject *key, struct dependency_property *impl, IInspectable *old_value,
++                           IInspectable *new_value )
++{
++    struct property_metadata *metadata = metadata_from_iface( impl->metadata );
++    IDependencyPropertyChangedCallback **callbacks = NULL;
++    struct dp_object *obj;
++    UINT32 i, count = 0;
++
++    TRACE( "%p %s: %p -> %p.\n", key, debugstr_w(impl->name), old_value, new_value );
++    if (metadata && metadata->changed)
++    {
++        struct changed_args *args;
++        if ((args = calloc( 1, sizeof(*args) )))
++        {
++            HRESULT hr;
++            args->IDependencyPropertyChangedEventArgs_iface.lpVtbl = &changed_args_vtbl;
++            args->ref = 1;
++            args->dp = &impl->IDependencyProperty_iface;
++            if ((args->old_value = old_value)) IInspectable_AddRef( old_value );
++            if ((args->new_value = new_value)) IInspectable_AddRef( new_value );
++            hr = IPropertyChangedCallback_Invoke( metadata->changed, key, &args->IDependencyPropertyChangedEventArgs_iface );
++            if (FAILED(hr)) WARN( "%s changed callback failed, hr %#lx.\n", debugstr_w(impl->name), hr );
++            IDependencyPropertyChangedEventArgs_Release( &args->IDependencyPropertyChangedEventArgs_iface );
++        }
++    }
++
++    /* RegisterPropertyChangedCallback handlers: copied, since they may unregister themselves */
++    EnterCriticalSection( &dp_cs );
++    if ((obj = dp_object_get( key, FALSE )) && obj->callback_count &&
++        (callbacks = malloc( obj->callback_count * sizeof(*callbacks) )))
++    {
++        for (i = 0; i < obj->callback_count; i++)
++        {
++            if (obj->callbacks[i].dp != &impl->IDependencyProperty_iface) continue;
++            IDependencyPropertyChangedCallback_AddRef( (callbacks[count++] = obj->callbacks[i].callback) );
++        }
++    }
++    LeaveCriticalSection( &dp_cs );
++    for (i = 0; i < count; i++)
++    {
++        IDependencyPropertyChangedCallback_Invoke( callbacks[i], key, &impl->IDependencyProperty_iface );
++        IDependencyPropertyChangedCallback_Release( callbacks[i] );
++    }
++    free( callbacks );
++}
++
++/* built-in properties changed through SetValue also notify RegisterPropertyChangedCallback handlers */
++void dp_notify_builtin( IDependencyObject *key, const WCHAR *owner, const WCHAR *name )
++{
++    IDependencyPropertyChangedCallback **callbacks = NULL;
++    struct dependency_property *impl;
++    struct dp_object *obj;
++    UINT32 i, count = 0;
++
++    EnterCriticalSection( &dp_cs );
++    if ((obj = dp_object_get( key, FALSE )) && obj->callback_count &&
++        (callbacks = malloc( obj->callback_count * 2 * sizeof(*callbacks) )))
++    {
++        for (i = 0; i < obj->callback_count; i++)
++        {
++            impl = impl_from_IDependencyProperty( obj->callbacks[i].dp );
++            if (!impl->builtin || wcscmp( impl->name, name ) || (owner && wcscmp( impl->owner, owner ))) continue;
++            callbacks[count++] = obj->callbacks[i].callback;
++            callbacks[count++] = (IDependencyPropertyChangedCallback *)obj->callbacks[i].dp;
++            IDependencyPropertyChangedCallback_AddRef( obj->callbacks[i].callback );
++        }
++    }
++    LeaveCriticalSection( &dp_cs );
++    for (i = 0; i < count; i += 2)
++    {
++        IDependencyPropertyChangedCallback_Invoke( callbacks[i], key, (IDependencyProperty *)callbacks[i + 1] );
++        IDependencyPropertyChangedCallback_Release( callbacks[i] );
++    }
++    free( callbacks );
++}
++
++HRESULT dp_get_value( IDependencyObject *key, IDependencyProperty *dp, IInspectable **result )
++{
++    struct dependency_property *impl = dp_from_iface( dp );
++    struct dp_value *v;
++
++    if (!result) return E_POINTER;
++    *result = NULL;
++    if (!impl)
++    {
++        FIXME( "%p is not one of our properties.\n", dp );
++        return E_INVALIDARG;
++    }
++    if (impl->builtin)
++    {
++        *result = markup_get_value_owned( (IInspectable *)key, impl->owner, impl->name );
++        TRACE( "%p built-in %s.%s -> %p.\n", key, debugstr_w(impl->owner), debugstr_w(impl->name), *result );
++        return S_OK;
++    }
++    EnterCriticalSection( &dp_cs );
++    if ((v = dp_object_find( dp_object_get( key, FALSE ), dp )) && v->local)
++    {
++        if ((*result = v->value)) IInspectable_AddRef( *result );
++        LeaveCriticalSection( &dp_cs );
++        return S_OK;
++    }
++    LeaveCriticalSection( &dp_cs );
++    return dp_default_value( key, impl, result );
++}
++
++HRESULT dp_read_local_value( IDependencyObject *key, IDependencyProperty *dp, IInspectable **result )
++{
++    struct dependency_property *impl = dp_from_iface( dp );
++    struct dp_value *v;
++
++    if (!result) return E_POINTER;
++    *result = &unset_value;
++    if (!impl) return E_INVALIDARG;
++    if (impl->builtin)
++    {
++        if (element_is_local_property( (IInspectable *)key, impl->name ))
++            *result = markup_get_value_owned( (IInspectable *)key, impl->owner, impl->name );
++        return S_OK;
++    }
++    EnterCriticalSection( &dp_cs );
++    if ((v = dp_object_find( dp_object_get( key, FALSE ), dp )) && v->local)
++    {
++        if ((*result = v->value)) IInspectable_AddRef( *result );
++    }
++    LeaveCriticalSection( &dp_cs );
++    return S_OK;
++}
++
++HRESULT dp_set_value( IDependencyObject *key, IDependencyProperty *dp, IInspectable *value )
++{
++    struct dependency_property *impl = dp_from_iface( dp );
++    IInspectable *old_value = NULL;
++    struct dp_object *obj;
++    struct dp_value *v;
++    BOOL had_local;
++
++    if (!impl)
++    {
++        FIXME( "%p is not one of our properties.\n", dp );
++        return E_INVALIDARG;
++    }
++    if (value == &unset_value) return dp_clear_value( key, dp );
++    if (impl->builtin)
++    {
++        TRACE( "%p built-in %s.%s = %p.\n", key, debugstr_w(impl->owner), debugstr_w(impl->name), value );
++        markup_set_value_owned( (IInspectable *)key, impl->owner, impl->name, value );
++        dp_notify_builtin( key, impl->owner, impl->name );
++        return S_OK;
++    }
++
++    dp_get_value( key, dp, &old_value );
++    EnterCriticalSection( &dp_cs );
++    if (!(obj = dp_object_get( key, TRUE )))
++    {
++        LeaveCriticalSection( &dp_cs );
++        if (old_value) IInspectable_Release( old_value );
++        return E_OUTOFMEMORY;
++    }
++    if (!(v = dp_object_find( obj, dp )))
++    {
++        struct dp_value *values = realloc( obj->values, (obj->value_count + 1) * sizeof(*values) );
++        if (!values)
++        {
++            LeaveCriticalSection( &dp_cs );
++            if (old_value) IInspectable_Release( old_value );
++            return E_OUTOFMEMORY;
++        }
++        obj->values = values;
++        v = &values[obj->value_count++];
++        v->dp = dp;
++        v->value = NULL;
++    }
++    had_local = v->local;
++    if (v->value) IInspectable_Release( v->value );
++    if ((v->value = value)) IInspectable_AddRef( value );
++    v->local = TRUE;
++    LeaveCriticalSection( &dp_cs );
++
++    TRACE( "%p %s.%s = %p.\n", key, debugstr_w(impl->owner), debugstr_w(impl->name), value );
++    if (!values_equal( old_value, value ) || (!had_local && old_value != value))
++    {
++        raise_changed( key, impl, old_value, value );
++        element_property_changed( (IInspectable *)key, impl->name );
++    }
++    if (old_value) IInspectable_Release( old_value );
++    return S_OK;
++}
++
++HRESULT dp_clear_value( IDependencyObject *key, IDependencyProperty *dp )
++{
++    struct dependency_property *impl = dp_from_iface( dp );
++    IInspectable *old_value = NULL, *new_value = NULL;
++    struct dp_object *obj;
++    struct dp_value *v;
++    BOOL had_local = FALSE;
++
++    if (!impl) return E_INVALIDARG;
++    if (impl->builtin)
++    {
++        FIXME( "%p clearing built-in %s.%s isn't supported.\n", key, debugstr_w(impl->owner), debugstr_w(impl->name) );
++        return S_OK;
++    }
++    EnterCriticalSection( &dp_cs );
++    if ((obj = dp_object_get( key, FALSE )) && (v = dp_object_find( obj, dp )) && v->local)
++    {
++        had_local = TRUE;
++        old_value = v->value;
++        *v = obj->values[--obj->value_count];
++    }
++    LeaveCriticalSection( &dp_cs );
++    if (!had_local) return S_OK;
++    dp_get_value( key, dp, &new_value );
++    if (!values_equal( old_value, new_value )) raise_changed( key, impl, old_value, new_value );
++    if (old_value) IInspectable_Release( old_value );
++    if (new_value) IInspectable_Release( new_value );
++    return S_OK;
++}
++
++HRESULT dp_register_callback( IDependencyObject *key, IDependencyProperty *dp, IDependencyPropertyChangedCallback *callback,
++                              INT64 *token )
++{
++    struct dp_object *obj;
++    struct dp_callback *callbacks;
++
++    if (!dp_from_iface( dp ) || !callback || !token) return E_INVALIDARG;
++    EnterCriticalSection( &dp_cs );
++    if (!(obj = dp_object_get( key, TRUE )) ||
++        !(callbacks = realloc( obj->callbacks, (obj->callback_count + 1) * sizeof(*callbacks) )))
++    {
++        LeaveCriticalSection( &dp_cs );
++        return E_OUTOFMEMORY;
++    }
++    obj->callbacks = callbacks;
++    callbacks[obj->callback_count].dp = dp;
++    IDependencyPropertyChangedCallback_AddRef( (callbacks[obj->callback_count].callback = callback) );
++    *token = callbacks[obj->callback_count++].token = next_token++;
++    LeaveCriticalSection( &dp_cs );
++    return S_OK;
++}
++
++HRESULT dp_unregister_callback( IDependencyObject *key, IDependencyProperty *dp, INT64 token )
++{
++    IDependencyPropertyChangedCallback *callback = NULL;
++    struct dp_object *obj;
++    UINT32 i;
++
++    EnterCriticalSection( &dp_cs );
++    if ((obj = dp_object_get( key, FALSE )))
++    {
++        for (i = 0; i < obj->callback_count; i++)
++        {
++            if (obj->callbacks[i].token != token) continue;
++            callback = obj->callbacks[i].callback;
++            obj->callbacks[i] = obj->callbacks[--obj->callback_count];
++            break;
++        }
++    }
++    LeaveCriticalSection( &dp_cs );
++    if (callback) IDependencyPropertyChangedCallback_Release( callback );
++    return S_OK;
++}
++
++/* ---- DependencyObject: the composable base for app classes and WinUI's own ---- */
++
++struct dependency_object
++{
++    IDependencyObject IDependencyObject_iface;
++    IDependencyObject2 IDependencyObject2_iface;
++    IInspectable IInspectable_inner;
++    IInspectable *outer;
++    LONG ref;
++};
++
++static inline struct dependency_object *impl_from_do_inner( IInspectable *iface )
++{
++    return CONTAINING_RECORD( iface, struct dependency_object, IInspectable_inner );
++}
++
++static HRESULT WINAPI do_inner_QueryInterface( IInspectable *iface, REFIID iid, void **out )
++{
++    struct dependency_object *impl = impl_from_do_inner( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ))
++        *out = &impl->IInspectable_inner;
++    else if (IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IDependencyObject ))
++        *out = &impl->IDependencyObject_iface;
++    else if (IsEqualGUID( iid, &IID_IDependencyObject2 ))
++        *out = &impl->IDependencyObject2_iface;
++    else
++    {
++        TRACE( "%s not implemented.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI do_inner_AddRef( IInspectable *iface )
++{
++    return InterlockedIncrement( &impl_from_do_inner( iface )->ref );
++}
++
++static ULONG WINAPI do_inner_Release( IInspectable *iface )
++{
++    struct dependency_object *impl = impl_from_do_inner( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        dp_store_free( &impl->IDependencyObject_iface );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI do_inner_GetIids( IInspectable *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI do_inner_GetRuntimeClassName( IInspectable *iface, HSTRING *name )
++{
++    static const WCHAR class_name[] = L"Windows.UI.Xaml.DependencyObject";
++    return WindowsCreateString( class_name, wcslen( class_name ), name );
++}
++
++static HRESULT WINAPI do_inner_GetTrustLevel( IInspectable *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static const struct IInspectableVtbl do_inner_vtbl =
++{
++    do_inner_QueryInterface, do_inner_AddRef, do_inner_Release,
++    do_inner_GetIids, do_inner_GetRuntimeClassName, do_inner_GetTrustLevel,
++};
++
++DEFINE_IINSPECTABLE_( do_dependency_object, IDependencyObject, struct dependency_object, impl_from_do_IDependencyObject,
++                      IDependencyObject_iface, impl->outer )
++
++static HRESULT WINAPI do_dependency_object_GetValue( IDependencyObject *iface, IDependencyProperty *dp, IInspectable **result )
++{
++    return dp_get_value( iface, dp, result );
++}
++
++static HRESULT WINAPI do_dependency_object_SetValue( IDependencyObject *iface, IDependencyProperty *dp, IInspectable *value )
++{
++    return dp_set_value( iface, dp, value );
++}
++
++static HRESULT WINAPI do_dependency_object_ClearValue( IDependencyObject *iface, IDependencyProperty *dp )
++{
++    return dp_clear_value( iface, dp );
++}
++
++static HRESULT WINAPI do_dependency_object_ReadLocalValue( IDependencyObject *iface, IDependencyProperty *dp, IInspectable **result )
++{
++    return dp_read_local_value( iface, dp, result );
++}
++
++static HRESULT WINAPI do_dependency_object_GetAnimationBaseValue( IDependencyObject *iface, IDependencyProperty *dp, IInspectable **result )
++{
++    return dp_get_value( iface, dp, result );
++}
++
++static HRESULT WINAPI do_dependency_object_get_Dispatcher( IDependencyObject *iface, ICoreDispatcher **value )
++{
++    return xaml_get_dispatcher( value );
++}
++
++static const struct IDependencyObjectVtbl do_dependency_object_vtbl =
++{
++    do_dependency_object_QueryInterface,
++    do_dependency_object_AddRef,
++    do_dependency_object_Release,
++    /* IInspectable methods */
++    do_dependency_object_GetIids,
++    do_dependency_object_GetRuntimeClassName,
++    do_dependency_object_GetTrustLevel,
++    /* IDependencyObject methods */
++    do_dependency_object_GetValue,
++    do_dependency_object_SetValue,
++    do_dependency_object_ClearValue,
++    do_dependency_object_ReadLocalValue,
++    do_dependency_object_GetAnimationBaseValue,
++    do_dependency_object_get_Dispatcher,
++};
++
++DEFINE_IINSPECTABLE_( do_dependency_object2, IDependencyObject2, struct dependency_object, impl_from_do_IDependencyObject2,
++                      IDependencyObject2_iface, impl->outer )
++
++static HRESULT WINAPI do_dependency_object2_RegisterPropertyChangedCallback( IDependencyObject2 *iface, IDependencyProperty *dp,
++                                                                              IDependencyPropertyChangedCallback *callback, INT64 *token )
++{
++    return dp_register_callback( &impl_from_do_IDependencyObject2( iface )->IDependencyObject_iface, dp, callback, token );
++}
++
++static HRESULT WINAPI do_dependency_object2_UnregisterPropertyChangedCallback( IDependencyObject2 *iface, IDependencyProperty *dp,
++                                                                                INT64 token )
++{
++    return dp_unregister_callback( &impl_from_do_IDependencyObject2( iface )->IDependencyObject_iface, dp, token );
++}
++
++static const struct IDependencyObject2Vtbl do_dependency_object2_vtbl =
++{
++    do_dependency_object2_QueryInterface,
++    do_dependency_object2_AddRef,
++    do_dependency_object2_Release,
++    /* IInspectable methods */
++    do_dependency_object2_GetIids,
++    do_dependency_object2_GetRuntimeClassName,
++    do_dependency_object2_GetTrustLevel,
++    /* IDependencyObject2 methods */
++    do_dependency_object2_RegisterPropertyChangedCallback,
++    do_dependency_object2_UnregisterPropertyChangedCallback,
++};
++
++struct do_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IDependencyObjectFactory IDependencyObjectFactory_iface;
++};
++
++static inline struct do_statics *impl_from_do_factory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct do_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI do_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct do_statics *impl = impl_from_do_factory( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IDependencyObjectFactory ))
++        *out = &impl->IDependencyObjectFactory_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI do_factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI do_factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI do_factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI do_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI do_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI do_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance ) { return E_NOTIMPL; }
++
++static const struct IActivationFactoryVtbl do_factory_vtbl =
++{
++    do_factory_QueryInterface,
++    do_factory_AddRef,
++    do_factory_Release,
++    /* IInspectable methods */
++    do_factory_GetIids,
++    do_factory_GetRuntimeClassName,
++    do_factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    do_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( do_composable, IDependencyObjectFactory, struct do_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI do_composable_CreateInstance( IDependencyObjectFactory *iface, IInspectable *outer, IInspectable **inner,
++                                                    IDependencyObject **value )
++{
++    struct dependency_object *impl;
++
++    TRACE( "outer %p, inner %p, value %p.\n", outer, inner, value );
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IDependencyObject_iface.lpVtbl = &do_dependency_object_vtbl;
++    impl->IDependencyObject2_iface.lpVtbl = &do_dependency_object2_vtbl;
++    impl->IInspectable_inner.lpVtbl = &do_inner_vtbl;
++    impl->outer = outer ? outer : &impl->IInspectable_inner;
++    impl->ref = 1;
++    if (outer)
++    {
++        /* the outer object holds the inner reference; the returned interface is the outer's */
++        *inner = &impl->IInspectable_inner;
++        *value = &impl->IDependencyObject_iface;
++        IInspectable_AddRef( outer );
++    }
++    else
++    {
++        if (inner) *inner = NULL;
++        *value = &impl->IDependencyObject_iface;
++    }
++    return S_OK;
++}
++
++static const struct IDependencyObjectFactoryVtbl do_composable_vtbl =
++{
++    do_composable_QueryInterface,
++    do_composable_AddRef,
++    do_composable_Release,
++    /* IInspectable methods */
++    do_composable_GetIids,
++    do_composable_GetRuntimeClassName,
++    do_composable_GetTrustLevel,
++    /* IDependencyObjectFactory methods */
++    do_composable_CreateInstance,
++};
++
++static struct do_statics do_statics =
++{
++    {&do_factory_vtbl},
++    {&do_composable_vtbl},
++};
++
++IActivationFactory *dependency_object_factory = &do_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/element.c b/dlls/windows.ui.xaml/element.c
+index 10986cc..6cd5a97 100644
+--- a/dlls/windows.ui.xaml/element.c
++++ b/dlls/windows.ui.xaml/element.c
+@@ -50,6 +50,8 @@ static HRESULT WINAPI inner_QueryInterface( IInspectable *iface, REFIID iid, voi
+         *out = &impl->IFrameworkElement2_iface;
+     else if (IsEqualGUID( iid, &IID_IDependencyObject ))
+         *out = &impl->IDependencyObject_iface;
++    else if (IsEqualGUID( iid, &IID_IDependencyObject2 ))
++        *out = &impl->IDependencyObject2_iface;
+     else if (impl->ops->query_interface && SUCCEEDED(impl->ops->query_interface( impl, iid, out )))
+         return S_OK;
+     else
+@@ -82,6 +84,7 @@ static ULONG WINAPI inner_Release( IInspectable *iface )
+ 
+     if (!ref)
+     {
++        dp_store_free( &impl->IDependencyObject_iface );
+         WindowsDeleteString( impl->name );
+         if (impl->resources) IInspectable_Release( impl->resources );
+         if (impl->style) IInspectable_Release( impl->style );
+@@ -1395,32 +1398,27 @@ DEFINE_IINSPECTABLE(element_dependency_object, IDependencyObject, struct xaml_el
+ 
+ static HRESULT WINAPI element_dependency_object_GetValue(IDependencyObject *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp, IInspectable **result)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return dp_get_value( iface, dp, result );
+ }
+ 
+ static HRESULT WINAPI element_dependency_object_SetValue(IDependencyObject *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp, IInspectable *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return dp_set_value( iface, dp, value );
+ }
+ 
+ static HRESULT WINAPI element_dependency_object_ClearValue(IDependencyObject *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return dp_clear_value( iface, dp );
+ }
+ 
+ static HRESULT WINAPI element_dependency_object_ReadLocalValue(IDependencyObject *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp, IInspectable **result)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return dp_read_local_value( iface, dp, result );
+ }
+ 
+ static HRESULT WINAPI element_dependency_object_GetAnimationBaseValue(IDependencyObject *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyProperty *dp, IInspectable **result)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return dp_get_value( iface, dp, result );
+ }
+ 
+ static HRESULT WINAPI element_dependency_object_get_Dispatcher(IDependencyObject *iface, __x_ABI_CWindows_CUI_CCore_CICoreDispatcher **value)
+@@ -1446,6 +1444,36 @@ static const struct IDependencyObjectVtbl element_dependency_object_vtbl =
+     element_dependency_object_get_Dispatcher
+ };
+ 
++DEFINE_IINSPECTABLE(element_dependency_object2, IDependencyObject2, struct xaml_element, IUIElement_iface)
++
++static HRESULT WINAPI element_dependency_object2_RegisterPropertyChangedCallback( IDependencyObject2 *iface, IDependencyProperty *dp,
++                                                                                   IDependencyPropertyChangedCallback *callback, INT64 *token )
++{
++    struct xaml_element *impl = impl_from_IDependencyObject2( iface );
++    return dp_register_callback( &impl->IDependencyObject_iface, dp, callback, token );
++}
++
++static HRESULT WINAPI element_dependency_object2_UnregisterPropertyChangedCallback( IDependencyObject2 *iface, IDependencyProperty *dp,
++                                                                                     INT64 token )
++{
++    struct xaml_element *impl = impl_from_IDependencyObject2( iface );
++    return dp_unregister_callback( &impl->IDependencyObject_iface, dp, token );
++}
++
++static const struct IDependencyObject2Vtbl element_dependency_object2_vtbl =
++{
++    element_dependency_object2_QueryInterface,
++    element_dependency_object2_AddRef,
++    element_dependency_object2_Release,
++    /* IInspectable methods */
++    element_dependency_object2_GetIids,
++    element_dependency_object2_GetRuntimeClassName,
++    element_dependency_object2_GetTrustLevel,
++    /* IDependencyObject2 methods */
++    element_dependency_object2_RegisterPropertyChangedCallback,
++    element_dependency_object2_UnregisterPropertyChangedCallback,
++};
++
+ /* whether to FIXME an interface a class doesn't have: the first time only, since the markup writer probes objects
+  * for many interfaces */
+ BOOL report_missing_interface( const WCHAR *class_name, REFIID iid )
+@@ -1500,6 +1528,7 @@ void element_init( struct xaml_element *element, const struct element_ops *ops,
+     element->IFrameworkElement_iface.lpVtbl = &framework_element_vtbl;
+     element->IFrameworkElement2_iface.lpVtbl = &framework_element2_vtbl;
+     element->IDependencyObject_iface.lpVtbl = &element_dependency_object_vtbl;
++    element->IDependencyObject2_iface.lpVtbl = &element_dependency_object2_vtbl;
+     element->IInspectable_inner.lpVtbl = &inner_vtbl;
+     element->outer = outer ? outer : &element->IInspectable_inner;
+     element->ref = 1;
+diff --git a/dlls/windows.ui.xaml/main.c b/dlls/windows.ui.xaml/main.c
+index 9d41b8e..515d3c0 100644
+--- a/dlls/windows.ui.xaml/main.c
++++ b/dlls/windows.ui.xaml/main.c
+@@ -157,6 +157,13 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ContentPresenter ))
+         IActivationFactory_QueryInterface( content_presenter_factory, &IID_IActivationFactory, (void **)factory );
+ 
++    if (!wcscmp( buffer, L"Windows.UI.Xaml.DependencyProperty" ))
++        IActivationFactory_QueryInterface( dependency_property_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, L"Windows.UI.Xaml.PropertyMetadata" ))
++        IActivationFactory_QueryInterface( property_metadata_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, L"Windows.UI.Xaml.DependencyObject" ))
++        IActivationFactory_QueryInterface( dependency_object_factory, &IID_IActivationFactory, (void **)factory );
++
+     if (*factory) return S_OK;
+     return CLASS_E_CLASSNOTAVAILABLE;
+ }
+diff --git a/dlls/windows.ui.xaml/panel.c b/dlls/windows.ui.xaml/panel.c
+index 0e0e93e..79a4ac6 100644
+--- a/dlls/windows.ui.xaml/panel.c
++++ b/dlls/windows.ui.xaml/panel.c
+@@ -1177,9 +1177,8 @@ static struct xaml_element *attached_target( IFrameworkElement *element )
+ #define GRID_ATTACHED( Name, field ) \
+ static HRESULT WINAPI grid_statics_get_##Name##Property( IGridStatics *iface, IDependencyProperty **value ) \
+ { \
+-    FIXME( "iface %p: no DependencyProperty objects yet.\n", iface ); \
+-    *value = NULL; \
+-    return E_NOTIMPL; \
++    *value = dp_builtin( L"Grid", L ## #Name ); \
++    return *value ? S_OK : E_OUTOFMEMORY; \
+ } \
+ static HRESULT WINAPI grid_statics_Get##Name( IGridStatics *iface, IFrameworkElement *element, INT32 *value ) \
+ { \
+@@ -1315,12 +1314,15 @@ static struct xaml_element *canvas_target( IUIElement *element )
+     return element_from_iinspectable( (IInspectable *)element );
+ }
+ 
+-static HRESULT WINAPI canvas_statics_get_property( ICanvasStatics *iface, IDependencyProperty **value )
+-{
+-    FIXME( "iface %p: no DependencyProperty objects yet.\n", iface );
+-    *value = NULL;
+-    return E_NOTIMPL;
++#define CANVAS_PROPERTY( Name ) \
++static HRESULT WINAPI canvas_statics_get_##Name##Property( ICanvasStatics *iface, IDependencyProperty **value ) \
++{ \
++    *value = dp_builtin( L"Canvas", L ## #Name ); \
++    return *value ? S_OK : E_OUTOFMEMORY; \
+ }
++CANVAS_PROPERTY( Left )
++CANVAS_PROPERTY( Top )
++CANVAS_PROPERTY( ZIndex )
+ 
+ #define CANVAS_ATTACHED( Name, type, field ) \
+ static HRESULT WINAPI canvas_statics_Get##Name( ICanvasStatics *iface, IUIElement *element, type *value ) \
+@@ -1354,13 +1356,13 @@ static const struct ICanvasStaticsVtbl canvas_statics_vtbl =
+     canvas_statics_GetRuntimeClassName,
+     canvas_statics_GetTrustLevel,
+     /* ICanvasStatics methods */
+-    canvas_statics_get_property,
++    canvas_statics_get_LeftProperty,
+     canvas_statics_GetLeft,
+     canvas_statics_SetLeft,
+-    canvas_statics_get_property,
++    canvas_statics_get_TopProperty,
+     canvas_statics_GetTop,
+     canvas_statics_SetTop,
+-    canvas_statics_get_property,
++    canvas_statics_get_ZIndexProperty,
+     canvas_statics_GetZIndex,
+     canvas_statics_SetZIndex,
+ };
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index 0529c20..1ef626f 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -186,6 +186,25 @@ IInspectable *markup_get_value( IInspectable *target, const WCHAR *name );  /* b
+ BOOL markup_has_value( IInspectable *target, const WCHAR *name );
+ void markup_set_value( IInspectable *target, const WCHAR *name, IInspectable *value, BOOL animated );
+ void markup_set_string( IInspectable *target, const WCHAR *name, const WCHAR *value, BOOL animated );
++IInspectable *markup_get_value_owned( IInspectable *target, const WCHAR *owner, const WCHAR *name );
++void markup_set_value_owned( IInspectable *target, const WCHAR *owner, const WCHAR *name, IInspectable *value );
++BOOL element_is_local_property( IInspectable *target, const WCHAR *name );
++/* dependency.c */
++extern IActivationFactory *dependency_property_factory;
++extern IActivationFactory *property_metadata_factory;
++extern IActivationFactory *dependency_object_factory;
++IInspectable *dp_unset_value(void);
++IDependencyProperty *dp_builtin( const WCHAR *owner, const WCHAR *name );   /* not referenced */
++const WCHAR *dp_name( IDependencyProperty *dp, const WCHAR **owner, BOOL *builtin );
++void dp_store_free( IDependencyObject *key );
++void dp_notify_builtin( IDependencyObject *key, const WCHAR *owner, const WCHAR *name );
++HRESULT dp_get_value( IDependencyObject *key, IDependencyProperty *dp, IInspectable **result );
++HRESULT dp_read_local_value( IDependencyObject *key, IDependencyProperty *dp, IInspectable **result );
++HRESULT dp_set_value( IDependencyObject *key, IDependencyProperty *dp, IInspectable *value );
++HRESULT dp_clear_value( IDependencyObject *key, IDependencyProperty *dp );
++HRESULT dp_register_callback( IDependencyObject *key, IDependencyProperty *dp, IDependencyPropertyChangedCallback *callback,
++                              INT64 *token );
++HRESULT dp_unregister_callback( IDependencyObject *key, IDependencyProperty *dp, INT64 token );
+ BOOL markup_set_color( IInspectable *target, const WCHAR *name, Color c, BOOL animated );
+ BOOL markup_property_path( const WCHAR *path, WCHAR *property, SIZE_T len, BOOL *brush_color );
+ BOOL markup_resolve_path( IInspectable *target, const WCHAR *path, IInspectable **out, WCHAR *property, SIZE_T len,
+@@ -341,6 +360,7 @@ struct xaml_element
+     IFrameworkElement IFrameworkElement_iface;
+     IFrameworkElement2 IFrameworkElement2_iface;
+     IDependencyObject IDependencyObject_iface;
++    IDependencyObject2 IDependencyObject2_iface;
+     IInspectable IInspectable_inner;  /* non-delegating */
+     IInspectable *outer;              /* the controlling object, or &IInspectable_inner */
+     LONG ref;
+diff --git a/dlls/windows.ui.xaml/xbf.c b/dlls/windows.ui.xaml/xbf.c
+index 0c51bcf..ad450e0 100644
+--- a/dlls/windows.ui.xaml/xbf.c
++++ b/dlls/windows.ui.xaml/xbf.c
+@@ -2265,6 +2265,23 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+     }
+ 
+     /* Grid attached properties */
++    if (!wcscmp( prop->owner, L"Canvas" ) && (prop_is( prop, L"Left" ) || prop_is( prop, L"Top" ) || prop_is( prop, L"ZIndex" )))
++    {
++        if ((element = element_from_object( target )))
++        {
++            if (prop_is( prop, L"ZIndex" ))
++            {
++                if (to_int( value, &e )) element->z_index = e;
++            }
++            else if (to_double( value, &d ))
++            {
++                if (prop_is( prop, L"Left" )) element->canvas_left = d;
++                else element->canvas_top = d;
++            }
++            window_invalidate();
++        }
++        return S_OK;
++    }
+     if (!wcscmp( prop->owner, L"Grid" ) && (prop_is( prop, L"Row" ) || prop_is( prop, L"Column" ) ||
+         prop_is( prop, L"RowSpan" ) || prop_is( prop, L"ColumnSpan" )))
+     {
+@@ -4879,6 +4896,66 @@ void markup_set_value( IInspectable *target, const WCHAR *name, IInspectable *ob
+     xvalue_clear( &value );
+ }
+ 
++/* DependencyProperty.GetValue/SetValue for built-in properties: owner is the declaring type's short name */
++IInspectable *markup_get_value_owned( IInspectable *target, const WCHAR *owner, const WCHAR *name )
++{
++    struct xaml_element *element = element_from_object( target );
++
++    if (element && owner && !wcscmp( owner, L"Canvas" ) && (!wcscmp( name, L"Left" ) || !wcscmp( name, L"Top" )))
++    {
++        struct xvalue value = { XV_FLOAT };
++        value.f = !wcscmp( name, L"Left" ) ? element->canvas_left : element->canvas_top;
++        box_value( &value );
++        return value.object;
++    }
++    if (element && owner && !wcscmp( owner, L"Canvas" ) && !wcscmp( name, L"ZIndex" ))
++    {
++        struct xvalue value = { XV_SIGNED };
++        value.i = element->z_index;
++        box_value( &value );
++        return value.object;
++    }
++    if (element && owner && !wcscmp( owner, L"Grid" ))
++    {
++        INT32 v = -1;
++        if (!wcscmp( name, L"Row" )) v = element->row;
++        else if (!wcscmp( name, L"Column" )) v = element->column;
++        else if (!wcscmp( name, L"RowSpan" )) v = element->row_span;
++        else if (!wcscmp( name, L"ColumnSpan" )) v = element->column_span;
++        if (v != -1)
++        {
++            struct xvalue value = { XV_SIGNED };
++            value.i = v;
++            box_value( &value );
++            return value.object;
++        }
++    }
++    return markup_get_value( target, name );
++}
++
++void markup_set_value_owned( IInspectable *target, const WCHAR *owner, const WCHAR *name, IInspectable *object )
++{
++    struct xvalue value = {0};
++    struct xprop prop = {0};
++
++    if (owner) lstrcpynW( prop.owner, owner, ARRAY_SIZE(prop.owner) );
++    lstrcpynW( prop.name, name, ARRAY_SIZE(prop.name) );
++    if (object)
++    {
++        value.kind = XV_OBJECT;
++        IInspectable_AddRef( (value.object = object) );
++    }
++    else value.kind = XV_NULL;
++    set_property( NULL, target, &prop, &value, SET_LOCAL );
++    xvalue_clear( &value );
++}
++
++BOOL element_is_local_property( IInspectable *target, const WCHAR *name )
++{
++    struct xaml_element *element = element_from_object( target );
++    return element && element_is_local( element, name );
++}
++
+ void markup_set_string( IInspectable *target, const WCHAR *name, const WCHAR *str, BOOL animated )
+ {
+     struct xvalue value = { XV_STRING };

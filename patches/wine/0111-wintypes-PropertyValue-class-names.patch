@@ -1,0 +1,53 @@
+Subject: wintypes: PropertyValue runtime class names (IReference`1<T>), so .NET unboxes them
+
+diff --git a/dlls/wintypes/main.c b/dlls/wintypes/main.c
+index 44af61b..12eefd0 100644
+--- a/dlls/wintypes/main.c
++++ b/dlls/wintypes/main.c
+@@ -659,16 +659,42 @@ static HRESULT STDMETHODCALLTYPE property_value_GetIids(IPropertyValue *iface, U
+     return E_NOTIMPL;
+ }
+ 
++/* "Windows.Foundation.IReference`1<Double>", as on Windows: projections (.NET in particular) unbox by this name */
+ static HRESULT STDMETHODCALLTYPE property_value_GetRuntimeClassName(IPropertyValue *iface, HSTRING *class_name)
+ {
+-    FIXME("iface %p, class_name %p stub!\n", iface, class_name);
+-    return E_NOTIMPL;
++    static const WCHAR *const names[] =
++    {
++        NULL, L"UInt8", L"Int16", L"UInt16", L"Int32", L"UInt32", L"Int64", L"UInt64", L"Single", L"Double",
++        L"Char16", L"Boolean", L"String", L"Object", L"Windows.Foundation.DateTime", L"Windows.Foundation.TimeSpan",
++        L"Guid", L"Windows.Foundation.Point", L"Windows.Foundation.Size", L"Windows.Foundation.Rect", NULL,
++    };
++    struct property_value *impl = impl_from_IPropertyValue(iface);
++    unsigned int type = impl->type;
++    BOOL array = FALSE;
++    WCHAR buffer[96];
++
++    TRACE("iface %p, class_name %p.\n", iface, class_name);
++
++    if (type >= PropertyType_UInt8Array)
++    {
++        type -= PropertyType_UInt8Array - PropertyType_UInt8;
++        array = TRUE;
++    }
++    if (type >= ARRAY_SIZE(names) || !names[type])
++    {
++        *class_name = NULL;
++        return S_OK;
++    }
++    swprintf(buffer, ARRAY_SIZE(buffer), array ? L"Windows.Foundation.IReferenceArray`1<%s>" :
++             L"Windows.Foundation.IReference`1<%s>", names[type]);
++    return WindowsCreateString(buffer, wcslen(buffer), class_name);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE property_value_GetTrustLevel(IPropertyValue *iface, TrustLevel *trust_level)
+ {
+-    FIXME("iface %p, trust_level %p stub!\n", iface, trust_level);
+-    return E_NOTIMPL;
++    TRACE("iface %p, trust_level %p.\n", iface, trust_level);
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE property_value_get_Type(IPropertyValue *iface, enum PropertyType *type)
