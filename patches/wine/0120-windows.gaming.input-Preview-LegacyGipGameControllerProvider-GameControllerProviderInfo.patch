@@ -1,0 +1,583 @@
+Subject: windows.gaming.input: Windows.Gaming.Input.Preview LegacyGipGameControllerProvider and GameControllerProviderInfo
+
+The IDL is generated from Windows.winmd. Wine has no GIP driver, so there are no GIP devices: FromGameController
+and FromGameControllerProvider return no provider, nothing is paired, and nothing is ever sent to a controller.
+GetProviderId reports the controller's NonRoamableId. Registering the class makes ApiInformation.IsTypePresent
+find it, so Xbox Accessories no longer decides Windows is too old.
+
+diff --git a/dlls/windows.gaming.input/Makefile.in b/dlls/windows.gaming.input/Makefile.in
+index 34936b7..058f029 100644
+--- a/dlls/windows.gaming.input/Makefile.in
++++ b/dlls/windows.gaming.input/Makefile.in
+@@ -13,6 +13,7 @@ SOURCES = \
+ 	gamepad.c \
+ 	main.c \
+ 	manager.c \
++	preview.c \
+ 	periodic_effect.c \
+ 	provider.c \
+ 	provider.idl \
+diff --git a/dlls/windows.gaming.input/classes.idl b/dlls/windows.gaming.input/classes.idl
+index 4ad7b50..52a3957 100644
+--- a/dlls/windows.gaming.input/classes.idl
++++ b/dlls/windows.gaming.input/classes.idl
+@@ -33,6 +33,7 @@ import "windows.devices.power.idl";
+ import "windows.gaming.input.idl";
+ import "windows.gaming.input.custom.idl";
+ import "windows.gaming.input.forcefeedback.idl";
++import "windows.gaming.input.preview.idl";
+ 
+ namespace Windows.Gaming.Input {
+     runtimeclass RawGameController;
+@@ -42,6 +43,10 @@ namespace Windows.Gaming.Input {
+ namespace Windows.Gaming.Input.Custom {
+     runtimeclass GameControllerFactoryManager;
+ }
++namespace Windows.Gaming.Input.Preview {
++    runtimeclass GameControllerProviderInfo;
++    runtimeclass LegacyGipGameControllerProvider;
++}
+ namespace Windows.Gaming.Input.ForceFeedback {
+     runtimeclass ConstantForceEffect;
+     runtimeclass RampForceEffect;
+diff --git a/dlls/windows.gaming.input/main.c b/dlls/windows.gaming.input/main.c
+index e69c401..8e27e26 100644
+--- a/dlls/windows.gaming.input/main.c
++++ b/dlls/windows.gaming.input/main.c
+@@ -188,6 +188,11 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING class_str, IActivationFactory **
+     if (!wcscmp( buffer, RuntimeClass_Windows_Gaming_Input_Custom_GameControllerFactoryManager ))
+         IGameControllerFactoryManagerStatics2_QueryInterface( manager_factory, &IID_IActivationFactory, (void **)factory );
+ 
++    if (!wcscmp( buffer, L"Windows.Gaming.Input.Preview.LegacyGipGameControllerProvider" ))
++        IActivationFactory_QueryInterface( legacy_gip_provider_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, L"Windows.Gaming.Input.Preview.GameControllerProviderInfo" ))
++        IActivationFactory_QueryInterface( provider_info_factory, &IID_IActivationFactory, (void **)factory );
++
+     if (!wcscmp( buffer, RuntimeClass_Windows_Gaming_Input_ForceFeedback_ConstantForceEffect ))
+         IInspectable_QueryInterface( constant_effect_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_Gaming_Input_ForceFeedback_RampForceEffect ))
+diff --git a/dlls/windows.gaming.input/preview.c b/dlls/windows.gaming.input/preview.c
+new file mode 100644
+index 0000000..ebe5ae8
+--- /dev/null
++++ b/dlls/windows.gaming.input/preview.c
+@@ -0,0 +1,255 @@
++/*
++ * Windows.Gaming.Input.Preview: GameControllerProviderInfo and LegacyGipGameControllerProvider
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++
++#define WIDL_using_Windows_Gaming_Input_Preview
++#include "initguid.h"   /* the preview interfaces' IIDs are defined here, not in libuuid */
++#include "windows.gaming.input.preview.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(input);
++
++/* On Windows, LegacyGipGameControllerProvider is the Xbox accessory management interface of the GIP driver
++ * (xboxgip.sys): battery, firmware state, button remapping, pilot/copilot pairing. Wine has no GIP driver; Xbox
++ * controllers reach it through the host's driver as HID or SDL gamepads, so there is no GIP device to manage.
++ * FromGameController and FromGameControllerProvider therefore return no provider (NULL, like Windows does for a
++ * controller that isn't a GIP device), and nothing that would change a controller is ever sent. */
++
++struct preview_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    ILegacyGipGameControllerProviderStatics ILegacyGipGameControllerProviderStatics_iface;
++    IGameControllerProviderInfoStatics IGameControllerProviderInfoStatics_iface;
++    const WCHAR *class_name;
++};
++
++static inline struct preview_statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct preview_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct preview_statics *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        *out = &impl->IActivationFactory_iface;
++        return S_OK;
++    }
++    if (impl->ILegacyGipGameControllerProviderStatics_iface.lpVtbl &&
++        IsEqualGUID( iid, &IID_ILegacyGipGameControllerProviderStatics ))
++    {
++        *out = &impl->ILegacyGipGameControllerProviderStatics_iface;
++        return S_OK;
++    }
++    if (impl->IGameControllerProviderInfoStatics_iface.lpVtbl &&
++        IsEqualGUID( iid, &IID_IGameControllerProviderInfoStatics ))
++    {
++        *out = &impl->IGameControllerProviderInfoStatics_iface;
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    struct preview_statics *impl = impl_from_IActivationFactory( iface );
++    return WindowsCreateString( impl->class_name, wcslen( impl->class_name ), class_name );
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    WARN( "iface %p, instance %p: this class has no constructor.\n", iface, instance );
++    *instance = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++/* LegacyGipGameControllerProvider statics */
++
++DEFINE_IINSPECTABLE( legacy_gip_statics, ILegacyGipGameControllerProviderStatics, struct preview_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI legacy_gip_statics_FromGameController( ILegacyGipGameControllerProviderStatics *iface,
++                                                             IGameController *controller,
++                                                             ILegacyGipGameControllerProvider **value )
++{
++    TRACE( "iface %p, controller %p, value %p: no GIP devices.\n", iface, controller, value );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return controller ? S_OK : E_INVALIDARG;
++}
++
++static HRESULT WINAPI legacy_gip_statics_FromGameControllerProvider( ILegacyGipGameControllerProviderStatics *iface,
++                                                                     IGameControllerProvider *provider,
++                                                                     ILegacyGipGameControllerProvider **value )
++{
++    TRACE( "iface %p, provider %p, value %p: no GIP devices.\n", iface, provider, value );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return provider ? S_OK : E_INVALIDARG;
++}
++
++/* pilot/copilot pairing belongs to the GIP driver; with no GIP devices there is nothing to pair */
++static HRESULT WINAPI legacy_gip_statics_PairPilotToCopilot( ILegacyGipGameControllerProviderStatics *iface, __x_ABI_CWindows_CSystem_CIUser *user,
++                                                             HSTRING pilot_id, HSTRING copilot_id )
++{
++    FIXME( "iface %p, user %p, pilot %s, copilot %s: no GIP devices to pair.\n", iface, user,
++           debugstr_hstring( pilot_id ), debugstr_hstring( copilot_id ) );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI legacy_gip_statics_ClearPairing( ILegacyGipGameControllerProviderStatics *iface, __x_ABI_CWindows_CSystem_CIUser *user,
++                                                       HSTRING controller_id )
++{
++    TRACE( "iface %p, user %p, controller %s: nothing is paired.\n", iface, user, debugstr_hstring( controller_id ) );
++    return S_OK;
++}
++
++static HRESULT WINAPI legacy_gip_statics_IsPilot( ILegacyGipGameControllerProviderStatics *iface, __x_ABI_CWindows_CSystem_CIUser *user,
++                                                  HSTRING controller_id, HSTRING *value )
++{
++    TRACE( "iface %p, user %p, controller %s, value %p: not paired.\n", iface, user, debugstr_hstring( controller_id ), value );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI legacy_gip_statics_IsCopilot( ILegacyGipGameControllerProviderStatics *iface, __x_ABI_CWindows_CSystem_CIUser *user,
++                                                    HSTRING controller_id, HSTRING *value )
++{
++    TRACE( "iface %p, user %p, controller %s, value %p: not paired.\n", iface, user, debugstr_hstring( controller_id ), value );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return S_OK;
++}
++
++static const struct ILegacyGipGameControllerProviderStaticsVtbl legacy_gip_statics_vtbl =
++{
++    legacy_gip_statics_QueryInterface,
++    legacy_gip_statics_AddRef,
++    legacy_gip_statics_Release,
++    /* IInspectable methods */
++    legacy_gip_statics_GetIids,
++    legacy_gip_statics_GetRuntimeClassName,
++    legacy_gip_statics_GetTrustLevel,
++    /* ILegacyGipGameControllerProviderStatics methods */
++    legacy_gip_statics_FromGameController,
++    legacy_gip_statics_FromGameControllerProvider,
++    legacy_gip_statics_PairPilotToCopilot,
++    legacy_gip_statics_ClearPairing,
++    legacy_gip_statics_IsPilot,
++    legacy_gip_statics_IsCopilot,
++};
++
++/* GameControllerProviderInfo statics */
++
++DEFINE_IINSPECTABLE( provider_info_statics, IGameControllerProviderInfoStatics, struct preview_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI provider_info_statics_GetParentProviderId( IGameControllerProviderInfoStatics *iface,
++                                                                 IGameControllerProvider *provider, HSTRING *value )
++{
++    TRACE( "iface %p, provider %p, value %p.\n", iface, provider, value );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    /* Wine's providers are each a device of their own; none has a parent (such as a wireless adapter) */
++    return provider ? S_OK : E_INVALIDARG;
++}
++
++static HRESULT WINAPI provider_info_statics_GetProviderId( IGameControllerProviderInfoStatics *iface,
++                                                           IGameControllerProvider *provider, HSTRING *value )
++{
++    IWineGameControllerProvider *wine_provider;
++    HRESULT hr;
++
++    TRACE( "iface %p, provider %p, value %p.\n", iface, provider, value );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (!provider) return E_INVALIDARG;
++    /* the device's own identifier, as RawGameController.NonRoamableId reports it */
++    if (FAILED(IGameControllerProvider_QueryInterface( provider, &IID_IWineGameControllerProvider, (void **)&wine_provider )))
++        return S_OK;
++    hr = IWineGameControllerProvider_get_NonRoamableId( wine_provider, value );
++    IWineGameControllerProvider_Release( wine_provider );
++    return hr;
++}
++
++static const struct IGameControllerProviderInfoStaticsVtbl provider_info_statics_vtbl =
++{
++    provider_info_statics_QueryInterface,
++    provider_info_statics_AddRef,
++    provider_info_statics_Release,
++    /* IInspectable methods */
++    provider_info_statics_GetIids,
++    provider_info_statics_GetRuntimeClassName,
++    provider_info_statics_GetTrustLevel,
++    /* IGameControllerProviderInfoStatics methods */
++    provider_info_statics_GetParentProviderId,
++    provider_info_statics_GetProviderId,
++};
++
++static struct preview_statics legacy_gip_statics =
++{
++    {&factory_vtbl},
++    {&legacy_gip_statics_vtbl},
++    {NULL},
++    L"Windows.Gaming.Input.Preview.LegacyGipGameControllerProvider",
++};
++
++static struct preview_statics provider_info_statics =
++{
++    {&factory_vtbl},
++    {NULL},
++    {&provider_info_statics_vtbl},
++    L"Windows.Gaming.Input.Preview.GameControllerProviderInfo",
++};
++
++IActivationFactory *legacy_gip_provider_factory = &legacy_gip_statics.IActivationFactory_iface;
++IActivationFactory *provider_info_factory = &provider_info_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.gaming.input/private.h b/dlls/windows.gaming.input/private.h
+index e345ca4..594071b 100644
+--- a/dlls/windows.gaming.input/private.h
++++ b/dlls/windows.gaming.input/private.h
+@@ -50,6 +50,8 @@ extern ICustomGameControllerFactory *controller_factory;
+ extern ICustomGameControllerFactory *gamepad_factory;
+ extern ICustomGameControllerFactory *racing_wheel_factory;
+ extern IGameControllerFactoryManagerStatics2 *manager_factory;
++extern IActivationFactory *legacy_gip_provider_factory;
++extern IActivationFactory *provider_info_factory;
+ extern IInspectable *constant_effect_factory;
+ extern IInspectable *ramp_effect_factory;
+ extern IInspectable *periodic_effect_factory;
+diff --git a/include/Makefile.in b/include/Makefile.in
+index b81d916..d838650 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -1046,6 +1046,7 @@ SOURCES = \
+ 	windows.gaming.input.custom.idl \
+ 	windows.gaming.input.forcefeedback.idl \
+ 	windows.gaming.input.idl \
++	windows.gaming.input.preview.idl \
+ 	windows.gaming.ui.idl \
+ 	windows.globalization.datetimeformatting.idl \
+ 	windows.globalization.fonts.idl \
+diff --git a/include/windows.gaming.input.preview.idl b/include/windows.gaming.input.preview.idl
+new file mode 100644
+index 0000000..a262511
+--- /dev/null
++++ b/include/windows.gaming.input.preview.idl
+@@ -0,0 +1,233 @@
++/*
++ * Windows.Gaming.Input.Preview, generated from Windows.winmd by wine-uwp's winmd2idl.py
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifdef __WIDL__
++#pragma winrt ns_prefix
++#endif
++
++import "inspectable.idl";
++import "asyncinfo.idl";
++import "eventtoken.idl";
++import "windowscontracts.idl";
++import "windows.foundation.idl";
++import "windows.system.idl";
++import "windows.gaming.input.idl";
++import "windows.gaming.input.custom.idl";
++
++namespace Windows.Gaming.Input {
++    [contractversion(2)]
++    apicontract GamingInputPreviewContract
++    {};
++}
++
++namespace Windows.Gaming.Input.Preview {
++    typedef enum DeviceCommand DeviceCommand;
++    typedef enum GameControllerBatteryChargingState GameControllerBatteryChargingState;
++    typedef enum GameControllerBatteryKind GameControllerBatteryKind;
++    typedef enum GameControllerBatteryLevel GameControllerBatteryLevel;
++    typedef enum GameControllerFirmwareCorruptReason GameControllerFirmwareCorruptReason;
++    runtimeclass GameControllerProviderInfo;
++    typedef enum HeadsetOperation HeadsetOperation;
++    interface IGameControllerProviderInfoStatics;
++    interface ILegacyGipGameControllerProvider;
++    interface ILegacyGipGameControllerProviderStatics;
++    runtimeclass LegacyGipGameControllerProvider;
++    typedef enum RemappingButtonCategory RemappingButtonCategory;
++}
++
++namespace Windows.Gaming.Input.Preview {
++    declare {
++        interface Windows.Foundation.Collections.IIterator<HSTRING>;
++        interface Windows.Foundation.Collections.IIterable<HSTRING>;
++        interface Windows.Foundation.Collections.IVectorView<HSTRING>;
++        interface Windows.Foundation.Collections.IKeyValuePair<Windows.Gaming.Input.Preview.RemappingButtonCategory, IInspectable *>;
++        interface Windows.Foundation.Collections.IIterator<Windows.Foundation.Collections.IKeyValuePair<Windows.Gaming.Input.Preview.RemappingButtonCategory, IInspectable *> *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.Foundation.Collections.IKeyValuePair<Windows.Gaming.Input.Preview.RemappingButtonCategory, IInspectable *> *>;
++        interface Windows.Foundation.Collections.IMapView<Windows.Gaming.Input.Preview.RemappingButtonCategory, IInspectable *>;
++    }
++}
++
++namespace Windows.Gaming.Input.Preview {
++    [
++        contract(Windows.Gaming.Input.GamingInputPreviewContract, 2.0)
++    ]
++    enum DeviceCommand
++    {
++        Reset = 0
++    };
++
++    [
++        contract(Windows.Gaming.Input.GamingInputPreviewContract, 2.0)
++    ]
++    enum GameControllerBatteryChargingState
++    {
++        Unknown = 0,
++        Inactive = 1,
++        Active = 2,
++        Error = 3
++    };
++
++    [
++        contract(Windows.Gaming.Input.GamingInputPreviewContract, 2.0)
++    ]
++    enum GameControllerBatteryKind
++    {
++        Unknown = 0,
++        None = 1,
++        Standard = 2,
++        Rechargeable = 3
++    };
++
++    [
++        contract(Windows.Gaming.Input.GamingInputPreviewContract, 2.0)
++    ]
++    enum GameControllerBatteryLevel
++    {
++        Unknown = 0,
++        Critical = 1,
++        Low = 2,
++        Medium = 3,
++        Full = 4
++    };
++
++    [
++        contract(Windows.Gaming.Input.GamingInputPreviewContract, 2.0)
++    ]
++    enum GameControllerFirmwareCorruptReason
++    {
++        Unknown = 0,
++        NotCorrupt = 1,
++        TwoUpCorrupt = 2,
++        AppCorrupt = 3,
++        RadioCorrupt = 4,
++        EepromCorrupt = 5,
++        SafeToUpdate = 6
++    };
++
++    [
++        contract(Windows.Gaming.Input.GamingInputPreviewContract, 2.0)
++    ]
++    enum HeadsetOperation
++    {
++        Geq = 0,
++        BassBoostGain = 1,
++        SmartMute = 2,
++        SideTone = 3,
++        MuteLedBrightness = 4,
++        SwapMixAndVolumeDials = 5
++    };
++
++    [
++        contract(Windows.Gaming.Input.GamingInputPreviewContract, 2.0)
++    ]
++    enum RemappingButtonCategory
++    {
++        ButtonSettings = 0,
++        AnalogSettings = 1,
++        VibrationSettings = 2,
++        ShareShortPress = 3,
++        ShareShortPressMetaData = 4,
++        ShareShortPressMetaDataDisplay = 5,
++        ShareLongPress = 6,
++        ShareLongPressMetaData = 7,
++        ShareLongPressMetaDataDisplay = 8,
++        ShareDoublePress = 9,
++        ShareDoublePressMetaData = 10,
++        ShareDoublePressMetaDataDisplay = 11
++    };
++
++}
++
++namespace Windows.Gaming.Input.Preview {
++    [
++        contract(Windows.Gaming.Input.GamingInputPreviewContract, 1.0),
++        exclusiveto(Windows.Gaming.Input.Preview.GameControllerProviderInfo),
++        uuid(0be1e6c5-d9bd-44ee-8362-488b2e464bfb)
++    ]
++    interface IGameControllerProviderInfoStatics : IInspectable
++    {
++        HRESULT GetParentProviderId([in] Windows.Gaming.Input.Custom.IGameControllerProvider * provider, [out, retval] HSTRING *value);
++        HRESULT GetProviderId([in] Windows.Gaming.Input.Custom.IGameControllerProvider * provider, [out, retval] HSTRING *value);
++    }
++
++    [
++        contract(Windows.Gaming.Input.GamingInputPreviewContract, 2.0),
++        exclusiveto(Windows.Gaming.Input.Preview.LegacyGipGameControllerProvider),
++        uuid(2da3ed52-ffd9-43e2-825c-1d2790e04d14)
++    ]
++    interface ILegacyGipGameControllerProvider : IInspectable
++    {
++        [propget] HRESULT BatteryChargingState([out, retval] Windows.Gaming.Input.Preview.GameControllerBatteryChargingState *value);
++        [propget] HRESULT BatteryKind([out, retval] Windows.Gaming.Input.Preview.GameControllerBatteryKind *value);
++        [propget] HRESULT BatteryLevel([out, retval] Windows.Gaming.Input.Preview.GameControllerBatteryLevel *value);
++        HRESULT GetDeviceFirmwareCorruptionState([out, retval] Windows.Gaming.Input.Preview.GameControllerFirmwareCorruptReason *value);
++        [propget] HRESULT IsFirmwareCorrupted([out, retval] boolean *value);
++        HRESULT IsInterfaceSupported([in] GUID interfaceId, [out, retval] boolean *value);
++        [propget] HRESULT IsSyntheticDevice([out, retval] boolean *value);
++        [propget] HRESULT PreferredTypes([out, retval] Windows.Foundation.Collections.IVectorView<HSTRING> * *value);
++        HRESULT ExecuteCommand([in] Windows.Gaming.Input.Preview.DeviceCommand command);
++        HRESULT SetHomeLedIntensity([in] BYTE intensity);
++        HRESULT GetExtendedDeviceInfo([out] UINT32 *__valueSize, [out, retval, size_is(, *__valueSize)] BYTE **value);
++        HRESULT SetHeadsetOperation([in] Windows.Gaming.Input.Preview.HeadsetOperation operation, [in] UINT32 __bufferSize, [in, size_is(__bufferSize)] BYTE *buffer);
++        HRESULT GetHeadsetOperation([in] Windows.Gaming.Input.Preview.HeadsetOperation operation, [out] UINT32 *__valueSize, [out, retval, size_is(, *__valueSize)] BYTE **value);
++        [propget] HRESULT AppCompatVersion([out, retval] UINT32 *value);
++        HRESULT SetStandardControllerButtonRemapping([in] Windows.System.User * user, [in] boolean previous, [in] Windows.Foundation.Collections.IMapView<Windows.Gaming.Input.Preview.RemappingButtonCategory, IInspectable *> * remapping);
++        HRESULT GetStandardControllerButtonRemapping([in] Windows.System.User * user, [in] boolean previous, [out, retval] Windows.Foundation.Collections.IMapView<Windows.Gaming.Input.Preview.RemappingButtonCategory, IInspectable *> * *value);
++    }
++
++    [
++        contract(Windows.Gaming.Input.GamingInputPreviewContract, 2.0),
++        exclusiveto(Windows.Gaming.Input.Preview.LegacyGipGameControllerProvider),
++        uuid(d40dda17-b1f4-499a-874c-7095aac15291)
++    ]
++    interface ILegacyGipGameControllerProviderStatics : IInspectable
++    {
++        HRESULT FromGameController([in] Windows.Gaming.Input.IGameController * controller, [out, retval] Windows.Gaming.Input.Preview.LegacyGipGameControllerProvider * *value);
++        HRESULT FromGameControllerProvider([in] Windows.Gaming.Input.Custom.IGameControllerProvider * provider, [out, retval] Windows.Gaming.Input.Preview.LegacyGipGameControllerProvider * *value);
++        HRESULT PairPilotToCopilot([in] Windows.System.User * user, [in] HSTRING pilotControllerProviderId, [in] HSTRING copilotControllerProviderId);
++        HRESULT ClearPairing([in] Windows.System.User * user, [in] HSTRING controllerProviderId);
++        HRESULT IsPilot([in] Windows.System.User * user, [in] HSTRING controllerProviderId, [out, retval] HSTRING *value);
++        HRESULT IsCopilot([in] Windows.System.User * user, [in] HSTRING controllerProviderId, [out, retval] HSTRING *value);
++    }
++
++}
++
++namespace Windows.Gaming.Input.Preview {
++    [
++        contract(Windows.Gaming.Input.GamingInputPreviewContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.Gaming.Input.Preview.IGameControllerProviderInfoStatics, Windows.Gaming.Input.GamingInputPreviewContract, 1.0),
++        threading(both)
++    ]
++    runtimeclass GameControllerProviderInfo
++    {
++    }
++
++    [
++        contract(Windows.Gaming.Input.GamingInputPreviewContract, 2.0),
++        marshaling_behavior(agile),
++        static(Windows.Gaming.Input.Preview.ILegacyGipGameControllerProviderStatics, Windows.Gaming.Input.GamingInputPreviewContract, 2.0),
++        threading(both)
++    ]
++    runtimeclass LegacyGipGameControllerProvider
++    {
++        [default] interface Windows.Gaming.Input.Preview.ILegacyGipGameControllerProvider;
++    }
++
++}
++

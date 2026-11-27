@@ -1,0 +1,720 @@
+Subject: twinapi.appcore, windows.ui, windows.ui.xaml, combase, windows.applicationmodel: Xbox Accessories startup
+
+ApplicationViewTitleBar (colours are stored and returned), Windows.UI.Colors (the 141 named colours),
+Application.Resources[key] finding the framework theme resources, RoCaptureErrorContext, and
+DesignMode.DesignModeEnabled / DesignMode2Enabled returning false instead of E_NOTIMPL.
+
+diff --git a/dlls/combase/combase.spec b/dlls/combase/combase.spec
+index 07469a4..a216d45 100644
+--- a/dlls/combase/combase.spec
++++ b/dlls/combase/combase.spec
+@@ -288,7 +288,7 @@
+ @ stdcall PropVariantCopy(ptr ptr)
+ @ stub ReleaseFuncDescs
+ @ stdcall RoActivateInstance(ptr ptr)
+-@ stub RoCaptureErrorContext
++@ stdcall RoCaptureErrorContext(long)
+ @ stub RoClearError
+ @ stdcall RoFailFastWithErrorContext(long)
+ @ stub RoFreeParameterizedTypeExtra
+diff --git a/dlls/combase/roapi.c b/dlls/combase/roapi.c
+index f8f2249..3583ae3 100644
+--- a/dlls/combase/roapi.c
++++ b/dlls/combase/roapi.c
+@@ -702,6 +702,18 @@ HRESULT WINAPI DllGetActivationFactory(HSTRING classid, IActivationFactory **fac
+     return REGDB_E_CLASSNOTREG;
+ }
+ 
++/***********************************************************************
++ *      RoCaptureErrorContext (combase.@)
++ *
++ * Windows stores the thread's current error information so a later RoFailFastWithErrorContext or crash dump can
++ * report it. Wine keeps no such store, so this only records the error in the log.
++ */
++HRESULT WINAPI RoCaptureErrorContext(HRESULT hr)
++{
++    TRACE("(0x%08lx)\n", hr);
++    return S_OK;
++}
++
+ /***********************************************************************
+  *      RoFailFastWithErrorContext (combase.@)
+  */
+diff --git a/dlls/twinapi.appcore/application_view.c b/dlls/twinapi.appcore/application_view.c
+index aa0a209..763bd8f 100644
+--- a/dlls/twinapi.appcore/application_view.c
++++ b/dlls/twinapi.appcore/application_view.c
+@@ -283,12 +283,139 @@ static const IApplicationView2Vtbl view2_vtbl =
+ 
+ DEFINE_IINSPECTABLE(view3, IApplicationView3, struct application_view, IApplicationView_iface)
+ 
+-static HRESULT WINAPI view3_get_TitleBar(IApplicationView3 *iface, IApplicationViewTitleBar **value)
++/* ApplicationViewTitleBar: one per process, like the view. Wine draws the title bar itself, so the colours are only
++ * stored and handed back; each property holds the IReference<Color> the app set (NULL means the system default). */
++enum title_bar_color
+ {
+-    FIXME("iface %p, value %p stub!\n", iface, value);
++    TB_FOREGROUND, TB_BACKGROUND, TB_BUTTON_FOREGROUND, TB_BUTTON_BACKGROUND, TB_BUTTON_HOVER_FOREGROUND,
++    TB_BUTTON_HOVER_BACKGROUND, TB_BUTTON_PRESSED_FOREGROUND, TB_BUTTON_PRESSED_BACKGROUND, TB_INACTIVE_FOREGROUND,
++    TB_INACTIVE_BACKGROUND, TB_BUTTON_INACTIVE_FOREGROUND, TB_BUTTON_INACTIVE_BACKGROUND, TB_COLOR_COUNT
++};
++
++struct title_bar
++{
++    IApplicationViewTitleBar IApplicationViewTitleBar_iface;
++    CRITICAL_SECTION cs;
++    __FIReference_1_Color *colors[TB_COLOR_COUNT];
++};
++
++static struct title_bar title_bar;
++
++static HRESULT WINAPI title_bar_QueryInterface(IApplicationViewTitleBar *iface, REFIID iid, void **out)
++{
++    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
++
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IApplicationViewTitleBar))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI title_bar_AddRef(IApplicationViewTitleBar *iface) { return 2; }
++static ULONG WINAPI title_bar_Release(IApplicationViewTitleBar *iface) { return 1; }
++
++static HRESULT WINAPI title_bar_GetIids(IApplicationViewTitleBar *iface, ULONG *count, IID **iids)
++{
++    FIXME("iface %p, count %p, iids %p stub!\n", iface, count, iids);
+     return E_NOTIMPL;
+ }
+ 
++static HRESULT WINAPI title_bar_GetRuntimeClassName(IApplicationViewTitleBar *iface, HSTRING *name)
++{
++    static const WCHAR class_name[] = L"Windows.UI.ViewManagement.ApplicationViewTitleBar";
++    return WindowsCreateString(class_name, ARRAY_SIZE(class_name) - 1, name);
++}
++
++static HRESULT WINAPI title_bar_GetTrustLevel(IApplicationViewTitleBar *iface, TrustLevel *level)
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT title_bar_get(enum title_bar_color which, __FIReference_1_Color **value)
++{
++    if (!value) return E_POINTER;
++    EnterCriticalSection(&title_bar.cs);
++    if ((*value = title_bar.colors[which])) __FIReference_1_Color_AddRef(*value);
++    LeaveCriticalSection(&title_bar.cs);
++    return S_OK;
++}
++
++static HRESULT title_bar_put(enum title_bar_color which, __FIReference_1_Color *value)
++{
++    __FIReference_1_Color *old;
++
++    if (value) __FIReference_1_Color_AddRef(value);
++    EnterCriticalSection(&title_bar.cs);
++    old = title_bar.colors[which];
++    title_bar.colors[which] = value;
++    LeaveCriticalSection(&title_bar.cs);
++    if (old) __FIReference_1_Color_Release(old);
++    return S_OK;
++}
++
++#define TITLE_BAR_COLOR(name, which) \
++    static HRESULT WINAPI title_bar_put_##name(IApplicationViewTitleBar *iface, __FIReference_1_Color *value) \
++    { TRACE("iface %p, value %p.\n", iface, value); return title_bar_put(which, value); } \
++    static HRESULT WINAPI title_bar_get_##name(IApplicationViewTitleBar *iface, __FIReference_1_Color **value) \
++    { TRACE("iface %p, value %p.\n", iface, value); return title_bar_get(which, value); }
++
++TITLE_BAR_COLOR(ForegroundColor, TB_FOREGROUND)
++TITLE_BAR_COLOR(BackgroundColor, TB_BACKGROUND)
++TITLE_BAR_COLOR(ButtonForegroundColor, TB_BUTTON_FOREGROUND)
++TITLE_BAR_COLOR(ButtonBackgroundColor, TB_BUTTON_BACKGROUND)
++TITLE_BAR_COLOR(ButtonHoverForegroundColor, TB_BUTTON_HOVER_FOREGROUND)
++TITLE_BAR_COLOR(ButtonHoverBackgroundColor, TB_BUTTON_HOVER_BACKGROUND)
++TITLE_BAR_COLOR(ButtonPressedForegroundColor, TB_BUTTON_PRESSED_FOREGROUND)
++TITLE_BAR_COLOR(ButtonPressedBackgroundColor, TB_BUTTON_PRESSED_BACKGROUND)
++TITLE_BAR_COLOR(InactiveForegroundColor, TB_INACTIVE_FOREGROUND)
++TITLE_BAR_COLOR(InactiveBackgroundColor, TB_INACTIVE_BACKGROUND)
++TITLE_BAR_COLOR(ButtonInactiveForegroundColor, TB_BUTTON_INACTIVE_FOREGROUND)
++TITLE_BAR_COLOR(ButtonInactiveBackgroundColor, TB_BUTTON_INACTIVE_BACKGROUND)
++
++#undef TITLE_BAR_COLOR
++
++static const IApplicationViewTitleBarVtbl title_bar_vtbl =
++{
++    title_bar_QueryInterface, title_bar_AddRef, title_bar_Release,
++    title_bar_GetIids, title_bar_GetRuntimeClassName, title_bar_GetTrustLevel,
++    title_bar_put_ForegroundColor, title_bar_get_ForegroundColor,
++    title_bar_put_BackgroundColor, title_bar_get_BackgroundColor,
++    title_bar_put_ButtonForegroundColor, title_bar_get_ButtonForegroundColor,
++    title_bar_put_ButtonBackgroundColor, title_bar_get_ButtonBackgroundColor,
++    title_bar_put_ButtonHoverForegroundColor, title_bar_get_ButtonHoverForegroundColor,
++    title_bar_put_ButtonHoverBackgroundColor, title_bar_get_ButtonHoverBackgroundColor,
++    title_bar_put_ButtonPressedForegroundColor, title_bar_get_ButtonPressedForegroundColor,
++    title_bar_put_ButtonPressedBackgroundColor, title_bar_get_ButtonPressedBackgroundColor,
++    title_bar_put_InactiveForegroundColor, title_bar_get_InactiveForegroundColor,
++    title_bar_put_InactiveBackgroundColor, title_bar_get_InactiveBackgroundColor,
++    title_bar_put_ButtonInactiveForegroundColor, title_bar_get_ButtonInactiveForegroundColor,
++    title_bar_put_ButtonInactiveBackgroundColor, title_bar_get_ButtonInactiveBackgroundColor,
++};
++
++static BOOL WINAPI title_bar_init(INIT_ONCE *once, void *param, void **ctx)
++{
++    title_bar.IApplicationViewTitleBar_iface.lpVtbl = &title_bar_vtbl;
++    InitializeCriticalSection(&title_bar.cs);
++    return TRUE;
++}
++
++static HRESULT WINAPI view3_get_TitleBar(IApplicationView3 *iface, IApplicationViewTitleBar **value)
++{
++    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
++
++    TRACE("iface %p, value %p.\n", iface, value);
++    if (!value) return E_POINTER;
++    InitOnceExecuteOnce(&once, title_bar_init, NULL, NULL);
++    *value = &title_bar.IApplicationViewTitleBar_iface;
++    return S_OK;
++}
++
+ static HRESULT WINAPI view3_get_FullScreenSystemOverlayMode(IApplicationView3 *iface, FullScreenSystemOverlayMode *value)
+ {
+     *value = impl_from_IApplicationView3(iface)->overlay_mode;
+diff --git a/dlls/windows.applicationmodel/designmode.c b/dlls/windows.applicationmodel/designmode.c
+index fc1da5d..900d5c5 100644
+--- a/dlls/windows.applicationmodel/designmode.c
++++ b/dlls/windows.applicationmodel/designmode.c
+@@ -125,9 +125,12 @@ DEFINE_IINSPECTABLE(design_mode_statics, IDesignModeStatics, struct design_mode_
+ 
+ static HRESULT WINAPI design_mode_statics_DesignModeEnabled(IDesignModeStatics *iface, boolean *value)
+ {
+-    FIXME("iface %p, value %p.\n", iface, value);
++    TRACE("iface %p, value %p.\n", iface, value);
+ 
+-    return E_NOTIMPL;
++    /* apps only run inside a XAML designer on Windows, never under Wine */
++    if (!value) return E_POINTER;
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static const struct IDesignModeStaticsVtbl design_mode_statics_vtbl =
+@@ -147,9 +150,12 @@ DEFINE_IINSPECTABLE(design_mode_statics2, IDesignModeStatics2, struct design_mod
+ 
+ static HRESULT WINAPI design_mode_statics2_DesignMode2Enabled(IDesignModeStatics2 *iface, boolean *value)
+ {
+-    FIXME("iface %p, value %p.\n", iface, value);
++    TRACE("iface %p, value %p.\n", iface, value);
+ 
+-    return E_NOTIMPL;
++    /* apps only run inside a XAML designer on Windows, never under Wine */
++    if (!value) return E_POINTER;
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static const struct IDesignModeStatics2Vtbl design_mode_statics2_vtbl =
+diff --git a/dlls/windows.ui.xaml/resources.c b/dlls/windows.ui.xaml/resources.c
+index 5fe6982..71aeca1 100644
+--- a/dlls/windows.ui.xaml/resources.c
++++ b/dlls/windows.ui.xaml/resources.c
+@@ -320,6 +320,13 @@ static HRESULT WINAPI map_Lookup( IMap_IInspectable_IInspectable *iface, IInspec
+     }
+     /* like Windows, the indexer also finds the theme and merged dictionaries' resources */
+     else *value = resource_dictionary_lookup( (IInspectable *)&impl->IResourceDictionary_iface, WindowsGetStringRawBuffer( str, NULL ) );
++    /* and Application.Current.Resources[key] also finds the framework's own theme resources
++     * (SystemControlForegroundBaseHighBrush ...), which apps read from code */
++    if (!entry && !*value && application_resources() && dictionary_from_object( application_resources() ) == impl)
++    {
++        if (!(*value = generic_resource_lookup( WindowsGetStringRawBuffer( str, NULL ) )))
++            *value = theme_resource_lookup( WindowsGetStringRawBuffer( str, NULL ) );
++    }
+     TRACE( "iface %p, key %s -> %p.\n", iface, debugstr_hstring(str), *value );
+     WindowsDeleteString( str );
+     return entry || *value ? S_OK : E_BOUNDS;
+diff --git a/dlls/windows.ui/Makefile.in b/dlls/windows.ui/Makefile.in
+index a2eae42..a4fea6f 100644
+--- a/dlls/windows.ui/Makefile.in
++++ b/dlls/windows.ui/Makefile.in
+@@ -4,6 +4,7 @@ IMPORTS = combase advapi32 user32
+ SOURCES = \
+ 	accessibilitysettings.c \
+ 	classes.idl \
++	colors.c \
+ 	corewindow.c \
+ 	inputpane.c \
+ 	main.c \
+diff --git a/dlls/windows.ui/classes.idl b/dlls/windows.ui/classes.idl
+index 41dca72..d32e257 100644
+--- a/dlls/windows.ui/classes.idl
++++ b/dlls/windows.ui/classes.idl
+@@ -37,6 +37,10 @@ import "windows.ui.viewmanagement.idl";
+ 
+ /* Windows.UI.Core.CoreWindow is registered by twinapi.appcore, which implements it (as on Windows) */
+ 
++namespace Windows.UI {
++    runtimeclass Colors;
++}
++
+ namespace Windows.UI.ViewManagement {
+     runtimeclass AccessibilitySettings;
+     runtimeclass UISettings;
+diff --git a/dlls/windows.ui/colors.c b/dlls/windows.ui/colors.c
+new file mode 100644
+index 0000000..9e6716c
+--- /dev/null
++++ b/dlls/windows.ui/colors.c
+@@ -0,0 +1,409 @@
++/*
++ * WinRT Windows.UI.Colors implementation
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(ui);
++
++/* Windows.UI.Colors only has statics: the 141 named colours (the CSS/X11 set, as in .NET), as ARGB. */
++struct colors_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IColorsStatics IColorsStatics_iface;
++};
++
++static inline struct colors_statics *impl_from_IActivationFactory(IActivationFactory *iface)
++{
++    return CONTAINING_RECORD(iface, struct colors_statics, IActivationFactory_iface);
++}
++
++static HRESULT WINAPI factory_QueryInterface(IActivationFactory *iface, REFIID iid, void **out)
++{
++    struct colors_statics *impl = impl_from_IActivationFactory(iface);
++
++    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
++
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IActivationFactory))
++    {
++        *out = &impl->IActivationFactory_iface;
++        return S_OK;
++    }
++    if (IsEqualGUID(iid, &IID_IColorsStatics))
++    {
++        *out = &impl->IColorsStatics_iface;
++        return S_OK;
++    }
++    FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI factory_AddRef(IActivationFactory *iface) { return 2; }
++static ULONG WINAPI factory_Release(IActivationFactory *iface) { return 1; }
++
++static HRESULT WINAPI factory_GetIids(IActivationFactory *iface, ULONG *iid_count, IID **iids)
++{
++    FIXME("iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName(IActivationFactory *iface, HSTRING *class_name)
++{
++    static const WCHAR name[] = L"Windows.UI.Colors";
++    return WindowsCreateString(name, ARRAY_SIZE(name) - 1, class_name);
++}
++
++static HRESULT WINAPI factory_GetTrustLevel(IActivationFactory *iface, TrustLevel *trust_level)
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance(IActivationFactory *iface, IInspectable **instance)
++{
++    FIXME("iface %p, instance %p: Colors has no instances.\n", iface, instance);
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE(colors_statics, IColorsStatics, struct colors_statics, IActivationFactory_iface)
++
++#define NAMED_COLOR(name, a, r, g, b) \
++    static HRESULT WINAPI colors_statics_get_##name(IColorsStatics *iface, Color *value) \
++    { \
++        TRACE("iface %p, value %p.\n", iface, value); \
++        if (!value) return E_POINTER; \
++        value->A = a; value->R = r; value->G = g; value->B = b; \
++        return S_OK; \
++    }
++
++NAMED_COLOR(AliceBlue, 0xff, 0xf0, 0xf8, 0xff)
++NAMED_COLOR(AntiqueWhite, 0xff, 0xfa, 0xeb, 0xd7)
++NAMED_COLOR(Aqua, 0xff, 0x00, 0xff, 0xff)
++NAMED_COLOR(Aquamarine, 0xff, 0x7f, 0xff, 0xd4)
++NAMED_COLOR(Azure, 0xff, 0xf0, 0xff, 0xff)
++NAMED_COLOR(Beige, 0xff, 0xf5, 0xf5, 0xdc)
++NAMED_COLOR(Bisque, 0xff, 0xff, 0xe4, 0xc4)
++NAMED_COLOR(Black, 0xff, 0x00, 0x00, 0x00)
++NAMED_COLOR(BlanchedAlmond, 0xff, 0xff, 0xeb, 0xcd)
++NAMED_COLOR(Blue, 0xff, 0x00, 0x00, 0xff)
++NAMED_COLOR(BlueViolet, 0xff, 0x8a, 0x2b, 0xe2)
++NAMED_COLOR(Brown, 0xff, 0xa5, 0x2a, 0x2a)
++NAMED_COLOR(BurlyWood, 0xff, 0xde, 0xb8, 0x87)
++NAMED_COLOR(CadetBlue, 0xff, 0x5f, 0x9e, 0xa0)
++NAMED_COLOR(Chartreuse, 0xff, 0x7f, 0xff, 0x00)
++NAMED_COLOR(Chocolate, 0xff, 0xd2, 0x69, 0x1e)
++NAMED_COLOR(Coral, 0xff, 0xff, 0x7f, 0x50)
++NAMED_COLOR(CornflowerBlue, 0xff, 0x64, 0x95, 0xed)
++NAMED_COLOR(Cornsilk, 0xff, 0xff, 0xf8, 0xdc)
++NAMED_COLOR(Crimson, 0xff, 0xdc, 0x14, 0x3c)
++NAMED_COLOR(Cyan, 0xff, 0x00, 0xff, 0xff)
++NAMED_COLOR(DarkBlue, 0xff, 0x00, 0x00, 0x8b)
++NAMED_COLOR(DarkCyan, 0xff, 0x00, 0x8b, 0x8b)
++NAMED_COLOR(DarkGoldenrod, 0xff, 0xb8, 0x86, 0x0b)
++NAMED_COLOR(DarkGray, 0xff, 0xa9, 0xa9, 0xa9)
++NAMED_COLOR(DarkGreen, 0xff, 0x00, 0x64, 0x00)
++NAMED_COLOR(DarkKhaki, 0xff, 0xbd, 0xb7, 0x6b)
++NAMED_COLOR(DarkMagenta, 0xff, 0x8b, 0x00, 0x8b)
++NAMED_COLOR(DarkOliveGreen, 0xff, 0x55, 0x6b, 0x2f)
++NAMED_COLOR(DarkOrange, 0xff, 0xff, 0x8c, 0x00)
++NAMED_COLOR(DarkOrchid, 0xff, 0x99, 0x32, 0xcc)
++NAMED_COLOR(DarkRed, 0xff, 0x8b, 0x00, 0x00)
++NAMED_COLOR(DarkSalmon, 0xff, 0xe9, 0x96, 0x7a)
++NAMED_COLOR(DarkSeaGreen, 0xff, 0x8f, 0xbc, 0x8f)
++NAMED_COLOR(DarkSlateBlue, 0xff, 0x48, 0x3d, 0x8b)
++NAMED_COLOR(DarkSlateGray, 0xff, 0x2f, 0x4f, 0x4f)
++NAMED_COLOR(DarkTurquoise, 0xff, 0x00, 0xce, 0xd1)
++NAMED_COLOR(DarkViolet, 0xff, 0x94, 0x00, 0xd3)
++NAMED_COLOR(DeepPink, 0xff, 0xff, 0x14, 0x93)
++NAMED_COLOR(DeepSkyBlue, 0xff, 0x00, 0xbf, 0xff)
++NAMED_COLOR(DimGray, 0xff, 0x69, 0x69, 0x69)
++NAMED_COLOR(DodgerBlue, 0xff, 0x1e, 0x90, 0xff)
++NAMED_COLOR(Firebrick, 0xff, 0xb2, 0x22, 0x22)
++NAMED_COLOR(FloralWhite, 0xff, 0xff, 0xfa, 0xf0)
++NAMED_COLOR(ForestGreen, 0xff, 0x22, 0x8b, 0x22)
++NAMED_COLOR(Fuchsia, 0xff, 0xff, 0x00, 0xff)
++NAMED_COLOR(Gainsboro, 0xff, 0xdc, 0xdc, 0xdc)
++NAMED_COLOR(GhostWhite, 0xff, 0xf8, 0xf8, 0xff)
++NAMED_COLOR(Gold, 0xff, 0xff, 0xd7, 0x00)
++NAMED_COLOR(Goldenrod, 0xff, 0xda, 0xa5, 0x20)
++NAMED_COLOR(Gray, 0xff, 0x80, 0x80, 0x80)
++NAMED_COLOR(Green, 0xff, 0x00, 0x80, 0x00)
++NAMED_COLOR(GreenYellow, 0xff, 0xad, 0xff, 0x2f)
++NAMED_COLOR(Honeydew, 0xff, 0xf0, 0xff, 0xf0)
++NAMED_COLOR(HotPink, 0xff, 0xff, 0x69, 0xb4)
++NAMED_COLOR(IndianRed, 0xff, 0xcd, 0x5c, 0x5c)
++NAMED_COLOR(Indigo, 0xff, 0x4b, 0x00, 0x82)
++NAMED_COLOR(Ivory, 0xff, 0xff, 0xff, 0xf0)
++NAMED_COLOR(Khaki, 0xff, 0xf0, 0xe6, 0x8c)
++NAMED_COLOR(Lavender, 0xff, 0xe6, 0xe6, 0xfa)
++NAMED_COLOR(LavenderBlush, 0xff, 0xff, 0xf0, 0xf5)
++NAMED_COLOR(LawnGreen, 0xff, 0x7c, 0xfc, 0x00)
++NAMED_COLOR(LemonChiffon, 0xff, 0xff, 0xfa, 0xcd)
++NAMED_COLOR(LightBlue, 0xff, 0xad, 0xd8, 0xe6)
++NAMED_COLOR(LightCoral, 0xff, 0xf0, 0x80, 0x80)
++NAMED_COLOR(LightCyan, 0xff, 0xe0, 0xff, 0xff)
++NAMED_COLOR(LightGoldenrodYellow, 0xff, 0xfa, 0xfa, 0xd2)
++NAMED_COLOR(LightGreen, 0xff, 0x90, 0xee, 0x90)
++NAMED_COLOR(LightGray, 0xff, 0xd3, 0xd3, 0xd3)
++NAMED_COLOR(LightPink, 0xff, 0xff, 0xb6, 0xc1)
++NAMED_COLOR(LightSalmon, 0xff, 0xff, 0xa0, 0x7a)
++NAMED_COLOR(LightSeaGreen, 0xff, 0x20, 0xb2, 0xaa)
++NAMED_COLOR(LightSkyBlue, 0xff, 0x87, 0xce, 0xfa)
++NAMED_COLOR(LightSlateGray, 0xff, 0x77, 0x88, 0x99)
++NAMED_COLOR(LightSteelBlue, 0xff, 0xb0, 0xc4, 0xde)
++NAMED_COLOR(LightYellow, 0xff, 0xff, 0xff, 0xe0)
++NAMED_COLOR(Lime, 0xff, 0x00, 0xff, 0x00)
++NAMED_COLOR(LimeGreen, 0xff, 0x32, 0xcd, 0x32)
++NAMED_COLOR(Linen, 0xff, 0xfa, 0xf0, 0xe6)
++NAMED_COLOR(Magenta, 0xff, 0xff, 0x00, 0xff)
++NAMED_COLOR(Maroon, 0xff, 0x80, 0x00, 0x00)
++NAMED_COLOR(MediumAquamarine, 0xff, 0x66, 0xcd, 0xaa)
++NAMED_COLOR(MediumBlue, 0xff, 0x00, 0x00, 0xcd)
++NAMED_COLOR(MediumOrchid, 0xff, 0xba, 0x55, 0xd3)
++NAMED_COLOR(MediumPurple, 0xff, 0x93, 0x70, 0xdb)
++NAMED_COLOR(MediumSeaGreen, 0xff, 0x3c, 0xb3, 0x71)
++NAMED_COLOR(MediumSlateBlue, 0xff, 0x7b, 0x68, 0xee)
++NAMED_COLOR(MediumSpringGreen, 0xff, 0x00, 0xfa, 0x9a)
++NAMED_COLOR(MediumTurquoise, 0xff, 0x48, 0xd1, 0xcc)
++NAMED_COLOR(MediumVioletRed, 0xff, 0xc7, 0x15, 0x85)
++NAMED_COLOR(MidnightBlue, 0xff, 0x19, 0x19, 0x70)
++NAMED_COLOR(MintCream, 0xff, 0xf5, 0xff, 0xfa)
++NAMED_COLOR(MistyRose, 0xff, 0xff, 0xe4, 0xe1)
++NAMED_COLOR(Moccasin, 0xff, 0xff, 0xe4, 0xb5)
++NAMED_COLOR(NavajoWhite, 0xff, 0xff, 0xde, 0xad)
++NAMED_COLOR(Navy, 0xff, 0x00, 0x00, 0x80)
++NAMED_COLOR(OldLace, 0xff, 0xfd, 0xf5, 0xe6)
++NAMED_COLOR(Olive, 0xff, 0x80, 0x80, 0x00)
++NAMED_COLOR(OliveDrab, 0xff, 0x6b, 0x8e, 0x23)
++NAMED_COLOR(Orange, 0xff, 0xff, 0xa5, 0x00)
++NAMED_COLOR(OrangeRed, 0xff, 0xff, 0x45, 0x00)
++NAMED_COLOR(Orchid, 0xff, 0xda, 0x70, 0xd6)
++NAMED_COLOR(PaleGoldenrod, 0xff, 0xee, 0xe8, 0xaa)
++NAMED_COLOR(PaleGreen, 0xff, 0x98, 0xfb, 0x98)
++NAMED_COLOR(PaleTurquoise, 0xff, 0xaf, 0xee, 0xee)
++NAMED_COLOR(PaleVioletRed, 0xff, 0xdb, 0x70, 0x93)
++NAMED_COLOR(PapayaWhip, 0xff, 0xff, 0xef, 0xd5)
++NAMED_COLOR(PeachPuff, 0xff, 0xff, 0xda, 0xb9)
++NAMED_COLOR(Peru, 0xff, 0xcd, 0x85, 0x3f)
++NAMED_COLOR(Pink, 0xff, 0xff, 0xc0, 0xcb)
++NAMED_COLOR(Plum, 0xff, 0xdd, 0xa0, 0xdd)
++NAMED_COLOR(PowderBlue, 0xff, 0xb0, 0xe0, 0xe6)
++NAMED_COLOR(Purple, 0xff, 0x80, 0x00, 0x80)
++NAMED_COLOR(Red, 0xff, 0xff, 0x00, 0x00)
++NAMED_COLOR(RosyBrown, 0xff, 0xbc, 0x8f, 0x8f)
++NAMED_COLOR(RoyalBlue, 0xff, 0x41, 0x69, 0xe1)
++NAMED_COLOR(SaddleBrown, 0xff, 0x8b, 0x45, 0x13)
++NAMED_COLOR(Salmon, 0xff, 0xfa, 0x80, 0x72)
++NAMED_COLOR(SandyBrown, 0xff, 0xf4, 0xa4, 0x60)
++NAMED_COLOR(SeaGreen, 0xff, 0x2e, 0x8b, 0x57)
++NAMED_COLOR(SeaShell, 0xff, 0xff, 0xf5, 0xee)
++NAMED_COLOR(Sienna, 0xff, 0xa0, 0x52, 0x2d)
++NAMED_COLOR(Silver, 0xff, 0xc0, 0xc0, 0xc0)
++NAMED_COLOR(SkyBlue, 0xff, 0x87, 0xce, 0xeb)
++NAMED_COLOR(SlateBlue, 0xff, 0x6a, 0x5a, 0xcd)
++NAMED_COLOR(SlateGray, 0xff, 0x70, 0x80, 0x90)
++NAMED_COLOR(Snow, 0xff, 0xff, 0xfa, 0xfa)
++NAMED_COLOR(SpringGreen, 0xff, 0x00, 0xff, 0x7f)
++NAMED_COLOR(SteelBlue, 0xff, 0x46, 0x82, 0xb4)
++NAMED_COLOR(Tan, 0xff, 0xd2, 0xb4, 0x8c)
++NAMED_COLOR(Teal, 0xff, 0x00, 0x80, 0x80)
++NAMED_COLOR(Thistle, 0xff, 0xd8, 0xbf, 0xd8)
++NAMED_COLOR(Tomato, 0xff, 0xff, 0x63, 0x47)
++NAMED_COLOR(Transparent, 0x00, 0xff, 0xff, 0xff)
++NAMED_COLOR(Turquoise, 0xff, 0x40, 0xe0, 0xd0)
++NAMED_COLOR(Violet, 0xff, 0xee, 0x82, 0xee)
++NAMED_COLOR(Wheat, 0xff, 0xf5, 0xde, 0xb3)
++NAMED_COLOR(White, 0xff, 0xff, 0xff, 0xff)
++NAMED_COLOR(WhiteSmoke, 0xff, 0xf5, 0xf5, 0xf5)
++NAMED_COLOR(Yellow, 0xff, 0xff, 0xff, 0x00)
++NAMED_COLOR(YellowGreen, 0xff, 0x9a, 0xcd, 0x32)
++
++#undef NAMED_COLOR
++
++static const struct IColorsStaticsVtbl colors_statics_vtbl =
++{
++    colors_statics_QueryInterface,
++    colors_statics_AddRef,
++    colors_statics_Release,
++    colors_statics_GetIids,
++    colors_statics_GetRuntimeClassName,
++    colors_statics_GetTrustLevel,
++    /* IColorsStatics methods */
++    colors_statics_get_AliceBlue,
++    colors_statics_get_AntiqueWhite,
++    colors_statics_get_Aqua,
++    colors_statics_get_Aquamarine,
++    colors_statics_get_Azure,
++    colors_statics_get_Beige,
++    colors_statics_get_Bisque,
++    colors_statics_get_Black,
++    colors_statics_get_BlanchedAlmond,
++    colors_statics_get_Blue,
++    colors_statics_get_BlueViolet,
++    colors_statics_get_Brown,
++    colors_statics_get_BurlyWood,
++    colors_statics_get_CadetBlue,
++    colors_statics_get_Chartreuse,
++    colors_statics_get_Chocolate,
++    colors_statics_get_Coral,
++    colors_statics_get_CornflowerBlue,
++    colors_statics_get_Cornsilk,
++    colors_statics_get_Crimson,
++    colors_statics_get_Cyan,
++    colors_statics_get_DarkBlue,
++    colors_statics_get_DarkCyan,
++    colors_statics_get_DarkGoldenrod,
++    colors_statics_get_DarkGray,
++    colors_statics_get_DarkGreen,
++    colors_statics_get_DarkKhaki,
++    colors_statics_get_DarkMagenta,
++    colors_statics_get_DarkOliveGreen,
++    colors_statics_get_DarkOrange,
++    colors_statics_get_DarkOrchid,
++    colors_statics_get_DarkRed,
++    colors_statics_get_DarkSalmon,
++    colors_statics_get_DarkSeaGreen,
++    colors_statics_get_DarkSlateBlue,
++    colors_statics_get_DarkSlateGray,
++    colors_statics_get_DarkTurquoise,
++    colors_statics_get_DarkViolet,
++    colors_statics_get_DeepPink,
++    colors_statics_get_DeepSkyBlue,
++    colors_statics_get_DimGray,
++    colors_statics_get_DodgerBlue,
++    colors_statics_get_Firebrick,
++    colors_statics_get_FloralWhite,
++    colors_statics_get_ForestGreen,
++    colors_statics_get_Fuchsia,
++    colors_statics_get_Gainsboro,
++    colors_statics_get_GhostWhite,
++    colors_statics_get_Gold,
++    colors_statics_get_Goldenrod,
++    colors_statics_get_Gray,
++    colors_statics_get_Green,
++    colors_statics_get_GreenYellow,
++    colors_statics_get_Honeydew,
++    colors_statics_get_HotPink,
++    colors_statics_get_IndianRed,
++    colors_statics_get_Indigo,
++    colors_statics_get_Ivory,
++    colors_statics_get_Khaki,
++    colors_statics_get_Lavender,
++    colors_statics_get_LavenderBlush,
++    colors_statics_get_LawnGreen,
++    colors_statics_get_LemonChiffon,
++    colors_statics_get_LightBlue,
++    colors_statics_get_LightCoral,
++    colors_statics_get_LightCyan,
++    colors_statics_get_LightGoldenrodYellow,
++    colors_statics_get_LightGreen,
++    colors_statics_get_LightGray,
++    colors_statics_get_LightPink,
++    colors_statics_get_LightSalmon,
++    colors_statics_get_LightSeaGreen,
++    colors_statics_get_LightSkyBlue,
++    colors_statics_get_LightSlateGray,
++    colors_statics_get_LightSteelBlue,
++    colors_statics_get_LightYellow,
++    colors_statics_get_Lime,
++    colors_statics_get_LimeGreen,
++    colors_statics_get_Linen,
++    colors_statics_get_Magenta,
++    colors_statics_get_Maroon,
++    colors_statics_get_MediumAquamarine,
++    colors_statics_get_MediumBlue,
++    colors_statics_get_MediumOrchid,
++    colors_statics_get_MediumPurple,
++    colors_statics_get_MediumSeaGreen,
++    colors_statics_get_MediumSlateBlue,
++    colors_statics_get_MediumSpringGreen,
++    colors_statics_get_MediumTurquoise,
++    colors_statics_get_MediumVioletRed,
++    colors_statics_get_MidnightBlue,
++    colors_statics_get_MintCream,
++    colors_statics_get_MistyRose,
++    colors_statics_get_Moccasin,
++    colors_statics_get_NavajoWhite,
++    colors_statics_get_Navy,
++    colors_statics_get_OldLace,
++    colors_statics_get_Olive,
++    colors_statics_get_OliveDrab,
++    colors_statics_get_Orange,
++    colors_statics_get_OrangeRed,
++    colors_statics_get_Orchid,
++    colors_statics_get_PaleGoldenrod,
++    colors_statics_get_PaleGreen,
++    colors_statics_get_PaleTurquoise,
++    colors_statics_get_PaleVioletRed,
++    colors_statics_get_PapayaWhip,
++    colors_statics_get_PeachPuff,
++    colors_statics_get_Peru,
++    colors_statics_get_Pink,
++    colors_statics_get_Plum,
++    colors_statics_get_PowderBlue,
++    colors_statics_get_Purple,
++    colors_statics_get_Red,
++    colors_statics_get_RosyBrown,
++    colors_statics_get_RoyalBlue,
++    colors_statics_get_SaddleBrown,
++    colors_statics_get_Salmon,
++    colors_statics_get_SandyBrown,
++    colors_statics_get_SeaGreen,
++    colors_statics_get_SeaShell,
++    colors_statics_get_Sienna,
++    colors_statics_get_Silver,
++    colors_statics_get_SkyBlue,
++    colors_statics_get_SlateBlue,
++    colors_statics_get_SlateGray,
++    colors_statics_get_Snow,
++    colors_statics_get_SpringGreen,
++    colors_statics_get_SteelBlue,
++    colors_statics_get_Tan,
++    colors_statics_get_Teal,
++    colors_statics_get_Thistle,
++    colors_statics_get_Tomato,
++    colors_statics_get_Transparent,
++    colors_statics_get_Turquoise,
++    colors_statics_get_Violet,
++    colors_statics_get_Wheat,
++    colors_statics_get_White,
++    colors_statics_get_WhiteSmoke,
++    colors_statics_get_Yellow,
++    colors_statics_get_YellowGreen,
++};
++
++static struct colors_statics colors_statics =
++{
++    {&factory_vtbl},
++    {&colors_statics_vtbl},
++};
++
++IActivationFactory *colors_factory = &colors_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui/main.c b/dlls/windows.ui/main.c
+index 9c76661..fab74db 100644
+--- a/dlls/windows.ui/main.c
++++ b/dlls/windows.ui/main.c
+@@ -50,6 +50,9 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_ViewManagement_InputPane ))
+         IActivationFactory_QueryInterface( inputpane_factory, &IID_IActivationFactory, (void **)factory );
+ 
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Colors ))
++        IActivationFactory_QueryInterface( colors_factory, &IID_IActivationFactory, (void **)factory );
++
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Core_CoreWindow ))
+         IActivationFactory_QueryInterface( corewindow_factory, &IID_IActivationFactory, (void **)factory );
+ 
+diff --git a/dlls/windows.ui/private.h b/dlls/windows.ui/private.h
+index 64566fd..88e23ea 100644
+--- a/dlls/windows.ui/private.h
++++ b/dlls/windows.ui/private.h
+@@ -43,6 +43,7 @@ extern IActivationFactory *uisettings_factory;
+ extern IActivationFactory *uiviewsettings_factory;
+ extern IActivationFactory *inputpane_factory;
+ extern IActivationFactory *corewindow_factory;
++extern IActivationFactory *colors_factory;
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \
+diff --git a/include/roerrorapi.h b/include/roerrorapi.h
+index f154c67..0469c0a 100644
+--- a/include/roerrorapi.h
++++ b/include/roerrorapi.h
+@@ -37,6 +37,7 @@ typedef enum
+ } RO_ERROR_REPORTING_FLAGS;
+ 
+ HRESULT WINAPI GetRestrictedErrorInfo(IRestrictedErrorInfo **info);
++HRESULT WINAPI RoCaptureErrorContext(HRESULT hr);
+ void    WINAPI RoFailFastWithErrorContext(HRESULT hr);
+ HRESULT WINAPI RoGetErrorReportingFlags(UINT32 *flags);
+ BOOL    WINAPI RoOriginateError(HRESULT error, HSTRING message);
