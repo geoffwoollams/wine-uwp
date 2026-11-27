@@ -59,7 +59,7 @@ Both put their output in `build/`, where `fetch-release.sh` would also unpack. M
 
 ## Set up an app
 
-You need the app as an **unpacked package folder**: the folder with `AppxManifest.xml`, `AppxBlockMap.xml` and the executable, for example copied from `C:\Program Files\WindowsApps\<package>` or extracted from the `.appx`/`.msix`. This project does not provide apps and does not bypass licensing: the app is treated as licensed because Wine has no Store client to ask, so you need to own it.
+You need the app as an **unpacked package folder** (the folder with `AppxManifest.xml`, `AppxBlockMap.xml` and the executable, for example copied from `C:\Program Files\WindowsApps\<package>`) or as a **package file**: an `.appx`/`.msix`, or an `.appxbundle`/`.msixbundle`, from which the x64 app package is taken. A package file is unpacked once into `~/.local/share/wine-uwp/packages/<package name>/` and set up from there; giving it a newer version of the same app replaces that folder. Encrypted Store downloads (`.eappx`, `.emsix`) can't be used. This project does not provide apps and does not bypass licensing: the app is treated as licensed because Wine has no Store client to ask, so you need to own it.
 
 If you installed a game with **Lutris**, its game folder works too. Lutris puts the files in its own Wine prefix, for example `~/Games/<game>/drive_c/Games/<game name>/`. Pass the folder that holds `AppxManifest.xml` to `setup-prefix.sh`. Starting the game from Lutris still won't work, because Lutris runs it with a Wine that has no UWP support. Start it with `run-app.sh` or the launcher `setup-prefix.sh` offers to add. The game's files are only linked, never changed, so the Lutris install is unaffected.
 
@@ -70,6 +70,7 @@ Apps also need the **framework packages** their `AppxManifest.xml` lists as depe
 
 ```bash
 scripts/setup-prefix.sh "/path/to/package-folder"
+scripts/setup-prefix.sh /path/to/MyApp.appx       # or a package file
 # importing framework packages first (once):
 scripts/setup-prefix.sh "/path/to/package-folder" --frameworks /path/to/folder-of-framework-packages
 ```
@@ -231,10 +232,10 @@ For maintainers. After building (see above) and committing, with GE-Proton 11-14
 ```bash
 scripts/build-wine.sh
 scripts/package-release.sh
-gh release create 11.22-uwp3.0 dist/wine-uwp-x86_64.tar.xz dist/wine-uwp-x86_64.tar.xz.sha256 --notes-file dist/NOTES.md
+gh release create 11.22-uwp4 --title wine-11.22-uwp4 dist/wine-uwp-x86_64.tar.xz dist/wine-uwp-x86_64.tar.xz.sha256 --notes-file dist/NOTES.md
 ```
 
-**Version numbers** look like `11.22-uwp3.0`: the Wine release the patches are based on, then wine-uwp's own version. Raise `UWP_VERSION` in `scripts/common.sh` for each GitHub release (`3.0`, `3.1`, ...) and change `WINE_TAG` when moving to a newer Wine; `RELEASE_VERSION` is made from both. `build-wine.sh` tags its source checkout so that `wine --version` reports `wine-11.22-uwp3.0`, and `package-release.sh` refuses a build whose version doesn't match. The download keeps the same file name, `wine-uwp-x86_64.tar.xz`, in every release, which is what lets `fetch-release.sh` find the latest one.
+**Version numbers** look like `11.22-uwp4`: the Wine release the patches are based on, then wine-uwp's own version, a whole number. Raise `UWP_VERSION` in `scripts/common.sh` by one for each GitHub release (`4`, `5`, ...; releases before 4 were `3.0`, `v2.1` and so on) and change `WINE_TAG` when moving to a newer Wine; `RELEASE_VERSION` is made from both. `build-wine.sh` tags its source checkout so that `wine --version` reports `wine-11.22-uwp4`, and `package-release.sh` refuses a build whose version doesn't match. The download keeps the same file name, `wine-uwp-x86_64.tar.xz`, in every release, which is what lets `fetch-release.sh` find the latest one.
 
 The archive contains the Wine install tree, DXVK's `dxgi.dll`, `d3d11.dll` and `d3d10core.dll` (D3D11 games and XAML's Direct2D drawing need them with that dxgi), the four component DLLs (`d3d12.dll`, `d3d12core.dll`, `wintypes.dll`, `windows.storage.dll`), the licence texts, `SOURCE.txt` (where to get every part's source) and a copy of `patches/`, `docker/` and `scripts/` (the recipe that built it). The script refuses to run with uncommitted changes in those folders, and refuses a Wine build containing add-on unlocking code.
 

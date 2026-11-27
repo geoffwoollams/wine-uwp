@@ -1,6 +1,7 @@
 #!/bin/bash
 # Creates the shared Wine prefix (once) and links one unpacked UWP package into it. The package folder is never modified.
-# Usage: scripts/setup-prefix.sh /path/to/package-folder [--frameworks DIR] [--vclibs /path/to/Microsoft.VCLibs...appx|folder]
+# An .appx/.msix file (or .appxbundle/.msixbundle) is first unpacked into ~/.local/share/wine-uwp/packages/<package name>.
+# Usage: scripts/setup-prefix.sh /path/to/package-folder|package.appx [--frameworks DIR] [--vclibs /path/to/Microsoft.VCLibs...appx|folder]
 #        [--verify] [--shortcut | --no-shortcut] [--prefix DIR]
 #        scripts/setup-prefix.sh --update-all
 # Run it again for each app; they share the prefix. It offers to add a launcher (a .desktop file with the app's icon) to
@@ -28,7 +29,7 @@ while [ $# -gt 0 ]; do
         --update-all) UPDATE_ALL=1; shift ;;
         --prefix) mkdir -p "$2"; OWN_PREFIX="$(cd "$2" && pwd)"; shift 2 ;;
         -*) die "unknown option $1" ;;
-        *) PKG_DIR="$(cd "$1" && pwd)"; shift ;;
+        *) if [ -f "$1" ]; then PKG_DIR="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"; else PKG_DIR="$(cd "$1" && pwd)"; fi; shift ;;
     esac
 done
 if [ "$UPDATE_ALL" = 1 ]; then
@@ -57,6 +58,10 @@ fi
 [ -n "$PKG_DIR" ] || die "usage: $0 /path/to/package-folder [--vclibs path] [--verify] [--shortcut | --no-shortcut], or $0 --update-all"
 [ -x "$WINE_ROOT/bin/wine" ] || die "patched Wine not found in $WINE_ROOT: run scripts/fetch-release.sh or scripts/build-wine.sh first"
 [ -f "$DXVK_DXGI" ] || die "patched dxgi.dll not found at $DXVK_DXGI: run scripts/fetch-release.sh or scripts/build-dxvk.sh first"
+if [ -f "$PKG_DIR" ]; then
+    # a package file: unpack it once into the packages folder (again when it is a different version), and set up from there
+    PKG_DIR="$(python3 -I "$REPO/scripts/uwptool.py" extract-package "$PKG_DIR" "$PACKAGES")" || die "could not unpack the package"
+fi
 IFS=$'\t' read -r PKG_NAME PKG_EXE < <(python3 -I "$REPO/scripts/uwptool.py" info "$PKG_DIR")
 # the manifest's Executable is a Windows path ("GearGame\Binaries\UWP64\GearGame.exe"), and its case need not match the
 # file's (Forza Motorsport 7 names ForzaMotorsport7.exe, the file is forzamotorsport7.exe): Windows and Wine ignore it

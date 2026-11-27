@@ -2,8 +2,8 @@
 # Packs a built tree (build-wine.sh, build-dxvk.sh and GE-Proton, or an unpacked release) into dist/ for a GitHub release:
 #   dist/wine-uwp-x86_64.tar.xz         patched Wine, dxgi.dll, the four component DLLs, licences and source information
 #   dist/wine-uwp-x86_64.tar.xz.sha256
-# Usage: scripts/package-release.sh [version]     (default: RELEASE_VERSION from common.sh, e.g. 11.22-uwp3.0)
-# Then: gh release create <version> dist/wine-uwp-x86_64.tar.xz dist/wine-uwp-x86_64.tar.xz.sha256 --notes-file dist/NOTES.md
+# Usage: scripts/package-release.sh [version]     (default: RELEASE_VERSION from common.sh, e.g. 11.22-uwp4)
+# Then: gh release create <version> --title wine-<version> dist/wine-uwp-x86_64.tar.xz dist/wine-uwp-x86_64.tar.xz.sha256 --notes-file dist/NOTES.md
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
 VERSION="${1:-$RELEASE_VERSION}"

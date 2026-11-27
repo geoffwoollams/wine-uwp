@@ -12,10 +12,11 @@ LOGS="${UWP_LOGS:-$DATA/logs}"
 APPS_DIR_NAME="UWP"                                          # apps are linked into C:\UWP\<package name> inside the prefix
 FRAMEWORKS="$DATA/frameworks"   # framework packages (VCLibs, .NET Native, WinUI ...), one copy for every app
 SOURCES="$DATA/apps"   # <package>.source: the package folder, its VCLibs package and its own prefix (empty: the shared one)
+PACKAGES="$DATA/packages"   # apps set up from .appx/.msix files, unpacked: one folder per package name
 
 WINE_TAG="wine-11.22"
-UWP_VERSION="3.0"                                            # wine-uwp's own version: raise it for each GitHub release
-RELEASE_VERSION="${WINE_TAG#wine-}-uwp$UWP_VERSION"          # e.g. 11.22-uwp3.0: the release tag, and Wine's version as wine-11.22-uwp3.0
+UWP_VERSION="4"                                              # wine-uwp's own version, a whole number: raise it by one for each GitHub release
+RELEASE_VERSION="${WINE_TAG#wine-}-uwp$UWP_VERSION"          # e.g. 11.22-uwp4: the release tag, and Wine's version as wine-11.22-uwp4
 WINE_GIT="https://gitlab.winehq.org/wine/wine.git"
 DXVK_COMMIT="f90f1bf180f41356695ddf3df6af62119fb64a3e"     # DXVK master the patch was made against (v3.1.1-235)
 DXVK_GIT="https://github.com/doitsujin/dxvk.git"

@@ -14,10 +14,14 @@
                                            link the DLLs of the frameworks the package depends on into APP_DIR, and print
                                            the ones the store doesn't have (MISSING<TAB>name<TAB>min version)
   uwptool.py timezone-mui EXPORTED_REG    print a REGEDIT4 file deleting the time zones' MUI_* names (IL2CPP apps)
+  uwptool.py extract-package FILE ROOT    unpack an .appx/.msix (or the x64 app package of an .appxbundle/.msixbundle) into
+                                           ROOT/<package name> unless that version is already there; print the folder
 """
 import base64
 import hashlib
 import html
+import io
+import urllib.parse
 import os
 import re
 import shutil
@@ -381,11 +385,112 @@ def native_copy(src, dest):
         out.write(data)
 
 
+# ---- packages given as files ----
+
+class FileSlice(io.RawIOBase):
+    """A read-only view of part of a file: a package stored uncompressed inside a bundle, read in place."""
+    def __init__(self, path, start, size):
+        self.f, self.start, self.size, self.pos = open(path, "rb"), start, size, 0
+    def readable(self): return True
+    def seekable(self): return True
+    def tell(self): return self.pos
+    def seek(self, offset, whence=0):
+        self.pos = max(0, offset if whence == 0 else self.pos + offset if whence == 1 else self.size + offset)
+        return self.pos
+    def readinto(self, buf):
+        n = max(0, min(len(buf), self.size - self.pos))
+        self.f.seek(self.start + self.pos)
+        data = self.f.read(n)
+        buf[:len(data)] = data
+        self.pos += len(data)
+        return len(data)
+
+
+def open_member(path, info, scratch):
+    """A bundle's inner package as a seekable file: in place when stored, else copied out to a temporary file."""
+    if info.compress_type == zipfile.ZIP_STORED:
+        with open(path, "rb") as f:
+            f.seek(info.header_offset)
+            header = f.read(30)
+            start = info.header_offset + 30 + int.from_bytes(header[26:28], "little") + int.from_bytes(header[28:30], "little")
+        return FileSlice(path, start, info.file_size)
+    os.makedirs(scratch, exist_ok=True)
+    tmp = open(os.path.join(scratch, ".bundle-member.tmp"), "w+b")
+    with zipfile.ZipFile(path) as z, z.open(info) as src:
+        shutil.copyfileobj(src, tmp, 1 << 20)
+    os.unlink(tmp.name)   # removed when closed
+    tmp.seek(0)
+    return tmp
+
+
+def extract_package(source, root):
+    """Unpack a package file into root/<package name>, replacing an older version there; returns the folder."""
+    try:
+        z = zipfile.ZipFile(source)
+    except (zipfile.BadZipFile, OSError):
+        sys.exit("%s is not a readable package: encrypted Store downloads (.eappx, .emsix) can't be used, "
+                 "only plain .appx/.msix files" % source)
+    names = set(z.namelist())
+    if "AppxMetadata/AppxBundleManifest.xml" in names:
+        # a bundle: its x64 (or neutral) application package; the resource packages (languages, scales) aren't needed
+        bundle = z.read("AppxMetadata/AppxBundleManifest.xml").decode("utf-8", "replace")
+        chosen = None
+        for tag in re.findall(r"<(?:\w+:)?Package\b[^>]*>", bundle):
+            attrs = dict(re.findall(r'(\w+)="([^"]*)"', tag))
+            if attrs.get("Type", "application").lower() != "application":
+                continue
+            arch = attrs.get("Architecture", "neutral").lower()
+            if arch == "x64" or (arch == "neutral" and not chosen):
+                chosen = attrs.get("FileName")
+        if not chosen:
+            sys.exit("%s has no x64 application package" % source)
+        inner = urllib.parse.unquote(chosen)
+        member = chosen if chosen in names else inner
+        print("Using %s from the bundle" % inner, file=sys.stderr)
+        z = zipfile.ZipFile(open_member(source, z.getinfo(member), root))
+        names = set(z.namelist())
+    if "AppxManifest.xml" not in names:
+        sys.exit("%s has no AppxManifest.xml: is it a UWP package?" % source)
+    ident = manifest_identity(z.read("AppxManifest.xml").decode("utf-8", "replace"))
+    if not ident or not ident[0]:
+        sys.exit("%s: no package identity in AppxManifest.xml" % source)
+    name, version, arch, _ = ident
+    if arch not in ("x64", "neutral"):
+        sys.exit("%s is a %s package; only x64 ones run here" % (source, arch))
+    dest = os.path.join(root, name)
+    manifest = os.path.join(dest, "AppxManifest.xml")
+    if os.path.exists(manifest):
+        old = manifest_identity(open(manifest, encoding="utf-8", errors="replace").read())
+        if old and old[1] == version:
+            print("%s %s is already unpacked in %s" % (name, version, dest), file=sys.stderr)
+            print(dest)
+            return
+    infos = [i for i in z.infolist() if not i.is_dir()]
+    total = sum(i.file_size for i in infos)
+    print("Unpacking %s %s (%d files, %.1f GB) into %s" % (name, version, len(infos), total / 1e9, dest), file=sys.stderr)
+    tmp = dest + ".tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    base = os.path.normpath(tmp) + os.sep
+    for info in infos:
+        target = os.path.normpath(os.path.join(tmp, urllib.parse.unquote(info.filename)))
+        if not target.startswith(base):
+            continue   # nothing outside the folder
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with z.open(info) as src, open(target, "wb") as out:
+            shutil.copyfileobj(src, out, 1 << 20)
+    shutil.rmtree(dest, ignore_errors=True)
+    os.makedirs(root, exist_ok=True)
+    os.replace(tmp, dest)
+    print(dest)
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "verify":
         verify(sys.argv[2])
     elif len(sys.argv) == 3 and sys.argv[1] == "timezone-mui":
         timezone_mui(sys.argv[2])
+    elif len(sys.argv) == 4 and sys.argv[1] == "extract-package":
+        extract_package(sys.argv[2], sys.argv[3])
     elif len(sys.argv) == 3 and sys.argv[1] == "info":
         info(sys.argv[2])
     elif len(sys.argv) == 4 and sys.argv[1] == "vclibs":
