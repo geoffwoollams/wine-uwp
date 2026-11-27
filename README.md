@@ -286,7 +286,8 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 MediaPlaybackSession, 0079 AcceleratorKeyActivated (Unreal Engine's game keys) and CoreWindow key
                 state from any thread, 0080 the *FromApp file functions, 0081-0083 for Microsoft Sudoku
                 (Unity 6): a package's own WinRT classes first (Unity games no longer load each other's),
-                DispatcherQueue.GetForCurrentThread, ResourceContext
+                DispatcherQueue.GetForCurrentThread, ResourceContext, 0084 FileIO, 0085 hash algorithms, 0086
+                classes from a package's namespace-named DLLs
 patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings

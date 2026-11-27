@@ -1,0 +1,516 @@
+Subject: windows.storage.applicationdata: Windows.Storage.FileIO (text, lines, buffers and bytes)
+
+diff --git a/dlls/windows.storage.applicationdata/classes.idl b/dlls/windows.storage.applicationdata/classes.idl
+index 6029ac1..de89310 100644
+--- a/dlls/windows.storage.applicationdata/classes.idl
++++ b/dlls/windows.storage.applicationdata/classes.idl
+@@ -25,4 +25,5 @@ import "windows.storage.idl";
+ 
+ namespace Windows.Storage {
+     runtimeclass ApplicationData;
++    runtimeclass FileIO;
+ }
+diff --git a/dlls/windows.storage.applicationdata/main.c b/dlls/windows.storage.applicationdata/main.c
+index 508ba0d..6791015 100644
+--- a/dlls/windows.storage.applicationdata/main.c
++++ b/dlls/windows.storage.applicationdata/main.c
+@@ -40,6 +40,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+ 
+     if (!wcscmp( buffer, RuntimeClass_Windows_Storage_ApplicationData ))
+         IActivationFactory_QueryInterface( application_data_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_Storage_FileIO ))
++        IActivationFactory_QueryInterface( file_io_factory, &IID_IActivationFactory, (void **)factory );
+ 
+     if (*factory) return S_OK;
+     return CLASS_E_CLASSNOTAVAILABLE;
+diff --git a/dlls/windows.storage.applicationdata/private.h b/dlls/windows.storage.applicationdata/private.h
+index b199e9c..1f3cfc8 100644
+--- a/dlls/windows.storage.applicationdata/private.h
++++ b/dlls/windows.storage.applicationdata/private.h
+@@ -38,6 +38,7 @@
+ #include "windows.storage.h"
+ 
+ extern IActivationFactory *application_data_factory;
++extern IActivationFactory *file_io_factory;
+ extern HRESULT storage_folder_create( const WCHAR *path, IStorageFolder **out );
+ extern HRESULT storage_file_create( const WCHAR *path, IStorageFile **out );
+ extern HRESULT storage_file_operation( HRESULT hr, IStorageFile *file, IAsyncOperation_StorageFile **operation );
+diff --git a/dlls/windows.storage.applicationdata/storagefile.c b/dlls/windows.storage.applicationdata/storagefile.c
+index 6f45eb4..94596cf 100644
+--- a/dlls/windows.storage.applicationdata/storagefile.c
++++ b/dlls/windows.storage.applicationdata/storagefile.c
+@@ -20,6 +20,7 @@
+ 
+ #include "private.h"
+ #include "robuffer.h"
++#include "roapi.h"
+ 
+ #include "wine/debug.h"
+ 
+@@ -43,6 +44,8 @@ struct done_op
+     const GUID *iid;
+     HRESULT hr;
+     IUnknown *object;     /* interface result, or NULL */
++    HSTRING string;       /* string result (IAsyncOperation<HSTRING>), when has_string */
++    BOOL has_string;
+     UINT64 value;         /* value result */
+     UINT32 value_size;
+     IUnknown *handler;
+@@ -80,6 +83,7 @@ static ULONG WINAPI done_Release(struct done_op *op)
+     if (!ref)
+     {
+         if (op->object) IUnknown_Release(op->object);
++        WindowsDeleteString(op->string);
+         if (op->handler) IUnknown_Release(op->handler);
+         if (op->progress) IUnknown_Release(op->progress);
+         free(op);
+@@ -119,6 +123,7 @@ static HRESULT WINAPI done_GetResults(struct done_op *op, void *results)
+ {
+     if (FAILED(op->hr)) return op->hr;
+     if (!results) return S_OK;
++    if (op->has_string) return WindowsDuplicateString(op->string, (HSTRING *)results);
+     if (op->object)
+     {
+         *(IUnknown **)results = op->object;
+@@ -1049,3 +1054,381 @@ HRESULT storage_file_operation(HRESULT hr, IStorageFile *file, IAsyncOperation_S
+ {
+     return done_create(DONE_OPERATION, &IID_IAsyncOperation_StorageFile, hr, (IUnknown *)file, NULL, 0, (void **)operation);
+ }
++
++
++/* ===== Windows.Storage.FileIO: whole-file reads and writes, done synchronously ===== */
++
++static HRESULT read_file(IStorageFile *file, BYTE **data, DWORD *size)
++{
++    WCHAR path[MAX_PATH];
++    LARGE_INTEGER length;
++    HANDLE handle;
++    HRESULT hr = S_OK;
++
++    *data = NULL;
++    *size = 0;
++    if (FAILED(hr = item_path(file, path))) return hr;
++    handle = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
++    if (handle == INVALID_HANDLE_VALUE) return last_error();
++    if (!GetFileSizeEx(handle, &length)) hr = last_error();
++    else if (length.QuadPart > 0x7fffffff) hr = E_OUTOFMEMORY;
++    else if (!(*data = malloc(length.QuadPart + 2))) hr = E_OUTOFMEMORY;
++    else if (!ReadFile(handle, *data, length.LowPart, size, NULL)) hr = last_error();
++    CloseHandle(handle);
++    if (FAILED(hr))
++    {
++        free(*data);
++        *data = NULL;
++    }
++    return hr;
++}
++
++static HRESULT write_file(IStorageFile *file, const void *data, DWORD size, BOOL append)
++{
++    WCHAR path[MAX_PATH];
++    HANDLE handle;
++    DWORD written;
++    HRESULT hr = S_OK;
++
++    if (FAILED(hr = item_path(file, path))) return hr;
++    handle = CreateFileW(path, append ? FILE_APPEND_DATA : GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
++                         append ? OPEN_ALWAYS : CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
++    if (handle == INVALID_HANDLE_VALUE) return last_error();
++    if (size && !WriteFile(handle, data, size, &written, NULL)) hr = last_error();
++    CloseHandle(handle);
++    return hr;
++}
++
++/* text in a file: a byte order mark decides the encoding, otherwise the one given (UTF-8 by default) */
++static HRESULT decode_text(BYTE *data, DWORD size, int encoding, HSTRING *out)
++{
++    HSTRING_BUFFER buffer;
++    WCHAR *str;
++    DWORD i, count;
++    HRESULT hr;
++
++    if (size >= 3 && data[0] == 0xef && data[1] == 0xbb && data[2] == 0xbf) { data += 3; size -= 3; encoding = UnicodeEncoding_Utf8; }
++    else if (size >= 2 && data[0] == 0xff && data[1] == 0xfe) { data += 2; size -= 2; encoding = UnicodeEncoding_Utf16LE; }
++    else if (size >= 2 && data[0] == 0xfe && data[1] == 0xff) { data += 2; size -= 2; encoding = UnicodeEncoding_Utf16BE; }
++
++    if (!size) return WindowsCreateString(NULL, 0, out);
++    if (encoding == UnicodeEncoding_Utf8)
++    {
++        if (!(count = MultiByteToWideChar(CP_UTF8, 0, (char *)data, size, NULL, 0))) return HRESULT_FROM_WIN32(ERROR_NO_UNICODE_TRANSLATION);
++        if (FAILED(hr = WindowsPreallocateStringBuffer(count, &str, &buffer))) return hr;
++        MultiByteToWideChar(CP_UTF8, 0, (char *)data, size, str, count);
++    }
++    else
++    {
++        count = size / 2;
++        if (FAILED(hr = WindowsPreallocateStringBuffer(count, &str, &buffer))) return hr;
++        for (i = 0; i < count; i++)
++            str[i] = encoding == UnicodeEncoding_Utf16LE ? data[2 * i] | data[2 * i + 1] << 8 : data[2 * i] << 8 | data[2 * i + 1];
++    }
++    return WindowsPromoteStringBuffer(buffer, out);
++}
++
++/* the bytes for some text: UTF-8 without a byte order mark, UTF-16 with one unless appending */
++static HRESULT encode_text(const WCHAR *str, UINT32 length, int encoding, BOOL mark, BYTE **data, DWORD *size)
++{
++    DWORD i, count;
++
++    *data = NULL;
++    *size = 0;
++    if (encoding == UnicodeEncoding_Utf8)
++    {
++        count = length ? WideCharToMultiByte(CP_UTF8, 0, str, length, NULL, 0, NULL, NULL) : 0;
++        if (!(*data = malloc(count + 1))) return E_OUTOFMEMORY;
++        if (count) WideCharToMultiByte(CP_UTF8, 0, str, length, (char *)*data, count, NULL, NULL);
++        *size = count;
++        return S_OK;
++    }
++    if (!(*data = malloc(length * 2 + 2))) return E_OUTOFMEMORY;
++    if (mark)
++    {
++        (*data)[0] = encoding == UnicodeEncoding_Utf16LE ? 0xff : 0xfe;
++        (*data)[1] = encoding == UnicodeEncoding_Utf16LE ? 0xfe : 0xff;
++        *size = 2;
++    }
++    for (i = 0; i < length; i++, *size += 2)
++    {
++        BYTE low = str[i] & 0xff, high = str[i] >> 8;
++        (*data)[*size] = encoding == UnicodeEncoding_Utf16LE ? low : high;
++        (*data)[*size + 1] = encoding == UnicodeEncoding_Utf16LE ? high : low;
++    }
++    return S_OK;
++}
++
++static HRESULT read_text_op(IStorageFile *file, int encoding, IAsyncOperation_HSTRING **operation)
++{
++    struct done_op *op;
++    HSTRING text = NULL;
++    DWORD size;
++    BYTE *data;
++    HRESULT hr;
++
++    if (!file || !operation) return E_POINTER;
++    if (SUCCEEDED(hr = read_file(file, &data, &size)))
++    {
++        hr = decode_text(data, size, encoding, &text);
++        free(data);
++    }
++    if (FAILED(done_create(DONE_OPERATION, &IID_IAsyncOperation_HSTRING, hr, NULL, NULL, 0, (void **)&op)))
++    {
++        WindowsDeleteString(text);
++        return E_OUTOFMEMORY;
++    }
++    op->string = text;
++    op->has_string = TRUE;
++    *operation = (IAsyncOperation_HSTRING *)op;
++    return S_OK;
++}
++
++static HRESULT write_text_op(IStorageFile *file, HSTRING contents, int encoding, BOOL append, IAsyncAction **operation)
++{
++    UINT32 length;
++    const WCHAR *str = WindowsGetStringRawBuffer(contents, &length);
++    DWORD size;
++    BYTE *data;
++    HRESULT hr;
++
++    if (!file || !operation) return E_POINTER;
++    if (SUCCEEDED(hr = encode_text(str, length, encoding, !append, &data, &size)))
++    {
++        hr = write_file(file, data, size, append);
++        free(data);
++    }
++    return done_action(hr, operation);
++}
++
++static HRESULT write_lines_op(IStorageFile *file, IIterable_HSTRING *lines, int encoding, BOOL append, IAsyncAction **operation)
++{
++    IIterator_HSTRING *iterator;
++    WCHAR *text = NULL, *grown;
++    SIZE_T length = 0, capacity = 0;
++    boolean more = FALSE;
++    DWORD size;
++    BYTE *data;
++    HRESULT hr;
++
++    if (!file || !lines || !operation) return E_POINTER;
++    if (FAILED(hr = IIterable_HSTRING_First(lines, &iterator))) return done_action(hr, operation);
++    IIterator_HSTRING_get_HasCurrent(iterator, &more);
++    while (more && SUCCEEDED(hr))
++    {
++        HSTRING line;
++        UINT32 line_length;
++        const WCHAR *str;
++
++        if (FAILED(hr = IIterator_HSTRING_get_Current(iterator, &line))) break;
++        str = WindowsGetStringRawBuffer(line, &line_length);
++        if (length + line_length + 2 > capacity)
++        {
++            capacity = max(capacity * 2, length + line_length + 64);
++            if (!(grown = realloc(text, capacity * sizeof(WCHAR)))) hr = E_OUTOFMEMORY;
++            else text = grown;
++        }
++        if (SUCCEEDED(hr))
++        {
++            memcpy(text + length, str, line_length * sizeof(WCHAR));
++            length += line_length;
++            text[length++] = '\r';
++            text[length++] = '\n';
++        }
++        WindowsDeleteString(line);
++        if (SUCCEEDED(hr)) hr = IIterator_HSTRING_MoveNext(iterator, &more);
++    }
++    IIterator_HSTRING_Release(iterator);
++    if (SUCCEEDED(hr) && SUCCEEDED(hr = encode_text(text ? text : L"", length, encoding, !append, &data, &size)))
++    {
++        hr = write_file(file, data, size, append);
++        free(data);
++    }
++    free(text);
++    return done_action(hr, operation);
++}
++
++static HRESULT WINAPI file_io_ReadTextAsync(IFileIOStatics *iface, IStorageFile *file, IAsyncOperation_HSTRING **value)
++{
++    TRACE("iface %p, file %p, value %p.\n", iface, file, value);
++    return read_text_op(file, UnicodeEncoding_Utf8, value);
++}
++static HRESULT WINAPI file_io_ReadTextWithEncodingAsync(IFileIOStatics *iface, IStorageFile *file, UnicodeEncoding encoding, IAsyncOperation_HSTRING **value)
++{
++    TRACE("iface %p, file %p, encoding %d, value %p.\n", iface, file, encoding, value);
++    return read_text_op(file, encoding, value);
++}
++static HRESULT WINAPI file_io_WriteTextAsync(IFileIOStatics *iface, IStorageFile *file, HSTRING contents, IAsyncAction **value)
++{
++    TRACE("iface %p, file %p, value %p.\n", iface, file, value);
++    return write_text_op(file, contents, UnicodeEncoding_Utf8, FALSE, value);
++}
++static HRESULT WINAPI file_io_WriteTextWithEncodingAsync(IFileIOStatics *iface, IStorageFile *file, HSTRING contents, UnicodeEncoding encoding, IAsyncAction **value)
++{
++    TRACE("iface %p, file %p, encoding %d, value %p.\n", iface, file, encoding, value);
++    return write_text_op(file, contents, encoding, FALSE, value);
++}
++static HRESULT WINAPI file_io_AppendTextAsync(IFileIOStatics *iface, IStorageFile *file, HSTRING contents, IAsyncAction **value)
++{
++    TRACE("iface %p, file %p, value %p.\n", iface, file, value);
++    return write_text_op(file, contents, UnicodeEncoding_Utf8, TRUE, value);
++}
++static HRESULT WINAPI file_io_AppendTextWithEncodingAsync(IFileIOStatics *iface, IStorageFile *file, HSTRING contents, UnicodeEncoding encoding, IAsyncAction **value)
++{
++    TRACE("iface %p, file %p, encoding %d, value %p.\n", iface, file, encoding, value);
++    return write_text_op(file, contents, encoding, TRUE, value);
++}
++static HRESULT WINAPI file_io_ReadLinesAsync(IFileIOStatics *iface, IStorageFile *file, IAsyncOperation_IVector_HSTRING **value)
++{
++    FIXME("iface %p, file %p, value %p stub!\n", iface, file, value);
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI file_io_ReadLinesWithEncodingAsync(IFileIOStatics *iface, IStorageFile *file, UnicodeEncoding encoding, IAsyncOperation_IVector_HSTRING **value)
++{
++    FIXME("iface %p, file %p, encoding %d, value %p stub!\n", iface, file, encoding, value);
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI file_io_WriteLinesAsync(IFileIOStatics *iface, IStorageFile *file, IIterable_HSTRING *lines, IAsyncAction **value)
++{
++    TRACE("iface %p, file %p, lines %p, value %p.\n", iface, file, lines, value);
++    return write_lines_op(file, lines, UnicodeEncoding_Utf8, FALSE, value);
++}
++static HRESULT WINAPI file_io_WriteLinesWithEncodingAsync(IFileIOStatics *iface, IStorageFile *file, IIterable_HSTRING *lines, UnicodeEncoding encoding, IAsyncAction **value)
++{
++    TRACE("iface %p, file %p, lines %p, encoding %d, value %p.\n", iface, file, lines, encoding, value);
++    return write_lines_op(file, lines, encoding, FALSE, value);
++}
++static HRESULT WINAPI file_io_AppendLinesAsync(IFileIOStatics *iface, IStorageFile *file, IIterable_HSTRING *lines, IAsyncAction **value)
++{
++    TRACE("iface %p, file %p, lines %p, value %p.\n", iface, file, lines, value);
++    return write_lines_op(file, lines, UnicodeEncoding_Utf8, TRUE, value);
++}
++static HRESULT WINAPI file_io_AppendLinesWithEncodingAsync(IFileIOStatics *iface, IStorageFile *file, IIterable_HSTRING *lines, UnicodeEncoding encoding, IAsyncAction **value)
++{
++    TRACE("iface %p, file %p, lines %p, encoding %d, value %p.\n", iface, file, lines, encoding, value);
++    return write_lines_op(file, lines, encoding, TRUE, value);
++}
++
++static HRESULT create_buffer(const BYTE *data, DWORD size, IBuffer **out)
++{
++    static const WCHAR class_name[] = L"Windows.Storage.Streams.Buffer";
++    IBufferFactory *factory;
++    HSTRING str;
++    BYTE *bytes;
++    HRESULT hr;
++
++    *out = NULL;
++    if (FAILED(hr = WindowsCreateString(class_name, ARRAY_SIZE(class_name) - 1, &str))) return hr;
++    hr = RoGetActivationFactory(str, &IID_IBufferFactory, (void **)&factory);
++    WindowsDeleteString(str);
++    if (FAILED(hr)) return hr;
++    hr = IBufferFactory_Create(factory, size, out);
++    IBufferFactory_Release(factory);
++    if (FAILED(hr)) return hr;
++    if (size)
++    {
++        IBuffer_put_Length(*out, size);
++        if ((bytes = buffer_bytes(*out))) memcpy(bytes, data, size);
++        else
++        {
++            IBuffer_Release(*out);
++            *out = NULL;
++            return E_FAIL;
++        }
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI file_io_ReadBufferAsync(IFileIOStatics *iface, IStorageFile *file, IAsyncOperation_IBuffer **value)
++{
++    IBuffer *buffer = NULL;
++    DWORD size;
++    BYTE *data;
++    HRESULT hr;
++
++    TRACE("iface %p, file %p, value %p.\n", iface, file, value);
++    if (!file || !value) return E_POINTER;
++    if (SUCCEEDED(hr = read_file(file, &data, &size)))
++    {
++        hr = create_buffer(data, size, &buffer);
++        free(data);
++    }
++    return done_create(DONE_OPERATION, &IID_IAsyncOperation_IBuffer, hr, (IUnknown *)buffer, NULL, 0, (void **)value);
++}
++static HRESULT WINAPI file_io_WriteBufferAsync(IFileIOStatics *iface, IStorageFile *file, IBuffer *buffer, IAsyncAction **value)
++{
++    UINT32 length = 0;
++    BYTE *bytes = NULL;
++    HRESULT hr;
++
++    TRACE("iface %p, file %p, buffer %p, value %p.\n", iface, file, buffer, value);
++    if (!file || !buffer || !value) return E_POINTER;
++    IBuffer_get_Length(buffer, &length);
++    if (length && !(bytes = buffer_bytes(buffer))) hr = E_INVALIDARG;
++    else hr = write_file(file, bytes, length, FALSE);
++    return done_action(hr, value);
++}
++static HRESULT WINAPI file_io_WriteBytesAsync(IFileIOStatics *iface, IStorageFile *file, UINT32 size, BYTE *buffer, IAsyncAction **value)
++{
++    TRACE("iface %p, file %p, size %u, buffer %p, value %p.\n", iface, file, size, buffer, value);
++    if (!file || !value || (size && !buffer)) return E_POINTER;
++    return done_action(write_file(file, buffer, size, FALSE), value);
++}
++
++static HRESULT WINAPI file_io_QueryInterface(IFileIOStatics *iface, REFIID iid, void **out);
++static ULONG WINAPI file_io_AddRef(IFileIOStatics *iface) { return 2; }
++static ULONG WINAPI file_io_Release(IFileIOStatics *iface) { return 1; }
++static HRESULT WINAPI file_io_GetIids(IFileIOStatics *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI file_io_GetRuntimeClassName(IFileIOStatics *iface, HSTRING *name) { return E_NOTIMPL; }
++static HRESULT WINAPI file_io_GetTrustLevel(IFileIOStatics *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++
++static const IFileIOStaticsVtbl file_io_vtbl =
++{
++    file_io_QueryInterface, file_io_AddRef, file_io_Release,
++    file_io_GetIids, file_io_GetRuntimeClassName, file_io_GetTrustLevel,
++    file_io_ReadTextAsync, file_io_ReadTextWithEncodingAsync,
++    file_io_WriteTextAsync, file_io_WriteTextWithEncodingAsync,
++    file_io_AppendTextAsync, file_io_AppendTextWithEncodingAsync,
++    file_io_ReadLinesAsync, file_io_ReadLinesWithEncodingAsync,
++    file_io_WriteLinesAsync, file_io_WriteLinesWithEncodingAsync,
++    file_io_AppendLinesAsync, file_io_AppendLinesWithEncodingAsync,
++    file_io_ReadBufferAsync, file_io_WriteBufferAsync, file_io_WriteBytesAsync,
++};
++static IFileIOStatics file_io_statics = { &file_io_vtbl };
++
++static HRESULT WINAPI file_io_factory_QueryInterface(IActivationFactory *iface, REFIID iid, void **out)
++{
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IActivationFactory))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    if (IsEqualGUID(iid, &IID_IFileIOStatics))
++    {
++        *out = &file_io_statics;
++        return S_OK;
++    }
++    FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI file_io_factory_AddRef(IActivationFactory *iface) { return 2; }
++static ULONG WINAPI file_io_factory_Release(IActivationFactory *iface) { return 1; }
++static HRESULT WINAPI file_io_factory_GetIids(IActivationFactory *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI file_io_factory_GetRuntimeClassName(IActivationFactory *iface, HSTRING *name) { return E_NOTIMPL; }
++static HRESULT WINAPI file_io_factory_GetTrustLevel(IActivationFactory *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI file_io_factory_ActivateInstance(IActivationFactory *iface, IInspectable **instance) { return E_NOTIMPL; }
++static const IActivationFactoryVtbl file_io_factory_vtbl =
++{
++    file_io_factory_QueryInterface, file_io_factory_AddRef, file_io_factory_Release,
++    file_io_factory_GetIids, file_io_factory_GetRuntimeClassName, file_io_factory_GetTrustLevel,
++    file_io_factory_ActivateInstance,
++};
++static IActivationFactory file_io_factory_obj = { &file_io_factory_vtbl };
++IActivationFactory *file_io_factory = &file_io_factory_obj;
++
++static HRESULT WINAPI file_io_QueryInterface(IFileIOStatics *iface, REFIID iid, void **out)
++{
++    return file_io_factory_QueryInterface(file_io_factory, iid, out);
++}
+diff --git a/include/windows.storage.idl b/include/windows.storage.idl
+index 6f4aa6d..f264ef5 100644
+--- a/include/windows.storage.idl
++++ b/include/windows.storage.idl
+@@ -80,8 +80,16 @@ namespace Windows.Storage {
+     runtimeclass StorageFolder;
+     runtimeclass StorageFile;
+     runtimeclass StorageStreamTransaction;
++    interface IFileIOStatics;
++    runtimeclass FileIO;
+ 
+     declare {
++        interface Windows.Foundation.Collections.IIterable<HSTRING>;
++        interface Windows.Foundation.Collections.IIterator<HSTRING>;
++        interface Windows.Foundation.Collections.IVectorView<HSTRING>;
++        interface Windows.Foundation.Collections.IVector<HSTRING>;
++        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.Foundation.Collections.IVector<HSTRING> *>;
++        interface Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVector<HSTRING> *>;
+         interface Windows.Foundation.Collections.IKeyValuePair<HSTRING, Windows.Storage.ApplicationDataContainer *>;
+         interface Windows.Foundation.Collections.IIterable<Windows.Foundation.Collections.IKeyValuePair<HSTRING, Windows.Storage.ApplicationDataContainer *> *>;
+         interface Windows.Foundation.Collections.IIterator<Windows.Foundation.Collections.IKeyValuePair<HSTRING, Windows.Storage.ApplicationDataContainer *> *>;
+@@ -712,4 +720,38 @@ namespace Windows.Storage {
+         interface Windows.Foundation.IClosable;
+     }
+ #endif
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Storage.FileIO),
++        uuid(887411eb-7f54-4732-a5f0-5e43e3b8c2f5)
++    ]
++    interface IFileIOStatics : IInspectable
++    {
++        [overload("ReadTextAsync")] HRESULT ReadTextAsync([in] Windows.Storage.IStorageFile *file, [out, retval] Windows.Foundation.IAsyncOperation<HSTRING> **value);
++        [overload("ReadTextAsync")] HRESULT ReadTextWithEncodingAsync([in] Windows.Storage.IStorageFile *file, [in] Windows.Storage.Streams.UnicodeEncoding encoding, [out, retval] Windows.Foundation.IAsyncOperation<HSTRING> **value);
++        [overload("WriteTextAsync")] HRESULT WriteTextAsync([in] Windows.Storage.IStorageFile *file, [in] HSTRING contents, [out, retval] Windows.Foundation.IAsyncAction **value);
++        [overload("WriteTextAsync")] HRESULT WriteTextWithEncodingAsync([in] Windows.Storage.IStorageFile *file, [in] HSTRING contents, [in] Windows.Storage.Streams.UnicodeEncoding encoding, [out, retval] Windows.Foundation.IAsyncAction **value);
++        [overload("AppendTextAsync")] HRESULT AppendTextAsync([in] Windows.Storage.IStorageFile *file, [in] HSTRING contents, [out, retval] Windows.Foundation.IAsyncAction **value);
++        [overload("AppendTextAsync")] HRESULT AppendTextWithEncodingAsync([in] Windows.Storage.IStorageFile *file, [in] HSTRING contents, [in] Windows.Storage.Streams.UnicodeEncoding encoding, [out, retval] Windows.Foundation.IAsyncAction **value);
++        [overload("ReadLinesAsync")] HRESULT ReadLinesAsync([in] Windows.Storage.IStorageFile *file, [out, retval] Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVector<HSTRING> *> **value);
++        [overload("ReadLinesAsync")] HRESULT ReadLinesWithEncodingAsync([in] Windows.Storage.IStorageFile *file, [in] Windows.Storage.Streams.UnicodeEncoding encoding, [out, retval] Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVector<HSTRING> *> **value);
++        [overload("WriteLinesAsync")] HRESULT WriteLinesAsync([in] Windows.Storage.IStorageFile *file, [in] Windows.Foundation.Collections.IIterable<HSTRING> *lines, [out, retval] Windows.Foundation.IAsyncAction **value);
++        [overload("WriteLinesAsync")] HRESULT WriteLinesWithEncodingAsync([in] Windows.Storage.IStorageFile *file, [in] Windows.Foundation.Collections.IIterable<HSTRING> *lines, [in] Windows.Storage.Streams.UnicodeEncoding encoding, [out, retval] Windows.Foundation.IAsyncAction **value);
++        [overload("AppendLinesAsync")] HRESULT AppendLinesAsync([in] Windows.Storage.IStorageFile *file, [in] Windows.Foundation.Collections.IIterable<HSTRING> *lines, [out, retval] Windows.Foundation.IAsyncAction **value);
++        [overload("AppendLinesAsync")] HRESULT AppendLinesWithEncodingAsync([in] Windows.Storage.IStorageFile *file, [in] Windows.Foundation.Collections.IIterable<HSTRING> *lines, [in] Windows.Storage.Streams.UnicodeEncoding encoding, [out, retval] Windows.Foundation.IAsyncAction **value);
++        HRESULT ReadBufferAsync([in] Windows.Storage.IStorageFile *file, [out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.Streams.IBuffer *> **value);
++        HRESULT WriteBufferAsync([in] Windows.Storage.IStorageFile *file, [in] Windows.Storage.Streams.IBuffer *buffer, [out, retval] Windows.Foundation.IAsyncAction **value);
++        HRESULT WriteBytesAsync([in] Windows.Storage.IStorageFile *file, [in] UINT32 __bufferSize, [in, size_is(__bufferSize)] BYTE *buffer, [out, retval] Windows.Foundation.IAsyncAction **value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.Storage.IFileIOStatics, Windows.Foundation.UniversalApiContract, 1.0),
++        threading(both)
++    ]
++    runtimeclass FileIO
++    {
++    }
+ }

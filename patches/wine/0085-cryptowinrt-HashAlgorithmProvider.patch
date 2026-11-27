@@ -1,0 +1,587 @@
+Subject: cryptowinrt: HashAlgorithmNames, HashAlgorithmProvider and CryptographicHash on BCrypt
+
+diff --git a/dlls/cryptowinrt/Makefile.in b/dlls/cryptowinrt/Makefile.in
+index 95df467..259e8ee 100644
+--- a/dlls/cryptowinrt/Makefile.in
++++ b/dlls/cryptowinrt/Makefile.in
+@@ -7,4 +7,5 @@ SOURCES = \
+ 	async_private.idl \
+ 	classes.idl \
+ 	credentials.c \
++	hash.c \
+ 	main.c
+diff --git a/dlls/cryptowinrt/classes.idl b/dlls/cryptowinrt/classes.idl
+index 7e1e634..624c186 100644
+--- a/dlls/cryptowinrt/classes.idl
++++ b/dlls/cryptowinrt/classes.idl
+@@ -21,10 +21,15 @@
+ 
+ import "windows.security.cryptography.idl";
+ import "windows.security.credentials.idl";
++import "windows.security.cryptography.core.idl";
+ 
+ namespace Windows.Security.Cryptography {
+     runtimeclass CryptographicBuffer;
+ }
++namespace Windows.Security.Cryptography.Core {
++    runtimeclass HashAlgorithmNames;
++    runtimeclass HashAlgorithmProvider;
++}
+ namespace Windows.Security.Credentials {
+     runtimeclass KeyCredentialManager;
+ }
+diff --git a/dlls/cryptowinrt/hash.c b/dlls/cryptowinrt/hash.c
+new file mode 100644
+index 0000000..0a5cc18
+--- /dev/null
++++ b/dlls/cryptowinrt/hash.c
+@@ -0,0 +1,400 @@
++/* WinRT Windows.Security.Cryptography.Core: HashAlgorithmNames, HashAlgorithmProvider, CryptographicHash
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#define WIDL_using_Windows_Security_Cryptography_Core
++#include "private.h"
++
++#include "bcrypt.h"
++#include "windows.security.cryptography.core.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(crypto);
++
++/* the WinRT names and their BCrypt algorithms */
++static const struct
++{
++    const WCHAR *name;
++    const WCHAR *bcrypt;
++}
++algorithms[] =
++{
++    { L"MD5",    BCRYPT_MD5_ALGORITHM },
++    { L"SHA1",   BCRYPT_SHA1_ALGORITHM },
++    { L"SHA256", BCRYPT_SHA256_ALGORITHM },
++    { L"SHA384", BCRYPT_SHA384_ALGORITHM },
++    { L"SHA512", BCRYPT_SHA512_ALGORITHM },
++};
++
++/* ---- HashAlgorithmNames ---- */
++
++struct names
++{
++    IActivationFactory IActivationFactory_iface;
++    IHashAlgorithmNamesStatics IHashAlgorithmNamesStatics_iface;
++};
++
++static inline struct names *names_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct names, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI names_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct names *impl = names_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IHashAlgorithmNamesStatics ))
++        *out = &impl->IHashAlgorithmNamesStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++static ULONG WINAPI names_factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI names_factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance ) { return E_NOTIMPL; }
++
++static const IActivationFactoryVtbl names_factory_vtbl =
++{
++    names_factory_QueryInterface, names_factory_AddRef, names_factory_Release,
++    factory_GetIids, factory_GetRuntimeClassName, factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++static inline struct names *names_from_statics( IHashAlgorithmNamesStatics *iface )
++{
++    return CONTAINING_RECORD( iface, struct names, IHashAlgorithmNamesStatics_iface );
++}
++static HRESULT WINAPI names_QueryInterface( IHashAlgorithmNamesStatics *iface, REFIID iid, void **out )
++{
++    return names_factory_QueryInterface( &names_from_statics( iface )->IActivationFactory_iface, iid, out );
++}
++static ULONG WINAPI names_AddRef( IHashAlgorithmNamesStatics *iface ) { return 2; }
++static ULONG WINAPI names_Release( IHashAlgorithmNamesStatics *iface ) { return 1; }
++static HRESULT WINAPI names_GetIids( IHashAlgorithmNamesStatics *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI names_GetRuntimeClassName( IHashAlgorithmNamesStatics *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI names_GetTrustLevel( IHashAlgorithmNamesStatics *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT name_string( int index, HSTRING *value )
++{
++    if (!value) return E_POINTER;
++    return WindowsCreateString( algorithms[index].name, wcslen( algorithms[index].name ), value );
++}
++static HRESULT WINAPI names_get_Md5( IHashAlgorithmNamesStatics *iface, HSTRING *value ) { return name_string( 0, value ); }
++static HRESULT WINAPI names_get_Sha1( IHashAlgorithmNamesStatics *iface, HSTRING *value ) { return name_string( 1, value ); }
++static HRESULT WINAPI names_get_Sha256( IHashAlgorithmNamesStatics *iface, HSTRING *value ) { return name_string( 2, value ); }
++static HRESULT WINAPI names_get_Sha384( IHashAlgorithmNamesStatics *iface, HSTRING *value ) { return name_string( 3, value ); }
++static HRESULT WINAPI names_get_Sha512( IHashAlgorithmNamesStatics *iface, HSTRING *value ) { return name_string( 4, value ); }
++
++static const IHashAlgorithmNamesStaticsVtbl names_vtbl =
++{
++    names_QueryInterface, names_AddRef, names_Release,
++    names_GetIids, names_GetRuntimeClassName, names_GetTrustLevel,
++    names_get_Md5, names_get_Sha1, names_get_Sha256, names_get_Sha384, names_get_Sha512,
++};
++
++static struct names names = { {&names_factory_vtbl}, {&names_vtbl} };
++IActivationFactory *hash_names_factory = &names.IActivationFactory_iface;
++
++/* ---- CryptographicHash: an incremental hash ---- */
++
++struct hash
++{
++    IHashComputation IHashComputation_iface;
++    LONG ref;
++    BCRYPT_HASH_HANDLE handle;
++    ULONG length;
++};
++
++static inline struct hash *impl_from_IHashComputation( IHashComputation *iface )
++{
++    return CONTAINING_RECORD( iface, struct hash, IHashComputation_iface );
++}
++
++static HRESULT WINAPI hash_QueryInterface( IHashComputation *iface, REFIID iid, void **out )
++{
++    struct hash *impl = impl_from_IHashComputation( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IHashComputation ))
++    {
++        InterlockedIncrement( &impl->ref );
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI hash_AddRef( IHashComputation *iface ) { return InterlockedIncrement( &impl_from_IHashComputation( iface )->ref ); }
++static ULONG WINAPI hash_Release( IHashComputation *iface )
++{
++    struct hash *impl = impl_from_IHashComputation( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        BCryptDestroyHash( impl->handle );
++        free( impl );
++    }
++    return ref;
++}
++static HRESULT WINAPI hash_GetIids( IHashComputation *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI hash_GetRuntimeClassName( IHashComputation *iface, HSTRING *name )
++{
++    return WindowsCreateString( L"Windows.Security.Cryptography.Core.CryptographicHash", 52, name );
++}
++static HRESULT WINAPI hash_GetTrustLevel( IHashComputation *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI hash_Append( IHashComputation *iface, IBuffer *data )
++{
++    struct hash *impl = impl_from_IHashComputation( iface );
++    UINT32 length;
++    BYTE *bytes;
++    HRESULT hr;
++
++    TRACE( "iface %p, data %p.\n", iface, data );
++    if (FAILED(hr = buffer_bytes( data, &bytes, &length ))) return hr;
++    if (length && BCryptHashData( impl->handle, bytes, length, 0 )) return E_FAIL;
++    return S_OK;
++}
++
++static HRESULT WINAPI hash_GetValueAndReset( IHashComputation *iface, IBuffer **value )
++{
++    struct hash *impl = impl_from_IHashComputation( iface );
++    BYTE digest[64];
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    /* BCryptFinishHash leaves a reusable hash object ready for new data */
++    if (BCryptFinishHash( impl->handle, digest, impl->length, 0 )) return E_FAIL;
++    return create_buffer( digest, impl->length, value );
++}
++
++static const IHashComputationVtbl hash_vtbl =
++{
++    hash_QueryInterface, hash_AddRef, hash_Release,
++    hash_GetIids, hash_GetRuntimeClassName, hash_GetTrustLevel,
++    hash_Append, hash_GetValueAndReset,
++};
++
++/* ---- HashAlgorithmProvider ---- */
++
++struct provider
++{
++    IHashAlgorithmProvider IHashAlgorithmProvider_iface;
++    LONG ref;
++    BCRYPT_ALG_HANDLE alg;
++    ULONG length;
++    int index;
++};
++
++static inline struct provider *impl_from_IHashAlgorithmProvider( IHashAlgorithmProvider *iface )
++{
++    return CONTAINING_RECORD( iface, struct provider, IHashAlgorithmProvider_iface );
++}
++
++static HRESULT WINAPI provider_QueryInterface( IHashAlgorithmProvider *iface, REFIID iid, void **out )
++{
++    struct provider *impl = impl_from_IHashAlgorithmProvider( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IHashAlgorithmProvider ))
++    {
++        InterlockedIncrement( &impl->ref );
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI provider_AddRef( IHashAlgorithmProvider *iface ) { return InterlockedIncrement( &impl_from_IHashAlgorithmProvider( iface )->ref ); }
++static ULONG WINAPI provider_Release( IHashAlgorithmProvider *iface )
++{
++    struct provider *impl = impl_from_IHashAlgorithmProvider( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        BCryptCloseAlgorithmProvider( impl->alg, 0 );
++        free( impl );
++    }
++    return ref;
++}
++static HRESULT WINAPI provider_GetIids( IHashAlgorithmProvider *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI provider_GetRuntimeClassName( IHashAlgorithmProvider *iface, HSTRING *name )
++{
++    return WindowsCreateString( L"Windows.Security.Cryptography.Core.HashAlgorithmProvider", 56, name );
++}
++static HRESULT WINAPI provider_GetTrustLevel( IHashAlgorithmProvider *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI provider_get_AlgorithmName( IHashAlgorithmProvider *iface, HSTRING *value )
++{
++    return name_string( impl_from_IHashAlgorithmProvider( iface )->index, value );
++}
++
++static HRESULT WINAPI provider_get_HashLength( IHashAlgorithmProvider *iface, UINT32 *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IHashAlgorithmProvider( iface )->length;
++    return S_OK;
++}
++
++static HRESULT WINAPI provider_HashData( IHashAlgorithmProvider *iface, IBuffer *data, IBuffer **value )
++{
++    struct provider *impl = impl_from_IHashAlgorithmProvider( iface );
++    BYTE digest[64];
++    UINT32 length;
++    BYTE *bytes;
++    HRESULT hr;
++
++    TRACE( "iface %p, data %p, value %p.\n", iface, data, value );
++    if (!value) return E_POINTER;
++    if (FAILED(hr = buffer_bytes( data, &bytes, &length ))) return hr;
++    if (BCryptHash( impl->alg, NULL, 0, bytes, length, digest, impl->length )) return E_FAIL;
++    return create_buffer( digest, impl->length, value );
++}
++
++static HRESULT WINAPI provider_CreateHash( IHashAlgorithmProvider *iface, IHashComputation **value )
++{
++    struct provider *impl = impl_from_IHashAlgorithmProvider( iface );
++    struct hash *hash;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    if (!(hash = calloc( 1, sizeof(*hash) ))) return E_OUTOFMEMORY;
++    if (BCryptCreateHash( impl->alg, &hash->handle, NULL, 0, NULL, 0, BCRYPT_HASH_REUSABLE_FLAG ))
++    {
++        free( hash );
++        return E_FAIL;
++    }
++    hash->IHashComputation_iface.lpVtbl = &hash_vtbl;
++    hash->ref = 1;
++    hash->length = impl->length;
++    *value = &hash->IHashComputation_iface;
++    return S_OK;
++}
++
++static const IHashAlgorithmProviderVtbl provider_vtbl =
++{
++    provider_QueryInterface, provider_AddRef, provider_Release,
++    provider_GetIids, provider_GetRuntimeClassName, provider_GetTrustLevel,
++    provider_get_AlgorithmName, provider_get_HashLength, provider_HashData, provider_CreateHash,
++};
++
++/* ---- HashAlgorithmProvider statics ---- */
++
++struct provider_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IHashAlgorithmProviderStatics IHashAlgorithmProviderStatics_iface;
++};
++
++static inline struct provider_statics *provider_statics_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct provider_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI provider_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct provider_statics *impl = provider_statics_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IHashAlgorithmProviderStatics ))
++        *out = &impl->IHashAlgorithmProviderStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static const IActivationFactoryVtbl provider_factory_vtbl =
++{
++    provider_factory_QueryInterface, names_factory_AddRef, names_factory_Release,
++    factory_GetIids, factory_GetRuntimeClassName, factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++static inline struct provider_statics *provider_statics_from_statics( IHashAlgorithmProviderStatics *iface )
++{
++    return CONTAINING_RECORD( iface, struct provider_statics, IHashAlgorithmProviderStatics_iface );
++}
++static HRESULT WINAPI provider_statics_QueryInterface( IHashAlgorithmProviderStatics *iface, REFIID iid, void **out )
++{
++    return provider_factory_QueryInterface( &provider_statics_from_statics( iface )->IActivationFactory_iface, iid, out );
++}
++static ULONG WINAPI provider_statics_AddRef( IHashAlgorithmProviderStatics *iface ) { return 2; }
++static ULONG WINAPI provider_statics_Release( IHashAlgorithmProviderStatics *iface ) { return 1; }
++static HRESULT WINAPI provider_statics_GetIids( IHashAlgorithmProviderStatics *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI provider_statics_GetRuntimeClassName( IHashAlgorithmProviderStatics *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI provider_statics_GetTrustLevel( IHashAlgorithmProviderStatics *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI provider_statics_OpenAlgorithm( IHashAlgorithmProviderStatics *iface, HSTRING algorithm, IHashAlgorithmProvider **value )
++{
++    const WCHAR *name = WindowsGetStringRawBuffer( algorithm, NULL );
++    struct provider *impl;
++    ULONG size;
++    int i;
++
++    TRACE( "iface %p, algorithm %s, value %p.\n", iface, debugstr_hstring(algorithm), value );
++
++    if (!value) return E_POINTER;
++    for (i = 0; i < ARRAY_SIZE(algorithms); i++) if (!wcsicmp( name, algorithms[i].name )) break;
++    if (i == ARRAY_SIZE(algorithms))
++    {
++        FIXME( "algorithm %s not supported.\n", debugstr_w(name) );
++        return NTE_NOT_SUPPORTED;
++    }
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    if (BCryptOpenAlgorithmProvider( &impl->alg, algorithms[i].bcrypt, NULL, BCRYPT_HASH_REUSABLE_FLAG ) ||
++        BCryptGetProperty( impl->alg, BCRYPT_HASH_LENGTH, (BYTE *)&impl->length, sizeof(impl->length), &size, 0 ))
++    {
++        if (impl->alg) BCryptCloseAlgorithmProvider( impl->alg, 0 );
++        free( impl );
++        return E_FAIL;
++    }
++    impl->IHashAlgorithmProvider_iface.lpVtbl = &provider_vtbl;
++    impl->ref = 1;
++    impl->index = i;
++    *value = &impl->IHashAlgorithmProvider_iface;
++    return S_OK;
++}
++
++static const IHashAlgorithmProviderStaticsVtbl provider_statics_vtbl =
++{
++    provider_statics_QueryInterface, provider_statics_AddRef, provider_statics_Release,
++    provider_statics_GetIids, provider_statics_GetRuntimeClassName, provider_statics_GetTrustLevel,
++    provider_statics_OpenAlgorithm,
++};
++
++static struct provider_statics provider_statics = { {&provider_factory_vtbl}, {&provider_statics_vtbl} };
++IActivationFactory *hash_provider_factory = &provider_statics.IActivationFactory_iface;
+diff --git a/dlls/cryptowinrt/main.c b/dlls/cryptowinrt/main.c
+index a6899f7..450983c 100644
+--- a/dlls/cryptowinrt/main.c
++++ b/dlls/cryptowinrt/main.c
+@@ -137,7 +137,7 @@ static const struct IActivationFactoryVtbl cryptobuffer_factory_vtbl =
+ };
+ 
+ /* the bytes of a buffer the app passed in; an empty buffer gives no bytes */
+-static HRESULT buffer_bytes( IBuffer *buffer, BYTE **data, UINT32 *length )
++HRESULT buffer_bytes( IBuffer *buffer, BYTE **data, UINT32 *length )
+ {
+     IBufferByteAccess *access;
+     HRESULT hr;
+@@ -154,7 +154,7 @@ static HRESULT buffer_bytes( IBuffer *buffer, BYTE **data, UINT32 *length )
+ }
+ 
+ /* a new Windows.Storage.Streams.Buffer holding a copy of the given bytes */
+-static HRESULT create_buffer( const void *data, UINT32 length, IBuffer **out )
++HRESULT create_buffer( const void *data, UINT32 length, IBuffer **out )
+ {
+     static const WCHAR class_name[] = L"Windows.Storage.Streams.Buffer";
+     IBufferFactory *factory;
+@@ -514,6 +514,10 @@ HRESULT WINAPI DllGetActivationFactory(HSTRING classid, IActivationFactory **fac
+ 
+     if (!wcscmp(name, RuntimeClass_Windows_Security_Cryptography_CryptographicBuffer))
+         IActivationFactory_QueryInterface(cryptobuffer_activation_factory, &IID_IActivationFactory, (void **)factory);
++    if (!wcscmp(name, L"Windows.Security.Cryptography.Core.HashAlgorithmNames"))
++        IActivationFactory_QueryInterface(hash_names_factory, &IID_IActivationFactory, (void **)factory);
++    if (!wcscmp(name, L"Windows.Security.Cryptography.Core.HashAlgorithmProvider"))
++        IActivationFactory_QueryInterface(hash_provider_factory, &IID_IActivationFactory, (void **)factory);
+     if (!wcscmp(name, RuntimeClass_Windows_Security_Credentials_KeyCredentialManager))
+         IActivationFactory_QueryInterface(credentials_activation_factory, &IID_IActivationFactory, (void **)factory);
+ 
+diff --git a/dlls/cryptowinrt/private.h b/dlls/cryptowinrt/private.h
+index f48b8e7..ffad039 100644
+--- a/dlls/cryptowinrt/private.h
++++ b/dlls/cryptowinrt/private.h
+@@ -84,4 +84,9 @@ extern HRESULT async_operation_boolean_create( IUnknown *invoker, IUnknown *para
+ #define DEFINE_IINSPECTABLE_OUTER( pfx, iface_type, impl_type, outer_iface )                       \
+     DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from_##iface_type, iface_type##_iface, impl->outer_iface )
+ 
++extern HRESULT buffer_bytes( IBuffer *buffer, BYTE **data, UINT32 *length );
++extern HRESULT create_buffer( const void *data, UINT32 length, IBuffer **out );
++extern IActivationFactory *hash_names_factory;
++extern IActivationFactory *hash_provider_factory;
++
+ #endif
+diff --git a/include/windows.security.cryptography.core.idl b/include/windows.security.cryptography.core.idl
+index 48a7f4c..4917c9c 100644
+--- a/include/windows.security.cryptography.core.idl
++++ b/include/windows.security.cryptography.core.idl
+@@ -44,3 +44,97 @@ namespace Windows.Security.Cryptography.Core {
+         BCryptEccFullPublicKey   = 4,
+     };
+ }
++
++namespace Windows.Security.Cryptography.Core {
++    runtimeclass CryptographicHash;
++    runtimeclass HashAlgorithmNames;
++    runtimeclass HashAlgorithmProvider;
++    interface IHashAlgorithmNamesStatics;
++    interface IHashAlgorithmProvider;
++    interface IHashAlgorithmProviderStatics;
++    interface IHashComputation;
++}
++
++namespace Windows.Security.Cryptography.Core {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Security.Cryptography.Core.HashAlgorithmNames),
++        uuid(6b5e0516-de96-4f0a-8d57-dcc9dae36c76)
++    ]
++    interface IHashAlgorithmNamesStatics : IInspectable
++    {
++        [propget] HRESULT Md5([out, retval] HSTRING *value);
++        [propget] HRESULT Sha1([out, retval] HSTRING *value);
++        [propget] HRESULT Sha256([out, retval] HSTRING *value);
++        [propget] HRESULT Sha384([out, retval] HSTRING *value);
++        [propget] HRESULT Sha512([out, retval] HSTRING *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Security.Cryptography.Core.HashAlgorithmProvider),
++        uuid(be9b3080-b2c3-422b-bce1-ec90efb5d7b5)
++    ]
++    interface IHashAlgorithmProvider : IInspectable
++    {
++        [propget] HRESULT AlgorithmName([out, retval] HSTRING *value);
++        [propget] HRESULT HashLength([out, retval] UINT32 *value);
++        HRESULT HashData([in] Windows.Storage.Streams.IBuffer * data, [out, retval] Windows.Storage.Streams.IBuffer * *value);
++        HRESULT CreateHash([out, retval] Windows.Security.Cryptography.Core.CryptographicHash * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Security.Cryptography.Core.HashAlgorithmProvider),
++        uuid(9fac9741-5cc4-4336-ae38-6212b75a915a)
++    ]
++    interface IHashAlgorithmProviderStatics : IInspectable
++    {
++        HRESULT OpenAlgorithm([in] HSTRING algorithm, [out, retval] Windows.Security.Cryptography.Core.HashAlgorithmProvider * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Security.Cryptography.Core.CryptographicHash),
++        uuid(5904d1b6-ad31-4603-a3a4-b1bda98e2562)
++    ]
++    interface IHashComputation : IInspectable
++    {
++        HRESULT Append([in] Windows.Storage.Streams.IBuffer * data);
++        HRESULT GetValueAndReset([out, retval] Windows.Storage.Streams.IBuffer * *value);
++    }
++
++}
++
++namespace Windows.Security.Cryptography.Core {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile)
++    ]
++    runtimeclass CryptographicHash
++    {
++        [default] interface Windows.Security.Cryptography.Core.IHashComputation;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.Security.Cryptography.Core.IHashAlgorithmNamesStatics, Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass HashAlgorithmNames
++    {
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.Security.Cryptography.Core.IHashAlgorithmProviderStatics, Windows.Foundation.UniversalApiContract, 1.0),
++        threading(both)
++    ]
++    runtimeclass HashAlgorithmProvider
++    {
++        [default] interface Windows.Security.Cryptography.Core.IHashAlgorithmProvider;
++    }
++
++}
++
