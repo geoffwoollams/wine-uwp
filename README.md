@@ -22,7 +22,7 @@ UWP apps don't create a normal Win32 window. They ask Windows for a `CoreApplica
 | ✅ | Microsoft Minesweeper (`Microsoft.MicrosoftMinesweeper`, Unity, XAML, .NET Native) | Playable offline: menus and Classic games with mouse clicks, flags and local saves. Needs `mrt100.dll` (see [framework packages](#set-up-an-app)). After the tutorial, each start waits about 30 seconds on "Downloading Game Data" while its Xbox cloud saves fail as offline. No ads, achievements or cloud saves. |
 | ✅ | Microsoft Sudoku (`Microsoft.MicrosoftSudoku`, Unity 6, XAML, .NET Native) | Playable offline: the tutorial and puzzles with the mouse. Its Xbox cloud sync and ads fail as offline. |
 | ✅ | Minecraft for Windows 1.21.114 and 1.19.83 (`Microsoft.MinecraftUWP`, D3D11) | Starts and plays offline: menus, worlds. Xbox sign-in and online features fail as offline. |
-| ❌ | Microsoft Mahjong (`Microsoft.MicrosoftMahjong`, XAML, .NET Native) | Not working yet: it gets past the offline questions, then stays on its loading screen. |
+| ✅ | Microsoft Mahjong (`Microsoft.MicrosoftMahjong`, XAML, .NET Native) | Playable offline: answer "OK" and "Play Offline" at the download questions, then menus and games with the mouse and keyboard. Its Xbox sign-in, downloads and ads fail as offline. |
 | ❓ | Microsoft Solitaire Collection, Wordament (`Microsoft.MicrosoftSolitaireCollection`, `Microsoft.Studios.Wordament`) | Not tested yet. |
 | ❌ | Forza Motorsport 7 (`Microsoft.ApolloBaseGame`, D3D12) | Not working: it starts and its hardware warning is answered, but it isn't playable yet. |
 | ❌ | Windows Calculator (`Microsoft.WindowsCalculator`, XAML, WinUI 2.8) | Not working: stops at startup. It needs XAML's dependency-property system and the WinUI 2 control library, which the partial XAML doesn't support yet. |
@@ -183,7 +183,7 @@ Local files and settings are written where Windows would put them, inside the pr
 - **No add-ons.** Wine has no Store client, so only the app's own licence is reported; add-ons and DLC that require a licence are unavailable.
 - **Xbox cloud saves stay on this PC.** Nothing is synchronised with Xbox Live, so saves from Windows or Xbox do not appear, and the reverse.
 - **The screen can still blank.** `DisplayRequest` asks Wine to keep the display on, but Wine 11.22 does not pass that on to the desktop, so a screensaver or display power-off may still happen.
-- **Fullscreen or windowed is chosen at launch.** The window is created borderless at your screen's resolution (or as a 1280x720 window with `WINE_CORE_WINDOWED=1`) and is not resized while you play, because resizing a mapped window under its Vulkan swapchain can leave it without mouse input under XWayland. An app's own windowed-mode option may lose the mouse the same way; set `WINE_CORE_WINDOWED=1` instead.
+- **Fullscreen or windowed is chosen at launch.** The window is created borderless at your screen's resolution, or as a 1280x720 window with a title bar with `WINE_CORE_WINDOWED=1` or when the app last asked to launch windowed (its `PreferredLaunchWindowingMode`, which casual games such as Minesweeper set; it is kept per app in `HKCU\Software\Wine\WindowsRuntime\Packages\<package name>`). Its style is not changed while you play, because resizing a mapped window under its Vulkan swapchain can leave it without mouse input under XWayland. An app's own windowed-mode option may lose the mouse the same way; set `WINE_CORE_WINDOWED=1` instead.
 - **Resource strings.** `ms-resource:` names in the manifest are not resolved (no `resources.pri` support), so an app with such a display name gets its package name as the window title.
 - **Only D3D12 apps are covered** by the graphics setup; D3D11 or other renderers on a CoreWindow are untested.
 
@@ -305,7 +305,8 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 SpatialAudio classes, device information, CoreTextEditContext2, 0099 game controllers: a
                 controller's User and its events (Minecraft stopped when a pad was connected), 0100 ResourceManager over
                 the package's resources.pri (.NET Native's resx strings; Mahjong stopped after "Play Offline"), 0101
-                relative paths in StorageFolder.GetFileAsync and the like
+                relative paths in StorageFolder.GetFileAsync and the like, 0102-0105 for Mahjong: AppInfo,
+                DateTimeFormatter, KeyRoutedEventArgs.OriginalKey, and a title bar for apps launched windowed
 patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings

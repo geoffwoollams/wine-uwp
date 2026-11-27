@@ -1,0 +1,1099 @@
+Subject: windows.globalization: DateTimeFormatter for templates and patterns
+
+diff --git a/dlls/windows.globalization/Makefile.in b/dlls/windows.globalization/Makefile.in
+index 1410076..e77294f 100644
+--- a/dlls/windows.globalization/Makefile.in
++++ b/dlls/windows.globalization/Makefile.in
+@@ -3,5 +3,6 @@ IMPORTS = combase uuid
+ 
+ SOURCES = \
+ 	classes.idl \
++	datetime_formatter.c \
+ 	geographic_region.c \
+ 	main.c
+diff --git a/dlls/windows.globalization/classes.idl b/dlls/windows.globalization/classes.idl
+index 1a295fe..ed5b89c 100644
+--- a/dlls/windows.globalization/classes.idl
++++ b/dlls/windows.globalization/classes.idl
+@@ -29,6 +29,7 @@ import "windows.foundation.idl";
+ import "windows.system.idl";
+ import "windows.globalization.idl";
+ import "windows.system.userprofile.idl";
++import "windows.globalization.datetimeformatting.idl";
+ 
+ namespace Windows.System.UserProfile {
+     runtimeclass GlobalizationPreferences;
+@@ -38,3 +39,6 @@ namespace Windows.Globalization {
+     runtimeclass GeographicRegion;
+     runtimeclass ApplicationLanguages;
+ }
++namespace Windows.Globalization.DateTimeFormatting {
++    runtimeclass DateTimeFormatter;
++}
+diff --git a/dlls/windows.globalization/datetime_formatter.c b/dlls/windows.globalization/datetime_formatter.c
+new file mode 100644
+index 0000000..055b38d
+--- /dev/null
++++ b/dlls/windows.globalization/datetime_formatter.c
+@@ -0,0 +1,806 @@
++/* WinRT Windows.Globalization.DateTimeFormatting.DateTimeFormatter
++ *
++ * Dates and times are formatted for the user's locale with GetDateFormatEx and GetTimeFormatEx, in the local time
++ * zone. A template is either keywords ("shortdate", "longtime", "month day", "dayofweek.full", ...), shown in the
++ * locale's own formats, or a pattern ("{month.full} {day.integer}"), whose parts are formatted one by one.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#include "initguid.h"
++#define WIDL_using_Windows_Globalization_DateTimeFormatting
++#include "windows.globalization.datetimeformatting.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(locale);
++
++/* ---- IVectorView<String> of one string: Languages and Patterns ---- */
++
++struct string_view
++{
++    IVectorView_HSTRING IVectorView_HSTRING_iface;
++    LONG ref;
++    HSTRING str;
++};
++
++static inline struct string_view *impl_from_IVectorView_HSTRING( IVectorView_HSTRING *iface )
++{
++    return CONTAINING_RECORD( iface, struct string_view, IVectorView_HSTRING_iface );
++}
++
++static HRESULT WINAPI view_QueryInterface( IVectorView_HSTRING *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IVectorView_HSTRING ))
++    {
++        IVectorView_HSTRING_AddRef( iface );
++        *out = iface;
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI view_AddRef( IVectorView_HSTRING *iface )
++{
++    return InterlockedIncrement( &impl_from_IVectorView_HSTRING( iface )->ref );
++}
++
++static ULONG WINAPI view_Release( IVectorView_HSTRING *iface )
++{
++    struct string_view *impl = impl_from_IVectorView_HSTRING( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        WindowsDeleteString( impl->str );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI view_GetIids( IVectorView_HSTRING *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI view_GetRuntimeClassName( IVectorView_HSTRING *iface, HSTRING *name ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI view_GetTrustLevel( IVectorView_HSTRING *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI view_GetAt( IVectorView_HSTRING *iface, UINT32 index, HSTRING *value )
++{
++    *value = NULL;
++    if (index) return E_BOUNDS;
++    return WindowsDuplicateString( impl_from_IVectorView_HSTRING( iface )->str, value );
++}
++
++static HRESULT WINAPI view_get_Size( IVectorView_HSTRING *iface, UINT32 *value )
++{
++    *value = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI view_IndexOf( IVectorView_HSTRING *iface, HSTRING element, UINT32 *index, boolean *found )
++{
++    INT32 order = 1;
++    WindowsCompareStringOrdinal( element, impl_from_IVectorView_HSTRING( iface )->str, &order );
++    *index = 0;
++    *found = !order;
++    return S_OK;
++}
++
++static HRESULT WINAPI view_GetMany( IVectorView_HSTRING *iface, UINT32 start, UINT32 size, HSTRING *items, UINT32 *count )
++{
++    *count = 0;
++    if (start || !size) return S_OK;
++    *count = 1;
++    return WindowsDuplicateString( impl_from_IVectorView_HSTRING( iface )->str, items );
++}
++
++static const struct IVectorView_HSTRINGVtbl view_vtbl =
++{
++    view_QueryInterface,
++    view_AddRef,
++    view_Release,
++    view_GetIids,
++    view_GetRuntimeClassName,
++    view_GetTrustLevel,
++    view_GetAt,
++    view_get_Size,
++    view_IndexOf,
++    view_GetMany,
++};
++
++static HRESULT string_view_create( const WCHAR *str, IVectorView_HSTRING **out )
++{
++    struct string_view *impl;
++    HRESULT hr;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IVectorView_HSTRING_iface.lpVtbl = &view_vtbl;
++    impl->ref = 1;
++    if (FAILED(hr = WindowsCreateString( str, wcslen( str ), &impl->str )))
++    {
++        free( impl );
++        return hr;
++    }
++    *out = &impl->IVectorView_HSTRING_iface;
++    return S_OK;
++}
++
++/* ---- DateTimeFormatter ---- */
++
++struct formatter
++{
++    IDateTimeFormatter IDateTimeFormatter_iface;
++    IDateTimeFormatter2 IDateTimeFormatter2_iface;
++    LONG ref;
++    WCHAR *template;    /* as given, or made from the parts below */
++    BOOL pattern;       /* the template is a {pattern} */
++    YearFormat year;
++    MonthFormat month;
++    DayFormat day;
++    DayOfWeekFormat day_of_week;
++    HourFormat hour;
++    MinuteFormat minute;
++    SecondFormat second;
++    WCHAR locale[LOCALE_NAME_MAX_LENGTH];
++};
++
++static inline struct formatter *impl_from_IDateTimeFormatter( IDateTimeFormatter *iface )
++{
++    return CONTAINING_RECORD( iface, struct formatter, IDateTimeFormatter_iface );
++}
++
++static HRESULT WINAPI formatter_QueryInterface( IDateTimeFormatter *iface, REFIID iid, void **out )
++{
++    struct formatter *impl = impl_from_IDateTimeFormatter( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IDateTimeFormatter ))
++        *out = &impl->IDateTimeFormatter_iface;
++    else if (IsEqualGUID( iid, &IID_IDateTimeFormatter2 ))
++        *out = &impl->IDateTimeFormatter2_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI formatter_AddRef( IDateTimeFormatter *iface )
++{
++    return InterlockedIncrement( &impl_from_IDateTimeFormatter( iface )->ref );
++}
++
++static ULONG WINAPI formatter_Release( IDateTimeFormatter *iface )
++{
++    struct formatter *impl = impl_from_IDateTimeFormatter( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        free( impl->template );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI formatter_GetIids( IDateTimeFormatter *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI formatter_GetRuntimeClassName( IDateTimeFormatter *iface, HSTRING *name )
++{
++    return WindowsCreateString( RuntimeClass_Windows_Globalization_DateTimeFormatting_DateTimeFormatter,
++                                wcslen( RuntimeClass_Windows_Globalization_DateTimeFormatting_DateTimeFormatter ), name );
++}
++
++static HRESULT WINAPI formatter_GetTrustLevel( IDateTimeFormatter *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI formatter_get_Languages( IDateTimeFormatter *iface, IVectorView_HSTRING **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return string_view_create( impl_from_IDateTimeFormatter( iface )->locale, value );
++}
++
++static HRESULT region( struct formatter *impl, HSTRING *value )
++{
++    WCHAR name[16];
++    if (!GetLocaleInfoEx( impl->locale, LOCALE_SISO3166CTRYNAME, name, ARRAY_SIZE(name) )) lstrcpyW( name, L"US" );
++    return WindowsCreateString( name, wcslen( name ), value );
++}
++
++static HRESULT WINAPI formatter_get_GeographicRegion( IDateTimeFormatter *iface, HSTRING *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return region( impl_from_IDateTimeFormatter( iface ), value );
++}
++
++static HRESULT WINAPI formatter_get_Calendar( IDateTimeFormatter *iface, HSTRING *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return WindowsCreateString( L"GregorianCalendar", 17, value );
++}
++
++static HRESULT WINAPI formatter_get_Clock( IDateTimeFormatter *iface, HSTRING *value )
++{
++    struct formatter *impl = impl_from_IDateTimeFormatter( iface );
++    WCHAR format[80];
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    /* a time format with H (not h) is a 24-hour clock */
++    if (GetLocaleInfoEx( impl->locale, LOCALE_STIMEFORMAT, format, ARRAY_SIZE(format) ) && wcschr( format, 'H' ))
++        return WindowsCreateString( L"24HourClock", 11, value );
++    return WindowsCreateString( L"12HourClock", 11, value );
++}
++
++static HRESULT WINAPI formatter_get_NumeralSystem( IDateTimeFormatter *iface, HSTRING *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return WindowsCreateString( L"Latn", 4, value );
++}
++
++static HRESULT WINAPI formatter_put_NumeralSystem( IDateTimeFormatter *iface, HSTRING value )
++{
++    FIXME( "iface %p, value %s: only Latn digits.\n", iface, debugstr_hstring(value) );
++    return S_OK;
++}
++
++static HRESULT WINAPI formatter_get_Patterns( IDateTimeFormatter *iface, IVectorView_HSTRING **value )
++{
++    struct formatter *impl = impl_from_IDateTimeFormatter( iface );
++    FIXME( "iface %p, value %p: the template %s.\n", iface, value, debugstr_w(impl->template) );
++    return string_view_create( impl->template, value );
++}
++
++static HRESULT WINAPI formatter_get_Template( IDateTimeFormatter *iface, HSTRING *value )
++{
++    struct formatter *impl = impl_from_IDateTimeFormatter( iface );
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return WindowsCreateString( impl->template, wcslen( impl->template ), value );
++}
++
++/* appends the formatted date (date format picture) or time (time picture) to buf */
++static void append( WCHAR *buf, SIZE_T size, const WCHAR *locale, const SYSTEMTIME *st, BOOL time, DWORD flags,
++                    const WCHAR *picture )
++{
++    SIZE_T len = wcslen( buf );
++    if (len + 1 >= size) return;
++    if (time) GetTimeFormatEx( locale, flags, st, picture, buf + len, size - len );
++    else GetDateFormatEx( locale, flags, st, picture, buf + len, size - len, NULL );
++}
++
++static void append_text( WCHAR *buf, SIZE_T size, const WCHAR *text, SIZE_T count )
++{
++    SIZE_T len = wcslen( buf );
++    if (len + count + 1 > size) count = size - len - 1;
++    memcpy( buf + len, text, count * sizeof(WCHAR) );
++    buf[len + count] = 0;
++}
++
++/* one {part} of a pattern: "month.full", "day.integer(2)", "hour", "period.abbreviated", ... */
++static void format_part( WCHAR *buf, SIZE_T size, const WCHAR *locale, const SYSTEMTIME *st, const WCHAR *part, SIZE_T len )
++{
++    static const struct { const WCHAR *name; BOOL time; const WCHAR *picture; } parts[] =
++    {
++        { L"year.full", FALSE, L"yyyy" }, { L"year.abbreviated", FALSE, L"yy" }, { L"year", FALSE, L"yyyy" },
++        { L"month.full", FALSE, L"MMMM" }, { L"month.abbreviated", FALSE, L"MMM" }, { L"month.solo.full", FALSE, L"MMMM" },
++        { L"month.solo.abbreviated", FALSE, L"MMM" }, { L"month.integer(2)", FALSE, L"MM" },
++        { L"month.integer", FALSE, L"M" }, { L"month", FALSE, L"MMMM" },
++        { L"day.integer(2)", FALSE, L"dd" }, { L"day.integer", FALSE, L"d" }, { L"day", FALSE, L"d" },
++        { L"dayofweek.full", FALSE, L"dddd" }, { L"dayofweek.abbreviated", FALSE, L"ddd" },
++        { L"dayofweek.solo.full", FALSE, L"dddd" }, { L"dayofweek.solo.abbreviated", FALSE, L"ddd" },
++        { L"dayofweek", FALSE, L"dddd" },
++        { L"hour.integer(2)", TRUE, L"hh" }, { L"hour.integer", TRUE, L"h" }, { L"hour", TRUE, L"h" },
++        { L"minute.integer(2)", TRUE, L"mm" }, { L"minute.integer", TRUE, L"m" }, { L"minute", TRUE, L"mm" },
++        { L"second.integer(2)", TRUE, L"ss" }, { L"second.integer", TRUE, L"s" }, { L"second", TRUE, L"ss" },
++        { L"period.abbreviated", TRUE, L"tt" }, { L"period", TRUE, L"tt" },
++    };
++    UINT i;
++
++    for (i = 0; i < ARRAY_SIZE(parts); i++)
++    {
++        if (wcslen( parts[i].name ) != len || wcsnicmp( parts[i].name, part, len )) continue;
++        append( buf, size, locale, st, parts[i].time, 0, parts[i].picture );
++        return;
++    }
++    FIXME( "unknown pattern part %s.\n", debugstr_wn(part, len) );
++}
++
++static void format_pattern( struct formatter *impl, const SYSTEMTIME *st, WCHAR *buf, SIZE_T size )
++{
++    const WCHAR *p = impl->template, *end;
++
++    while (*p)
++    {
++        if (*p == '{' && (end = wcschr( p, '}' )))
++        {
++            format_part( buf, size, impl->locale, st, p + 1, end - p - 1 );
++            p = end + 1;
++        }
++        else
++        {
++            SIZE_T n = wcscspn( p, L"{" );
++            if (!n) n = 1;
++            append_text( buf, size, p, n );
++            p += n;
++        }
++    }
++}
++
++/* the locale's own formats for the parts asked for */
++static void format_parts( struct formatter *impl, const SYSTEMTIME *st, WCHAR *buf, SIZE_T size )
++{
++    BOOL year = impl->year != YearFormat_None, month = impl->month != MonthFormat_None;
++    BOOL day = impl->day != DayFormat_None, dow = impl->day_of_week != DayOfWeekFormat_None;
++    BOOL date = year || month || day || dow;
++
++    if (year && month && day)
++    {
++        if (dow || impl->month == MonthFormat_Full || impl->month == MonthFormat_Abbreviated)
++            append( buf, size, impl->locale, st, FALSE, DATE_LONGDATE, NULL );
++        else append( buf, size, impl->locale, st, FALSE, DATE_SHORTDATE, NULL );
++    }
++    else if (year && month) append( buf, size, impl->locale, st, FALSE, DATE_YEARMONTH, NULL );
++    else if (month && day)
++    {
++        append( buf, size, impl->locale, st, FALSE, 0,
++                impl->month == MonthFormat_Numeric ? L"M/d" : impl->month == MonthFormat_Abbreviated ? L"MMM d" : L"MMMM d" );
++    }
++    else
++    {
++        if (dow) append( buf, size, impl->locale, st, FALSE, 0, impl->day_of_week == DayOfWeekFormat_Abbreviated ? L"ddd" : L"dddd" );
++        if (month)
++        {
++            if (dow) append_text( buf, size, L" ", 1 );
++            append( buf, size, impl->locale, st, FALSE, 0, impl->month == MonthFormat_Numeric ? L"M" :
++                    impl->month == MonthFormat_Abbreviated ? L"MMM" : L"MMMM" );
++        }
++        if (day)
++        {
++            if (dow || month) append_text( buf, size, L" ", 1 );
++            append( buf, size, impl->locale, st, FALSE, 0, L"d" );
++        }
++        if (year)
++        {
++            if (dow || month || day) append_text( buf, size, L" ", 1 );
++            append( buf, size, impl->locale, st, FALSE, 0, impl->year == YearFormat_Abbreviated ? L"yy" : L"yyyy" );
++        }
++    }
++
++    if (impl->hour != HourFormat_None || impl->minute != MinuteFormat_None || impl->second != SecondFormat_None)
++    {
++        if (date) append_text( buf, size, L" ", 1 );
++        if (impl->hour != HourFormat_None && impl->minute != MinuteFormat_None)
++            append( buf, size, impl->locale, st, TRUE, impl->second != SecondFormat_None ? 0 : TIME_NOSECONDS, NULL );
++        else if (impl->hour != HourFormat_None) append( buf, size, impl->locale, st, TRUE, TIME_NOMINUTESORSECONDS, NULL );
++        else
++        {
++            if (impl->minute != MinuteFormat_None) append( buf, size, impl->locale, st, TRUE, 0, L"mm" );
++            if (impl->second != SecondFormat_None) append( buf, size, impl->locale, st, TRUE, 0, L"ss" );
++        }
++    }
++}
++
++static HRESULT format( struct formatter *impl, DateTime value, HSTRING *result )
++{
++    SYSTEMTIME utc, local;
++    FILETIME ft;
++    WCHAR buf[256] = {0};
++
++    ft.dwLowDateTime = value.UniversalTime;
++    ft.dwHighDateTime = value.UniversalTime >> 32;
++    if (!FileTimeToSystemTime( &ft, &utc ) || !SystemTimeToTzSpecificLocalTime( NULL, &utc, &local ))
++        return E_INVALIDARG;
++    if (impl->pattern) format_pattern( impl, &local, buf, ARRAY_SIZE(buf) );
++    else format_parts( impl, &local, buf, ARRAY_SIZE(buf) );
++    TRACE( "%s: %s.\n", debugstr_w(impl->template), debugstr_w(buf) );
++    return WindowsCreateString( buf, wcslen( buf ), result );
++}
++
++static HRESULT WINAPI formatter_Format( IDateTimeFormatter *iface, DateTime value, HSTRING *result )
++{
++    TRACE( "iface %p, value %I64d, result %p.\n", iface, value.UniversalTime, result );
++    return format( impl_from_IDateTimeFormatter( iface ), value, result );
++}
++
++#define GETTER( name, type, field ) \
++    static HRESULT WINAPI formatter_get_##name( IDateTimeFormatter *iface, type *value ) \
++    { \
++        TRACE( "iface %p, value %p.\n", iface, value ); \
++        *value = impl_from_IDateTimeFormatter( iface )->field; \
++        return S_OK; \
++    }
++
++GETTER( IncludeYear, YearFormat, year )
++GETTER( IncludeMonth, MonthFormat, month )
++GETTER( IncludeDayOfWeek, DayOfWeekFormat, day_of_week )
++GETTER( IncludeDay, DayFormat, day )
++GETTER( IncludeHour, HourFormat, hour )
++GETTER( IncludeMinute, MinuteFormat, minute )
++GETTER( IncludeSecond, SecondFormat, second )
++
++static HRESULT WINAPI formatter_get_ResolvedLanguage( IDateTimeFormatter *iface, HSTRING *value )
++{
++    struct formatter *impl = impl_from_IDateTimeFormatter( iface );
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return WindowsCreateString( impl->locale, wcslen( impl->locale ), value );
++}
++
++static HRESULT WINAPI formatter_get_ResolvedGeographicRegion( IDateTimeFormatter *iface, HSTRING *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return region( impl_from_IDateTimeFormatter( iface ), value );
++}
++
++static const struct IDateTimeFormatterVtbl formatter_vtbl =
++{
++    formatter_QueryInterface,
++    formatter_AddRef,
++    formatter_Release,
++    formatter_GetIids,
++    formatter_GetRuntimeClassName,
++    formatter_GetTrustLevel,
++    formatter_get_Languages,
++    formatter_get_GeographicRegion,
++    formatter_get_Calendar,
++    formatter_get_Clock,
++    formatter_get_NumeralSystem,
++    formatter_put_NumeralSystem,
++    formatter_get_Patterns,
++    formatter_get_Template,
++    formatter_Format,
++    formatter_get_IncludeYear,
++    formatter_get_IncludeMonth,
++    formatter_get_IncludeDayOfWeek,
++    formatter_get_IncludeDay,
++    formatter_get_IncludeHour,
++    formatter_get_IncludeMinute,
++    formatter_get_IncludeSecond,
++    formatter_get_ResolvedLanguage,
++    formatter_get_ResolvedGeographicRegion,
++};
++
++DEFINE_IINSPECTABLE( formatter2, IDateTimeFormatter2, struct formatter, IDateTimeFormatter_iface )
++
++static HRESULT WINAPI formatter2_FormatUsingTimeZone( IDateTimeFormatter2 *iface, DateTime value, HSTRING zone, HSTRING *result )
++{
++    FIXME( "iface %p, zone %s: in the local time zone.\n", iface, debugstr_hstring(zone) );
++    return format( impl_from_IDateTimeFormatter2( iface ), value, result );
++}
++
++static const struct IDateTimeFormatter2Vtbl formatter2_vtbl =
++{
++    formatter2_QueryInterface,
++    formatter2_AddRef,
++    formatter2_Release,
++    formatter2_GetIids,
++    formatter2_GetRuntimeClassName,
++    formatter2_GetTrustLevel,
++    formatter2_FormatUsingTimeZone,
++};
++
++static struct formatter *formatter_alloc(void)
++{
++    struct formatter *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return NULL;
++    impl->IDateTimeFormatter_iface.lpVtbl = &formatter_vtbl;
++    impl->IDateTimeFormatter2_iface.lpVtbl = &formatter2_vtbl;
++    impl->ref = 1;
++    if (!GetUserDefaultLocaleName( impl->locale, ARRAY_SIZE(impl->locale) )) lstrcpyW( impl->locale, L"en-US" );
++    return impl;
++}
++
++/* "shortdate shorttime", "month day", "dayofweek.abbreviated", "year.full month.full", ... */
++static BOOL parse_keywords( struct formatter *impl, const WCHAR *template )
++{
++    const WCHAR *p = template;
++    WCHAR word[64];
++    SIZE_T len;
++
++    while (*p)
++    {
++        while (*p == ' ') p++;
++        if (!*p) break;
++        len = wcscspn( p, L" " );
++        if (len >= ARRAY_SIZE(word)) return FALSE;
++        memcpy( word, p, len * sizeof(WCHAR) );
++        word[len] = 0;
++        p += len;
++
++        if (!wcsicmp( word, L"shortdate" )) impl->year = impl->month = impl->day = 1;
++        else if (!wcsicmp( word, L"longdate" ))
++        {
++            impl->year = YearFormat_Full;
++            impl->month = MonthFormat_Full;
++            impl->day = DayFormat_Default;
++            impl->day_of_week = DayOfWeekFormat_Full;
++        }
++        else if (!wcsicmp( word, L"shorttime" )) impl->hour = impl->minute = 1;
++        else if (!wcsicmp( word, L"longtime" )) impl->hour = impl->minute = impl->second = 1;
++        else if (!wcsicmp( word, L"year" ) || !wcsicmp( word, L"year.full" )) impl->year = YearFormat_Full;
++        else if (!wcsicmp( word, L"year.abbreviated" )) impl->year = YearFormat_Abbreviated;
++        else if (!wcsicmp( word, L"month" ) || !wcsicmp( word, L"month.full" )) impl->month = MonthFormat_Full;
++        else if (!wcsicmp( word, L"month.abbreviated" )) impl->month = MonthFormat_Abbreviated;
++        else if (!wcsicmp( word, L"month.numeric" )) impl->month = MonthFormat_Numeric;
++        else if (!wcsicmp( word, L"day" )) impl->day = DayFormat_Default;
++        else if (!wcsicmp( word, L"dayofweek" ) || !wcsicmp( word, L"dayofweek.full" )) impl->day_of_week = DayOfWeekFormat_Full;
++        else if (!wcsicmp( word, L"dayofweek.abbreviated" )) impl->day_of_week = DayOfWeekFormat_Abbreviated;
++        else if (!wcsicmp( word, L"hour" )) impl->hour = HourFormat_Default;
++        else if (!wcsicmp( word, L"minute" )) impl->minute = MinuteFormat_Default;
++        else if (!wcsicmp( word, L"second" )) impl->second = SecondFormat_Default;
++        else
++        {
++            FIXME( "unknown template keyword %s.\n", debugstr_w(word) );
++            return FALSE;
++        }
++    }
++    return TRUE;
++}
++
++static HRESULT formatter_create_template( const WCHAR *template, IDateTimeFormatter **out )
++{
++    struct formatter *impl;
++
++    *out = NULL;
++    if (!template || !*template) return E_INVALIDARG;
++    if (!(impl = formatter_alloc())) return E_OUTOFMEMORY;
++    if (!(impl->template = wcsdup( template )))
++    {
++        free( impl );
++        return E_OUTOFMEMORY;
++    }
++    if (wcschr( template, '{' )) impl->pattern = TRUE;
++    else if (!parse_keywords( impl, template ))
++    {
++        IDateTimeFormatter_Release( &impl->IDateTimeFormatter_iface );
++        return E_INVALIDARG;
++    }
++    TRACE( "template %s -> %p.\n", debugstr_w(template), impl );
++    *out = &impl->IDateTimeFormatter_iface;
++    return S_OK;
++}
++
++static HRESULT formatter_create_parts( YearFormat year, MonthFormat month, DayFormat day, DayOfWeekFormat dow,
++                                       HourFormat hour, MinuteFormat minute, SecondFormat second, IDateTimeFormatter **out )
++{
++    WCHAR template[128] = {0};
++    struct formatter *impl;
++
++    *out = NULL;
++    if (!(impl = formatter_alloc())) return E_OUTOFMEMORY;
++    impl->year = year;
++    impl->month = month;
++    impl->day = day;
++    impl->day_of_week = dow;
++    impl->hour = hour;
++    impl->minute = minute;
++    impl->second = second;
++    /* the template these parts would have been asked for with */
++    if (dow) lstrcatW( template, dow == DayOfWeekFormat_Abbreviated ? L"dayofweek.abbreviated " : L"dayofweek " );
++    if (month) lstrcatW( template, month == MonthFormat_Abbreviated ? L"month.abbreviated " :
++                                    month == MonthFormat_Numeric ? L"month.numeric " : L"month " );
++    if (day) lstrcatW( template, L"day " );
++    if (year) lstrcatW( template, year == YearFormat_Abbreviated ? L"year.abbreviated " : L"year " );
++    if (hour) lstrcatW( template, L"hour " );
++    if (minute) lstrcatW( template, L"minute " );
++    if (second) lstrcatW( template, L"second " );
++    if (template[0]) template[wcslen( template ) - 1] = 0;
++    if (!(impl->template = wcsdup( template )))
++    {
++        free( impl );
++        return E_OUTOFMEMORY;
++    }
++    *out = &impl->IDateTimeFormatter_iface;
++    return S_OK;
++}
++
++/* ---- the class factory ---- */
++
++struct formatter_factory
++{
++    IActivationFactory IActivationFactory_iface;
++    IDateTimeFormatterFactory IDateTimeFormatterFactory_iface;
++    IDateTimeFormatterStatics IDateTimeFormatterStatics_iface;
++};
++
++static inline struct formatter_factory *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct formatter_factory, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct formatter_factory *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IDateTimeFormatterFactory ))
++        *out = &impl->IDateTimeFormatterFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IDateTimeFormatterStatics ))
++        *out = &impl->IDateTimeFormatterStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    FIXME( "iface %p, instance %p: needs a template.\n", iface, instance );
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( create, IDateTimeFormatterFactory, struct formatter_factory, IActivationFactory_iface )
++
++static HRESULT WINAPI create_CreateDateTimeFormatter( IDateTimeFormatterFactory *iface, HSTRING template,
++                                                      IDateTimeFormatter **value )
++{
++    TRACE( "iface %p, template %s, value %p.\n", iface, debugstr_hstring(template), value );
++    return formatter_create_template( WindowsGetStringRawBuffer( template, NULL ), value );
++}
++
++static HRESULT WINAPI create_CreateDateTimeFormatterLanguages( IDateTimeFormatterFactory *iface, HSTRING template,
++                                                               IIterable_HSTRING *languages, IDateTimeFormatter **value )
++{
++    FIXME( "iface %p, template %s, languages %p: the user's language.\n", iface, debugstr_hstring(template), languages );
++    return formatter_create_template( WindowsGetStringRawBuffer( template, NULL ), value );
++}
++
++static HRESULT WINAPI create_CreateDateTimeFormatterContext( IDateTimeFormatterFactory *iface, HSTRING template,
++                                                             IIterable_HSTRING *languages, HSTRING region, HSTRING calendar,
++                                                             HSTRING clock, IDateTimeFormatter **value )
++{
++    FIXME( "iface %p, template %s, region %s, calendar %s, clock %s: the user's settings.\n", iface,
++           debugstr_hstring(template), debugstr_hstring(region), debugstr_hstring(calendar), debugstr_hstring(clock) );
++    return formatter_create_template( WindowsGetStringRawBuffer( template, NULL ), value );
++}
++
++static HRESULT WINAPI create_CreateDateTimeFormatterDate( IDateTimeFormatterFactory *iface, YearFormat year, MonthFormat month,
++                                                          DayFormat day, DayOfWeekFormat dow, IDateTimeFormatter **value )
++{
++    TRACE( "iface %p, year %d, month %d, day %d, dow %d, value %p.\n", iface, year, month, day, dow, value );
++    return formatter_create_parts( year, month, day, dow, 0, 0, 0, value );
++}
++
++static HRESULT WINAPI create_CreateDateTimeFormatterTime( IDateTimeFormatterFactory *iface, HourFormat hour,
++                                                          MinuteFormat minute, SecondFormat second, IDateTimeFormatter **value )
++{
++    TRACE( "iface %p, hour %d, minute %d, second %d, value %p.\n", iface, hour, minute, second, value );
++    return formatter_create_parts( 0, 0, 0, 0, hour, minute, second, value );
++}
++
++static HRESULT WINAPI create_CreateDateTimeFormatterDateTimeLanguages( IDateTimeFormatterFactory *iface, YearFormat year,
++        MonthFormat month, DayFormat day, DayOfWeekFormat dow, HourFormat hour, MinuteFormat minute, SecondFormat second,
++        IIterable_HSTRING *languages, IDateTimeFormatter **value )
++{
++    FIXME( "iface %p, languages %p: the user's language.\n", iface, languages );
++    return formatter_create_parts( year, month, day, dow, hour, minute, second, value );
++}
++
++static HRESULT WINAPI create_CreateDateTimeFormatterDateTimeContext( IDateTimeFormatterFactory *iface, YearFormat year,
++        MonthFormat month, DayFormat day, DayOfWeekFormat dow, HourFormat hour, MinuteFormat minute, SecondFormat second,
++        IIterable_HSTRING *languages, HSTRING region, HSTRING calendar, HSTRING clock, IDateTimeFormatter **value )
++{
++    FIXME( "iface %p, region %s, calendar %s, clock %s: the user's settings.\n", iface, debugstr_hstring(region),
++           debugstr_hstring(calendar), debugstr_hstring(clock) );
++    return formatter_create_parts( year, month, day, dow, hour, minute, second, value );
++}
++
++static const struct IDateTimeFormatterFactoryVtbl create_vtbl =
++{
++    create_QueryInterface,
++    create_AddRef,
++    create_Release,
++    create_GetIids,
++    create_GetRuntimeClassName,
++    create_GetTrustLevel,
++    create_CreateDateTimeFormatter,
++    create_CreateDateTimeFormatterLanguages,
++    create_CreateDateTimeFormatterContext,
++    create_CreateDateTimeFormatterDate,
++    create_CreateDateTimeFormatterTime,
++    create_CreateDateTimeFormatterDateTimeLanguages,
++    create_CreateDateTimeFormatterDateTimeContext,
++};
++
++DEFINE_IINSPECTABLE( statics, IDateTimeFormatterStatics, struct formatter_factory, IActivationFactory_iface )
++
++static HRESULT WINAPI statics_get_LongDate( IDateTimeFormatterStatics *iface, IDateTimeFormatter **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return formatter_create_template( L"longdate", value );
++}
++
++static HRESULT WINAPI statics_get_LongTime( IDateTimeFormatterStatics *iface, IDateTimeFormatter **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return formatter_create_template( L"longtime", value );
++}
++
++static HRESULT WINAPI statics_get_ShortDate( IDateTimeFormatterStatics *iface, IDateTimeFormatter **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return formatter_create_template( L"shortdate", value );
++}
++
++static HRESULT WINAPI statics_get_ShortTime( IDateTimeFormatterStatics *iface, IDateTimeFormatter **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return formatter_create_template( L"shorttime", value );
++}
++
++static const struct IDateTimeFormatterStaticsVtbl statics_vtbl =
++{
++    statics_QueryInterface,
++    statics_AddRef,
++    statics_Release,
++    statics_GetIids,
++    statics_GetRuntimeClassName,
++    statics_GetTrustLevel,
++    statics_get_LongDate,
++    statics_get_LongTime,
++    statics_get_ShortDate,
++    statics_get_ShortTime,
++};
++
++static struct formatter_factory formatter_factory =
++{
++    {&factory_vtbl},
++    {&create_vtbl},
++    {&statics_vtbl},
++};
++
++IActivationFactory *datetime_formatter_factory = &formatter_factory.IActivationFactory_iface;
+diff --git a/dlls/windows.globalization/main.c b/dlls/windows.globalization/main.c
+index 5902b8f..9d3702e 100644
+--- a/dlls/windows.globalization/main.c
++++ b/dlls/windows.globalization/main.c
+@@ -1134,6 +1134,11 @@ HRESULT WINAPI DllGetActivationFactory(HSTRING classid, IActivationFactory **fac
+         *factory = geographic_region_factory;
+         IUnknown_AddRef(*factory);
+     }
++    else if (!wcscmp(name, L"Windows.Globalization.DateTimeFormatting.DateTimeFormatter"))
++    {
++        *factory = datetime_formatter_factory;
++        IUnknown_AddRef(*factory);
++    }
+     else if (!wcscmp(name, RuntimeClass_Windows_Globalization_ApplicationLanguages))
+     {
+         *factory = &application_languages.IActivationFactory_iface;
+diff --git a/dlls/windows.globalization/private.h b/dlls/windows.globalization/private.h
+index 5d8e4e9..a453947 100644
+--- a/dlls/windows.globalization/private.h
++++ b/dlls/windows.globalization/private.h
+@@ -38,6 +38,7 @@
+ #include "windows.system.userprofile.h"
+ 
+ extern IActivationFactory *geographic_region_factory;
++extern IActivationFactory *datetime_formatter_factory;
+ 
+ #include "wine/debug.h"
+ #include "wine/list.h"
+diff --git a/include/Makefile.in b/include/Makefile.in
+index 6fb7ec3..424bfab 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -1047,6 +1047,7 @@ SOURCES = \
+ 	windows.gaming.input.forcefeedback.idl \
+ 	windows.gaming.input.idl \
+ 	windows.gaming.ui.idl \
++	windows.globalization.datetimeformatting.idl \
+ 	windows.globalization.idl \
+ 	windows.graphics.capture.idl \
+ 	windows.graphics.capture.interop.idl \
+diff --git a/include/windows.globalization.datetimeformatting.idl b/include/windows.globalization.datetimeformatting.idl
+new file mode 100644
+index 0000000..f87dd69
+--- /dev/null
++++ b/include/windows.globalization.datetimeformatting.idl
+@@ -0,0 +1,209 @@
++/*
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifdef __WIDL__
++#pragma winrt ns_prefix
++#endif
++
++import "inspectable.idl";
++import "asyncinfo.idl";
++import "eventtoken.idl";
++import "windowscontracts.idl";
++import "windows.foundation.idl";
++
++namespace Windows.Globalization.DateTimeFormatting {
++    runtimeclass DateTimeFormatter;
++    typedef enum DayFormat DayFormat;
++    typedef enum DayOfWeekFormat DayOfWeekFormat;
++    typedef enum HourFormat HourFormat;
++    interface IDateTimeFormatter;
++    interface IDateTimeFormatter2;
++    interface IDateTimeFormatterFactory;
++    interface IDateTimeFormatterStatics;
++    typedef enum MinuteFormat MinuteFormat;
++    typedef enum MonthFormat MonthFormat;
++    typedef enum SecondFormat SecondFormat;
++    typedef enum YearFormat YearFormat;
++}
++
++namespace Windows.Globalization.DateTimeFormatting {
++    declare {
++        interface Windows.Foundation.Collections.IIterator<HSTRING>;
++        interface Windows.Foundation.Collections.IIterable<HSTRING>;
++        interface Windows.Foundation.Collections.IVectorView<HSTRING>;
++    }
++}
++
++namespace Windows.Globalization.DateTimeFormatting {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum DayFormat
++    {
++        None = 0,
++        Default = 1
++    };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum DayOfWeekFormat
++    {
++        None = 0,
++        Default = 1,
++        Abbreviated = 2,
++        Full = 3
++    };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum HourFormat
++    {
++        None = 0,
++        Default = 1
++    };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum MinuteFormat
++    {
++        None = 0,
++        Default = 1
++    };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum MonthFormat
++    {
++        None = 0,
++        Default = 1,
++        Abbreviated = 2,
++        Full = 3,
++        Numeric = 4
++    };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum SecondFormat
++    {
++        None = 0,
++        Default = 1
++    };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum YearFormat
++    {
++        None = 0,
++        Default = 1,
++        Abbreviated = 2,
++        Full = 3
++    };
++
++}
++
++namespace Windows.Globalization.DateTimeFormatting {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Globalization.DateTimeFormatting.DateTimeFormatter),
++        uuid(95eeca10-73e0-4e4b-a183-3d6ad0ba35ec)
++    ]
++    interface IDateTimeFormatter : IInspectable
++    {
++        [propget] HRESULT Languages([out, retval] Windows.Foundation.Collections.IVectorView<HSTRING> * *value);
++        [propget] HRESULT GeographicRegion([out, retval] HSTRING *value);
++        [propget] HRESULT Calendar([out, retval] HSTRING *value);
++        [propget] HRESULT Clock([out, retval] HSTRING *value);
++        [propget] HRESULT NumeralSystem([out, retval] HSTRING *value);
++        [propput] HRESULT NumeralSystem([in] HSTRING value);
++        [propget] HRESULT Patterns([out, retval] Windows.Foundation.Collections.IVectorView<HSTRING> * *value);
++        [propget] HRESULT Template([out, retval] HSTRING *value);
++        HRESULT Format([in] Windows.Foundation.DateTime value, [out, retval] HSTRING *result);
++        [propget] HRESULT IncludeYear([out, retval] Windows.Globalization.DateTimeFormatting.YearFormat *value);
++        [propget] HRESULT IncludeMonth([out, retval] Windows.Globalization.DateTimeFormatting.MonthFormat *value);
++        [propget] HRESULT IncludeDayOfWeek([out, retval] Windows.Globalization.DateTimeFormatting.DayOfWeekFormat *value);
++        [propget] HRESULT IncludeDay([out, retval] Windows.Globalization.DateTimeFormatting.DayFormat *value);
++        [propget] HRESULT IncludeHour([out, retval] Windows.Globalization.DateTimeFormatting.HourFormat *value);
++        [propget] HRESULT IncludeMinute([out, retval] Windows.Globalization.DateTimeFormatting.MinuteFormat *value);
++        [propget] HRESULT IncludeSecond([out, retval] Windows.Globalization.DateTimeFormatting.SecondFormat *value);
++        [propget] HRESULT ResolvedLanguage([out, retval] HSTRING *value);
++        [propget] HRESULT ResolvedGeographicRegion([out, retval] HSTRING *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Globalization.DateTimeFormatting.DateTimeFormatter),
++        uuid(27c91a86-bdaa-4fd0-9e36-671d5aa5ee03)
++    ]
++    interface IDateTimeFormatter2 : IInspectable
++    {
++        [overload("Format")] HRESULT FormatUsingTimeZone([in] Windows.Foundation.DateTime datetime, [in] HSTRING timeZoneId, [out, retval] HSTRING *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Globalization.DateTimeFormatting.DateTimeFormatter),
++        uuid(ec8d8a53-1a2e-412d-8815-3b745fb1a2a0)
++    ]
++    interface IDateTimeFormatterFactory : IInspectable
++    {
++        HRESULT CreateDateTimeFormatter([in] HSTRING formatTemplate, [out, retval] Windows.Globalization.DateTimeFormatting.DateTimeFormatter * *value);
++        HRESULT CreateDateTimeFormatterLanguages([in] HSTRING formatTemplate, [in] Windows.Foundation.Collections.IIterable<HSTRING> * languages, [out, retval] Windows.Globalization.DateTimeFormatting.DateTimeFormatter * *value);
++        HRESULT CreateDateTimeFormatterContext([in] HSTRING formatTemplate, [in] Windows.Foundation.Collections.IIterable<HSTRING> * languages, [in] HSTRING geographicRegion, [in] HSTRING calendar, [in] HSTRING clock, [out, retval] Windows.Globalization.DateTimeFormatting.DateTimeFormatter * *value);
++        HRESULT CreateDateTimeFormatterDate([in] Windows.Globalization.DateTimeFormatting.YearFormat yearFormat, [in] Windows.Globalization.DateTimeFormatting.MonthFormat monthFormat, [in] Windows.Globalization.DateTimeFormatting.DayFormat dayFormat, [in] Windows.Globalization.DateTimeFormatting.DayOfWeekFormat dayOfWeekFormat, [out, retval] Windows.Globalization.DateTimeFormatting.DateTimeFormatter * *value);
++        HRESULT CreateDateTimeFormatterTime([in] Windows.Globalization.DateTimeFormatting.HourFormat hourFormat, [in] Windows.Globalization.DateTimeFormatting.MinuteFormat minuteFormat, [in] Windows.Globalization.DateTimeFormatting.SecondFormat secondFormat, [out, retval] Windows.Globalization.DateTimeFormatting.DateTimeFormatter * *value);
++        HRESULT CreateDateTimeFormatterDateTimeLanguages([in] Windows.Globalization.DateTimeFormatting.YearFormat yearFormat, [in] Windows.Globalization.DateTimeFormatting.MonthFormat monthFormat, [in] Windows.Globalization.DateTimeFormatting.DayFormat dayFormat, [in] Windows.Globalization.DateTimeFormatting.DayOfWeekFormat dayOfWeekFormat, [in] Windows.Globalization.DateTimeFormatting.HourFormat hourFormat, [in] Windows.Globalization.DateTimeFormatting.MinuteFormat minuteFormat, [in] Windows.Globalization.DateTimeFormatting.SecondFormat secondFormat, [in] Windows.Foundation.Collections.IIterable<HSTRING> * languages, [out, retval] Windows.Globalization.DateTimeFormatting.DateTimeFormatter * *value);
++        HRESULT CreateDateTimeFormatterDateTimeContext([in] Windows.Globalization.DateTimeFormatting.YearFormat yearFormat, [in] Windows.Globalization.DateTimeFormatting.MonthFormat monthFormat, [in] Windows.Globalization.DateTimeFormatting.DayFormat dayFormat, [in] Windows.Globalization.DateTimeFormatting.DayOfWeekFormat dayOfWeekFormat, [in] Windows.Globalization.DateTimeFormatting.HourFormat hourFormat, [in] Windows.Globalization.DateTimeFormatting.MinuteFormat minuteFormat, [in] Windows.Globalization.DateTimeFormatting.SecondFormat secondFormat, [in] Windows.Foundation.Collections.IIterable<HSTRING> * languages, [in] HSTRING geographicRegion, [in] HSTRING calendar, [in] HSTRING clock, [out, retval] Windows.Globalization.DateTimeFormatting.DateTimeFormatter * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Globalization.DateTimeFormatting.DateTimeFormatter),
++        uuid(bfcde7c0-df4c-4a2e-9012-f47daf3f1212)
++    ]
++    interface IDateTimeFormatterStatics : IInspectable
++    {
++        [propget] HRESULT LongDate([out, retval] Windows.Globalization.DateTimeFormatting.DateTimeFormatter * *value);
++        [propget] HRESULT LongTime([out, retval] Windows.Globalization.DateTimeFormatting.DateTimeFormatter * *value);
++        [propget] HRESULT ShortDate([out, retval] Windows.Globalization.DateTimeFormatting.DateTimeFormatter * *value);
++        [propget] HRESULT ShortTime([out, retval] Windows.Globalization.DateTimeFormatting.DateTimeFormatter * *value);
++    }
++
++}
++
++namespace Windows.Globalization.DateTimeFormatting {
++    [
++        activatable(Windows.Globalization.DateTimeFormatting.IDateTimeFormatterFactory, Windows.Foundation.UniversalApiContract, 1.0),
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.Globalization.DateTimeFormatting.IDateTimeFormatterStatics, Windows.Foundation.UniversalApiContract, 1.0),
++        threading(both)
++    ]
++    runtimeclass DateTimeFormatter
++    {
++        [default] [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Globalization.DateTimeFormatting.IDateTimeFormatter;
++        [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Globalization.DateTimeFormatting.IDateTimeFormatter2;
++    }
++
++}
++

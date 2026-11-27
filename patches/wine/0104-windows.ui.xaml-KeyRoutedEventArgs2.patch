@@ -1,0 +1,108 @@
+Subject: windows.ui.xaml: KeyRoutedEventArgs.OriginalKey and DeviceId
+
+diff --git a/dlls/windows.ui.xaml/focus.c b/dlls/windows.ui.xaml/focus.c
+index c4f40fe..7164035 100644
+--- a/dlls/windows.ui.xaml/focus.c
++++ b/dlls/windows.ui.xaml/focus.c
+@@ -239,10 +239,29 @@ static struct xaml_element *find_edge( struct xaml_element *scope, BOOL last )
+ 
+ /* ---- key events ---- */
+ 
++/* IKeyRoutedEventArgs2 (OriginalKey) and IKeyRoutedEventArgs3 (DeviceId), which Wine's headers don't have yet */
++static const GUID IID_IKeyRoutedEventArgs2_local = {0x1b02d57a, 0x9634, 0x4f14, {0x91, 0xb2, 0x13, 0x3e, 0x42, 0xfd, 0xb3, 0xcd}};
++static const GUID IID_IKeyRoutedEventArgs3_local = {0x2779f5b4, 0xca41, 0x411b, {0xa8, 0xef, 0xf4, 0xfc, 0x78, 0xe7, 0x80, 0x57}};
++
++struct key_args;
++struct key_args2 { const struct key_args2_vtbl *lpVtbl; };
++struct key_args2_vtbl
++{
++    HRESULT (WINAPI *QueryInterface)( struct key_args2 *iface, REFIID iid, void **out );
++    ULONG (WINAPI *AddRef)( struct key_args2 *iface );
++    ULONG (WINAPI *Release)( struct key_args2 *iface );
++    HRESULT (WINAPI *GetIids)( struct key_args2 *iface, ULONG *count, IID **iids );
++    HRESULT (WINAPI *GetRuntimeClassName)( struct key_args2 *iface, HSTRING *name );
++    HRESULT (WINAPI *GetTrustLevel)( struct key_args2 *iface, TrustLevel *level );
++    HRESULT (WINAPI *get_Value)( struct key_args2 *iface, void *value );   /* OriginalKey or DeviceId */
++};
++
+ struct key_args
+ {
+     IKeyRoutedEventArgs IKeyRoutedEventArgs_iface;
+     IRoutedEventArgs IRoutedEventArgs_iface;
++    struct key_args2 key_args2_iface;
++    struct key_args2 key_args3_iface;
+     LONG ref;
+     __x_ABI_CWindows_CSystem_CVirtualKey key;
+     CorePhysicalKeyStatus status;
+@@ -264,6 +283,10 @@ static HRESULT WINAPI key_args_QueryInterface( IKeyRoutedEventArgs *iface, REFII
+         *out = &impl->IKeyRoutedEventArgs_iface;
+     else if (IsEqualGUID( iid, &IID_IRoutedEventArgs ))
+         *out = &impl->IRoutedEventArgs_iface;
++    else if (IsEqualGUID( iid, &IID_IKeyRoutedEventArgs2_local ))
++        *out = &impl->key_args2_iface;
++    else if (IsEqualGUID( iid, &IID_IKeyRoutedEventArgs3_local ))
++        *out = &impl->key_args3_iface;
+     else
+     {
+         report_missing_interface( L"KeyRoutedEventArgs", iid );
+@@ -348,6 +371,51 @@ static const struct IRoutedEventArgsVtbl key_routed_vtbl =
+     key_routed_get_OriginalSource,
+ };
+ 
++#define KEY_ARGS_IINSPECTABLE( pfx, member ) \
++    static inline struct key_args *pfx##_impl( struct key_args2 *iface ) \
++    { return CONTAINING_RECORD( iface, struct key_args, member ); } \
++    static HRESULT WINAPI pfx##_QueryInterface( struct key_args2 *iface, REFIID iid, void **out ) \
++    { return key_args_QueryInterface( &pfx##_impl( iface )->IKeyRoutedEventArgs_iface, iid, out ); } \
++    static ULONG WINAPI pfx##_AddRef( struct key_args2 *iface ) \
++    { return key_args_AddRef( &pfx##_impl( iface )->IKeyRoutedEventArgs_iface ); } \
++    static ULONG WINAPI pfx##_Release( struct key_args2 *iface ) \
++    { return key_args_Release( &pfx##_impl( iface )->IKeyRoutedEventArgs_iface ); } \
++    static HRESULT WINAPI pfx##_GetIids( struct key_args2 *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; } \
++    static HRESULT WINAPI pfx##_GetRuntimeClassName( struct key_args2 *iface, HSTRING *name ) \
++    { return key_args_GetRuntimeClassName( &pfx##_impl( iface )->IKeyRoutedEventArgs_iface, name ); } \
++    static HRESULT WINAPI pfx##_GetTrustLevel( struct key_args2 *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++KEY_ARGS_IINSPECTABLE( key_args2, key_args2_iface )
++
++/* the key before any translation: the same key, as no input method or gamepad navigation changes it here */
++static HRESULT WINAPI key_args2_get_OriginalKey( struct key_args2 *iface, void *value )
++{
++    *(__x_ABI_CWindows_CSystem_CVirtualKey *)value = key_args2_impl( iface )->key;
++    return S_OK;
++}
++
++static const struct key_args2_vtbl key_args2_vtbl =
++{
++    key_args2_QueryInterface, key_args2_AddRef, key_args2_Release,
++    key_args2_GetIids, key_args2_GetRuntimeClassName, key_args2_GetTrustLevel,
++    key_args2_get_OriginalKey,
++};
++
++KEY_ARGS_IINSPECTABLE( key_args3, key_args3_iface )
++
++/* which keyboard: there is only the one */
++static HRESULT WINAPI key_args3_get_DeviceId( struct key_args2 *iface, void *value )
++{
++    return WindowsCreateString( NULL, 0, (HSTRING *)value );
++}
++
++static const struct key_args2_vtbl key_args3_vtbl =
++{
++    key_args3_QueryInterface, key_args3_AddRef, key_args3_Release,
++    key_args3_GetIids, key_args3_GetRuntimeClassName, key_args3_GetTrustLevel,
++    key_args3_get_DeviceId,
++};
++
+ /* KeyDown or KeyUp from the element up the tree; TRUE if a handler set Handled */
+ static BOOL raise_key_event( struct xaml_element *start, BOOL down, WPARAM vk, LPARAM lparam )
+ {
+@@ -360,6 +428,8 @@ static BOOL raise_key_event( struct xaml_element *start, BOOL down, WPARAM vk, L
+     if (!(args = calloc( 1, sizeof(*args) ))) return FALSE;
+     args->IKeyRoutedEventArgs_iface.lpVtbl = &key_args_vtbl;
+     args->IRoutedEventArgs_iface.lpVtbl = &key_routed_vtbl;
++    args->key_args2_iface.lpVtbl = &key_args2_vtbl;
++    args->key_args3_iface.lpVtbl = &key_args3_vtbl;
+     args->ref = 1;
+     args->key = vk;
+     args->status.RepeatCount = LOWORD( lparam );

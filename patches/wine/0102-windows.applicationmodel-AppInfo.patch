@@ -1,0 +1,432 @@
+Subject: windows.applicationmodel: AppInfo.Current and AppDisplayInfo
+
+diff --git a/dlls/windows.applicationmodel/Makefile.in b/dlls/windows.applicationmodel/Makefile.in
+index 0e5274f..125a40b 100644
+--- a/dlls/windows.applicationmodel/Makefile.in
++++ b/dlls/windows.applicationmodel/Makefile.in
+@@ -2,6 +2,7 @@ MODULE  = windows.applicationmodel.dll
+ IMPORTS = combase kernelbase
+ 
+ SOURCES = \
++	app_info.c \
+ 	classes.idl \
+ 	designmode.c \
+ 	main.c \
+diff --git a/dlls/windows.applicationmodel/app_info.c b/dlls/windows.applicationmodel/app_info.c
+new file mode 100644
+index 0000000..a529bd6
+--- /dev/null
++++ b/dlls/windows.applicationmodel/app_info.c
+@@ -0,0 +1,375 @@
++/* WinRT Windows.ApplicationModel.AppInfo: the running app, from its package identity
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#include "appmodel.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(model);
++
++/* kernelbase exports it, appmodel.h doesn't declare it yet */
++LONG WINAPI GetCurrentApplicationUserModelId( UINT32 *length, WCHAR *id );
++
++/* "Family_publisherid!App": the package family name, then the application's Id from the manifest */
++static HRESULT get_app_user_model_id( WCHAR *buf, UINT32 len )
++{
++    if (GetCurrentApplicationUserModelId( &len, buf )) return HRESULT_FROM_WIN32( APPMODEL_ERROR_NO_APPLICATION );
++    return S_OK;
++}
++
++static HRESULT get_package( IPackage **package )
++{
++    IPackageStatics *statics;
++    HRESULT hr;
++
++    if (FAILED(hr = IActivationFactory_QueryInterface( package_factory, &IID_IPackageStatics, (void **)&statics ))) return hr;
++    hr = IPackageStatics_get_Current( statics, package );
++    IPackageStatics_Release( statics );
++    return hr;
++}
++
++/* ---- AppDisplayInfo ---- */
++
++static HRESULT WINAPI display_QueryInterface( IAppDisplayInfo *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IAppDisplayInfo ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI display_AddRef( IAppDisplayInfo *iface ) { return 2; }
++static ULONG WINAPI display_Release( IAppDisplayInfo *iface ) { return 1; }
++static HRESULT WINAPI display_GetIids( IAppDisplayInfo *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI display_GetRuntimeClassName( IAppDisplayInfo *iface, HSTRING *name )
++{
++    static const WCHAR class_name[] = L"Windows.ApplicationModel.AppDisplayInfo";
++    return WindowsCreateString( class_name, wcslen( class_name ), name );
++}
++
++static HRESULT WINAPI display_GetTrustLevel( IAppDisplayInfo *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI display_get_DisplayName( IAppDisplayInfo *iface, HSTRING *value )
++{
++    IPackage2 *package2;
++    IPackage *package;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (FAILED(hr = get_package( &package ))) return hr;
++    if (SUCCEEDED(hr = IPackage_QueryInterface( package, &IID_IPackage2, (void **)&package2 )))
++    {
++        hr = IPackage2_get_DisplayName( package2, value );
++        IPackage2_Release( package2 );
++    }
++    IPackage_Release( package );
++    return hr;
++}
++
++static HRESULT WINAPI display_get_Description( IAppDisplayInfo *iface, HSTRING *value )
++{
++    IPackage2 *package2;
++    IPackage *package;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (FAILED(hr = get_package( &package ))) return hr;
++    if (SUCCEEDED(hr = IPackage_QueryInterface( package, &IID_IPackage2, (void **)&package2 )))
++    {
++        hr = IPackage2_get_Description( package2, value );
++        IPackage2_Release( package2 );
++    }
++    IPackage_Release( package );
++    return hr;
++}
++
++static HRESULT WINAPI display_GetLogo( IAppDisplayInfo *iface, Size size, __x_ABI_CWindows_CStorage_CStreams_CIRandomAccessStreamReference **value )
++{
++    FIXME( "iface %p, size %fx%f, value %p stub!\n", iface, size.Width, size.Height, value );
++    return E_NOTIMPL;
++}
++
++static const struct IAppDisplayInfoVtbl display_vtbl =
++{
++    display_QueryInterface,
++    display_AddRef,
++    display_Release,
++    display_GetIids,
++    display_GetRuntimeClassName,
++    display_GetTrustLevel,
++    display_get_DisplayName,
++    display_get_Description,
++    display_GetLogo,
++};
++
++static IAppDisplayInfo display_info = { &display_vtbl };
++
++/* ---- AppInfo, one for the process ---- */
++
++struct app_info
++{
++    IActivationFactory IActivationFactory_iface;
++    IAppInfoStatics IAppInfoStatics_iface;
++    IAppInfo IAppInfo_iface;
++    IAppInfo2 IAppInfo2_iface;
++};
++
++static inline struct app_info *impl_from_IAppInfo( IAppInfo *iface )
++{
++    return CONTAINING_RECORD( iface, struct app_info, IAppInfo_iface );
++}
++
++static HRESULT WINAPI info_QueryInterface( IAppInfo *iface, REFIID iid, void **out )
++{
++    struct app_info *impl = impl_from_IAppInfo( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IAppInfo ))
++        *out = &impl->IAppInfo_iface;
++    else if (IsEqualGUID( iid, &IID_IAppInfo2 ))
++        *out = &impl->IAppInfo2_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI info_AddRef( IAppInfo *iface ) { return 2; }
++static ULONG WINAPI info_Release( IAppInfo *iface ) { return 1; }
++static HRESULT WINAPI info_GetIids( IAppInfo *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI info_GetRuntimeClassName( IAppInfo *iface, HSTRING *name )
++{
++    static const WCHAR class_name[] = L"Windows.ApplicationModel.AppInfo";
++    return WindowsCreateString( class_name, wcslen( class_name ), name );
++}
++
++static HRESULT WINAPI info_GetTrustLevel( IAppInfo *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI info_get_Id( IAppInfo *iface, HSTRING *value )
++{
++    WCHAR aumid[APPLICATION_USER_MODEL_ID_MAX_LENGTH], *id;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (FAILED(hr = get_app_user_model_id( aumid, ARRAY_SIZE(aumid) ))) return hr;
++    id = wcschr( aumid, '!' ) ? wcschr( aumid, '!' ) + 1 : aumid;
++    return WindowsCreateString( id, wcslen( id ), value );
++}
++
++static HRESULT WINAPI info_get_AppUserModelId( IAppInfo *iface, HSTRING *value )
++{
++    WCHAR aumid[APPLICATION_USER_MODEL_ID_MAX_LENGTH];
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (FAILED(hr = get_app_user_model_id( aumid, ARRAY_SIZE(aumid) ))) return hr;
++    return WindowsCreateString( aumid, wcslen( aumid ), value );
++}
++
++static HRESULT WINAPI info_get_DisplayInfo( IAppInfo *iface, IAppDisplayInfo **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = &display_info;
++    return S_OK;
++}
++
++static HRESULT WINAPI info_get_PackageFamilyName( IAppInfo *iface, HSTRING *value )
++{
++    WCHAR family[PACKAGE_FAMILY_NAME_MAX_LENGTH + 1];
++    UINT32 len = ARRAY_SIZE(family);
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (GetCurrentPackageFamilyName( &len, family )) return HRESULT_FROM_WIN32( APPMODEL_ERROR_NO_PACKAGE );
++    return WindowsCreateString( family, wcslen( family ), value );
++}
++
++static const struct IAppInfoVtbl info_vtbl =
++{
++    info_QueryInterface,
++    info_AddRef,
++    info_Release,
++    info_GetIids,
++    info_GetRuntimeClassName,
++    info_GetTrustLevel,
++    info_get_Id,
++    info_get_AppUserModelId,
++    info_get_DisplayInfo,
++    info_get_PackageFamilyName,
++};
++
++DEFINE_IINSPECTABLE( info2, IAppInfo2, struct app_info, IAppInfo_iface )
++
++static HRESULT WINAPI info2_get_Package( IAppInfo2 *iface, IPackage **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return get_package( value );
++}
++
++static const struct IAppInfo2Vtbl info2_vtbl =
++{
++    info2_QueryInterface,
++    info2_AddRef,
++    info2_Release,
++    info2_GetIids,
++    info2_GetRuntimeClassName,
++    info2_GetTrustLevel,
++    info2_get_Package,
++};
++
++/* ---- the class factory, with AppInfo.Current ---- */
++
++static inline struct app_info *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct app_info, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct app_info *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IAppInfoStatics ))
++        *out = &impl->IAppInfoStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    FIXME( "iface %p, instance %p: not activatable.\n", iface, instance );
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( statics, IAppInfoStatics, struct app_info, IActivationFactory_iface )
++
++static HRESULT WINAPI statics_get_Current( IAppInfoStatics *iface, IAppInfo **value )
++{
++    struct app_info *impl = impl_from_IAppInfoStatics( iface );
++    WCHAR aumid[APPLICATION_USER_MODEL_ID_MAX_LENGTH];
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    *value = NULL;
++    if (FAILED(hr = get_app_user_model_id( aumid, ARRAY_SIZE(aumid) ))) return hr;
++    *value = &impl->IAppInfo_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_GetFromAppUserModelId( IAppInfoStatics *iface, HSTRING id, IAppInfo **result )
++{
++    struct app_info *impl = impl_from_IAppInfoStatics( iface );
++    WCHAR aumid[APPLICATION_USER_MODEL_ID_MAX_LENGTH];
++
++    TRACE( "iface %p, id %s, result %p.\n", iface, debugstr_hstring(id), result );
++
++    *result = NULL;
++    /* only the running app is known */
++    if (FAILED(get_app_user_model_id( aumid, ARRAY_SIZE(aumid) )) ||
++        wcsicmp( aumid, WindowsGetStringRawBuffer( id, NULL ) )) return E_INVALIDARG;
++    *result = &impl->IAppInfo_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_GetFromAppUserModelIdForUser( IAppInfoStatics *iface, __x_ABI_CWindows_CSystem_CIUser *user,
++                                                            HSTRING id, IAppInfo **result )
++{
++    TRACE( "iface %p, user %p, id %s, result %p.\n", iface, user, debugstr_hstring(id), result );
++    return statics_GetFromAppUserModelId( iface, id, result );
++}
++
++static const struct IAppInfoStaticsVtbl statics_vtbl =
++{
++    statics_QueryInterface,
++    statics_AddRef,
++    statics_Release,
++    statics_GetIids,
++    statics_GetRuntimeClassName,
++    statics_GetTrustLevel,
++    statics_get_Current,
++    statics_GetFromAppUserModelId,
++    statics_GetFromAppUserModelIdForUser,
++};
++
++static struct app_info app_info =
++{
++    {&factory_vtbl},
++    {&statics_vtbl},
++    {&info_vtbl},
++    {&info2_vtbl},
++};
++
++IActivationFactory *app_info_factory = &app_info.IActivationFactory_iface;
+diff --git a/dlls/windows.applicationmodel/classes.idl b/dlls/windows.applicationmodel/classes.idl
+index 0dfd980..36e6ae8 100644
+--- a/dlls/windows.applicationmodel/classes.idl
++++ b/dlls/windows.applicationmodel/classes.idl
+@@ -27,6 +27,7 @@ import "windows.system.idl";
+ import "windows.applicationmodel.idl";
+ 
+ namespace Windows.ApplicationModel {
++    runtimeclass AppInfo;
+     runtimeclass Package;
+     runtimeclass DesignMode;
+ }
+diff --git a/dlls/windows.applicationmodel/main.c b/dlls/windows.applicationmodel/main.c
+index 5d1e4e2..c910667 100644
+--- a/dlls/windows.applicationmodel/main.c
++++ b/dlls/windows.applicationmodel/main.c
+@@ -40,6 +40,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+ 
+     if (!wcscmp( buffer, RuntimeClass_Windows_ApplicationModel_Package ))
+         IActivationFactory_QueryInterface( package_factory, &IID_IActivationFactory, (void **)factory );
++    else if (!wcscmp( buffer, RuntimeClass_Windows_ApplicationModel_AppInfo ))
++        IActivationFactory_QueryInterface( app_info_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, RuntimeClass_Windows_ApplicationModel_DesignMode ))
+         IActivationFactory_QueryInterface( design_mode_factory, &IID_IActivationFactory, (void **)factory );
+ 
+diff --git a/dlls/windows.applicationmodel/private.h b/dlls/windows.applicationmodel/private.h
+index c84ab56..d7a8266 100644
+--- a/dlls/windows.applicationmodel/private.h
++++ b/dlls/windows.applicationmodel/private.h
+@@ -40,6 +40,7 @@ extern IActivationFactory *package_factory;
+ extern HRESULT package_id_create( IPackageId **out );
+ extern HRESULT package_status_create( IPackageStatus **out );
+ extern IActivationFactory *design_mode_factory;
++extern IActivationFactory *app_info_factory;
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \

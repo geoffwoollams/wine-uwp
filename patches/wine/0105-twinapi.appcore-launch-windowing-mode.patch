@@ -1,0 +1,135 @@
+Subject: twinapi.appcore: keep PreferredLaunchWindowingMode; a windowed launch gets a title bar
+
+diff --git a/dlls/twinapi.appcore/application_view.c b/dlls/twinapi.appcore/application_view.c
+index 6e3c37d..2af715b 100644
+--- a/dlls/twinapi.appcore/application_view.c
++++ b/dlls/twinapi.appcore/application_view.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "private.h"
++#include "appmodel.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
+ 
+@@ -359,6 +360,52 @@ static const IApplicationView3Vtbl view3_vtbl =
+ static IApplicationView *current_view;
+ static boolean terminate_on_final_close = TRUE;
+ static ApplicationViewWindowingMode preferred_windowing_mode;
++static BOOL preferred_windowing_mode_loaded;
++
++/* PreferredLaunchWindowingMode is kept for the next launch, as Windows keeps it: in
++ * HKCU\Software\Wine\WindowsRuntime\Packages\<package name>, value LaunchWindowingMode */
++static HKEY open_package_key(BOOL create)
++{
++    WCHAR family[PACKAGE_FAMILY_NAME_MAX_LENGTH + 1], key[PACKAGE_FAMILY_NAME_MAX_LENGTH + 64], *p;
++    UINT32 len = ARRAY_SIZE(family);
++    HKEY hkey;
++
++    if (GetCurrentPackageFamilyName(&len, family)) return NULL;
++    if ((p = wcschr(family, '_'))) *p = 0;
++    swprintf(key, ARRAY_SIZE(key), L"Software\\Wine\\WindowsRuntime\\Packages\\%s", family);
++    if (create ? RegCreateKeyExW(HKEY_CURRENT_USER, key, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &hkey, NULL)
++               : RegOpenKeyExW(HKEY_CURRENT_USER, key, 0, KEY_READ, &hkey)) return NULL;
++    return hkey;
++}
++
++static void load_preferred_windowing_mode(void)
++{
++    DWORD value, size = sizeof(value), type;
++    HKEY hkey;
++
++    if (preferred_windowing_mode_loaded) return;
++    preferred_windowing_mode_loaded = TRUE;
++    preferred_windowing_mode = ApplicationViewWindowingMode_Auto;
++    if (!(hkey = open_package_key(FALSE))) return;
++    if (!RegQueryValueExW(hkey, L"LaunchWindowingMode", NULL, &type, (BYTE *)&value, &size) && type == REG_DWORD)
++        preferred_windowing_mode = value;
++    RegCloseKey(hkey);
++}
++
++/* Whether the app last asked to launch in a window (Auto or a launch size), not full screen. Without a stored
++ * preference the window is borderless full screen, which suits games that never ask. */
++BOOL core_launch_windowed(void)
++{
++    DWORD value, size = sizeof(value), type;
++    BOOL windowed = FALSE;
++    HKEY hkey;
++
++    if (!(hkey = open_package_key(FALSE))) return FALSE;
++    if (!RegQueryValueExW(hkey, L"LaunchWindowingMode", NULL, &type, (BYTE *)&value, &size) && type == REG_DWORD)
++        windowed = value != ApplicationViewWindowingMode_FullScreen;
++    RegCloseKey(hkey);
++    return windowed;
++}
+ static Size preferred_launch_size;
+ 
+ static HRESULT get_current_view(IApplicationView **out)
+@@ -549,14 +596,24 @@ DEFINE_IINSPECTABLE(statics3, IApplicationViewStatics3, struct factory, IActivat
+ 
+ static HRESULT WINAPI statics3_get_PreferredLaunchWindowingMode(IApplicationViewStatics3 *iface, ApplicationViewWindowingMode *value)
+ {
++    load_preferred_windowing_mode();
+     *value = preferred_windowing_mode;
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI statics3_put_PreferredLaunchWindowingMode(IApplicationViewStatics3 *iface, ApplicationViewWindowingMode value)
+ {
+-    FIXME("iface %p, value %d semi-stub!\n", iface, value);
++    HKEY hkey;
++    DWORD mode = value;
++
++    TRACE("iface %p, value %d.\n", iface, value);
+     preferred_windowing_mode = value;
++    preferred_windowing_mode_loaded = TRUE;
++    if ((hkey = open_package_key(TRUE)))
++    {
++        RegSetValueExW(hkey, L"LaunchWindowingMode", 0, REG_DWORD, (const BYTE *)&mode, sizeof(mode));
++        RegCloseKey(hkey);
++    }
+     return S_OK;
+ }
+ 
+diff --git a/dlls/twinapi.appcore/core_gen.c b/dlls/twinapi.appcore/core_gen.c
+index 984158a..8c969e0 100644
+--- a/dlls/twinapi.appcore/core_gen.c
++++ b/dlls/twinapi.appcore/core_gen.c
+@@ -2246,8 +2246,11 @@ static LRESULT CALLBACK core_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPA
+ /* The CoreWindow is created borderless at monitor size and stays that size (TryEnterFullScreenMode is then a no-op):
+  * resizing an X11 window after it is mapped with a Vulkan swapchain can leave it without pointer input under
+  * XWayland. The app still learns its size from SizeChanged, raised when it activates the window.
+- * WINE_CORE_WINDOWED=1 gives a normal 1280x720 window instead. */
++ * WINE_CORE_WINDOWED=1, or an app whose last PreferredLaunchWindowingMode wasn't FullScreen, gets a normal
++ * 1280x720 window with a title bar instead. */
+ static BOOL fullscreen_wanted = TRUE;
++static BOOL captioned;       /* created as a normal window with a title bar: it stays windowed */
++extern BOOL core_launch_windowed(void);
+ static RECT windowed_rect;   /* outer window rect while windowed */
+ static HWND created_hwnd;
+ 
+@@ -2314,7 +2317,7 @@ static void apply_fullscreen(HWND hwnd, BOOL fullscreen)
+ /* Called from ApplicationView.TryEnterFullScreenMode / ExitFullScreenMode. */
+ void core_window_set_fullscreen(BOOL fullscreen)
+ {
+-    if (fullscreen && windowed_forced()) { FIXME("WINE_CORE_WINDOWED set, staying windowed.\n"); return; }
++    if (fullscreen && captioned) { FIXME("windowed launch, staying windowed.\n"); return; }
+     if (fullscreen == fullscreen_wanted)
+     {
+         /* already in that mode: the app still expects SizeChanged after its request, so re-send the current size */
+@@ -2346,10 +2349,13 @@ static HWND create_core_hwnd(void)
+     SetRect(&rect, 0, 0, 1280, 720);
+     OffsetRect(&rect, monitor.left + max(0, (monitor.right - monitor.left - 1280) / 2),
+                monitor.top + max(0, (monitor.bottom - monitor.top - 720) / 2));
+-    style = windowed_forced() ? WS_OVERLAPPEDWINDOW : WS_POPUP;
++    /* a title bar, so the window can be moved and closed, when windowed is asked for: WINE_CORE_WINDOWED, or the
++     * app's launch preference from its last run */
++    captioned = windowed_forced() || core_launch_windowed();
++    style = captioned ? WS_OVERLAPPEDWINDOW : WS_POPUP;
+     AdjustWindowRect(&rect, style, FALSE);
+     windowed_rect = rect;
+-    if (windowed_forced()) fullscreen_wanted = FALSE;
++    if (captioned) fullscreen_wanted = FALSE;
+     if (fullscreen_wanted) rect = monitor;
+     app_display_name(title, ARRAY_SIZE(title));
+     hwnd = CreateWindowExW(0, class_name, title, style, rect.left, rect.top,
