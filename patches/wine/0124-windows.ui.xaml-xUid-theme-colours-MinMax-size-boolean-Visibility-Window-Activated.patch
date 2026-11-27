@@ -1,0 +1,701 @@
+Subject: windows.ui.xaml: x:Uid, theme colours, MinWidth/MaxWidth, boolean Visibility and Window.Activated
+
+x:Uid: an element with x:Uid="Name" takes the localized values of its properties from the app's resources
+(Resources/Name/Content, .../Text, Header, PlaceholderText, Title, Label, Description, Glyph, the ContentDialog
+button texts, OnContent and OffContent), through ResourceManager, which chooses the language. Our ResourceManager
+can't list a subtree, so these properties are looked up in turn.
+
+generic.xaml has WinUI's theme colours (SystemAltHighColor ... SystemListMediumColor for Light and Dark, Windows
+10's values), Windows' default accent colour and its shades, the system colours, and FlyoutThemeMinWidth/Height
+and ScrollBarSize.
+
+FrameworkElement MinWidth, MaxWidth, MinHeight and MaxHeight bound layout (measure and arrange; Min wins over
+Max, as in WinUI) and can be set from markup; they were ignored.
+
+Visibility takes a boolean (true Visible, false Collapsed) or a boxed Visibility from a binding or converter.
+
+Window.Activated is raised: CodeActivated once Window.Activate has returned, then on WM_ACTIVATE changes, with
+WindowActivatedEventArgs.
+
+With these, Xbox Accessories' LandingPage has its title, its "Don't see your device?" text and its buttons'
+labels, and its view model's visibility bindings apply.
+
+diff --git a/dlls/windows.ui.xaml/Makefile.in b/dlls/windows.ui.xaml/Makefile.in
+index 9377610..4bf1f78 100644
+--- a/dlls/windows.ui.xaml/Makefile.in
++++ b/dlls/windows.ui.xaml/Makefile.in
+@@ -43,6 +43,7 @@ SOURCES = \
+ 	text_block.c \
+ 	textbox.c \
+ 	timer.c \
++	uid.c \
+ 	visual_tree.c \
+ 	window.c \
+ 	windows.ui.xaml.rc \
+diff --git a/dlls/windows.ui.xaml/element.c b/dlls/windows.ui.xaml/element.c
+index 9f9b1ce..705ec27 100644
+--- a/dlls/windows.ui.xaml/element.c
++++ b/dlls/windows.ui.xaml/element.c
+@@ -1064,59 +1064,67 @@ static HRESULT WINAPI framework_element_put_Language(IFrameworkElement *iface, H
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI framework_element_get_MinWidth(IFrameworkElement *iface, DOUBLE *value)
++static HRESULT WINAPI framework_element_get_MinWidth( IFrameworkElement *iface, DOUBLE *value )
+ {
+-    TRACE( "iface %p: default.\n", iface );
+     if (!value) return E_POINTER;
+-    memset( value, 0, sizeof(*value) );
++    *value = impl_from_IFrameworkElement( iface )->min_width;
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI framework_element_put_MinWidth(IFrameworkElement *iface, DOUBLE value)
++static HRESULT WINAPI framework_element_put_MinWidth( IFrameworkElement *iface, DOUBLE value )
+ {
+-    FIXME( "iface %p: ignored.\n", iface );
++    TRACE( "iface %p, value %f.\n", iface, value );
++    if (isnan( value ) || value < 0 || isinf( value )) return E_INVALIDARG;
++    impl_from_IFrameworkElement( iface )->min_width = value;
++    window_invalidate();
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI framework_element_get_MaxWidth(IFrameworkElement *iface, DOUBLE *value)
++static HRESULT WINAPI framework_element_get_MaxWidth( IFrameworkElement *iface, DOUBLE *value )
+ {
+-    TRACE( "iface %p: default.\n", iface );
+     if (!value) return E_POINTER;
+-    memset( value, 0, sizeof(*value) );
++    *value = impl_from_IFrameworkElement( iface )->max_width;
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI framework_element_put_MaxWidth(IFrameworkElement *iface, DOUBLE value)
++static HRESULT WINAPI framework_element_put_MaxWidth( IFrameworkElement *iface, DOUBLE value )
+ {
+-    FIXME( "iface %p: ignored.\n", iface );
++    TRACE( "iface %p, value %f.\n", iface, value );
++    if (isnan( value ) || value < 0) return E_INVALIDARG;
++    impl_from_IFrameworkElement( iface )->max_width = value;
++    window_invalidate();
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI framework_element_get_MinHeight(IFrameworkElement *iface, DOUBLE *value)
++static HRESULT WINAPI framework_element_get_MinHeight( IFrameworkElement *iface, DOUBLE *value )
+ {
+-    TRACE( "iface %p: default.\n", iface );
+     if (!value) return E_POINTER;
+-    memset( value, 0, sizeof(*value) );
++    *value = impl_from_IFrameworkElement( iface )->min_height;
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI framework_element_put_MinHeight(IFrameworkElement *iface, DOUBLE value)
++static HRESULT WINAPI framework_element_put_MinHeight( IFrameworkElement *iface, DOUBLE value )
+ {
+-    FIXME( "iface %p: ignored.\n", iface );
++    TRACE( "iface %p, value %f.\n", iface, value );
++    if (isnan( value ) || value < 0 || isinf( value )) return E_INVALIDARG;
++    impl_from_IFrameworkElement( iface )->min_height = value;
++    window_invalidate();
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI framework_element_get_MaxHeight(IFrameworkElement *iface, DOUBLE *value)
++static HRESULT WINAPI framework_element_get_MaxHeight( IFrameworkElement *iface, DOUBLE *value )
+ {
+-    TRACE( "iface %p: default.\n", iface );
+     if (!value) return E_POINTER;
+-    memset( value, 0, sizeof(*value) );
++    *value = impl_from_IFrameworkElement( iface )->max_height;
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI framework_element_put_MaxHeight(IFrameworkElement *iface, DOUBLE value)
++static HRESULT WINAPI framework_element_put_MaxHeight( IFrameworkElement *iface, DOUBLE value )
+ {
+-    FIXME( "iface %p: ignored.\n", iface );
++    TRACE( "iface %p, value %f.\n", iface, value );
++    if (isnan( value ) || value < 0) return E_INVALIDARG;
++    impl_from_IFrameworkElement( iface )->max_height = value;
++    window_invalidate();
+     return S_OK;
+ }
+ 
+@@ -1536,6 +1544,8 @@ void element_init( struct xaml_element *element, const struct element_ops *ops,
+     element->ops = ops;
+     element->class_name = class_name;
+     element->width = element->height = NAN;
++    element->min_width = element->min_height = 0;
++    element->max_width = element->max_height = INFINITY;
+     element->horizontal_alignment = HorizontalAlignment_Stretch;
+     element->vertical_alignment = VerticalAlignment_Stretch;
+     element->visibility = Visibility_Visible;
+@@ -1620,6 +1630,14 @@ void element_set_parent( struct xaml_element *child, struct xaml_element *parent
+     window_invalidate();
+ }
+ 
++/* a size within an element's MinWidth/MaxWidth (Min wins, as in WinUI) */
++static float clamp_size( float size, double min_size, double max_size )
++{
++    if (size > max_size) size = max_size;
++    if (size < min_size) size = min_size;
++    return size;
++}
++
+ void element_measure( struct xaml_element *element, struct layout_context *ctx, float avail_width, float avail_height )
+ {
+     const Thickness *m = &element->margin;
+@@ -1643,12 +1661,17 @@ void element_measure( struct xaml_element *element, struct layout_context *ctx,
+     content_height = max( 0.0f, avail_height - m->Top - m->Bottom );
+     if (!isnan( element->width )) content_width = element->width;
+     if (!isnan( element->height )) content_height = element->height;
++    /* MinWidth/MaxWidth (and heights) bound both what the content may have and what the element wants */
++    content_width = clamp_size( content_width, element->min_width, element->max_width );
++    content_height = clamp_size( content_height, element->min_height, element->max_height );
+     saved_family = ctx->font_family;
+     if (element->font_family) ctx->font_family = element->font_family;
+     element->ops->measure( element, ctx, content_width, content_height, &width, &height );
+     ctx->font_family = saved_family;
+     if (!isnan( element->width )) width = element->width;
+     if (!isnan( element->height )) height = element->height;
++    width = clamp_size( width, element->min_width, element->max_width );
++    height = clamp_size( height, element->min_height, element->max_height );
+ 
+     element->desired_width = min( avail_width, width + m->Left + m->Right );
+     element->desired_height = min( avail_height, height + m->Top + m->Bottom );
+@@ -1895,6 +1918,8 @@ void element_arrange( struct xaml_element *element, struct layout_context *ctx,
+     if (!isnan( element->height )) final_height = element->height;
+     else if (element->vertical_alignment == VerticalAlignment_Stretch) final_height = avail_height;
+     else final_height = min( desired_height, avail_height );
++    final_width = clamp_size( final_width, element->min_width, element->max_width );
++    final_height = clamp_size( final_height, element->min_height, element->max_height );
+ 
+     switch (element->horizontal_alignment)
+     {
+diff --git a/dlls/windows.ui.xaml/generic.xaml b/dlls/windows.ui.xaml/generic.xaml
+index b8cfb9f..a7f8929 100644
+--- a/dlls/windows.ui.xaml/generic.xaml
++++ b/dlls/windows.ui.xaml/generic.xaml
+@@ -28,6 +28,32 @@
+ 
+     <ResourceDictionary.ThemeDictionaries>
+         <ResourceDictionary x:Key="Light">
++            <!-- WinUI's theme colours (Windows 10 values) -->
++            <Color x:Key="SystemAltHighColor">#FFFFFFFF</Color>
++            <Color x:Key="SystemAltLowColor">#33FFFFFF</Color>
++            <Color x:Key="SystemAltMediumColor">#99FFFFFF</Color>
++            <Color x:Key="SystemAltMediumHighColor">#CCFFFFFF</Color>
++            <Color x:Key="SystemAltMediumLowColor">#66FFFFFF</Color>
++            <Color x:Key="SystemBaseHighColor">#FF000000</Color>
++            <Color x:Key="SystemBaseLowColor">#33000000</Color>
++            <Color x:Key="SystemBaseMediumColor">#99000000</Color>
++            <Color x:Key="SystemBaseMediumHighColor">#CC000000</Color>
++            <Color x:Key="SystemBaseMediumLowColor">#66000000</Color>
++            <Color x:Key="SystemChromeAltLowColor">#FF171717</Color>
++            <Color x:Key="SystemChromeBlackHighColor">#FF000000</Color>
++            <Color x:Key="SystemChromeBlackLowColor">#33000000</Color>
++            <Color x:Key="SystemChromeBlackMediumLowColor">#66000000</Color>
++            <Color x:Key="SystemChromeBlackMediumColor">#CC000000</Color>
++            <Color x:Key="SystemChromeDisabledHighColor">#FFCCCCCC</Color>
++            <Color x:Key="SystemChromeDisabledLowColor">#FF7A7A7A</Color>
++            <Color x:Key="SystemChromeHighColor">#FFCCCCCC</Color>
++            <Color x:Key="SystemChromeLowColor">#FFF2F2F2</Color>
++            <Color x:Key="SystemChromeMediumColor">#FFE6E6E6</Color>
++            <Color x:Key="SystemChromeMediumLowColor">#FFF2F2F2</Color>
++            <Color x:Key="SystemChromeWhiteColor">#FFFFFFFF</Color>
++            <Color x:Key="SystemChromeGrayColor">#FF767676</Color>
++            <Color x:Key="SystemListLowColor">#19000000</Color>
++            <Color x:Key="SystemListMediumColor">#33000000</Color>
+             <SolidColorBrush x:Key="ApplicationPageBackgroundThemeBrush" Color="#FFFFFFFF"/>
+             <SolidColorBrush x:Key="ApplicationForegroundThemeBrush" Color="#FF000000"/>
+             <SolidColorBrush x:Key="ApplicationSecondaryForegroundThemeBrush" Color="#FF5F5F5F"/>
+@@ -182,6 +208,32 @@
+             <SolidColorBrush x:Key="RadioButtonCheckGlyphFillDisabled" Color="#66000000"/>
+         </ResourceDictionary>
+         <ResourceDictionary x:Key="Dark">
++            <!-- WinUI's theme colours (Windows 10 values) -->
++            <Color x:Key="SystemAltHighColor">#FF000000</Color>
++            <Color x:Key="SystemAltLowColor">#33000000</Color>
++            <Color x:Key="SystemAltMediumColor">#99000000</Color>
++            <Color x:Key="SystemAltMediumHighColor">#CC000000</Color>
++            <Color x:Key="SystemAltMediumLowColor">#66000000</Color>
++            <Color x:Key="SystemBaseHighColor">#FFFFFFFF</Color>
++            <Color x:Key="SystemBaseLowColor">#33FFFFFF</Color>
++            <Color x:Key="SystemBaseMediumColor">#99FFFFFF</Color>
++            <Color x:Key="SystemBaseMediumHighColor">#CCFFFFFF</Color>
++            <Color x:Key="SystemBaseMediumLowColor">#66FFFFFF</Color>
++            <Color x:Key="SystemChromeAltLowColor">#FFF2F2F2</Color>
++            <Color x:Key="SystemChromeBlackHighColor">#FF000000</Color>
++            <Color x:Key="SystemChromeBlackLowColor">#33000000</Color>
++            <Color x:Key="SystemChromeBlackMediumLowColor">#66000000</Color>
++            <Color x:Key="SystemChromeBlackMediumColor">#CC000000</Color>
++            <Color x:Key="SystemChromeDisabledHighColor">#FF333333</Color>
++            <Color x:Key="SystemChromeDisabledLowColor">#FF858585</Color>
++            <Color x:Key="SystemChromeHighColor">#FF767676</Color>
++            <Color x:Key="SystemChromeLowColor">#FF171717</Color>
++            <Color x:Key="SystemChromeMediumColor">#FF1F1F1F</Color>
++            <Color x:Key="SystemChromeMediumLowColor">#FF2B2B2B</Color>
++            <Color x:Key="SystemChromeWhiteColor">#FFFFFFFF</Color>
++            <Color x:Key="SystemChromeGrayColor">#FF767676</Color>
++            <Color x:Key="SystemListLowColor">#19FFFFFF</Color>
++            <Color x:Key="SystemListMediumColor">#33FFFFFF</Color>
+             <SolidColorBrush x:Key="ApplicationPageBackgroundThemeBrush" Color="#FF000000"/>
+             <SolidColorBrush x:Key="ApplicationForegroundThemeBrush" Color="#FFFFFFFF"/>
+             <SolidColorBrush x:Key="ApplicationSecondaryForegroundThemeBrush" Color="#FFA0A0A0"/>
+@@ -337,6 +389,26 @@
+         </ResourceDictionary>
+     </ResourceDictionary.ThemeDictionaries>
+ 
++    <!-- the system colours: Windows' default accent blue and its shades, and the (non high contrast) system colours -->
++    <Color x:Key="SystemAccentColor">#FF0078D7</Color>
++    <Color x:Key="SystemAccentColorLight1">#FF429CE3</Color>
++    <Color x:Key="SystemAccentColorLight2">#FF76B9ED</Color>
++    <Color x:Key="SystemAccentColorLight3">#FFA6D8FF</Color>
++    <Color x:Key="SystemAccentColorDark1">#FF005A9E</Color>
++    <Color x:Key="SystemAccentColorDark2">#FF004275</Color>
++    <Color x:Key="SystemAccentColorDark3">#FF002642</Color>
++    <Color x:Key="SystemColorWindowColor">#FFFFFFFF</Color>
++    <Color x:Key="SystemColorWindowTextColor">#FF000000</Color>
++    <Color x:Key="SystemColorHighlightColor">#FF3399FF</Color>
++    <Color x:Key="SystemColorHighlightTextColor">#FFFFFFFF</Color>
++    <Color x:Key="SystemColorButtonFaceColor">#FFF0F0F0</Color>
++    <Color x:Key="SystemColorButtonTextColor">#FF000000</Color>
++    <Color x:Key="SystemColorGrayTextColor">#FF6D6D6D</Color>
++    <Color x:Key="SystemColorHotlightColor">#FF0066CC</Color>
++    <x:Double x:Key="FlyoutThemeMinWidth">96</x:Double>
++    <x:Double x:Key="FlyoutThemeMinHeight">40</x:Double>
++    <x:Double x:Key="ScrollBarSize">12</x:Double>
++
+     <!-- WinUI's theme fonts: text in the default font, symbols in the icon fonts Windows has -->
+     <FontFamily x:Key="ContentControlThemeFontFamily">XamlAutoFontFamily</FontFamily>
+     <FontFamily x:Key="PhoneFontFamilyNormal">Segoe UI</FontFamily>
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index cfc08e6..80b314f 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -131,6 +131,7 @@ extern IActivationFactory *frame_factory;
+ extern IActivationFactory *dispatcher_timer_factory;
+ extern IActivationFactory *flyout_factory;
+ extern IActivationFactory *font_family_factory;
++WCHAR *uid_string( const WCHAR *uid, const WCHAR *property );   /* uid.c: x:Uid's localized value, or NULL */
+ HRESULT font_family_create( const WCHAR *name, IFontFamily **value );
+ void element_set_font_family( struct xaml_element *element, const WCHAR *source );
+ HRESULT element_get_font_family( struct xaml_element *element, IFontFamily **value );
+@@ -392,6 +393,7 @@ struct xaml_element
+ 
+     /* FrameworkElement layout properties; NAN means Auto */
+     double width, height;
++    double min_width, max_width, min_height, max_height;   /* 0 and INFINITY when not set */
+     Thickness margin;
+     CornerRadius corner_radius;               /* Control, ContentPresenter, Grid (Border keeps its own) */
+     IInspectable *render_transform;           /* UIElement.RenderTransform */
+diff --git a/dlls/windows.ui.xaml/uid.c b/dlls/windows.ui.xaml/uid.c
+new file mode 100644
+index 0000000..25f0f74
+--- /dev/null
++++ b/dlls/windows.ui.xaml/uid.c
+@@ -0,0 +1,76 @@
++/* x:Uid: localized property values from the app's resources.pri
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#include "initguid.h"
++#define WIDL_using_Windows_ApplicationModel_Resources_Core
++#include "windows.applicationmodel.resources.core.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* An element with x:Uid="Name" takes the strings of the app's resources named Name.Property (in the Resources
++ * map of resources.pri: "Resources/Name/Property"). Our ResourceManager can't list a subtree, so each property
++ * that apps localize is looked up in turn; the language is the one ResourceManager chooses. */
++
++static IResourceMap *main_map;
++static BOOL main_map_failed;
++
++static IResourceMap *resource_map(void)
++{
++    static const WCHAR name[] = L"Windows.ApplicationModel.Resources.Core.ResourceManager";
++    IResourceManagerStatics *statics;
++    IResourceManager *manager;
++    HSTRING_HEADER header;
++    HSTRING class_name;
++
++    if (main_map || main_map_failed) return main_map;
++    main_map_failed = TRUE;
++    WindowsCreateStringReference( name, wcslen( name ), &header, &class_name );
++    if (FAILED(RoGetActivationFactory( class_name, &IID_IResourceManagerStatics, (void **)&statics ))) return NULL;
++    if (SUCCEEDED(IResourceManagerStatics_get_Current( statics, &manager )))
++    {
++        if (SUCCEEDED(IResourceManager_get_MainResourceMap( manager, &main_map ))) main_map_failed = FALSE;
++        IResourceManager_Release( manager );
++    }
++    IResourceManagerStatics_Release( statics );
++    return main_map;
++}
++
++/* the string for property of the element with x:Uid uid, or NULL */
++WCHAR *uid_string( const WCHAR *uid, const WCHAR *property )
++{
++    IResourceCandidate *candidate;
++    IResourceMap *map = resource_map();
++    HSTRING path, value = NULL;
++    WCHAR buffer[256], *ret = NULL;
++    HRESULT hr;
++
++    if (!map) return NULL;
++    swprintf( buffer, ARRAY_SIZE(buffer), L"Resources/%s/%s", uid, property );
++    if (FAILED(WindowsCreateString( buffer, wcslen( buffer ), &path ))) return NULL;
++    hr = IResourceMap_GetValue( map, path, &candidate );
++    WindowsDeleteString( path );
++    if (FAILED(hr)) return NULL;
++    if (SUCCEEDED(IResourceCandidate_get_ValueAsString( candidate, &value )))
++        ret = wcsdup( WindowsGetStringRawBuffer( value, NULL ) );
++    TRACE( "%s -> %s.\n", debugstr_w(buffer), debugstr_w(ret) );
++    WindowsDeleteString( value );
++    IResourceCandidate_Release( candidate );
++    return ret;
++}
+diff --git a/dlls/windows.ui.xaml/window.c b/dlls/windows.ui.xaml/window.c
+index dc0bd6b..0fb020e 100644
+--- a/dlls/windows.ui.xaml/window.c
++++ b/dlls/windows.ui.xaml/window.c
+@@ -38,6 +38,7 @@ struct xaml_window
+     BOOL tracking;
+     struct event_list activated, closed, size_changed, visibility_changed;
+     /* popups over the content, the topmost last (referenced): a ContentDialog's layer, a menu */
++    int activation;                 /* the CoreWindowActivationState last raised, or -1 */
+     struct xaml_element *popups[8];
+     BOOL modal[8];                  /* a modal popup gets all the input; others what they hit */
+     UINT32 popup_count;
+@@ -322,6 +323,153 @@ static void window_wheel( struct xaml_window *window, WPARAM wparam, LPARAM lpar
+         if (element->ops->wheel && element->ops->wheel( element, GET_WHEEL_DELTA_WPARAM( wparam ), horizontal )) break;
+ }
+ 
++/* Window.Activated: WindowActivatedEventArgs */
++
++#define WM_XAML_ACTIVATED (WM_APP + 0x5ea)   /* raise Activated after Activate() has returned */
++
++struct activated_args
++{
++    IWindowActivatedEventArgs IWindowActivatedEventArgs_iface;
++    ICoreWindowEventArgs ICoreWindowEventArgs_iface;
++    LONG ref;
++    CoreWindowActivationState state;
++    boolean handled;
++};
++
++static inline struct activated_args *impl_from_IWindowActivatedEventArgs( IWindowActivatedEventArgs *iface )
++{
++    return CONTAINING_RECORD( iface, struct activated_args, IWindowActivatedEventArgs_iface );
++}
++
++static HRESULT WINAPI activated_args_QueryInterface( IWindowActivatedEventArgs *iface, REFIID iid, void **out )
++{
++    struct activated_args *impl = impl_from_IWindowActivatedEventArgs( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IWindowActivatedEventArgs ))
++        *out = &impl->IWindowActivatedEventArgs_iface;
++    else if (IsEqualGUID( iid, &IID_ICoreWindowEventArgs ))
++        *out = &impl->ICoreWindowEventArgs_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI activated_args_AddRef( IWindowActivatedEventArgs *iface )
++{
++    return InterlockedIncrement( &impl_from_IWindowActivatedEventArgs( iface )->ref );
++}
++
++static ULONG WINAPI activated_args_Release( IWindowActivatedEventArgs *iface )
++{
++    struct activated_args *impl = impl_from_IWindowActivatedEventArgs( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI activated_args_GetIids( IWindowActivatedEventArgs *iface, ULONG *count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI activated_args_GetRuntimeClassName( IWindowActivatedEventArgs *iface, HSTRING *value )
++{
++    const WCHAR *name = RuntimeClass_Windows_UI_Core_WindowActivatedEventArgs;
++    return WindowsCreateString( name, wcslen( name ), value );
++}
++
++static HRESULT WINAPI activated_args_GetTrustLevel( IWindowActivatedEventArgs *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI activated_args_get_WindowActivationState( IWindowActivatedEventArgs *iface,
++                                                                CoreWindowActivationState *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IWindowActivatedEventArgs( iface )->state;
++    return S_OK;
++}
++
++static const struct IWindowActivatedEventArgsVtbl activated_args_vtbl =
++{
++    activated_args_QueryInterface,
++    activated_args_AddRef,
++    activated_args_Release,
++    activated_args_GetIids,
++    activated_args_GetRuntimeClassName,
++    activated_args_GetTrustLevel,
++    activated_args_get_WindowActivationState,
++};
++
++DEFINE_IINSPECTABLE( activated_core_args, ICoreWindowEventArgs, struct activated_args, IWindowActivatedEventArgs_iface )
++
++static HRESULT WINAPI activated_core_args_get_Handled( ICoreWindowEventArgs *iface, boolean *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_ICoreWindowEventArgs( iface )->handled;
++    return S_OK;
++}
++
++static HRESULT WINAPI activated_core_args_put_Handled( ICoreWindowEventArgs *iface, boolean value )
++{
++    impl_from_ICoreWindowEventArgs( iface )->handled = value;
++    return S_OK;
++}
++
++static const struct ICoreWindowEventArgsVtbl activated_core_args_vtbl =
++{
++    activated_core_args_QueryInterface,
++    activated_core_args_AddRef,
++    activated_core_args_Release,
++    activated_core_args_GetIids,
++    activated_core_args_GetRuntimeClassName,
++    activated_core_args_GetTrustLevel,
++    activated_core_args_get_Handled,
++    activated_core_args_put_Handled,
++};
++
++/* raise Activated when the window's activation changes */
++static void window_raise_activated( struct xaml_window *window, CoreWindowActivationState state )
++{
++    struct activated_args *args;
++    IUnknown **handlers;
++    UINT32 i, count = window->activated.count;
++    HRESULT hr;
++
++    if (window->activation == state) return;
++    window->activation = state;
++    TRACE( "window %p: state %d, %u handler slots.\n", window, state, count );
++    if (!count || !(args = calloc( 1, sizeof(*args) ))) return;
++    args->IWindowActivatedEventArgs_iface.lpVtbl = &activated_args_vtbl;
++    args->ICoreWindowEventArgs_iface.lpVtbl = &activated_core_args_vtbl;
++    args->ref = 1;
++    args->state = state;
++    if ((handlers = calloc( count, sizeof(*handlers) )))
++    {
++        for (i = 0; i < count; i++) if ((handlers[i] = window->activated.handlers[i])) IUnknown_AddRef( handlers[i] );
++        IWindow_AddRef( &window->IWindow_iface );
++        for (i = 0; i < count; i++)
++        {
++            if (!handlers[i]) continue;
++            hr = IWindowActivatedEventHandler_Invoke( (IWindowActivatedEventHandler *)handlers[i],
++                                                      (IInspectable *)&window->IWindow_iface, &args->IWindowActivatedEventArgs_iface );
++            if (FAILED(hr)) WARN( "Activated handler %p failed, hr %#lx.\n", handlers[i], hr );
++        }
++        for (i = 0; i < count; i++) if (handlers[i]) IUnknown_Release( handlers[i] );
++        IWindow_Release( &window->IWindow_iface );
++        free( handlers );
++    }
++    IWindowActivatedEventArgs_Release( &args->IWindowActivatedEventArgs_iface );
++}
++
+ static LRESULT CALLBACK window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
+ {
+     struct xaml_window *window = current_window;
+@@ -332,6 +480,15 @@ static LRESULT CALLBACK window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM
+     {
+     case WM_ERASEBKGND:
+         return 1;
++    case WM_XAML_ACTIVATED:
++        /* Activate() activated the window, even if the desktop (a locked screen, say) didn't bring it forward */
++        window_raise_activated( window, CoreWindowActivationState_CodeActivated );
++        return 0;
++    case WM_ACTIVATE:
++        window_raise_activated( window, LOWORD( wparam ) == WA_INACTIVE ? CoreWindowActivationState_Deactivated :
++                                LOWORD( wparam ) == WA_CLICKACTIVE ? CoreWindowActivationState_PointerActivated :
++                                CoreWindowActivationState_CodeActivated );
++        break;
+     case WM_TIMER:
+         if (wparam != FRAME_TIMER_ID) break;
+         composition_frame();
+@@ -511,7 +668,7 @@ static HRESULT WINAPI window_get_Dispatcher( IWindow *iface, ICoreDispatcher **v
+ 
+ static HRESULT WINAPI window_add_Activated( IWindow *iface, IWindowActivatedEventHandler *handler, EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, handler %p: handler is kept but never raised.\n", iface, handler );
++    TRACE( "iface %p, handler %p.\n", iface, handler );
+     return event_list_add( &impl_from_IWindow( iface )->activated, (IUnknown *)handler, token );
+ }
+ 
+@@ -565,6 +722,8 @@ static HRESULT WINAPI window_Activate( IWindow *iface )
+     {
+         InvalidateRect( impl->hwnd, NULL, FALSE );
+         UpdateWindow( impl->hwnd );
++        /* Activated comes once Activate has returned, as on Windows */
++        PostMessageW( impl->hwnd, WM_XAML_ACTIVATED, 0, 0 );
+     }
+     return hr;
+ }
+@@ -617,6 +776,7 @@ HRESULT window_create_for_core_window( ICoreWindow *core_window )
+     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+     impl->IWindow_iface.lpVtbl = &window_vtbl;
+     impl->ref = 1;
++    impl->activation = -1;
+     impl->core_window = core_window;
+     ICoreWindow_AddRef( core_window );
+ 
+diff --git a/dlls/windows.ui.xaml/xbf.c b/dlls/windows.ui.xaml/xbf.c
+index 8174f6e..ff8a75f 100644
+--- a/dlls/windows.ui.xaml/xbf.c
++++ b/dlls/windows.ui.xaml/xbf.c
+@@ -1863,7 +1863,6 @@ static BOOL to_enum( const struct xvalue *v, const WCHAR *const *names, UINT32 c
+ static const WCHAR *const horizontal_names[] = { L"Left", L"Center", L"Right", L"Stretch" };
+ static const WCHAR *const vertical_names[] = { L"Top", L"Center", L"Bottom", L"Stretch" };
+ static const WCHAR *const orientation_names[] = { L"Vertical", L"Horizontal" };
+-static const WCHAR *const visibility_names[] = { L"Visible", L"Collapsed" };
+ static const WCHAR *const wrapping_names[] = { NULL, L"NoWrap", L"Wrap", L"WrapWholeWords" };
+ static const WCHAR *const alignment_names[] = { L"Center", L"Left", L"Right", L"Justify", L"DetectFromContent" };
+ static const WCHAR *const theme_names[] = { L"Light", L"Dark" };
+@@ -1947,6 +1946,37 @@ static void convert_to_type( const struct xtype *type, struct xvalue *v )
+     v->object = object;
+ }
+ 
++static const WCHAR *const visibility_names[] = { L"Visible", L"Collapsed" };
++
++/* a Visibility: its name or value, or (as bindings give it) a boolean, true being Visible */
++static BOOL to_visibility( const struct xvalue *value, INT32 *e )
++{
++    IPropertyValue *pv;
++    PropertyType type;
++    boolean b;
++    BOOL ok = FALSE;
++
++    if (value->kind == XV_BOOL)
++    {
++        *e = value->b ? Visibility_Visible : Visibility_Collapsed;
++        return TRUE;
++    }
++    if (value->kind == XV_OBJECT && value->object &&
++        SUCCEEDED(IInspectable_QueryInterface( value->object, &IID_IPropertyValue, (void **)&pv )))
++    {
++        if (SUCCEEDED(IPropertyValue_get_Type( pv, &type )) && type == PropertyType_Boolean &&
++            SUCCEEDED(IPropertyValue_GetBoolean( pv, &b )))
++        {
++            *e = b ? Visibility_Visible : Visibility_Collapsed;
++            ok = TRUE;
++        }
++        else if (SUCCEEDED(IPropertyValue_GetInt32( pv, e ))) ok = *e == Visibility_Visible || *e == Visibility_Collapsed;
++        IPropertyValue_Release( pv );
++        if (ok) return TRUE;
++    }
++    return to_enum( value, visibility_names, 2, e );
++}
++
+ static BOOL prop_is( const struct xprop *prop, const WCHAR *name )
+ {
+     return !wcscmp( prop->name, name );
+@@ -2610,6 +2640,16 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+             done = TRUE;
+         }
+     }
++    else if ((prop_is( prop, L"MinWidth" ) || prop_is( prop, L"MaxWidth" ) || prop_is( prop, L"MinHeight" ) ||
++              prop_is( prop, L"MaxHeight" )) && to_double( value, &d ) && QI( target, IFrameworkElement, &fe ))
++    {
++        if (prop_is( prop, L"MinWidth" )) IFrameworkElement_put_MinWidth( fe, d );
++        else if (prop_is( prop, L"MaxWidth" )) IFrameworkElement_put_MaxWidth( fe, d );
++        else if (prop_is( prop, L"MinHeight" )) IFrameworkElement_put_MinHeight( fe, d );
++        else IFrameworkElement_put_MaxHeight( fe, d );
++        IFrameworkElement_Release( fe );
++        done = TRUE;
++    }
+     else if (prop_is( prop, L"HorizontalAlignment" ) && to_enum( value, horizontal_names, 4, &e ) && QI( target, IFrameworkElement, &fe ))
+     {
+         IFrameworkElement_put_HorizontalAlignment( fe, e );
+@@ -2640,7 +2680,7 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+         IStackPanel_Release( sp );
+         done = TRUE;
+     }
+-    else if (prop_is( prop, L"Visibility" ) && to_enum( value, visibility_names, 2, &e ) && QI( target, IUIElement, &ui ))
++    else if (prop_is( prop, L"Visibility" ) && to_visibility( value, &e ) && QI( target, IUIElement, &ui ))
+     {
+         IUIElement_put_Visibility( ui, e );
+         IUIElement_Release( ui );
+@@ -3367,6 +3407,30 @@ static BOOL scope_pop( struct writer *w )
+ }
+ 
+ /* Run a node stream from offset. With single, stop after one complete object (a resource, a deferred element). */
++/* x:Uid: the localized values of the properties apps localize */
++static void apply_uid( struct writer *w, IInspectable *target, const WCHAR *uid )
++{
++    static const WCHAR *const properties[] =
++    {
++        L"Content", L"Text", L"Header", L"PlaceholderText", L"Title", L"Label", L"Description", L"Glyph",
++        L"PrimaryButtonText", L"SecondaryButtonText", L"CloseButtonText", L"OnContent", L"OffContent",
++    };
++    struct xvalue value = { XV_STRING };
++    struct xprop prop = {0};
++    UINT32 i, found = 0;
++
++    if (!target) return;
++    for (i = 0; i < ARRAY_SIZE(properties); i++)
++    {
++        if (!(value.s = uid_string( uid, properties[i] ))) continue;
++        lstrcpynW( prop.name, properties[i], ARRAY_SIZE(prop.name) );
++        set_property( w, target, &prop, &value, SET_LOCAL );
++        free( value.s );
++        found++;
++    }
++    TRACE( "x:Uid %s: %u values.\n", debugstr_w(uid), found );
++}
++
+ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, enum run_mode mode )
+ {
+     struct reader r = {0};
+@@ -3476,8 +3540,7 @@ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, enum run
+             break;
+         case NODE_GET_RESOURCE_PROPERTY_BAG:
+             read_constant( &r, &value );
+-            FIXME( "x:Uid %s: localized resources (resources.pri) are not supported.\n",
+-                   value.kind == XV_STRING ? debugstr_w(value.s) : "" );
++            if (value.kind == XV_STRING) apply_uid( w, top_object( w ), value.s );
+             xvalue_clear( &value );
+             break;
+         case NODE_SET_CUSTOM_RUNTIME_DATA:
