@@ -1,0 +1,81 @@
+Subject: kernelbase: ResolveDelayLoadsFromDll
+
+diff --git a/dlls/kernelbase/kernelbase.spec b/dlls/kernelbase/kernelbase.spec
+index 5843573..c70b258 100644
+--- a/dlls/kernelbase/kernelbase.spec
++++ b/dlls/kernelbase/kernelbase.spec
+@@ -1404,7 +1404,7 @@
+ @ stdcall ResetWriteWatch(ptr long)
+ @ stdcall ResizePseudoConsole(ptr long)
+ @ stdcall -import ResolveDelayLoadedAPI(ptr ptr ptr ptr ptr long) LdrResolveDelayLoadedAPI
+-# @ stub ResolveDelayLoadsFromDll
++@ stdcall ResolveDelayLoadsFromDll(ptr str long)
+ @ stdcall ResolveLocaleName(wstr ptr long)
+ @ stdcall RestoreLastError(long) ntdll.RtlRestoreLastWin32Error
+ @ stdcall ResumeThread(long)
+diff --git a/dlls/kernelbase/loader.c b/dlls/kernelbase/loader.c
+index 63ccea1..d203aa4 100644
+--- a/dlls/kernelbase/loader.c
++++ b/dlls/kernelbase/loader.c
+@@ -1312,3 +1312,61 @@ BOOL WINAPI DECLSPEC_HOTPATCH ZombifyActCtx( HANDLE context )
+ {
+     return set_ntstatus( RtlZombifyActivationContext( context ));
+ }
++
++
++/***********************************************************************
++ *	ResolveDelayLoadsFromDll   (kernelbase.@)
++ *
++ * Binds all of a module's delay-loaded imports from one DLL now, instead of at their first call.
++ * Imports the DLL doesn't export keep their delay-load thunks.
++ */
++HRESULT WINAPI ResolveDelayLoadsFromDll( HMODULE parent, const char *target, ULONG flags )
++{
++    const IMAGE_DELAYLOAD_DESCRIPTOR *desc;
++    BYTE *base = (BYTE *)((ULONG_PTR)parent & ~(ULONG_PTR)3);
++    ULONG size;
++
++    TRACE( "parent %p, target %s, flags %#lx.\n", parent, debugstr_a(target), flags );
++
++    if (!base || !target) return E_INVALIDARG;
++    desc = RtlImageDirectoryEntryToData( (HMODULE)base, TRUE, IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, &size );
++    if (!desc) return HRESULT_FROM_WIN32( ERROR_MOD_NOT_FOUND );
++
++    for (; desc->DllNameRVA; desc++)
++    {
++        IMAGE_THUNK_DATA *iat, *names;
++        HMODULE *handle, module;
++        DWORD protect;
++        SIZE_T count;
++
++        if (!(desc->Attributes.RvaBased)) continue;   /* old VC6-style descriptors hold pointers */
++        if (_stricmp( (const char *)(base + desc->DllNameRVA), target )) continue;
++
++        handle = (HMODULE *)(base + desc->ModuleHandleRVA);
++        if (!(module = *handle))
++        {
++            if (!(module = LoadLibraryA( target ))) return HRESULT_FROM_WIN32( GetLastError() );
++            if (InterlockedCompareExchangePointer( (void **)handle, module, NULL )) FreeLibrary( module );
++            module = *handle;
++        }
++
++        iat = (IMAGE_THUNK_DATA *)(base + desc->ImportAddressTableRVA);
++        names = (IMAGE_THUNK_DATA *)(base + desc->ImportNameTableRVA);
++        for (count = 0; names[count].u1.AddressOfData; count++);
++        if (!VirtualProtect( iat, count * sizeof(*iat), PAGE_READWRITE, &protect )) return HRESULT_FROM_WIN32( GetLastError() );
++        for (SIZE_T i = 0; i < count; i++)
++        {
++            FARPROC proc;
++
++            if (IMAGE_SNAP_BY_ORDINAL( names[i].u1.Ordinal ))
++                proc = GetProcAddress( module, (const char *)(ULONG_PTR)IMAGE_ORDINAL( names[i].u1.Ordinal ) );
++            else
++                proc = GetProcAddress( module, (const char *)((IMAGE_IMPORT_BY_NAME *)(base + names[i].u1.AddressOfData))->Name );
++            if (proc) iat[i].u1.Function = (ULONG_PTR)proc;
++            else WARN( "%s: import %Iu not found, left delay-loaded.\n", debugstr_a(target), i );
++        }
++        VirtualProtect( iat, count * sizeof(*iat), protect, &protect );
++        return S_OK;
++    }
++    return HRESULT_FROM_WIN32( ERROR_MOD_NOT_FOUND );
++}

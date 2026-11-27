@@ -21,6 +21,7 @@ UWP apps don't create a normal Win32 window. They ask Windows for a `CoreApplica
 | ✅ | Crackdown 3 (`Microsoft.48248D2C77101`, Unreal Engine 4) | Campaign playable offline: menus with the mouse, keyboard movement, mouse look; saves kept locally. Holding the mouse button doesn't skip the intro video; let it play. Its online services fail as offline. |
 | ✅ | Microsoft Minesweeper (`Microsoft.MicrosoftMinesweeper`, Unity, XAML, .NET Native) | Playable offline: menus and Classic games with mouse clicks, flags and local saves. Needs `mrt100.dll` (see [framework packages](#set-up-an-app)). After the tutorial, each start waits about 30 seconds on "Downloading Game Data" while its Xbox cloud saves fail as offline. No ads, achievements or cloud saves. |
 | ✅ | Microsoft Sudoku (`Microsoft.MicrosoftSudoku`, Unity 6, XAML, .NET Native) | Playable offline: the tutorial and puzzles with the mouse. Its Xbox cloud sync and ads fail as offline. |
+| ✅ | Minecraft for Windows 1.21.114 (`Microsoft.MinecraftUWP`, D3D11) | Starts and plays offline: menus, worlds. Xbox sign-in and online features fail as offline. |
 | ❌ | Forza Motorsport 7 (`Microsoft.ApolloBaseGame`, D3D12) | Not working: it starts and its hardware warning is answered, but it isn't playable yet. |
 | ❌ | Windows Calculator (`Microsoft.WindowsCalculator`, XAML, WinUI 2.8) | Not working: stops at startup. It needs XAML's dependency-property system and the WinUI 2 control library, which the partial XAML doesn't support yet. |
 | ❌ | Windows Notepad, Paint (`Microsoft.WindowsNotepad`, `Microsoft.Paint`) | Not supported: Windows App SDK (WinUI 3) desktop apps, not UWP; nothing here supports them. |
@@ -289,7 +290,9 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 (Unity 6): a package's own WinRT classes first (Unity games no longer load each other's),
                 DispatcherQueue.GetForCurrentThread, ResourceContext, 0084 FileIO, 0085 hash algorithms, 0086
                 classes from a package's namespace-named DLLs, 0087 ThreadPoolTimer lifetime (a game's main loop
-                hung on a timer that never fired)
+                hung on a timer that never fired), 0088-0093 for Minecraft: ResolveDelayLoadsFromDll,
+                DeviceInformation.CreateFromIdAsync, InputPane events, ICoreDispatcherWithTaskPriority,
+                CoreTextEditContext, LocalCacheFolder and publisher cache folders
 patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings

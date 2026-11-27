@@ -1,0 +1,132 @@
+Subject: windows.ui.core.textinput: CoreTextEditContext and InputLanguageChanged
+
+diff --git a/dlls/windows.ui.core.textinput/services.c b/dlls/windows.ui.core.textinput/services.c
+index 8e928eb..cb33d58 100644
+--- a/dlls/windows.ui.core.textinput/services.c
++++ b/dlls/windows.ui.core.textinput/services.c
+@@ -196,20 +196,119 @@ static HRESULT WINAPI core_text_services_manager_get_InputLanguage( ICoreTextSer
+ 
+ static HRESULT WINAPI core_text_services_manager_add_InputLanguageChanged( ICoreTextServicesManager *iface, ITypedEventHandler_CoreTextServicesManager_IInspectable *handler, EventRegistrationToken* cookie )
+ {
+-    FIXME( "iface %p, handler %p, cookie %p stub!\n", iface, handler, cookie );
+-    return E_NOTIMPL;
++    /* the input language doesn't change while the app runs */
++    TRACE( "iface %p, handler %p, cookie %p.\n", iface, handler, cookie );
++    if (!handler || !cookie) return E_POINTER;
++    cookie->value = 0x696c;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI core_text_services_manager_remove_InputLanguageChanged( ICoreTextServicesManager *iface, EventRegistrationToken cookie )
+ {
+-    FIXME( "iface %p stub!\n", iface );
+-    return E_NOTIMPL;
++    TRACE( "iface %p.\n", iface );
++    return S_OK;
+ }
+ 
++/* ---- CoreTextEditContext: keeps its settings; text services never call into it, so its events are
++ * not raised (there is no IME or touch keyboard here: typing still reaches the CoreWindow's key and
++ * character events) ---- */
++struct edit_context
++{
++    const void *const *lpVtbl;   /* ICoreTextEditContext */
++    LONG ref;
++    HSTRING name;
++    INT32 input_scope;
++    boolean read_only;
++    INT32 pane_policy;
++};
++
++static HRESULT WINAPI edit_QueryInterface( struct edit_context *impl, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_ICoreTextEditContext ))
++    {
++        InterlockedIncrement( &impl->ref );
++        *out = impl;
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI edit_AddRef( struct edit_context *impl ) { return InterlockedIncrement( &impl->ref ); }
++static ULONG WINAPI edit_Release( struct edit_context *impl )
++{
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        WindowsDeleteString( impl->name );
++        free( impl );
++    }
++    return ref;
++}
++static HRESULT WINAPI edit_GetIids( struct edit_context *impl, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI edit_GetRuntimeClassName( struct edit_context *impl, HSTRING *name )
++{
++    return WindowsCreateString( L"Windows.UI.Text.Core.CoreTextEditContext", 40, name );
++}
++static HRESULT WINAPI edit_GetTrustLevel( struct edit_context *impl, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI edit_get_Name( struct edit_context *impl, HSTRING *value ) { return WindowsDuplicateString( impl->name, value ); }
++static HRESULT WINAPI edit_put_Name( struct edit_context *impl, HSTRING value )
++{
++    WindowsDeleteString( impl->name );
++    return WindowsDuplicateString( value, &impl->name );
++}
++static HRESULT WINAPI edit_get_InputScope( struct edit_context *impl, INT32 *value ) { *value = impl->input_scope; return S_OK; }
++static HRESULT WINAPI edit_put_InputScope( struct edit_context *impl, INT32 value ) { impl->input_scope = value; return S_OK; }
++static HRESULT WINAPI edit_get_IsReadOnly( struct edit_context *impl, boolean *value ) { *value = impl->read_only; return S_OK; }
++static HRESULT WINAPI edit_put_IsReadOnly( struct edit_context *impl, boolean value ) { impl->read_only = value; return S_OK; }
++static HRESULT WINAPI edit_get_InputPaneDisplayPolicy( struct edit_context *impl, INT32 *value ) { *value = impl->pane_policy; return S_OK; }
++static HRESULT WINAPI edit_put_InputPaneDisplayPolicy( struct edit_context *impl, INT32 value ) { impl->pane_policy = value; return S_OK; }
++static HRESULT WINAPI edit_add_event( struct edit_context *impl, IUnknown *handler, EventRegistrationToken *token )
++{
++    if (!handler || !token) return E_POINTER;
++    token->value = 0x7465;
++    return S_OK;
++}
++static HRESULT WINAPI edit_remove_event( struct edit_context *impl, EventRegistrationToken token ) { return S_OK; }
++static HRESULT WINAPI edit_notify( struct edit_context *impl ) { return S_OK; }
++/* NotifyTextChanged(CoreTextRange, INT32, CoreTextRange) and NotifySelectionChanged(CoreTextRange): the
++ * ranges are two INT32s, passed in a register; nothing listens to them */
++static HRESULT WINAPI edit_NotifyTextChanged( struct edit_context *impl, UINT64 modified, INT32 length, UINT64 selection ) { return S_OK; }
++static HRESULT WINAPI edit_NotifySelectionChanged( struct edit_context *impl, UINT64 selection ) { return S_OK; }
++
++static const void *const edit_vtbl[] =
++{
++    edit_QueryInterface, edit_AddRef, edit_Release,
++    edit_GetIids, edit_GetRuntimeClassName, edit_GetTrustLevel,
++    edit_get_Name, edit_put_Name, edit_get_InputScope, edit_put_InputScope,
++    edit_get_IsReadOnly, edit_put_IsReadOnly, edit_get_InputPaneDisplayPolicy, edit_put_InputPaneDisplayPolicy,
++    edit_add_event, edit_remove_event,      /* TextRequested */
++    edit_add_event, edit_remove_event,      /* SelectionRequested */
++    edit_add_event, edit_remove_event,      /* LayoutRequested */
++    edit_add_event, edit_remove_event,      /* TextUpdating */
++    edit_add_event, edit_remove_event,      /* SelectionUpdating */
++    edit_add_event, edit_remove_event,      /* FormatUpdating */
++    edit_add_event, edit_remove_event,      /* CompositionStarted */
++    edit_add_event, edit_remove_event,      /* CompositionCompleted */
++    edit_add_event, edit_remove_event,      /* FocusRemoved */
++    edit_notify, edit_notify,               /* NotifyFocusEnter, NotifyFocusLeave */
++    edit_NotifyTextChanged, edit_NotifySelectionChanged,
++    edit_notify,                            /* NotifyLayoutChanged */
++};
++
+ static HRESULT WINAPI core_text_services_manager_CreateEditContext( ICoreTextServicesManager *iface, ICoreTextEditContext **value )
+ {
+-    FIXME( "iface %p out %p created\n", iface, value );
+-    return E_NOTIMPL;
++    struct edit_context *impl;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->lpVtbl = edit_vtbl;
++    impl->ref = 1;
++    *value = (ICoreTextEditContext *)impl;
++    return S_OK;
+ }
+ 
+ static const struct ICoreTextServicesManagerVtbl core_text_services_manager_vtbl =

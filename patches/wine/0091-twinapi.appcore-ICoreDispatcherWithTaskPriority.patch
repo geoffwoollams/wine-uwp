@@ -1,0 +1,96 @@
+Subject: twinapi.appcore: ICoreDispatcherWithTaskPriority
+
+diff --git a/dlls/twinapi.appcore/core_gen.c b/dlls/twinapi.appcore/core_gen.c
+index 2bd250e..9eba023 100644
+--- a/dlls/twinapi.appcore/core_gen.c
++++ b/dlls/twinapi.appcore/core_gen.c
+@@ -41,7 +41,10 @@ struct core_dispatcher
+ {
+     ICoreDispatcher ICoreDispatcher_iface;
+     ICoreAcceleratorKeys ICoreAcceleratorKeys_iface;
++    struct { const void *const *lpVtbl; } priority_iface;   /* ICoreDispatcherWithTaskPriority, declared below */
+     LONG ref;
++    INT32 current_priority;
++    LONG stop;               /* StopProcessEvents was called */
+     DWORD thread_id;
+     CRITICAL_SECTION cs;
+     struct dispatch_item *queue_head, *queue_tail;
+@@ -369,6 +372,7 @@ static void dispatcher_drain_queue(struct core_dispatcher *impl)
+ }
+ 
+ /* ===== core_dispatcher ===== */
++static const GUID IID_ICoreDispatcherWithTaskPriority_local = {0xbafaecad,0x484d,0x41be,{0xba,0x80,0x1d,0x58,0xc6,0x52,0x63,0xea}};
+ static const GUID IID_probe_d4bbc1c8 = {0xd4bbc1c8,0xf5bf,0x4647,{0x94,0x95,0x2e,0x5c,0x0f,0x20,0xf7,0x5d}};
+ 
+ static HRESULT core_dispatcher_qi(struct core_dispatcher *impl, REFIID iid, void **out)
+@@ -387,6 +391,12 @@ static HRESULT core_dispatcher_qi(struct core_dispatcher *impl, REFIID iid, void
+         ICoreAcceleratorKeys_AddRef(*out);
+         return S_OK;
+     }
++    if (IsEqualGUID(iid, &IID_ICoreDispatcherWithTaskPriority_local))
++    {
++        *out = &impl->priority_iface;
++        InterlockedIncrement(&impl->ref);
++        return S_OK;
++    }
+     /* IL2CPP and .NET Native probe objects for interfaces they handle themselves; not worth a FIXME */
+     if (!IsEqualGUID(iid, &IID_probe_d4bbc1c8))
+         FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
+@@ -618,6 +628,7 @@ static HRESULT WINAPI core_dispatcher_ProcessEvents(ICoreDispatcher *iface, __x_
+         for (;;)
+         {
+             dispatcher_drain_queue(impl);
++            if (InterlockedExchange(&impl->stop, 0)) break;
+             if (GetMessageW(&msg, NULL, 0, 0) <= 0) break;
+             TranslateMessage(&msg);
+             DispatchMessageW(&msg);
+@@ -696,6 +707,41 @@ static const ICoreDispatcherVtbl core_dispatcher_vtbl =
+     core_dispatcher_RunIdleAsync,
+ };
+ 
++/* ---- ICoreDispatcherWithTaskPriority on core_dispatcher (hand-declared): 6/7 CurrentPriority, 8 ShouldYield,
++ * 9 ShouldYieldToPriority, 10 StopProcessEvents. Queued work isn't prioritised, so nothing is ever waiting
++ * that should run first. ---- */
++static inline struct core_dispatcher *impl_from_priority(void *iface)
++{ return CONTAINING_RECORD(iface, struct core_dispatcher, priority_iface); }
++static HRESULT WINAPI priority_QueryInterface(void *iface, REFIID iid, void **out)
++{ return core_dispatcher_qi(impl_from_priority(iface), iid, out); }
++static ULONG WINAPI priority_AddRef(void *iface) { return core_dispatcher_addref(impl_from_priority(iface)); }
++static ULONG WINAPI priority_Release(void *iface) { return core_dispatcher_release(impl_from_priority(iface)); }
++static HRESULT WINAPI priority_GetIids(void *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI priority_GetRuntimeClassName(void *iface, HSTRING *name)
++{ return WindowsCreateString(L"Windows.UI.Core.CoreDispatcher", 30, name); }
++static HRESULT WINAPI priority_GetTrustLevel(void *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI priority_get_CurrentPriority(void *iface, INT32 *value)
++{ *value = impl_from_priority(iface)->current_priority; return S_OK; }
++static HRESULT WINAPI priority_put_CurrentPriority(void *iface, INT32 value)
++{ impl_from_priority(iface)->current_priority = value; return S_OK; }
++static HRESULT WINAPI priority_ShouldYield(void *iface, boolean *value) { *value = FALSE; return S_OK; }
++static HRESULT WINAPI priority_ShouldYieldToPriority(void *iface, INT32 priority, boolean *value) { *value = FALSE; return S_OK; }
++static HRESULT WINAPI priority_StopProcessEvents(void *iface)
++{
++    struct core_dispatcher *impl = impl_from_priority(iface);
++    TRACE("iface %p.\n", iface);
++    InterlockedExchange(&impl->stop, 1);
++    PostThreadMessageW(impl->thread_id, WM_NULL, 0, 0);
++    return S_OK;
++}
++static const void *const priority_vtbl[] =
++{
++    priority_QueryInterface, priority_AddRef, priority_Release,
++    priority_GetIids, priority_GetRuntimeClassName, priority_GetTrustLevel,
++    priority_get_CurrentPriority, priority_put_CurrentPriority, priority_ShouldYield, priority_ShouldYieldToPriority,
++    priority_StopProcessEvents,
++};
++
+ /* ---- ICoreAcceleratorKeys on core_dispatcher ---- */
+ static inline struct core_dispatcher *impl_from_core_accel(ICoreAcceleratorKeys *iface)
+ { return CONTAINING_RECORD(iface, struct core_dispatcher, ICoreAcceleratorKeys_iface); }
+@@ -2322,6 +2368,7 @@ static struct core_view *get_core_view(void)
+         return NULL;
+     dispatcher->ICoreDispatcher_iface.lpVtbl = &core_dispatcher_vtbl;
+     dispatcher->ICoreAcceleratorKeys_iface.lpVtbl = &core_accel_vtbl;
++    dispatcher->priority_iface.lpVtbl = priority_vtbl;
+     dispatcher->ref = 1;
+     dispatcher->thread_id = GetCurrentThreadId();
+     InitializeCriticalSectionEx(&dispatcher->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);

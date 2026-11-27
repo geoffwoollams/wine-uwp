@@ -1,0 +1,77 @@
+Subject: windows.devices.enumeration: DeviceInformation.CreateFromIdAsync (the device object, without properties)
+
+diff --git a/dlls/windows.devices.enumeration/main.c b/dlls/windows.devices.enumeration/main.c
+index 9f6536a..572fb6a 100644
+--- a/dlls/windows.devices.enumeration/main.c
++++ b/dlls/windows.devices.enumeration/main.c
+@@ -712,19 +712,46 @@ static const struct IActivationFactoryVtbl activation_factory_vtbl =
+ 
+ DEFINE_IINSPECTABLE( device_statics, IDeviceInformationStatics, struct device_information_statics, IActivationFactory_iface );
+ 
++/* CreateFromIdAsync: the device object with that id, without its properties (this PC's own device
++ * container, which Minecraft asks for, has none worth reporting) */
++static HRESULT create_from_id_async( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
++{
++    if (!called_async) return STATUS_PENDING;
++    IUnknown_AddRef( param );
++    result->vt = VT_UNKNOWN;
++    result->punkVal = param;
++    return S_OK;
++}
++
++static HRESULT create_from_id( IUnknown *invoker, HSTRING id, DEV_OBJECT_TYPE type, IAsyncOperation_DeviceInformation **op )
++{
++    DEV_OBJECT obj = { .ObjectType = type };
++    IDeviceInformation *info;
++    HRESULT hr;
++
++    if (!op) return E_POINTER;
++    if (!id || !WindowsGetStringLen( id )) return E_INVALIDARG;
++    obj.pszObjectId = WindowsGetStringRawBuffer( id, NULL );
++    if (FAILED(hr = device_information_create( &obj, &info ))) return hr;
++    hr = async_operation_inspectable_create( &IID_IAsyncOperation_DeviceInformation, invoker, (IUnknown *)info,
++                                             create_from_id_async, (IAsyncOperation_IInspectable **)op );
++    IDeviceInformation_Release( info );
++    return hr;
++}
++
+ static HRESULT WINAPI device_statics_CreateFromIdAsync( IDeviceInformationStatics *iface, HSTRING id,
+                                                         IAsyncOperation_DeviceInformation **op )
+ {
+-    FIXME( "iface %p, id %s, op %p stub!\n", iface, debugstr_hstring(id), op );
+-    return E_NOTIMPL;
++    FIXME( "iface %p, id %s, op %p: no properties.\n", iface, debugstr_hstring(id), op );
++    return create_from_id( (IUnknown *)iface, id, DevObjectTypeDeviceInterface, op );
+ }
+ 
+ static HRESULT WINAPI device_statics_CreateFromIdAsyncAdditionalProperties( IDeviceInformationStatics *iface, HSTRING id,
+                                                                             IIterable_HSTRING *additional_properties,
+                                                                             IAsyncOperation_DeviceInformation **op )
+ {
+-    FIXME( "iface %p, id %s, additional_properties %p, op %p stub!\n", iface, debugstr_hstring(id), additional_properties, op );
+-    return E_NOTIMPL;
++    FIXME( "iface %p, id %s, additional_properties %p, op %p: no properties.\n", iface, debugstr_hstring(id), additional_properties, op );
++    return create_from_id( (IUnknown *)iface, id, DevObjectTypeDeviceInterface, op );
+ }
+ 
+ static HRESULT find_all_async( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
+@@ -913,9 +940,17 @@ static HRESULT WINAPI device_statics2_CreateFromIdAsync( IDeviceInformationStati
+                                                          IIterable_HSTRING *additional_properties, DeviceInformationKind kind,
+                                                          IAsyncOperation_DeviceInformation **async_operation )
+ {
+-    FIXME( "iface %p, device_id %s, additional_properties %p, kind %u, async_operation %p stub!\n",
++    static const DEV_OBJECT_TYPE types[] =
++    {
++        DevObjectTypeUnknown, DevObjectTypeDeviceInterface, DevObjectTypeDeviceContainer, DevObjectTypeDevice,
++        DevObjectTypeDeviceInterfaceClass, DevObjectTypeAEP, DevObjectTypeAEPContainer, DevObjectTypeAEPService,
++        DevObjectTypeDevicePanel,
++    };
++
++    FIXME( "iface %p, device_id %s, additional_properties %p, kind %u, async_operation %p: no properties.\n",
+             iface, debugstr_hstring( device_id ), additional_properties, kind, async_operation );
+-    return E_NOTIMPL;
++    return create_from_id( (IUnknown *)iface, device_id, kind < ARRAY_SIZE(types) ? types[kind] : DevObjectTypeUnknown,
++                           async_operation );
+ }
+ 
+ static HRESULT find_all_async_type( IDeviceInformationStatics *iface, HSTRING filter, IIterable_HSTRING *additional_properties,
