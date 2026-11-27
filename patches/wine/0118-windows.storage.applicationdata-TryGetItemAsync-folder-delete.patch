@@ -1,0 +1,225 @@
+Subject: windows.storage.applicationdata: IStorageFolder2.TryGetItemAsync, GetItemAsync, folder DeleteAsync
+
+diff --git a/dlls/windows.storage.applicationdata/private.h b/dlls/windows.storage.applicationdata/private.h
+index 9936335..86d555f 100644
+--- a/dlls/windows.storage.applicationdata/private.h
++++ b/dlls/windows.storage.applicationdata/private.h
+@@ -44,6 +44,8 @@ DEFINE_GUID(IID_IIterable_StorageFile, 0x9ac00304, 0x83ea, 0x5688, 0x87,0xb6, 0x
+ DEFINE_GUID(IID_IIterator_StorageFile, 0x43e29f53, 0x0298, 0x55aa, 0xa6,0xc8, 0x4e,0xdd,0x32,0x3d,0x95,0x98);
+ /* Windows.Storage.IStorageItemProperties, not in windows.storage.idl yet */
+ DEFINE_GUID(IID_IStorageItemProperties, 0x86664478, 0x8029, 0x46fe, 0xa7,0x89, 0x1c,0x2f,0x3e,0x2f,0xfb,0x5c);
++/* Windows.Storage.IStorageFolder2 (TryGetItemAsync), not in windows.storage.idl yet */
++DEFINE_GUID(IID_IStorageFolder2, 0xe827e8b9, 0x08d9, 0x4a8e, 0xa0,0xac, 0xfe,0x5e,0xd3,0xcb,0xbb,0xd3);
+ 
+ extern IActivationFactory *application_data_factory;
+ extern HRESULT item_properties_create( IUnknown *outer, const WCHAR *path, BOOL folder, void **out );
+@@ -52,6 +54,7 @@ extern HRESULT storage_folder_create( const WCHAR *path, IStorageFolder **out );
+ extern HRESULT storage_file_create( const WCHAR *path, IStorageFile **out );
+ extern HRESULT storage_file_operation( HRESULT hr, IStorageFile *file, IAsyncOperation_StorageFile **operation );
+ extern HRESULT storage_operation_create( const GUID *iid, HRESULT hr, IUnknown *object, void **out );
++extern HRESULT storage_action_create( HRESULT hr, IAsyncAction **out );
+ extern HRESULT property_set_create( BOOL missing_is_null, IPropertySet **out );
+ extern HRESULT property_set_create_persistent( BOOL missing_is_null, const WCHAR *path, IPropertySet **out );
+ 
+diff --git a/dlls/windows.storage.applicationdata/storagefile.c b/dlls/windows.storage.applicationdata/storagefile.c
+index d6286b1..d1f3adb 100644
+--- a/dlls/windows.storage.applicationdata/storagefile.c
++++ b/dlls/windows.storage.applicationdata/storagefile.c
+@@ -198,9 +198,11 @@ static HRESULT done_create(enum done_kind kind, const GUID *iid, HRESULT hr, IUn
+     return S_OK;
+ }
+ 
+-/* a completed IAsyncOperation<T> with interface result object (taken over; NULL on error) */
++/* a completed IAsyncOperation<T> with interface result object (taken over; NULL gives a null result) */
+ HRESULT storage_operation_create( const GUID *iid, HRESULT hr, IUnknown *object, void **out )
+ {
++    static void *const null;
++    if (!object) return done_create(DONE_OPERATION, iid, hr, NULL, &null, sizeof(null), out);
+     return done_create(DONE_OPERATION, iid, hr, object, NULL, 0, out);
+ }
+ 
+@@ -209,6 +211,11 @@ static HRESULT done_action(HRESULT hr, IAsyncAction **out)
+     return done_create(DONE_ACTION, &IID_IAsyncAction, hr, NULL, NULL, 0, (void **)out);
+ }
+ 
++HRESULT storage_action_create( HRESULT hr, IAsyncAction **out )
++{
++    return done_action(hr, out);
++}
++
+ static HRESULT last_error(void)
+ {
+     DWORD error = GetLastError();
+diff --git a/dlls/windows.storage.applicationdata/storagefolder_gen.c b/dlls/windows.storage.applicationdata/storagefolder_gen.c
+index acdc177..e274e01 100644
+--- a/dlls/windows.storage.applicationdata/storagefolder_gen.c
++++ b/dlls/windows.storage.applicationdata/storagefolder_gen.c
+@@ -8,6 +8,7 @@ struct storage_folder
+ {
+     IStorageFolder IStorageFolder_iface;
+     IStorageItem IStorageItem_iface;
++    struct { const void *const *lpVtbl; } IStorageFolder2_iface;
+     LONG ref;
+     WCHAR path[MAX_PATH];
+ };
+@@ -20,6 +21,8 @@ static HRESULT storage_folder_qi(struct storage_folder *impl, REFIID iid, void *
+         *out = &impl->IStorageFolder_iface;
+     else if (IsEqualGUID(iid, &IID_IStorageItem))
+         *out = &impl->IStorageItem_iface;
++    else if (IsEqualGUID(iid, &IID_IStorageFolder2))
++        *out = &impl->IStorageFolder2_iface;
+     else if (IsEqualGUID(iid, &IID_IStorageItemProperties))
+         return item_properties_create((IUnknown *)&impl->IStorageFolder_iface, impl->path, TRUE, out);
+     else
+@@ -342,10 +345,54 @@ static HRESULT WINAPI storage_folder_GetFolderAsync(IStorageFolder *iface, HSTRI
+     return folder_op_create(hr, folder, operation);
+ }
+ 
++/* the file or folder at path as an IStorageItem, or NULL if there is none */
++static HRESULT item_from_path(const WCHAR *path, IStorageItem **item)
++{
++    DWORD attrs = GetFileAttributesW(path);
++    IStorageFolder *folder;
++    IStorageFile *file;
++    HRESULT hr;
++
++    *item = NULL;
++    if (attrs == INVALID_FILE_ATTRIBUTES) return S_OK;
++    if (attrs & FILE_ATTRIBUTE_DIRECTORY)
++    {
++        if (FAILED(hr = storage_folder_create(path, &folder))) return hr;
++        hr = IStorageFolder_QueryInterface(folder, &IID_IStorageItem, (void **)item);
++        IStorageFolder_Release(folder);
++    }
++    else
++    {
++        if (FAILED(hr = storage_file_create(path, &file))) return hr;
++        hr = IStorageFile_QueryInterface(file, &IID_IStorageItem, (void **)item);
++        IStorageFile_Release(file);
++    }
++    return hr;
++}
++
++/* GetItemAsync fails for a missing name, TryGetItemAsync gives a null item */
++static HRESULT get_item(struct storage_folder *impl, HSTRING name, BOOL try, void **operation)
++{
++    const GUID *iid = &IID___FIAsyncOperation_1_Windows__CStorage__CIStorageItem;
++    IStorageItem *item = NULL;
++    WCHAR path[MAX_PATH];
++    HRESULT hr;
++
++    if (!operation) return E_POINTER;
++    if (SUCCEEDED(hr = child_path(impl, name, path)) && SUCCEEDED(hr = item_from_path(path, &item)) && !item && !try)
++        hr = HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
++    if (FAILED(hr) && item)
++    {
++        IStorageItem_Release(item);
++        item = NULL;
++    }
++    return storage_operation_create(iid, hr, (IUnknown *)item, operation);
++}
++
+ static HRESULT WINAPI storage_folder_GetItemAsync(IStorageFolder *iface, HSTRING name, __FIAsyncOperation_1_Windows__CStorage__CIStorageItem **operation)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE("iface %p, name %s, operation %p.\n", iface, debugstr_hstring(name), operation);
++    return get_item(impl_from_storage_folder(iface), name, FALSE, (void **)operation);
+ }
+ 
+ /* ---- IVectorView<T> (with IIterable<T>) of a folder's StorageFolder, StorageFile or IStorageItem entries ---- */
+@@ -706,18 +753,49 @@ static HRESULT WINAPI storage_item_RenameAsync(IStorageItem *iface, HSTRING name
+     return E_NOTIMPL;
+ }
+ 
+-static HRESULT WINAPI storage_item_DeleteAsyncOverloadDefaultOptions(IStorageItem *iface, __x_ABI_CWindows_CFoundation_CIAsyncAction **operation)
++/* deletes path with everything in it */
++static BOOL delete_tree(const WCHAR *path)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    WCHAR child[MAX_PATH];
++    WIN32_FIND_DATAW data;
++    HANDLE find;
++
++    swprintf(child, MAX_PATH, L"%s\\*", path);
++    if ((find = FindFirstFileW(child, &data)) != INVALID_HANDLE_VALUE)
++    {
++        do
++        {
++            if (!wcscmp(data.cFileName, L".") || !wcscmp(data.cFileName, L"..")) continue;
++            if (swprintf(child, MAX_PATH, L"%s\\%s", path, data.cFileName) < 0) continue;
++            if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) delete_tree(child);
++            else
++            {
++                if (data.dwFileAttributes & FILE_ATTRIBUTE_READONLY)
++                    SetFileAttributesW(child, data.dwFileAttributes & ~FILE_ATTRIBUTE_READONLY);
++                DeleteFileW(child);
++            }
++        } while (FindNextFileW(find, &data));
++        FindClose(find);
++    }
++    return RemoveDirectoryW(path);
+ }
+ 
++/* there is no recycle bin: StorageDeleteOption_Default deletes too */
+ static HRESULT WINAPI storage_item_DeleteAsync(IStorageItem *iface, __x_ABI_CWindows_CStorage_CStorageDeleteOption option, __x_ABI_CWindows_CFoundation_CIAsyncAction **operation)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
+-}
++    struct storage_folder *impl = impl_from_storage_item(iface);
++    HRESULT hr = S_OK;
+ 
++    TRACE("iface %p, option %d, operation %p, path %s.\n", iface, option, operation, debugstr_w(impl->path));
++    if (!operation) return E_POINTER;
++    if (wcslen(impl->path) <= 3) hr = E_ACCESSDENIED;   /* never a drive's root */
++    else if (!delete_tree(impl->path)) hr = HRESULT_FROM_WIN32(GetLastError());
++    return storage_action_create(hr, operation);
++}
++static HRESULT WINAPI storage_item_DeleteAsyncOverloadDefaultOptions(IStorageItem *iface, __x_ABI_CWindows_CFoundation_CIAsyncAction **operation)
++{
++    return storage_item_DeleteAsync(iface, StorageDeleteOption_Default, operation);
++}
+ static HRESULT WINAPI storage_item_GetBasicPropertiesAsync(IStorageItem *iface, __FIAsyncOperation_1_Windows__CStorage__CFileProperties__CBasicProperties **operation)
+ {
+     FIXME("iface %p stub!\n", iface);
+@@ -780,6 +858,30 @@ static const IStorageItemVtbl storage_item_vtbl =
+ };
+ 
+ 
++/* ---- IStorageFolder2 on storage_folder ---- */
++static inline struct storage_folder *impl_from_storage_folder2(void *iface)
++{ return CONTAINING_RECORD(iface, struct storage_folder, IStorageFolder2_iface); }
++static HRESULT WINAPI storage_folder2_QueryInterface(void *iface, REFIID iid, void **out)
++{ return storage_folder_qi(impl_from_storage_folder2(iface), iid, out); }
++static ULONG WINAPI storage_folder2_AddRef(void *iface)
++{ return storage_folder_addref(impl_from_storage_folder2(iface)); }
++static ULONG WINAPI storage_folder2_Release(void *iface)
++{ return storage_folder_release(impl_from_storage_folder2(iface)); }
++static HRESULT WINAPI storage_folder2_GetIids(void *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI storage_folder2_GetRuntimeClassName(void *iface, HSTRING *name) { return E_NOTIMPL; }
++static HRESULT WINAPI storage_folder2_GetTrustLevel(void *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI storage_folder2_TryGetItemAsync(void *iface, HSTRING name, void **operation)
++{
++    TRACE("iface %p, name %s, operation %p.\n", iface, debugstr_hstring(name), operation);
++    return get_item(impl_from_storage_folder2(iface), name, TRUE, operation);
++}
++static const void *const storage_folder2_vtbl[] =
++{
++    storage_folder2_QueryInterface, storage_folder2_AddRef, storage_folder2_Release,
++    storage_folder2_GetIids, storage_folder2_GetRuntimeClassName, storage_folder2_GetTrustLevel,
++    storage_folder2_TryGetItemAsync,
++};
++
+ /* Creates (including parents) a folder object for path. */
+ HRESULT storage_folder_create( const WCHAR *path, IStorageFolder **out )
+ {
+@@ -790,6 +892,7 @@ HRESULT storage_folder_create( const WCHAR *path, IStorageFolder **out )
+     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+     impl->IStorageFolder_iface.lpVtbl = &storage_folder_vtbl;
+     impl->IStorageItem_iface.lpVtbl = &storage_item_vtbl;
++    impl->IStorageFolder2_iface.lpVtbl = storage_folder2_vtbl;
+     impl->ref = 1;
+     lstrcpynW( impl->path, path, MAX_PATH );
+ 

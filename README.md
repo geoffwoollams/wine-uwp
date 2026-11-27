@@ -326,7 +326,8 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 ConnectionCost (Minecraft disabled multiplayer while it failed), 0117 publisher storage for the
                 Microsoft casual games: GetPublisherCacheFolder subfolders ("mcg\analytics"), CreateFolderAsync and
                 CreateFileAsync make missing parent folders, GetFoldersAsync/GetFilesAsync/GetItemsAsync, and
-                IStorageItemProperties (launch data such as mcg\user_data\Guest\launch_data was never written)
+                IStorageItemProperties (launch data such as mcg\user_data\Guest\launch_data was never written), 0118
+                IStorageFolder2.TryGetItemAsync (their ad-consent files), GetItemAsync and deleting a folder
 patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings
