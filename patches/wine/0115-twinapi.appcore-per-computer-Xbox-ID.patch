@@ -1,0 +1,39 @@
+Subject: twinapi.appcore: the offline Xbox user ID includes the computer name; WINE_UWP_GAMERTAG
+
+diff --git a/dlls/twinapi.appcore/xbox_identity.c b/dlls/twinapi.appcore/xbox_identity.c
+index cadd4c7..279196b 100644
+--- a/dlls/twinapi.appcore/xbox_identity.c
++++ b/dlls/twinapi.appcore/xbox_identity.c
+@@ -1,5 +1,7 @@
+-/* Offline Xbox identity for the signed-in local user: the gamertag is the OS account name and the user ID (XUID) is a
+- * stable number derived from it, so saves and settings keep working across runs without any Xbox Live sign-in. */
++/* Offline Xbox identity for the signed-in local user: the gamertag is the OS account name (or WINE_UWP_GAMERTAG) and
++ * the user ID (XUID) is a stable number derived from it and the computer's name, so saves and settings keep working
++ * across runs without any Xbox Live sign-in, and two computers with the same account name are still two players
++ * (Minecraft ignores LAN games hosted by its own user ID). */
+ #include "private.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
+@@ -16,12 +18,20 @@ static BOOL CALLBACK init_identity(INIT_ONCE *once, void *param, void **ctx)
+     UINT64 hash = 0xcbf29ce484222325ull;
+     const WCHAR *p;
+ 
++    WCHAR computer[MAX_COMPUTERNAME_LENGTH + 1];
++    DWORD computer_size = ARRAY_SIZE(computer);
++
+     lstrcpynW(identity.gamertag, L"Player", ARRAY_SIZE(identity.gamertag));
+-    if (GetUserNameW(name, &size) && name[0] && lstrcmpiW(name, L"Administrator"))
++    if (GetEnvironmentVariableW(L"WINE_UWP_GAMERTAG", name, ARRAY_SIZE(name)) && name[0])
++        lstrcpynW(identity.gamertag, name, ARRAY_SIZE(identity.gamertag));
++    else if (GetUserNameW(name, &size) && name[0] && lstrcmpiW(name, L"Administrator"))
+         lstrcpynW(identity.gamertag, name, ARRAY_SIZE(identity.gamertag));
++    if (!GetComputerNameW(computer, &computer_size)) computer[0] = 0;
+ 
+-    /* FNV-1a of the gamertag, folded into a 16-digit decimal XUID-like number */
++    /* FNV-1a of "gamertag@computer", folded into a 16-digit decimal XUID-like number */
+     for (p = identity.gamertag; *p; p++) { hash ^= *p; hash *= 0x100000001b3ull; }
++    hash ^= '@'; hash *= 0x100000001b3ull;
++    for (p = computer; *p; p++) { hash ^= towupper(*p); hash *= 0x100000001b3ull; }
+     swprintf(identity.user_id, ARRAY_SIZE(identity.user_id), L"%I64u", 2000000000000000ull + hash % 1000000000000000ull);
+     swprintf(identity.email, ARRAY_SIZE(identity.email), L"%s@localhost.invalid", identity.gamertag);
+     TRACE("offline identity: gamertag %s, id %s\n", debugstr_w(identity.gamertag), debugstr_w(identity.user_id));

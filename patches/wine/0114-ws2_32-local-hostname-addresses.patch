@@ -1,0 +1,93 @@
+Subject: ws2_32: getaddrinfo on the computer's own name gives its interface addresses when the host OS says loopback (Minecraft's LAN broadcasts)
+
+diff --git a/dlls/ws2_32/protocol.c b/dlls/ws2_32/protocol.c
+index d439744..860d220 100644
+--- a/dlls/ws2_32/protocol.c
++++ b/dlls/ws2_32/protocol.c
+@@ -209,6 +209,78 @@ static int dns_only_query( const char *node, const struct addrinfo *hints, struc
+     return 0;
+ }
+ 
++static struct hostent *get_local_ips( char *hostname );
++
++/* Windows resolves the computer's own name to its network addresses. Linux distributions usually map it to
++ * 127.0.1.1 in /etc/hosts, and apps that work out their LAN broadcast address from it (RakNet's LAN discovery,
++ * in Minecraft) then only ever broadcast to 127.0.1.255. When the local name comes back as loopback only, give
++ * the interface addresses instead, in routing order, as gethostbyname does. */
++static void replace_local_loopback( const char *node, const struct addrinfo *hints, struct addrinfo **info )
++{
++    struct addrinfo *ai, *out, *entry;
++    struct sockaddr_in *sin;
++    struct hostent *host;
++    char name[256], *fqdn;
++    unsigned int count = 0, i;
++    unsigned short port = 0;
++    BOOL local;
++
++    if (!node || !*info) return;
++    if (hints && ((hints->ai_family != AF_UNSPEC && hints->ai_family != AF_INET) ||
++                  (hints->ai_flags & (AI_CANONNAME | AI_NUMERICHOST)))) return;
++    if (gethostname( name, sizeof(name) )) return;
++    local = !_stricmp( node, name );
++    if (!local && (fqdn = get_fqdn()))
++    {
++        local = !_stricmp( node, fqdn );
++        free( fqdn );
++    }
++    if (!local) return;
++
++    for (ai = *info; ai; ai = ai->ai_next)
++    {
++        if (ai->ai_family == AF_INET)
++        {
++            const struct sockaddr_in *addr = (const struct sockaddr_in *)ai->ai_addr;
++            if ((ntohl( addr->sin_addr.s_addr ) >> 24) != 127) return;
++            port = addr->sin_port;
++        }
++        else if (ai->ai_family == AF_INET6)
++        {
++            const struct sockaddr_in6 *addr = (const struct sockaddr_in6 *)ai->ai_addr;
++            if (!IN6_IS_ADDR_LOOPBACK( &addr->sin6_addr )) return;
++            port = addr->sin6_port;
++        }
++        else return;
++    }
++
++    if (!(host = get_local_ips( name ))) return;
++    for (i = 0; host->h_addr_list[i]; i++)
++        if (memcmp( host->h_addr_list[i], magic_loopback_addr, 4 )) count++;
++    if (!count) return;
++
++    if (!(out = calloc( count, sizeof(*out) + sizeof(*sin) ))) return;
++    sin = (struct sockaddr_in *)(out + count);
++    for (i = 0, entry = out; host->h_addr_list[i]; i++)
++    {
++        if (!memcmp( host->h_addr_list[i], magic_loopback_addr, 4 )) continue;
++        entry->ai_family = AF_INET;
++        entry->ai_socktype = (*info)->ai_socktype;
++        entry->ai_protocol = (*info)->ai_protocol;
++        entry->ai_addrlen = sizeof(*sin);
++        entry->ai_addr = (struct sockaddr *)sin;
++        sin->sin_family = AF_INET;
++        sin->sin_port = port;
++        memcpy( &sin->sin_addr, host->h_addr_list[i], 4 );
++        if (entry - out + 1 < count) entry->ai_next = entry + 1;
++        entry++;
++        sin++;
++    }
++    TRACE( "%s resolved to loopback only: using the %u interface addresses.\n", debugstr_a(node), count );
++    free( *info );
++    *info = out;
++}
++
+ /***********************************************************************
+  *      getaddrinfo   (ws2_32.@)
+  */
+@@ -264,6 +336,7 @@ int WINAPI getaddrinfo( const char *node, const char *service,
+     }
+ 
+     ret = do_getaddrinfo( node, service, hints, info );
++    if (!ret) replace_local_loopback( node, hints, info );
+ 
+     if (ret && (!hints || !(hints->ai_flags & AI_NUMERICHOST)) && node)
+     {

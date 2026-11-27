@@ -21,7 +21,7 @@ UWP apps don't create a normal Win32 window. They ask Windows for a `CoreApplica
 | ✅ | Crackdown 3 (`Microsoft.48248D2C77101`, Unreal Engine 4) | Campaign playable offline: menus with the mouse, keyboard movement, mouse look; saves kept locally. Holding the mouse button doesn't skip the intro video; let it play. Its online services fail as offline. |
 | ✅ | Microsoft Minesweeper (`Microsoft.MicrosoftMinesweeper`, Unity, XAML, .NET Native) | Playable offline: menus and Classic games with mouse clicks, flags and local saves. Needs `mrt100.dll` (see [framework packages](#set-up-an-app)). After the tutorial, each start waits about 30 seconds on "Downloading Game Data" while its Xbox cloud saves fail as offline. No ads, achievements or cloud saves. |
 | ✅ | Microsoft Sudoku (`Microsoft.MicrosoftSudoku`, Unity 6, XAML, .NET Native) | Playable offline: the tutorial and puzzles with the mouse. Its Xbox cloud sync and ads fail as offline. |
-| ✅ | Minecraft for Windows 1.21.114 and 1.19.83 (`Microsoft.MinecraftUWP`, D3D11) | Starts and plays offline: menus, worlds. Xbox sign-in and online features fail as offline. |
+| ✅ | Minecraft for Windows 1.21.114 and 1.19.83 (`Microsoft.MinecraftUWP`, D3D11) | Starts and plays offline: menus, worlds. Xbox sign-in and online features (Servers tab, Realms) fail as offline. LAN games: not yet confirmed between two computers (both need this build or later); a firewall must let UDP 19132, 19133 and 7551 through. |
 | ✅ | Microsoft Mahjong (`Microsoft.MicrosoftMahjong`, XAML, .NET Native) | Playable offline: answer "OK" and "Play Offline" at the download questions, then menus and games with the mouse and keyboard. Its Xbox sign-in, downloads and ads fail as offline. |
 | ✅ | Microsoft Ultimate Word Games / Wordament (`Microsoft.Studios.Wordament`, Unity, XAML, .NET Native) | Playable offline. Its [`apps/` file](apps/Microsoft.Studios.Wordament.conf) reports no internet connection, so it doesn't keep asking about Xbox cloud saves. |
 | ❌ | Microsoft Solitaire Collection (`Microsoft.MicrosoftSolitaireCollection`, XAML, WinUI 2.8) | Not working: a blank window. Its interface is all XAML with WinUI 2 controls, which the partial XAML doesn't support yet (like Calculator). |
@@ -173,6 +173,7 @@ tests/xaml/run.sh
 | `WINE_APP_STORE_ID=...` | The Store ID reported for the app (it is not in the package manifest); apps that care need it set in [`apps/<package name>.conf`](apps/README.md) |
 | `WINE_MESSAGEDIALOG_AUTO=Continue` | Answer an app's pop-up dialogs without showing them: the first button whose label starts with this text (or a button number). Set for Gears of War 4 and Forza Motorsport 7 in their `apps/` files, to get past their hardware warnings; `WINE_MESSAGEDIALOG_AUTO=` (empty) shows them again |
 | `WINE_UWP_OFFLINE=1` | Report no internet connection to the app (`NetworkInformation`), as Windows does offline. Set for apps that otherwise keep retrying their online services; Xbox Live itself always looks unreachable to apps |
+| `WINE_UWP_GAMERTAG=name` | The player name apps see for the offline Xbox user (default: your Linux user name). The user ID always differs between computers, so two people on the same LAN don't clash. |
 | `WINE_REPORT_HOSTNAMES=1` | Report the PC's real IP addresses to the app (off by default) |
 | `WINEDEBUG=-all` | Turn off logging (default logs errors, fixmes and the WinRT channel) |
 | `UWP_PREFIX`, `UWP_DATA_DIR`, `UWP_LOGS`, `UWP_BUILD_DIR` | Move the shared prefix, data, logs or build folders |
@@ -319,6 +320,8 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 towards Calculator: real DependencyProperty/PropertyMetadata/DependencyObject (app-registered
                 properties, change callbacks, Grid and Canvas properties), App.xaml loaded for C# apps, PropertyValue
                 class names (.NET unboxing), ResourceLoader, NamedPolicy, SplashScreen, LanguageFontGroup
+                0114-0115 for Minecraft LAN games: the computer's own name resolves to its network addresses (RakNet
+                broadcast only to 127.0.1.255), and the offline Xbox user ID differs between computers
 patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings
