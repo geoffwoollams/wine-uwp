@@ -1,0 +1,589 @@
+Subject: windows.storage.applicationdata: publisher cache subfolders, nested CreateFolder/CreateFileAsync, folder listings, IStorageItemProperties
+
+diff --git a/dlls/windows.storage.applicationdata/applicationdata.c b/dlls/windows.storage.applicationdata/applicationdata.c
+index e3e8aeb..d18b500 100644
+--- a/dlls/windows.storage.applicationdata/applicationdata.c
++++ b/dlls/windows.storage.applicationdata/applicationdata.c
+@@ -454,23 +454,33 @@ static const struct IApplicationData2Vtbl application_data2_vtbl =
+ 
+ DEFINE_IINSPECTABLE( application_data3, IApplicationData3, struct application_data, IApplicationData_iface )
+ 
+-/* %LOCALAPPDATA%\Publishers\<publisher id>\<folder>: shared by the apps of one publisher */
++/* %LOCALAPPDATA%\Publishers\<publisher id>\<folder>: shared by the apps of one publisher. As on Windows the name may
++ * be a path below a declared folder ("mcg\user_data\Guest"), with either separator, made with its parents; but no
++ * root, drive, "." or ".." part, or empty part. */
+ static HRESULT WINAPI application_data3_GetPublisherCacheFolder( IApplicationData3 *iface, HSTRING folder_name, IStorageFolder **value )
+ {
+-    WCHAR base[MAX_PATH], path[MAX_PATH], family[PACKAGE_FAMILY_NAME_MAX_LENGTH + 1], *publisher;
++    WCHAR base[MAX_PATH], path[MAX_PATH], family[PACKAGE_FAMILY_NAME_MAX_LENGTH + 1], *publisher, *p;
+     UINT32 family_len = ARRAY_SIZE(family);
+-    const WCHAR *name = WindowsGetStringRawBuffer( folder_name, NULL );
++    const WCHAR *name = WindowsGetStringRawBuffer( folder_name, NULL ), *part;
+     DWORD len;
+ 
+     TRACE( "iface %p, folder_name %s, value %p.\n", iface, debugstr_hstring( folder_name ), value );
+ 
+     if (!value) return E_POINTER;
+-    if (!name || !*name || wcschr( name, '\\' ) || wcschr( name, '/' )) return E_INVALIDARG;
++    if (!name || !*name || wcschr( name, ':' )) return E_INVALIDARG;
++    for (part = name; ; part += len + 1)
++    {
++        len = wcscspn( part, L"\\/" );
++        if (!len || (len == 1 && part[0] == '.') || (len == 2 && part[0] == '.' && part[1] == '.')) return E_INVALIDARG;
++        if (!part[len]) break;
++    }
+     if (GetCurrentPackageFamilyName( &family_len, family )) return HRESULT_FROM_WIN32( APPMODEL_ERROR_NO_PACKAGE );
+     if (!(publisher = wcsrchr( family, '_' ))) return E_FAIL;
+     len = GetEnvironmentVariableW( L"LOCALAPPDATA", base, MAX_PATH );
+     if (!len || len >= MAX_PATH) return E_FAIL;
+-    if (swprintf( path, MAX_PATH, L"%s\\Publishers\\%s\\%s", base, publisher + 1, name ) < 0) return E_INVALIDARG;
++    if (swprintf( path, MAX_PATH, L"%s\\Publishers\\%s\\%s", base, publisher + 1, name ) < 0)
++        return HRESULT_FROM_WIN32( ERROR_FILENAME_EXCED_RANGE );
++    for (p = path; *p; p++) if (*p == '/') *p = '\\';
+     return storage_folder_create( path, value );
+ }
+ 
+diff --git a/dlls/windows.storage.applicationdata/private.h b/dlls/windows.storage.applicationdata/private.h
+index 1f3cfc8..9936335 100644
+--- a/dlls/windows.storage.applicationdata/private.h
++++ b/dlls/windows.storage.applicationdata/private.h
+@@ -37,11 +37,21 @@
+ #define WIDL_using_Windows_Storage_FileProperties
+ #include "windows.storage.h"
+ 
++/* IIterable/IIterator of StorageFolder and StorageFile are not in windows.storage.h */
++DEFINE_GUID(IID_IIterable_StorageFolder, 0x4669befc, 0xae5c, 0x52b1, 0x8a,0x97, 0x54,0x66,0xce,0x61,0xe9,0x4e);
++DEFINE_GUID(IID_IIterator_StorageFolder, 0x5aac96fb, 0xb3b9, 0x5a7f, 0xa9,0x20, 0x4b,0x5a,0x8d,0xf8,0x11,0x68);
++DEFINE_GUID(IID_IIterable_StorageFile, 0x9ac00304, 0x83ea, 0x5688, 0x87,0xb6, 0xae,0x38,0xaa,0xb6,0x5d,0x0b);
++DEFINE_GUID(IID_IIterator_StorageFile, 0x43e29f53, 0x0298, 0x55aa, 0xa6,0xc8, 0x4e,0xdd,0x32,0x3d,0x95,0x98);
++/* Windows.Storage.IStorageItemProperties, not in windows.storage.idl yet */
++DEFINE_GUID(IID_IStorageItemProperties, 0x86664478, 0x8029, 0x46fe, 0xa7,0x89, 0x1c,0x2f,0x3e,0x2f,0xfb,0x5c);
++
+ extern IActivationFactory *application_data_factory;
++extern HRESULT item_properties_create( IUnknown *outer, const WCHAR *path, BOOL folder, void **out );
+ extern IActivationFactory *file_io_factory;
+ extern HRESULT storage_folder_create( const WCHAR *path, IStorageFolder **out );
+ extern HRESULT storage_file_create( const WCHAR *path, IStorageFile **out );
+ extern HRESULT storage_file_operation( HRESULT hr, IStorageFile *file, IAsyncOperation_StorageFile **operation );
++extern HRESULT storage_operation_create( const GUID *iid, HRESULT hr, IUnknown *object, void **out );
+ extern HRESULT property_set_create( BOOL missing_is_null, IPropertySet **out );
+ extern HRESULT property_set_create_persistent( BOOL missing_is_null, const WCHAR *path, IPropertySet **out );
+ 
+diff --git a/dlls/windows.storage.applicationdata/storagefile.c b/dlls/windows.storage.applicationdata/storagefile.c
+index 94596cf..d6286b1 100644
+--- a/dlls/windows.storage.applicationdata/storagefile.c
++++ b/dlls/windows.storage.applicationdata/storagefile.c
+@@ -198,6 +198,12 @@ static HRESULT done_create(enum done_kind kind, const GUID *iid, HRESULT hr, IUn
+     return S_OK;
+ }
+ 
++/* a completed IAsyncOperation<T> with interface result object (taken over; NULL on error) */
++HRESULT storage_operation_create( const GUID *iid, HRESULT hr, IUnknown *object, void **out )
++{
++    return done_create(DONE_OPERATION, iid, hr, object, NULL, 0, out);
++}
++
+ static HRESULT done_action(HRESULT hr, IAsyncAction **out)
+ {
+     return done_create(DONE_ACTION, &IID_IAsyncAction, hr, NULL, NULL, 0, (void **)out);
+@@ -590,6 +596,121 @@ static HRESULT open_file_stream(const WCHAR *path, BOOL write, struct file_strea
+     return file_stream_create(file, 0, write, out);
+ }
+ 
++/* ===== IStorageItemProperties of a StorageFile or StorageFolder: a tear-off holding its object ===== */
++
++struct item_properties
++{
++    const void *const *lpVtbl;
++    LONG ref;
++    IUnknown *outer;
++    BOOL folder;
++    WCHAR path[MAX_PATH];
++};
++
++static HRESULT WINAPI item_properties_QueryInterface(struct item_properties *impl, REFIID iid, void **out)
++{
++    if (IsEqualGUID(iid, &IID_IStorageItemProperties))
++    {
++        InterlockedIncrement(&impl->ref);
++        *out = impl;
++        return S_OK;
++    }
++    return IUnknown_QueryInterface(impl->outer, iid, out);
++}
++static ULONG WINAPI item_properties_AddRef(struct item_properties *impl) { return InterlockedIncrement(&impl->ref); }
++static ULONG WINAPI item_properties_Release(struct item_properties *impl)
++{
++    ULONG ref = InterlockedDecrement(&impl->ref);
++    if (!ref)
++    {
++        IUnknown_Release(impl->outer);
++        free(impl);
++    }
++    return ref;
++}
++static HRESULT WINAPI item_properties_GetIids(struct item_properties *impl, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI item_properties_GetRuntimeClassName(struct item_properties *impl, HSTRING *name) { return E_NOTIMPL; }
++static HRESULT WINAPI item_properties_GetTrustLevel(struct item_properties *impl, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI item_properties_GetThumbnailAsyncOverloadDefaultSizeDefaultOptions(struct item_properties *impl, int mode, void **operation)
++{
++    FIXME("%s, mode %d stub!\n", debugstr_w(impl->path), mode);
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI item_properties_GetThumbnailAsyncOverloadDefaultOptions(struct item_properties *impl, int mode, UINT32 size, void **operation)
++{
++    FIXME("%s, mode %d, size %u stub!\n", debugstr_w(impl->path), mode, size);
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI item_properties_GetThumbnailAsync(struct item_properties *impl, int mode, UINT32 size, int options, void **operation)
++{
++    FIXME("%s, mode %d, size %u, options %d stub!\n", debugstr_w(impl->path), mode, size, options);
++    return E_NOTIMPL;
++}
++/* a file's name without its extension, or a folder's name */
++static HRESULT WINAPI item_properties_get_DisplayName(struct item_properties *impl, HSTRING *value)
++{
++    const WCHAR *name = wcsrchr(impl->path, '\\'), *ext;
++
++    TRACE("%s.\n", debugstr_w(impl->path));
++    name = name ? name + 1 : impl->path;
++    if (impl->folder || !(ext = wcsrchr(name, '.')) || ext == name) ext = name + wcslen(name);
++    return WindowsCreateString(name, ext - name, value);
++}
++/* "File folder", or "<EXTENSION> File" as Explorer shows a file without a registered type */
++static HRESULT WINAPI item_properties_get_DisplayType(struct item_properties *impl, HSTRING *value)
++{
++    const WCHAR *name = wcsrchr(impl->path, '\\'), *ext;
++    WCHAR type[MAX_PATH], *p;
++
++    TRACE("%s.\n", debugstr_w(impl->path));
++    name = name ? name + 1 : impl->path;
++    if (impl->folder) return WindowsCreateString(L"File folder", 11, value);
++    if (!(ext = wcsrchr(name, '.')) || !ext[1]) return WindowsCreateString(L"File", 4, value);
++    swprintf(type, ARRAY_SIZE(type), L"%s File", ext + 1);
++    for (p = type; *p != ' '; p++) *p = towupper(*p);
++    return WindowsCreateString(type, wcslen(type), value);
++}
++static HRESULT WINAPI item_properties_get_FolderRelativeId(struct item_properties *impl, HSTRING *value)
++{
++    const WCHAR *name = wcsrchr(impl->path, '\\');
++
++    FIXME("%s: returning the name.\n", debugstr_w(impl->path));
++    name = name ? name + 1 : impl->path;
++    return WindowsCreateString(name, wcslen(name), value);
++}
++static HRESULT WINAPI item_properties_get_Properties(struct item_properties *impl, IUnknown **value)
++{
++    FIXME("%s stub!\n", debugstr_w(impl->path));
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static const void *const item_properties_vtbl[] =
++{
++    item_properties_QueryInterface, item_properties_AddRef, item_properties_Release,
++    item_properties_GetIids, item_properties_GetRuntimeClassName, item_properties_GetTrustLevel,
++    item_properties_GetThumbnailAsyncOverloadDefaultSizeDefaultOptions, item_properties_GetThumbnailAsyncOverloadDefaultOptions,
++    item_properties_GetThumbnailAsync, item_properties_get_DisplayName, item_properties_get_DisplayType,
++    item_properties_get_FolderRelativeId, item_properties_get_Properties,
++};
++
++/* outer is AddRef'd and held */
++HRESULT item_properties_create(IUnknown *outer, const WCHAR *path, BOOL folder, void **out)
++{
++    struct item_properties *impl;
++
++    *out = NULL;
++    if (!(impl = calloc(1, sizeof(*impl)))) return E_OUTOFMEMORY;
++    impl->lpVtbl = item_properties_vtbl;
++    impl->ref = 1;
++    impl->outer = outer;
++    IUnknown_AddRef(outer);
++    impl->folder = folder;
++    lstrcpynW(impl->path, path, MAX_PATH);
++    *out = impl;
++    return S_OK;
++}
++
+ /* ===== StorageFile ===== */
+ 
+ struct storage_file
+@@ -620,6 +741,8 @@ static HRESULT WINAPI storage_file_QueryInterface(IStorageFile *iface, REFIID ii
+         *out = &impl->IRandomAccessStreamReference_iface;
+     else if (IsEqualGUID(iid, &IID_IInputStreamReference))
+         *out = &impl->IInputStreamReference_iface;
++    else if (IsEqualGUID(iid, &IID_IStorageItemProperties))
++        return item_properties_create((IUnknown *)&impl->IStorageFile_iface, impl->path, FALSE, out);
+     else
+     {
+         FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
+diff --git a/dlls/windows.storage.applicationdata/storagefolder_gen.c b/dlls/windows.storage.applicationdata/storagefolder_gen.c
+index 1729dd0..acdc177 100644
+--- a/dlls/windows.storage.applicationdata/storagefolder_gen.c
++++ b/dlls/windows.storage.applicationdata/storagefolder_gen.c
+@@ -20,6 +20,8 @@ static HRESULT storage_folder_qi(struct storage_folder *impl, REFIID iid, void *
+         *out = &impl->IStorageFolder_iface;
+     else if (IsEqualGUID(iid, &IID_IStorageItem))
+         *out = &impl->IStorageItem_iface;
++    else if (IsEqualGUID(iid, &IID_IStorageItemProperties))
++        return item_properties_create((IUnknown *)&impl->IStorageFolder_iface, impl->path, TRUE, out);
+     else
+     {
+         FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
+@@ -198,6 +200,20 @@ static HRESULT child_path(struct storage_folder *impl, HSTRING name, WCHAR *path
+     return S_OK;
+ }
+ 
++/* makes the folders between this folder and path's last part, as Windows does for a relative name */
++static void create_parents(struct storage_folder *impl, WCHAR *path)
++{
++    WCHAR *p;
++
++    for (p = path + wcslen(impl->path) + 1; *p; p++)
++    {
++        if (*p != '\\') continue;
++        *p = 0;
++        CreateDirectoryW(path, NULL);
++        *p = '\\';
++    }
++}
++
+ static HRESULT WINAPI storage_folder_CreateFolderAsync(IStorageFolder *iface, HSTRING name, CreationCollisionOption options, IAsyncOperation_StorageFolder **operation)
+ {
+     struct storage_folder *impl = impl_from_storage_folder(iface);
+@@ -209,6 +225,7 @@ static HRESULT WINAPI storage_folder_CreateFolderAsync(IStorageFolder *iface, HS
+ 
+     TRACE("iface %p, name %s, options %d.\n", iface, debugstr_hstring(name), options);
+     if (FAILED(hr = child_path(impl, name, path))) return folder_op_create(hr, NULL, operation);
++    create_parents(impl, path);
+     attrs = GetFileAttributesW(path);
+     if (attrs != INVALID_FILE_ATTRIBUTES)
+     {
+@@ -252,6 +269,7 @@ static HRESULT WINAPI storage_folder_CreateFileAsync(IStorageFolder *iface, HSTR
+     TRACE("iface %p, name %s, options %d.\n", iface, debugstr_hstring(name), options);
+     if (!operation) return E_POINTER;
+     if (FAILED(hr = child_path(impl, name, path))) return storage_file_operation(hr, NULL, operation);
++    create_parents(impl, path);
+ 
+     switch (options)
+     {
+@@ -330,22 +348,313 @@ static HRESULT WINAPI storage_folder_GetItemAsync(IStorageFolder *iface, HSTRING
+     return E_NOTIMPL;
+ }
+ 
++/* ---- IVectorView<T> (with IIterable<T>) of a folder's StorageFolder, StorageFile or IStorageItem entries ---- */
++
++enum entry_kind { ENTRY_FOLDERS, ENTRY_FILES, ENTRY_ITEMS };
++
++struct entry_iids { const GUID *view, *iterable, *iterator, *operation, *element; };
++static const struct entry_iids entry_iids[] =
++{
++    { &IID___FIVectorView_1_Windows__CStorage__CStorageFolder, &IID_IIterable_StorageFolder, &IID_IIterator_StorageFolder,
++      &IID___FIAsyncOperation_1___FIVectorView_1_Windows__CStorage__CStorageFolder, &IID_IStorageFolder },
++    { &IID___FIVectorView_1_Windows__CStorage__CStorageFile, &IID_IIterable_StorageFile, &IID_IIterator_StorageFile,
++      &IID___FIAsyncOperation_1___FIVectorView_1_Windows__CStorage__CStorageFile, &IID_IStorageFile },
++    { &IID___FIVectorView_1_Windows__CStorage__CIStorageItem, &IID___FIIterable_1_Windows__CStorage__CIStorageItem,
++      &IID___FIIterator_1_Windows__CStorage__CIStorageItem,
++      &IID___FIAsyncOperation_1___FIVectorView_1_Windows__CStorage__CIStorageItem, &IID_IStorageItem },
++};
++
++struct entry_iface { const void *const *lpVtbl; };
++
++struct entry_list
++{
++    struct entry_iface view;
++    struct entry_iface iterable;
++    LONG ref;
++    const struct entry_iids *iids;
++    UINT32 count;
++    IUnknown *items[];   /* each an element interface pointer */
++};
++
++struct entry_iterator
++{
++    struct entry_iface iface;
++    LONG ref;
++    struct entry_list *list;
++    UINT32 index;
++};
++
++static const void *const entry_view_vtbl[];
++static const void *const entry_iterable_vtbl[];
++
++static struct entry_list *list_from_iface(struct entry_iface *iface)
++{
++    if (iface->lpVtbl == entry_view_vtbl) return CONTAINING_RECORD(iface, struct entry_list, view);
++    return CONTAINING_RECORD(iface, struct entry_list, iterable);
++}
++
++static HRESULT WINAPI entries_QueryInterface(struct entry_iface *iface, REFIID iid, void **out)
++{
++    struct entry_list *list = list_from_iface(iface);
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, list->iids->view))
++        *out = &list->view;
++    else if (IsEqualGUID(iid, list->iids->iterable))
++        *out = &list->iterable;
++    else
++    {
++        FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    InterlockedIncrement(&list->ref);
++    return S_OK;
++}
++static ULONG WINAPI entries_AddRef(struct entry_iface *iface) { return InterlockedIncrement(&list_from_iface(iface)->ref); }
++static ULONG WINAPI entries_Release(struct entry_iface *iface)
++{
++    struct entry_list *list = list_from_iface(iface);
++    ULONG ref = InterlockedDecrement(&list->ref);
++    UINT32 i;
++    if (!ref)
++    {
++        for (i = 0; i < list->count; i++) IUnknown_Release(list->items[i]);
++        free(list);
++    }
++    return ref;
++}
++static HRESULT WINAPI entries_GetIids(struct entry_iface *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI entries_GetRuntimeClassName(struct entry_iface *iface, HSTRING *name) { return E_NOTIMPL; }
++static HRESULT WINAPI entries_GetTrustLevel(struct entry_iface *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI entries_GetAt(struct entry_iface *iface, UINT32 index, IUnknown **value)
++{
++    struct entry_list *list = list_from_iface(iface);
++    *value = NULL;
++    if (index >= list->count) return E_BOUNDS;
++    *value = list->items[index];
++    IUnknown_AddRef(*value);
++    return S_OK;
++}
++static HRESULT WINAPI entries_get_Size(struct entry_iface *iface, UINT32 *value)
++{
++    *value = list_from_iface(iface)->count;
++    return S_OK;
++}
++static HRESULT WINAPI entries_IndexOf(struct entry_iface *iface, IUnknown *value, UINT32 *index, boolean *found)
++{
++    struct entry_list *list = list_from_iface(iface);
++    for (*index = 0; *index < list->count; (*index)++)
++        if (list->items[*index] == value) return (*found = TRUE), S_OK;
++    *index = 0;
++    *found = FALSE;
++    return S_OK;
++}
++static HRESULT WINAPI entries_GetMany(struct entry_iface *iface, UINT32 start, UINT32 size, IUnknown **items, UINT32 *count)
++{
++    struct entry_list *list = list_from_iface(iface);
++    UINT32 i;
++    for (i = 0; start + i < list->count && i < size; i++)
++    {
++        items[i] = list->items[start + i];
++        IUnknown_AddRef(items[i]);
++    }
++    *count = i;
++    return S_OK;
++}
++
++static const void *const entry_view_vtbl[] =
++{
++    entries_QueryInterface, entries_AddRef, entries_Release, entries_GetIids, entries_GetRuntimeClassName,
++    entries_GetTrustLevel, entries_GetAt, entries_get_Size, entries_IndexOf, entries_GetMany,
++};
++
++static const void *const entry_iterator_vtbl[];
++
++static HRESULT WINAPI entries_First(struct entry_iface *iface, struct entry_iface **out)
++{
++    struct entry_list *list = list_from_iface(iface);
++    struct entry_iterator *iter;
++
++    if (!(iter = calloc(1, sizeof(*iter)))) return E_OUTOFMEMORY;
++    iter->iface.lpVtbl = entry_iterator_vtbl;
++    iter->ref = 1;
++    iter->list = list;
++    InterlockedIncrement(&list->ref);
++    *out = &iter->iface;
++    return S_OK;
++}
++
++static const void *const entry_iterable_vtbl[] =
++{
++    entries_QueryInterface, entries_AddRef, entries_Release, entries_GetIids, entries_GetRuntimeClassName,
++    entries_GetTrustLevel, entries_First,
++};
++
++static HRESULT WINAPI entry_iterator_QueryInterface(struct entry_iface *iface, REFIID iid, void **out)
++{
++    struct entry_iterator *iter = CONTAINING_RECORD(iface, struct entry_iterator, iface);
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, iter->list->iids->iterator))
++    {
++        InterlockedIncrement(&iter->ref);
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI entry_iterator_AddRef(struct entry_iface *iface)
++{ return InterlockedIncrement(&CONTAINING_RECORD(iface, struct entry_iterator, iface)->ref); }
++static ULONG WINAPI entry_iterator_Release(struct entry_iface *iface)
++{
++    struct entry_iterator *iter = CONTAINING_RECORD(iface, struct entry_iterator, iface);
++    ULONG ref = InterlockedDecrement(&iter->ref);
++    if (!ref)
++    {
++        entries_Release(&iter->list->view);
++        free(iter);
++    }
++    return ref;
++}
++static HRESULT WINAPI entry_iterator_get_Current(struct entry_iface *iface, IUnknown **value)
++{
++    struct entry_iterator *iter = CONTAINING_RECORD(iface, struct entry_iterator, iface);
++    return entries_GetAt(&iter->list->view, iter->index, value);
++}
++static HRESULT WINAPI entry_iterator_get_HasCurrent(struct entry_iface *iface, boolean *value)
++{
++    struct entry_iterator *iter = CONTAINING_RECORD(iface, struct entry_iterator, iface);
++    *value = iter->index < iter->list->count;
++    return S_OK;
++}
++static HRESULT WINAPI entry_iterator_MoveNext(struct entry_iface *iface, boolean *value)
++{
++    struct entry_iterator *iter = CONTAINING_RECORD(iface, struct entry_iterator, iface);
++    if (iter->index < iter->list->count) iter->index++;
++    return entry_iterator_get_HasCurrent(iface, value);
++}
++static HRESULT WINAPI entry_iterator_GetMany(struct entry_iface *iface, UINT32 size, IUnknown **items, UINT32 *count)
++{
++    struct entry_iterator *iter = CONTAINING_RECORD(iface, struct entry_iterator, iface);
++    HRESULT hr = entries_GetMany(&iter->list->view, iter->index, size, items, count);
++    iter->index += *count;
++    return hr;
++}
++
++static const void *const entry_iterator_vtbl[] =
++{
++    entry_iterator_QueryInterface, entry_iterator_AddRef, entry_iterator_Release, entries_GetIids,
++    entries_GetRuntimeClassName, entries_GetTrustLevel,
++    entry_iterator_get_Current, entry_iterator_get_HasCurrent, entry_iterator_MoveNext, entry_iterator_GetMany,
++};
++
++static int __cdecl compare_names(const void *a, const void *b)
++{
++    const WCHAR *x = *(const WCHAR *const *)a, *y = *(const WCHAR *const *)b;
++    if (x[0] != y[0]) return x[0] == '\\' ? -1 : 1;
++    return lstrcmpiW(x + 1, y + 1);
++}
++
++/* the folders and/or files directly in impl's folder, folders first, each by name */
++static HRESULT list_entries(struct storage_folder *impl, enum entry_kind kind, void **operation)
++{
++    const struct entry_iids *iids = &entry_iids[kind];
++    WCHAR path[MAX_PATH], **names = NULL, **tmp;
++    UINT32 count = 0, capacity = 0, i;
++    struct entry_list *list = NULL;
++    WIN32_FIND_DATAW data;
++    HRESULT hr = S_OK;
++    HANDLE find;
++    BOOL is_dir;
++
++    if (!operation) return E_POINTER;
++    swprintf(path, MAX_PATH, L"%s\\*", impl->path);
++    if ((find = FindFirstFileW(path, &data)) == INVALID_HANDLE_VALUE)
++        return storage_operation_create(iids->operation, HRESULT_FROM_WIN32(GetLastError()), NULL, operation);
++    do
++    {
++        if (!wcscmp(data.cFileName, L".") || !wcscmp(data.cFileName, L"..")) continue;
++        is_dir = !!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
++        if ((kind == ENTRY_FOLDERS && !is_dir) || (kind == ENTRY_FILES && is_dir)) continue;
++        if (count == capacity)
++        {
++            capacity = capacity ? capacity * 2 : 16;
++            if (!(tmp = realloc(names, capacity * sizeof(*names)))) { hr = E_OUTOFMEMORY; break; }
++            names = tmp;
++        }
++        /* a leading '\' marks a folder, '|' a file */
++        if (!(names[count] = malloc((wcslen(data.cFileName) + 2) * sizeof(WCHAR)))) { hr = E_OUTOFMEMORY; break; }
++        names[count][0] = is_dir ? '\\' : '|';
++        wcscpy(names[count] + 1, data.cFileName);
++        count++;
++    } while (FindNextFileW(find, &data));
++    FindClose(find);
++
++    if (SUCCEEDED(hr)) qsort(names, count, sizeof(*names), compare_names);
++    if (SUCCEEDED(hr) && !(list = calloc(1, offsetof(struct entry_list, items[count])))) hr = E_OUTOFMEMORY;
++    if (list)
++    {
++        list->view.lpVtbl = entry_view_vtbl;
++        list->iterable.lpVtbl = entry_iterable_vtbl;
++        list->ref = 1;
++        list->iids = iids;
++    }
++    for (i = 0; SUCCEEDED(hr) && i < count; i++)
++    {
++        IStorageFolder *folder;
++        IStorageFile *file;
++        IUnknown *object;
++
++        if (wcslen(impl->path) + wcslen(names[i]) + 1 >= MAX_PATH) continue;
++        swprintf(path, MAX_PATH, L"%s\\%s", impl->path, names[i] + 1);
++        if (names[i][0] == '\\')
++        {
++            if (FAILED(hr = storage_folder_create(path, &folder))) break;
++            object = (IUnknown *)folder;
++        }
++        else
++        {
++            if (FAILED(hr = storage_file_create(path, &file))) break;
++            object = (IUnknown *)file;
++        }
++        if (kind == ENTRY_ITEMS)
++        {
++            IUnknown *item;
++            hr = IUnknown_QueryInterface(object, &IID_IStorageItem, (void **)&item);
++            IUnknown_Release(object);
++            if (FAILED(hr)) break;
++            object = item;
++        }
++        list->items[list->count++] = object;
++    }
++    for (i = 0; i < count; i++) free(names[i]);
++    free(names);
++    if (FAILED(hr))
++    {
++        if (list) entries_Release(&list->view);
++        return storage_operation_create(iids->operation, hr, NULL, operation);
++    }
++    TRACE("%s: %u entries.\n", debugstr_w(impl->path), list->count);
++    return storage_operation_create(iids->operation, S_OK, (IUnknown *)&list->view, operation);
++}
++
+ static HRESULT WINAPI storage_folder_GetFilesAsyncOverloadDefaultOptionsStartAndCount(IStorageFolder *iface, __FIAsyncOperation_1___FIVectorView_1_Windows__CStorage__CStorageFile **operation)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE("iface %p, operation %p.\n", iface, operation);
++    return list_entries(impl_from_storage_folder(iface), ENTRY_FILES, (void **)operation);
+ }
+ 
+ static HRESULT WINAPI storage_folder_GetFoldersAsyncOverloadDefaultOptionsStartAndCount(IStorageFolder *iface, __FIAsyncOperation_1___FIVectorView_1_Windows__CStorage__CStorageFolder **operation)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE("iface %p, operation %p.\n", iface, operation);
++    return list_entries(impl_from_storage_folder(iface), ENTRY_FOLDERS, (void **)operation);
+ }
+ 
+ static HRESULT WINAPI storage_folder_GetItemsAsyncOverloadDefaultStartAndCount(IStorageFolder *iface, __FIAsyncOperation_1___FIVectorView_1_Windows__CStorage__CIStorageItem **operation)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE("iface %p, operation %p.\n", iface, operation);
++    return list_entries(impl_from_storage_folder(iface), ENTRY_ITEMS, (void **)operation);
+ }
+ 
+ static const IStorageFolderVtbl storage_folder_vtbl =

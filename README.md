@@ -323,7 +323,10 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 class names (.NET unboxing), ResourceLoader, NamedPolicy, SplashScreen, LanguageFontGroup
                 0114-0115 for Minecraft LAN games: the computer's own name resolves to its network addresses (RakNet
                 broadcast only to 127.0.1.255), and the offline Xbox user ID differs between computers, 0116
-                ConnectionCost (Minecraft disabled multiplayer while it failed)
+                ConnectionCost (Minecraft disabled multiplayer while it failed), 0117 publisher storage for the
+                Microsoft casual games: GetPublisherCacheFolder subfolders ("mcg\analytics"), CreateFolderAsync and
+                CreateFileAsync make missing parent folders, GetFoldersAsync/GetFilesAsync/GetItemsAsync, and
+                IStorageItemProperties (launch data such as mcg\user_data\Guest\launch_data was never written)
 patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings
