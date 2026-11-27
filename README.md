@@ -87,7 +87,7 @@ scripts/run-app.sh Microsoft.HoganThreshold
 
 Without a package name and with several apps set up, `run-app.sh` lists them by name and package, one per line, and asks for a number.
 
-**Controllers:** games see a controller when it looks like an Xbox (XInput) gamepad. Wine's SDL backend presents every controller SDL recognises that way, including PlayStation and Switch pads, because `setup-prefix.sh` turns off Wine's raw-HID handling for Sony (`054C`) and Nintendo (`057E`) devices in the prefix. To get a raw device back, set `Hidraw` to 1 under `HKLM\System\CurrentControlSet\Services\WineBus\Devices\<vendor id>`. Steam's controller handling also works, since it presents an Xbox pad.
+**Controllers:** games see a controller when it looks like an Xbox (XInput) gamepad. Wine's SDL backend presents every controller SDL recognises that way, including PlayStation and Switch pads, because `setup-prefix.sh` turns off Wine's raw-HID handling for Sony (`054C`) and Nintendo (`057E`) devices in the prefix. To get a raw device back, set `Hidraw` to 1 under `HKLM\System\CurrentControlSet\Services\WineBus\Devices\<vendor id>`. Steam's controller handling also works, since it presents an Xbox pad. Controllers SDL doesn't recognise as gamepads reach games only as raw controllers, which most games ignore; an `SDL_GAMECONTROLLERCONFIG` mapping for the device fixes that.
 
 The game window shows the app's icon in the taskbar, in Alt-Tab and in its title bar, and the desktop groups it under the launcher's icon. This works under X11 and under Wayland through XWayland, which is how Wine runs on a Wayland desktop by default. With Wine's own Wayland driver it needs a compositor that supports the `xdg-toplevel-icon` protocol (KDE Plasma 6.1 or later, for example). Elsewhere the launcher's icon still shows.
 
@@ -301,7 +301,8 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 CoreTextEditContext, LocalCacheFolder and publisher cache folders, 0094-0095 for Minecraft
                 1.19: PnpObject.CreateFromIdAsync, HolographicApplicationPreview, 0096-0098 for Microsoft
                 Mahjong (not working yet): XAML SizeHelper, PointHelper, Canvas and more FrameworkElement members,
-                SpatialAudio classes, device information, CoreTextEditContext2
+                SpatialAudio classes, device information, CoreTextEditContext2, 0099 game controllers: a
+                controller's User and its events (Minecraft stopped when a pad was connected)
 patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings

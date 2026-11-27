@@ -1,0 +1,463 @@
+Subject: windows.gaming.input: a controller's User, its events, headset and battery, trust levels
+
+diff --git a/dlls/windows.gaming.input/async.c b/dlls/windows.gaming.input/async.c
+index 7ac73fa..82f2a71 100644
+--- a/dlls/windows.gaming.input/async.c
++++ b/dlls/windows.gaming.input/async.c
+@@ -444,8 +444,9 @@ static HRESULT WINAPI async_bool_GetRuntimeClassName( IAsyncOperation_boolean *i
+ 
+ static HRESULT WINAPI async_bool_GetTrustLevel( IAsyncOperation_boolean *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI async_bool_put_Completed( IAsyncOperation_boolean *iface, IAsyncOperationCompletedHandler_boolean *bool_handler )
+@@ -589,8 +590,9 @@ static HRESULT WINAPI async_result_GetRuntimeClassName( IAsyncOperation_ForceFee
+ 
+ static HRESULT WINAPI async_result_GetTrustLevel( IAsyncOperation_ForceFeedbackLoadEffectResult *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI async_result_put_Completed( IAsyncOperation_ForceFeedbackLoadEffectResult *iface, IAsyncOperationCompletedHandler_ForceFeedbackLoadEffectResult *handler )
+diff --git a/dlls/windows.gaming.input/condition_effect.c b/dlls/windows.gaming.input/condition_effect.c
+index 24bd2b4..8da4c0a 100644
+--- a/dlls/windows.gaming.input/condition_effect.c
++++ b/dlls/windows.gaming.input/condition_effect.c
+@@ -95,8 +95,9 @@ static HRESULT WINAPI effect_GetRuntimeClassName( IConditionForceEffect *iface,
+ 
+ static HRESULT WINAPI effect_GetTrustLevel( IConditionForceEffect *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI effect_get_Kind( IConditionForceEffect *iface, ConditionForceEffectKind *kind )
+@@ -214,8 +215,9 @@ static HRESULT WINAPI activation_GetRuntimeClassName( IActivationFactory *iface,
+ 
+ static HRESULT WINAPI activation_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI activation_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+diff --git a/dlls/windows.gaming.input/constant_effect.c b/dlls/windows.gaming.input/constant_effect.c
+index f4c65fb..01355ad 100644
+--- a/dlls/windows.gaming.input/constant_effect.c
++++ b/dlls/windows.gaming.input/constant_effect.c
+@@ -93,8 +93,9 @@ static HRESULT WINAPI effect_GetRuntimeClassName( IConstantForceEffect *iface, H
+ 
+ static HRESULT WINAPI effect_GetTrustLevel( IConstantForceEffect *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI effect_SetParameters( IConstantForceEffect *iface, Vector3 direction, TimeSpan duration )
+@@ -226,8 +227,9 @@ static HRESULT WINAPI activation_GetRuntimeClassName( IActivationFactory *iface,
+ 
+ static HRESULT WINAPI activation_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI activation_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+diff --git a/dlls/windows.gaming.input/controller.c b/dlls/windows.gaming.input/controller.c
+index 7e7b570..c53001b 100644
+--- a/dlls/windows.gaming.input/controller.c
++++ b/dlls/windows.gaming.input/controller.c
+@@ -152,8 +152,9 @@ static HRESULT WINAPI controller_GetRuntimeClassName( IGameControllerImpl *iface
+ 
+ static HRESULT WINAPI controller_GetTrustLevel( IGameControllerImpl *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI controller_Initialize( IGameControllerImpl *iface, IGameController *outer,
+@@ -464,8 +465,9 @@ static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HS
+ 
+ static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+diff --git a/dlls/windows.gaming.input/force_feedback.c b/dlls/windows.gaming.input/force_feedback.c
+index 4fb9f09..12efc05 100644
+--- a/dlls/windows.gaming.input/force_feedback.c
++++ b/dlls/windows.gaming.input/force_feedback.c
+@@ -500,8 +500,9 @@ static HRESULT WINAPI motor_GetRuntimeClassName( IForceFeedbackMotor *iface, HST
+ 
+ static HRESULT WINAPI motor_GetTrustLevel( IForceFeedbackMotor *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI motor_get_AreEffectsPaused( IForceFeedbackMotor *iface, BOOLEAN *value )
+diff --git a/dlls/windows.gaming.input/gamepad.c b/dlls/windows.gaming.input/gamepad.c
+index ecac632..2ae30fc 100644
+--- a/dlls/windows.gaming.input/gamepad.c
++++ b/dlls/windows.gaming.input/gamepad.c
+@@ -155,8 +155,9 @@ static HRESULT WINAPI controller_GetRuntimeClassName( IGameControllerImpl *iface
+ 
+ static HRESULT WINAPI controller_GetTrustLevel( IGameControllerImpl *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI controller_Initialize( IGameControllerImpl *iface, IGameController *outer,
+@@ -453,8 +454,9 @@ static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HS
+ 
+ static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+diff --git a/dlls/windows.gaming.input/manager.c b/dlls/windows.gaming.input/manager.c
+index d54b01d..4561892 100644
+--- a/dlls/windows.gaming.input/manager.c
++++ b/dlls/windows.gaming.input/manager.c
+@@ -19,6 +19,7 @@
+ 
+ #include "private.h"
+ #include "provider.h"
++#include "roapi.h"
+ 
+ #include "wine/debug.h"
+ 
+@@ -125,59 +126,109 @@ static HRESULT WINAPI controller_GetTrustLevel( IGameController *iface, TrustLev
+ static HRESULT WINAPI controller_add_HeadsetConnected( IGameController *iface, ITypedEventHandler_IGameController_Headset *handler,
+                                                        EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, handler %p, token %p stub!\n", iface, handler, token );
+-    return E_NOTIMPL;
++    static LONG next_token;
++
++    TRACE( "iface %p, handler %p, token %p: never raised.\n", iface, handler, token );
++    if (!handler || !token) return E_INVALIDARG;
++    token->value = InterlockedIncrement( &next_token );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI controller_remove_HeadsetConnected( IGameController *iface, EventRegistrationToken token )
+ {
+-    FIXME( "iface %p, token %I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, token %I64x.\n", iface, token.value );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI controller_add_HeadsetDisconnected( IGameController *iface, ITypedEventHandler_IGameController_Headset *handler,
+                                                           EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, handler %p, token %p stub!\n", iface, handler, token );
+-    return E_NOTIMPL;
++    static LONG next_token;
++
++    TRACE( "iface %p, handler %p, token %p: never raised.\n", iface, handler, token );
++    if (!handler || !token) return E_INVALIDARG;
++    token->value = InterlockedIncrement( &next_token );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI controller_remove_HeadsetDisconnected( IGameController *iface, EventRegistrationToken token )
+ {
+-    FIXME( "iface %p, token %I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, token %I64x.\n", iface, token.value );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI controller_add_UserChanged( IGameController *iface,
+                                                   ITypedEventHandler_IGameController_UserChangedEventArgs *handler,
+                                                   EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, handler %p, token %p stub!\n", iface, handler, token );
+-    return E_NOTIMPL;
++    static LONG next_token;
++
++    TRACE( "iface %p, handler %p, token %p: never raised.\n", iface, handler, token );
++    if (!handler || !token) return E_INVALIDARG;
++    token->value = InterlockedIncrement( &next_token );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI controller_remove_UserChanged( IGameController *iface, EventRegistrationToken token )
+ {
+-    FIXME( "iface %p, token %I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, token %I64x.\n", iface, token.value );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI controller_get_Headset( IGameController *iface, IHeadset **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p: no headset.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI controller_get_IsWireless( IGameController *iface, boolean *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    FIXME( "iface %p, value %p semi-stub!\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = FALSE;
++    return S_OK;
+ }
+ 
++/* Windows.System.IUserStatics, which Wine's headers declare but don't define */
++static const GUID IID_IUserStatics = {0x155eb23b, 0x242a, 0x45e0, {0xa2, 0xe9, 0x31, 0x71, 0xfc, 0x6a, 0x7f, 0xdd}};
++typedef struct user_statics user_statics;
++struct user_statics_vtbl
++{
++    HRESULT (WINAPI *QueryInterface)( user_statics *iface, REFIID iid, void **out );
++    ULONG (WINAPI *AddRef)( user_statics *iface );
++    ULONG (WINAPI *Release)( user_statics *iface );
++    HRESULT (WINAPI *GetIids)( user_statics *iface, ULONG *count, IID **iids );
++    HRESULT (WINAPI *GetRuntimeClassName)( user_statics *iface, HSTRING *name );
++    HRESULT (WINAPI *GetTrustLevel)( user_statics *iface, TrustLevel *level );
++    HRESULT (WINAPI *CreateWatcher)( user_statics *iface, IInspectable **watcher );
++    HRESULT (WINAPI *FindAllAsync)( user_statics *iface, IInspectable **operation );
++    HRESULT (WINAPI *FindAllAsyncByType)( user_statics *iface, INT32 type, IInspectable **operation );
++    HRESULT (WINAPI *FindAllAsyncByTypeAndStatus)( user_statics *iface, INT32 type, INT32 status, IInspectable **operation );
++    HRESULT (WINAPI *GetFromId)( user_statics *iface, HSTRING id, __x_ABI_CWindows_CSystem_CIUser **user );
++};
++struct user_statics { const struct user_statics_vtbl *lpVtbl; };
++
++/* Every controller belongs to the one user signed in: the session's user, which Windows.System.User reports. Games
++ * take a controller's user for whose input it is, and C++/WinRT ones stop at once if there is none. */
+ static HRESULT WINAPI controller_get_User( IGameController *iface, __x_ABI_CWindows_CSystem_CIUser **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    static const WCHAR name[] = L"Windows.System.User";
++    user_statics *statics;
++    HSTRING_HEADER header;
++    HSTRING str;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (FAILED(hr = WindowsCreateStringReference( name, wcslen( name ), &header, &str ))) return hr;
++    if (FAILED(hr = RoGetActivationFactory( str, &IID_IUserStatics, (void **)&statics ))) return hr;
++    hr = statics->lpVtbl->GetFromId( statics, NULL, value );
++    statics->lpVtbl->Release( statics );
++    return hr;
+ }
+ 
+ static const struct IGameControllerVtbl controller_vtbl =
+@@ -205,8 +256,10 @@ DEFINE_IINSPECTABLE( battery, IGameControllerBatteryInfo, struct controller, IGa
+ 
+ static HRESULT WINAPI battery_TryGetBatteryReport( IGameControllerBatteryInfo *iface, IBatteryReport **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    FIXME( "iface %p, value %p: no battery report.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return S_OK;
+ }
+ 
+ static const struct IGameControllerBatteryInfoVtbl battery_vtbl =
+@@ -297,8 +350,9 @@ static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HS
+ 
+ static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+diff --git a/dlls/windows.gaming.input/periodic_effect.c b/dlls/windows.gaming.input/periodic_effect.c
+index 6c001a5..2eef03e 100644
+--- a/dlls/windows.gaming.input/periodic_effect.c
++++ b/dlls/windows.gaming.input/periodic_effect.c
+@@ -95,8 +95,9 @@ static HRESULT WINAPI effect_GetRuntimeClassName( IPeriodicForceEffect *iface, H
+ 
+ static HRESULT WINAPI effect_GetTrustLevel( IPeriodicForceEffect *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI effect_get_Kind( IPeriodicForceEffect *iface, PeriodicForceEffectKind *kind )
+@@ -252,8 +253,9 @@ static HRESULT WINAPI activation_GetRuntimeClassName( IActivationFactory *iface,
+ 
+ static HRESULT WINAPI activation_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI activation_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+diff --git a/dlls/windows.gaming.input/provider.c b/dlls/windows.gaming.input/provider.c
+index e8ce9ae..5393f2b 100644
+--- a/dlls/windows.gaming.input/provider.c
++++ b/dlls/windows.gaming.input/provider.c
+@@ -137,8 +137,9 @@ static HRESULT WINAPI wine_provider_GetRuntimeClassName( IWineGameControllerProv
+ 
+ static HRESULT WINAPI wine_provider_GetTrustLevel( IWineGameControllerProvider *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI wine_provider_get_NonRoamableId( IWineGameControllerProvider *iface, HSTRING *value )
+diff --git a/dlls/windows.gaming.input/racing_wheel.c b/dlls/windows.gaming.input/racing_wheel.c
+index d646ca2..f8da937 100644
+--- a/dlls/windows.gaming.input/racing_wheel.c
++++ b/dlls/windows.gaming.input/racing_wheel.c
+@@ -143,8 +143,9 @@ static HRESULT WINAPI controller_GetRuntimeClassName( IGameControllerImpl *iface
+ 
+ static HRESULT WINAPI controller_GetTrustLevel( IGameControllerImpl *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI controller_Initialize( IGameControllerImpl *iface, IGameController *outer,
+@@ -367,8 +368,9 @@ static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HS
+ 
+ static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+diff --git a/dlls/windows.gaming.input/ramp_effect.c b/dlls/windows.gaming.input/ramp_effect.c
+index 31c310b..3ac8995 100644
+--- a/dlls/windows.gaming.input/ramp_effect.c
++++ b/dlls/windows.gaming.input/ramp_effect.c
+@@ -93,8 +93,9 @@ static HRESULT WINAPI effect_GetRuntimeClassName( IRampForceEffect *iface, HSTRI
+ 
+ static HRESULT WINAPI effect_GetTrustLevel( IRampForceEffect *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI effect_SetParameters( IRampForceEffect *iface, Vector3 start_vector, Vector3 end_vector, TimeSpan duration )
+@@ -229,8 +230,9 @@ static HRESULT WINAPI activation_GetRuntimeClassName( IActivationFactory *iface,
+ 
+ static HRESULT WINAPI activation_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI activation_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+diff --git a/dlls/windows.gaming.input/vector.c b/dlls/windows.gaming.input/vector.c
+index 954d7df..e204360 100644
+--- a/dlls/windows.gaming.input/vector.c
++++ b/dlls/windows.gaming.input/vector.c
+@@ -97,8 +97,9 @@ static HRESULT WINAPI iterator_GetRuntimeClassName( IIterator_IInspectable *ifac
+ 
+ static HRESULT WINAPI iterator_GetTrustLevel( IIterator_IInspectable *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI iterator_get_Current( IIterator_IInspectable *iface, IInspectable **value )
+@@ -232,8 +233,9 @@ static HRESULT WINAPI vector_view_GetRuntimeClassName( IVectorView_IInspectable
+ 
+ static HRESULT WINAPI vector_view_GetTrustLevel( IVectorView_IInspectable *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI vector_view_GetAt( IVectorView_IInspectable *iface, UINT32 index, IInspectable **value )
+@@ -427,8 +429,9 @@ static HRESULT WINAPI vector_GetRuntimeClassName( IVector_IInspectable *iface, H
+ 
+ static HRESULT WINAPI vector_GetTrustLevel( IVector_IInspectable *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI vector_GetAt( IVector_IInspectable *iface, UINT32 index, IInspectable **value )
