@@ -1,0 +1,67 @@
+Subject: windows.ui.core.textinput: ICoreTextEditContext2
+
+diff --git a/dlls/windows.ui.core.textinput/services.c b/dlls/windows.ui.core.textinput/services.c
+index cb33d58..0ad7bba 100644
+--- a/dlls/windows.ui.core.textinput/services.c
++++ b/dlls/windows.ui.core.textinput/services.c
+@@ -215,6 +215,7 @@ static HRESULT WINAPI core_text_services_manager_remove_InputLanguageChanged( IC
+ struct edit_context
+ {
+     const void *const *lpVtbl;   /* ICoreTextEditContext */
++    const void *const *lpVtbl2;  /* ICoreTextEditContext2: the NotifyFocusLeaveCompleted event */
+     LONG ref;
+     HSTRING name;
+     INT32 input_scope;
+@@ -222,6 +223,8 @@ struct edit_context
+     INT32 pane_policy;
+ };
+ 
++static const GUID IID_ICoreTextEditContext2_local = { 0xb1867dbb, 0x083b, 0x49e1, { 0xb2, 0x81, 0x2b, 0x35, 0xd6, 0x2b, 0xf4, 0x66 } };
++
+ static HRESULT WINAPI edit_QueryInterface( struct edit_context *impl, REFIID iid, void **out )
+ {
+     if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+@@ -231,6 +234,12 @@ static HRESULT WINAPI edit_QueryInterface( struct edit_context *impl, REFIID iid
+         *out = impl;
+         return S_OK;
+     }
++    if (IsEqualGUID( iid, &IID_ICoreTextEditContext2_local ))
++    {
++        InterlockedIncrement( &impl->ref );
++        *out = &impl->lpVtbl2;
++        return S_OK;
++    }
+     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+     *out = NULL;
+     return E_NOINTERFACE;
+@@ -297,6 +306,22 @@ static const void *const edit_vtbl[] =
+     edit_notify,                            /* NotifyLayoutChanged */
+ };
+ 
++static inline struct edit_context *edit_from_2( void *iface ) { return CONTAINING_RECORD( iface, struct edit_context, lpVtbl2 ); }
++static HRESULT WINAPI edit2_QueryInterface( void *iface, REFIID iid, void **out ) { return edit_QueryInterface( edit_from_2( iface ), iid, out ); }
++static ULONG WINAPI edit2_AddRef( void *iface ) { return edit_AddRef( edit_from_2( iface ) ); }
++static ULONG WINAPI edit2_Release( void *iface ) { return edit_Release( edit_from_2( iface ) ); }
++static HRESULT WINAPI edit2_GetIids( void *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI edit2_GetRuntimeClassName( void *iface, HSTRING *name ) { return edit_GetRuntimeClassName( edit_from_2( iface ), name ); }
++static HRESULT WINAPI edit2_GetTrustLevel( void *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI edit2_add_event( void *iface, IUnknown *handler, EventRegistrationToken *token ) { return edit_add_event( edit_from_2( iface ), handler, token ); }
++static HRESULT WINAPI edit2_remove_event( void *iface, EventRegistrationToken token ) { return S_OK; }
++static const void *const edit2_vtbl[] =
++{
++    edit2_QueryInterface, edit2_AddRef, edit2_Release,
++    edit2_GetIids, edit2_GetRuntimeClassName, edit2_GetTrustLevel,
++    edit2_add_event, edit2_remove_event,    /* NotifyFocusLeaveCompleted */
++};
++
+ static HRESULT WINAPI core_text_services_manager_CreateEditContext( ICoreTextServicesManager *iface, ICoreTextEditContext **value )
+ {
+     struct edit_context *impl;
+@@ -306,6 +331,7 @@ static HRESULT WINAPI core_text_services_manager_CreateEditContext( ICoreTextSer
+     if (!value) return E_POINTER;
+     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+     impl->lpVtbl = edit_vtbl;
++    impl->lpVtbl2 = edit2_vtbl;
+     impl->ref = 1;
+     *value = (ICoreTextEditContext *)impl;
+     return S_OK;

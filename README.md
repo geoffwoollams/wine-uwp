@@ -22,6 +22,8 @@ UWP apps don't create a normal Win32 window. They ask Windows for a `CoreApplica
 | ✅ | Microsoft Minesweeper (`Microsoft.MicrosoftMinesweeper`, Unity, XAML, .NET Native) | Playable offline: menus and Classic games with mouse clicks, flags and local saves. Needs `mrt100.dll` (see [framework packages](#set-up-an-app)). After the tutorial, each start waits about 30 seconds on "Downloading Game Data" while its Xbox cloud saves fail as offline. No ads, achievements or cloud saves. |
 | ✅ | Microsoft Sudoku (`Microsoft.MicrosoftSudoku`, Unity 6, XAML, .NET Native) | Playable offline: the tutorial and puzzles with the mouse. Its Xbox cloud sync and ads fail as offline. |
 | ✅ | Minecraft for Windows 1.21.114 and 1.19.83 (`Microsoft.MinecraftUWP`, D3D11) | Starts and plays offline: menus, worlds. Xbox sign-in and online features fail as offline. |
+| ❌ | Microsoft Mahjong (`Microsoft.MicrosoftMahjong`, XAML, .NET Native) | Not working yet: it starts and asks whether to play offline, then crashes when you answer. |
+| ❓ | Microsoft Solitaire Collection, Wordament (`Microsoft.MicrosoftSolitaireCollection`, `Microsoft.Studios.Wordament`) | Not tested yet. |
 | ❌ | Forza Motorsport 7 (`Microsoft.ApolloBaseGame`, D3D12) | Not working: it starts and its hardware warning is answered, but it isn't playable yet. |
 | ❌ | Windows Calculator (`Microsoft.WindowsCalculator`, XAML, WinUI 2.8) | Not working: stops at startup. It needs XAML's dependency-property system and the WinUI 2 control library, which the partial XAML doesn't support yet. |
 | ❌ | Windows Notepad, Paint (`Microsoft.WindowsNotepad`, `Microsoft.Paint`) | Not supported: Windows App SDK (WinUI 3) desktop apps, not UWP; nothing here supports them. |
@@ -293,7 +295,9 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 hung on a timer that never fired), 0088-0093 for Minecraft: ResolveDelayLoadsFromDll,
                 DeviceInformation.CreateFromIdAsync, InputPane events, ICoreDispatcherWithTaskPriority,
                 CoreTextEditContext, LocalCacheFolder and publisher cache folders, 0094-0095 for Minecraft
-                1.19: PnpObject.CreateFromIdAsync, HolographicApplicationPreview
+                1.19: PnpObject.CreateFromIdAsync, HolographicApplicationPreview, 0096-0098 for Microsoft
+                Mahjong (not working yet): XAML SizeHelper, PointHelper, Canvas and more FrameworkElement members,
+                SpatialAudio classes, device information, CoreTextEditContext2
 patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings

@@ -1,0 +1,464 @@
+Subject: twinapi.appcore: SpatialAudio classes, device information, ProcessEvents from other threads
+
+diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
+index 9a030b9..0e7f9d2 100644
+--- a/dlls/twinapi.appcore/Makefile.in
++++ b/dlls/twinapi.appcore/Makefile.in
+@@ -19,6 +19,7 @@ SOURCES = \
+ 	diagnostics_settings.c \
+ 	core_input_gen.c \
+ 	sink.c \
++	spatial_audio.c \
+ 	system_navigation.c \
+ 	store.c \
+ 	xbox_identity.c \
+diff --git a/dlls/twinapi.appcore/analytics_info.c b/dlls/twinapi.appcore/analytics_info.c
+index baaa92a..e9648c5 100644
+--- a/dlls/twinapi.appcore/analytics_info.c
++++ b/dlls/twinapi.appcore/analytics_info.c
+@@ -239,8 +239,12 @@ static HRESULT WINAPI statics_get_VersionInfo( IAnalyticsInfoStatics *iface, IAn
+ 
+ static HRESULT WINAPI statics_get_DeviceForm( IAnalyticsInfoStatics *iface, HSTRING *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    /* the form factor of an ordinary PC */
++    static const WCHAR desktop[] = L"Desktop";
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    return WindowsCreateString( desktop, ARRAY_SIZE(desktop) - 1, value );
+ }
+ 
+ static const struct IAnalyticsInfoStaticsVtbl statics_vtbl =
+diff --git a/dlls/twinapi.appcore/client_device_information.c b/dlls/twinapi.appcore/client_device_information.c
+index 0cfbc00..3ce1e18 100644
+--- a/dlls/twinapi.appcore/client_device_information.c
++++ b/dlls/twinapi.appcore/client_device_information.c
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include "private.h"
++#include "winreg.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
+ 
+@@ -86,41 +87,73 @@ static HRESULT WINAPI client_device_information_GetTrustLevel( IEasClientDeviceI
+     return E_NOTIMPL;
+ }
+ 
+-static HRESULT WINAPI client_device_information_get_Id( IEasClientDeviceInformation *iface, GUID *value )
++static HRESULT registry_string( const WCHAR *key, const WCHAR *name, HSTRING *value )
+ {
+-    FIXME( "iface %p, value %p stub.\n", iface, value );
++    WCHAR buffer[256];
++    DWORD size = sizeof(buffer);
+ 
+-    return E_NOTIMPL;
++    if (!value) return E_POINTER;
++    if (RegGetValueW( HKEY_LOCAL_MACHINE, key, name, RRF_RT_REG_SZ, NULL, buffer, &size )) buffer[0] = 0;
++    return WindowsCreateString( buffer, wcslen( buffer ), value );
++}
++
++/* the machine's id: its MachineGuid */
++static HRESULT WINAPI client_device_information_get_Id( IEasClientDeviceInformation *iface, GUID *value )
++{
++    WCHAR buffer[64];
++    DWORD size = sizeof(buffer);
++    unsigned int data[11], i;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    memset( value, 0, sizeof(*value) );
++    if (RegGetValueW( HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Cryptography", L"MachineGuid", RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
++                      NULL, buffer, &size )) return S_OK;
++    if (swscanf( buffer, L"%8x-%4x-%4x-%2x%2x-%2x%2x%2x%2x%2x%2x", &data[0], &data[1], &data[2], &data[3], &data[4],
++                 &data[5], &data[6], &data[7], &data[8], &data[9], &data[10] ) != 11) return S_OK;
++    value->Data1 = data[0];
++    value->Data2 = data[1];
++    value->Data3 = data[2];
++    for (i = 0; i < 8; i++) value->Data4[i] = data[3 + i];
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI client_device_information_get_OperatingSystem( IEasClientDeviceInformation *iface, HSTRING *value )
+ {
+-    FIXME( "iface %p, value %p stub.\n", iface, value );
+-    return WindowsCreateString( NULL, 0, value );
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    return WindowsCreateString( L"WINDOWS", 7, value );
+ }
+ 
+ static HRESULT WINAPI client_device_information_get_FriendlyName( IEasClientDeviceInformation *iface, HSTRING *value )
+ {
+-    FIXME( "iface %p, value %p stub.\n", iface, value );
+-    return WindowsCreateString( NULL, 0, value );
++    WCHAR name[MAX_COMPUTERNAME_LENGTH + 1];
++    DWORD size = ARRAY_SIZE(name);
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    if (!GetComputerNameW( name, &size )) name[0] = 0;
++    return WindowsCreateString( name, wcslen( name ), value );
+ }
+ 
++/* the BIOS strings Wine records from the host's DMI tables */
+ static HRESULT WINAPI client_device_information_get_SystemManufacturer( IEasClientDeviceInformation *iface, HSTRING *value )
+ {
+-    FIXME( "iface %p, value %p stub.\n", iface, value );
+-    return WindowsCreateString( NULL, 0, value );
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return registry_string( L"Hardware\\Description\\System\\BIOS", L"SystemManufacturer", value );
+ }
+ 
+ static HRESULT WINAPI client_device_information_get_SystemProductName( IEasClientDeviceInformation *iface, HSTRING *value )
+ {
+-    FIXME( "iface %p, value %p stub.\n", iface, value );
+-    return WindowsCreateString( NULL, 0, value );
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return registry_string( L"Hardware\\Description\\System\\BIOS", L"SystemProductName", value );
+ }
+ 
+ static HRESULT WINAPI client_device_information_get_SystemSku( IEasClientDeviceInformation *iface, HSTRING *value )
+ {
+-    FIXME( "iface %p, value %p stub.\n", iface, value );
+-    return WindowsCreateString( NULL, 0, value );
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return registry_string( L"Hardware\\Description\\System\\BIOS", L"SystemSKU", value );
+ }
+ 
+ static IEasClientDeviceInformationVtbl client_device_information_vtbl =
+diff --git a/dlls/twinapi.appcore/core_gen.c b/dlls/twinapi.appcore/core_gen.c
+index 9eba023..984158a 100644
+--- a/dlls/twinapi.appcore/core_gen.c
++++ b/dlls/twinapi.appcore/core_gen.c
+@@ -622,6 +622,29 @@ static HRESULT WINAPI core_dispatcher_ProcessEvents(ICoreDispatcher *iface, __x_
+     struct core_dispatcher *impl __attribute__((unused)) = impl_from_core_dispatcher(iface);
+     MSG msg;
+     TRACE_(coreloop)("iface %p, options %d.\n", iface, options);
++    if (GetCurrentThreadId() != impl->thread_id)
++    {
++        /* a SwapChainPanel's independent input source hands out this dispatcher, and games pump it on
++         * their own input thread: pump that thread's messages, but leave the work queued for the UI thread
++         * to the UI thread */
++        TRACE("iface %p: pumping thread %#lx, not the dispatcher's.\n", iface, GetCurrentThreadId());
++        if (options == CoreProcessEventsOption_ProcessUntilQuit)
++        {
++            while (GetMessageW(&msg, NULL, 0, 0) > 0)
++            {
++                TranslateMessage(&msg);
++                DispatchMessageW(&msg);
++            }
++            return S_OK;
++        }
++        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
++        {
++            if (msg.message == WM_QUIT) { PostQuitMessage(msg.wParam); break; }
++            TranslateMessage(&msg);
++            DispatchMessageW(&msg);
++        }
++        return S_OK;
++    }
+     if (options == CoreProcessEventsOption_ProcessUntilQuit)
+     {
+         /* used by FrameworkView.Run (XAML): block until WM_QUIT, running RunAsync work as it is queued */
+diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
+index 99757a8..9cfa93d 100644
+--- a/dlls/twinapi.appcore/main.c
++++ b/dlls/twinapi.appcore/main.c
+@@ -156,6 +156,10 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( holographic_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, L"Windows.ApplicationModel.Resources.Core.ResourceContext" ))
+         IActivationFactory_QueryInterface( resource_context_factory, &IID_IActivationFactory, (void **)factory );
++    else if (!wcscmp( buffer, L"Windows.Media.Audio.SpatialAudioDeviceConfiguration" ))
++        IActivationFactory_QueryInterface( spatial_audio_factory, &IID_IActivationFactory, (void **)factory );
++    else if (!wcscmp( buffer, L"Windows.Media.Audio.SpatialAudioFormatSubtype" ))
++        IActivationFactory_QueryInterface( spatial_audio_subtype_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, L"Windows.System.Profile.HardwareIdentification" ))
+         IActivationFactory_QueryInterface( hardware_identification_factory, &IID_IActivationFactory, (void **)factory );
+ 
+diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
+index 2264b32..694e474 100644
+--- a/dlls/twinapi.appcore/private.h
++++ b/dlls/twinapi.appcore/private.h
+@@ -79,6 +79,8 @@ extern IActivationFactory *clipboard_factory;
+ extern IActivationFactory *api_information_factory;
+ extern IActivationFactory *resource_context_factory;
+ extern IActivationFactory *holographic_factory;
++extern IActivationFactory *spatial_audio_factory;
++extern IActivationFactory *spatial_audio_subtype_factory;
+ extern IActivationFactory *web_token_manager_factory, *web_token_request_factory, *web_account_provider_factory, *user_picker_factory, *system_user_factory, *launcher_factory, *web_account_factory, *web_token_response_factory, *thread_pool_timer_factory, *user_statics_factory, *store_context_real_factory, *message_websocket_factory, *store_context_factory, *logging_options_factory, *logging_fields_factory, *push_manager_factory, *logging_channel_factory, *loggingchanneloptions_factory, *loggingactivity_factory, *loggingsession_factory;
+ extern IActivationFactory *async_causality_tracer_factory;   /* causality.c */
+ extern IActivationFactory *mouse_device_factory;   /* mouse.c */
+diff --git a/dlls/twinapi.appcore/spatial_audio.c b/dlls/twinapi.appcore/spatial_audio.c
+new file mode 100644
+index 0000000..96bd8df
+--- /dev/null
++++ b/dlls/twinapi.appcore/spatial_audio.c
+@@ -0,0 +1,245 @@
++/* WinRT Windows.Media.Audio.SpatialAudioDeviceConfiguration (hand-declared)
++ *
++ * No spatial audio (Windows Sonic, Dolby Atmos) is available on any device.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
++
++static const GUID IID_ISpatialAudioDeviceConfigurationStatics_local =
++    { 0x3ec37f7b, 0x936d, 0x4e04, { 0x97, 0x28, 0x28, 0x27, 0xd9, 0xf7, 0x58, 0xc4 } };
++static const GUID IID_ISpatialAudioDeviceConfiguration_local =
++    { 0xee830034, 0x61cf, 0x5749, { 0x9d, 0xa4, 0x10, 0xf0, 0xfe, 0x02, 0x81, 0x99 } };
++
++/* ---- SpatialAudioDeviceConfiguration ---- */
++struct configuration
++{
++    const void *const *lpVtbl;
++    LONG ref;
++    HSTRING device_id;
++};
++
++static HRESULT WINAPI config_QueryInterface( struct configuration *impl, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_ISpatialAudioDeviceConfiguration_local ))
++    {
++        InterlockedIncrement( &impl->ref );
++        *out = impl;
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI config_AddRef( struct configuration *impl ) { return InterlockedIncrement( &impl->ref ); }
++static ULONG WINAPI config_Release( struct configuration *impl )
++{
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        WindowsDeleteString( impl->device_id );
++        free( impl );
++    }
++    return ref;
++}
++static HRESULT WINAPI config_GetIids( struct configuration *impl, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI config_GetRuntimeClassName( struct configuration *impl, HSTRING *name )
++{
++    return WindowsCreateString( L"Windows.Media.Audio.SpatialAudioDeviceConfiguration", 51, name );
++}
++static HRESULT WINAPI config_GetTrustLevel( struct configuration *impl, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI config_get_DeviceId( struct configuration *impl, HSTRING *value ) { return WindowsDuplicateString( impl->device_id, value ); }
++static HRESULT WINAPI config_get_false( struct configuration *impl, boolean *value ) { *value = FALSE; return S_OK; }
++static HRESULT WINAPI config_IsSpatialAudioFormatSupported( struct configuration *impl, HSTRING subtype, boolean *value )
++{
++    *value = FALSE;
++    return S_OK;
++}
++static HRESULT WINAPI config_get_empty( struct configuration *impl, HSTRING *value ) { *value = NULL; return S_OK; }
++static HRESULT WINAPI config_SetDefaultSpatialAudioFormatAsync( struct configuration *impl, HSTRING subtype, void **value )
++{
++    FIXME( "configuration %p, subtype %s: no spatial audio.\n", impl, debugstr_hstring( subtype ) );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI config_add_ConfigurationChanged( struct configuration *impl, IUnknown *handler, EventRegistrationToken *token )
++{
++    /* nothing changes */
++    if (!handler || !token) return E_POINTER;
++    token->value = 0x7361;
++    return S_OK;
++}
++static HRESULT WINAPI config_remove_ConfigurationChanged( struct configuration *impl, EventRegistrationToken token ) { return S_OK; }
++static const void *const config_vtbl[] =
++{
++    config_QueryInterface, config_AddRef, config_Release,
++    config_GetIids, config_GetRuntimeClassName, config_GetTrustLevel,
++    config_get_DeviceId, config_get_false, config_IsSpatialAudioFormatSupported,
++    config_get_empty, config_get_empty, config_SetDefaultSpatialAudioFormatAsync,
++    config_add_ConfigurationChanged, config_remove_ConfigurationChanged,
++};
++
++/* ---- the factory, with ISpatialAudioDeviceConfigurationStatics ---- */
++struct spatial_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    struct { const void *const *lpVtbl; } statics;
++};
++
++static struct spatial_statics spatial_statics;
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s.\n", iface, debugstr_guid( iid ) );
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        *out = &spatial_statics.IActivationFactory_iface;
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_ISpatialAudioDeviceConfigurationStatics_local ))
++    {
++        *out = &spatial_statics.statics;
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance ) { return E_NOTIMPL; }
++static const IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface, factory_AddRef, factory_Release,
++    factory_GetIids, factory_GetRuntimeClassName, factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++static HRESULT WINAPI statics_QueryInterface( void *iface, REFIID iid, void **out )
++{
++    return factory_QueryInterface( &spatial_statics.IActivationFactory_iface, iid, out );
++}
++static ULONG WINAPI statics_AddRef( void *iface ) { return 2; }
++static ULONG WINAPI statics_Release( void *iface ) { return 1; }
++static HRESULT WINAPI statics_GetIids( void *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI statics_GetRuntimeClassName( void *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI statics_GetTrustLevel( void *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI statics_GetForDeviceId( void *iface, HSTRING device_id, void **value )
++{
++    struct configuration *impl;
++    HRESULT hr;
++
++    TRACE( "iface %p, device_id %s, value %p.\n", iface, debugstr_hstring( device_id ), value );
++    if (!value) return E_POINTER;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->lpVtbl = config_vtbl;
++    impl->ref = 1;
++    if (FAILED(hr = WindowsDuplicateString( device_id, &impl->device_id )))
++    {
++        free( impl );
++        return hr;
++    }
++    *value = impl;
++    return S_OK;
++}
++static const void *const statics_vtbl[] =
++{
++    statics_QueryInterface, statics_AddRef, statics_Release,
++    statics_GetIids, statics_GetRuntimeClassName, statics_GetTrustLevel,
++    statics_GetForDeviceId,
++};
++
++static struct spatial_statics spatial_statics = { {&factory_vtbl}, {statics_vtbl} };
++
++IActivationFactory *spatial_audio_factory = &spatial_statics.IActivationFactory_iface;
++
++/* ---- SpatialAudioFormatSubtype: the format names. None is ever supported or active here, so they only need to be
++ * distinct from each other and from the empty active format. ---- */
++static const GUID IID_ISpatialAudioFormatSubtypeStatics_local =
++    { 0xb3de8a47, 0x83ee, 0x4266, { 0xa9, 0x45, 0xbe, 0xdf, 0x50, 0x7a, 0xfe, 0xed } };
++static const GUID IID_ISpatialAudioFormatSubtypeStatics2_local =
++    { 0x4565e6cb, 0xd95b, 0x5621, { 0xb6, 0xaf, 0x0e, 0x88, 0x49, 0xc5, 0x7c, 0x80 } };
++
++static struct subtype_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    struct { const void *const *lpVtbl; } statics, statics2;
++} subtype_statics;
++
++static HRESULT WINAPI subtype_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s.\n", iface, debugstr_guid( iid ) );
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &subtype_statics.IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_ISpatialAudioFormatSubtypeStatics_local ))
++        *out = &subtype_statics.statics;
++    else if (IsEqualGUID( iid, &IID_ISpatialAudioFormatSubtypeStatics2_local ))
++        *out = &subtype_statics.statics2;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++static const IActivationFactoryVtbl subtype_factory_vtbl =
++{
++    subtype_factory_QueryInterface, factory_AddRef, factory_Release,
++    factory_GetIids, factory_GetRuntimeClassName, factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++static HRESULT WINAPI subtype_QueryInterface( void *iface, REFIID iid, void **out )
++{
++    return subtype_factory_QueryInterface( &subtype_statics.IActivationFactory_iface, iid, out );
++}
++#define SUBTYPE( name ) \
++static HRESULT WINAPI subtype_get_##name( void *iface, HSTRING *value ) \
++{ \
++    static const WCHAR str[] = L"Wine." #name; \
++    return WindowsCreateString( str, ARRAY_SIZE(str) - 1, value ); \
++}
++SUBTYPE( WindowsSonic )
++SUBTYPE( DolbyAtmosForHeadphones )
++SUBTYPE( DolbyAtmosForHomeTheater )
++SUBTYPE( DolbyAtmosForSpeakers )
++SUBTYPE( DTSHeadphoneX )
++SUBTYPE( DTSXUltra )
++SUBTYPE( DTSXForHomeTheater )
++static const void *const subtype_vtbl[] =
++{
++    subtype_QueryInterface, statics_AddRef, statics_Release,
++    statics_GetIids, statics_GetRuntimeClassName, statics_GetTrustLevel,
++    subtype_get_WindowsSonic, subtype_get_DolbyAtmosForHeadphones, subtype_get_DolbyAtmosForHomeTheater,
++    subtype_get_DolbyAtmosForSpeakers, subtype_get_DTSHeadphoneX, subtype_get_DTSXUltra,
++};
++static const void *const subtype2_vtbl[] =
++{
++    subtype_QueryInterface, statics_AddRef, statics_Release,
++    statics_GetIids, statics_GetRuntimeClassName, statics_GetTrustLevel,
++    subtype_get_DTSXForHomeTheater,
++};
++
++static struct subtype_statics subtype_statics = { {&subtype_factory_vtbl}, {subtype_vtbl}, {subtype2_vtbl} };
++
++IActivationFactory *spatial_audio_subtype_factory = &subtype_statics.IActivationFactory_iface;
+diff --git a/dlls/twinapi.appcore/twinapi.appcore.rgs b/dlls/twinapi.appcore/twinapi.appcore.rgs
+index e775566..bec6981 100644
+--- a/dlls/twinapi.appcore/twinapi.appcore.rgs
++++ b/dlls/twinapi.appcore/twinapi.appcore.rgs
+@@ -100,6 +100,14 @@ HKLM
+                     {
+                         val 'DllPath' = s '%MODULE%'
+                     }
++                    ForceRemove Windows.Media.Audio.SpatialAudioDeviceConfiguration
++                    {
++                        val 'DllPath' = s '%MODULE%'
++                    }
++                    ForceRemove Windows.Media.Audio.SpatialAudioFormatSubtype
++                    {
++                        val 'DllPath' = s '%MODULE%'
++                    }
+                     ForceRemove Windows.System.Profile.HardwareIdentification
+                     {
+                         val 'DllPath' = s '%MODULE%'

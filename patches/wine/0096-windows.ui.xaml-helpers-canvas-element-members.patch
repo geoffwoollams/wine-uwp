@@ -1,0 +1,1874 @@
+Subject: windows.ui.xaml: SizeHelper, PointHelper, Canvas and more Control and FrameworkElement members
+
+diff --git a/dlls/windows.ui.xaml/Makefile.in b/dlls/windows.ui.xaml/Makefile.in
+index 307d70b..81815c5 100644
+--- a/dlls/windows.ui.xaml/Makefile.in
++++ b/dlls/windows.ui.xaml/Makefile.in
+@@ -18,6 +18,7 @@ SOURCES = \
+ 	dialog.c \
+ 	element.c \
+ 	focus.c \
++	helpers.c \
+ 	image.c \
+ 	icon.c \
+ 	items.c \
+diff --git a/dlls/windows.ui.xaml/brush.c b/dlls/windows.ui.xaml/brush.c
+index fadaaa8..5cc573e 100644
+--- a/dlls/windows.ui.xaml/brush.c
++++ b/dlls/windows.ui.xaml/brush.c
+@@ -214,8 +214,7 @@ static HRESULT WINAPI brush_dependency_object_GetAnimationBaseValue(IDependencyO
+ 
+ static HRESULT WINAPI brush_dependency_object_get_Dispatcher(IDependencyObject *iface, __x_ABI_CWindows_CUI_CCore_CICoreDispatcher **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return xaml_get_dispatcher( value );
+ }
+ 
+ static const struct IDependencyObjectVtbl brush_dependency_object_vtbl =
+diff --git a/dlls/windows.ui.xaml/button.c b/dlls/windows.ui.xaml/button.c
+index 59c4b33..0d05b62 100644
+--- a/dlls/windows.ui.xaml/button.c
++++ b/dlls/windows.ui.xaml/button.c
+@@ -1279,38 +1279,44 @@ static HRESULT WINAPI control_ApplyTemplate( IControl *iface, boolean *value )
+ 
+ static HRESULT WINAPI control_get_FontFamily(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIFontFamily **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_put_FontFamily(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIFontFamily *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_get_FontStretch(IControl *iface, __x_ABI_CWindows_CUI_CText_CFontStretch *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = 5; /* Normal */
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_put_FontStretch(IControl *iface, __x_ABI_CWindows_CUI_CText_CFontStretch value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_get_CharacterSpacing(IControl *iface, INT32 *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = 0;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_put_CharacterSpacing(IControl *iface, INT32 value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_get_IsTabStop(IControl *iface, boolean *value)
+@@ -1342,14 +1348,16 @@ static HRESULT WINAPI control_put_TabIndex(IControl *iface, INT32 value)
+ 
+ static HRESULT WINAPI control_get_TabNavigation(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CKeyboardNavigationMode *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = 0; /* Local */
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_put_TabNavigation(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CKeyboardNavigationMode value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_get_Template(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CControls_CIControlTemplate **value)
+@@ -1380,14 +1388,15 @@ static HRESULT WINAPI control_get_FocusState(IControl *iface, __x_ABI_CWindows_C
+ 
+ static HRESULT WINAPI control_add_IsEnabledChanged(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyPropertyChangedEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p, handler %p: never raised.\n", iface, handler );
++    if (!handler || !value) return E_POINTER;
++    value->value = 0x6965;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_remove_IsEnabledChanged(IControl *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_Focus(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CFocusState value, boolean *result)
+diff --git a/dlls/windows.ui.xaml/classes.idl b/dlls/windows.ui.xaml/classes.idl
+index 0653abb..5db74ba 100644
+--- a/dlls/windows.ui.xaml/classes.idl
++++ b/dlls/windows.ui.xaml/classes.idl
+@@ -30,6 +30,8 @@ namespace Windows.UI {
+ 
+ namespace Windows.UI.Xaml {
+     runtimeclass Application;
++    runtimeclass PointHelper;
++    runtimeclass SizeHelper;
+     runtimeclass ResourceDictionary;
+     runtimeclass Window;
+ }
+@@ -66,6 +68,7 @@ namespace Windows.UI.Xaml.Controls {
+     runtimeclass SwapChainPanel;
+     runtimeclass SymbolIcon;
+     runtimeclass StackPanel;
++    runtimeclass Canvas;
+     runtimeclass TextBlock;
+     runtimeclass TextBox;
+     runtimeclass ToggleSwitch;
+diff --git a/dlls/windows.ui.xaml/content.c b/dlls/windows.ui.xaml/content.c
+index 9c74de1..d4dbc61 100644
+--- a/dlls/windows.ui.xaml/content.c
++++ b/dlls/windows.ui.xaml/content.c
+@@ -674,194 +674,226 @@ static HRESULT WINAPI control_ApplyTemplate( IControl *iface, boolean *value )
+ 
+ static HRESULT WINAPI control_get_FontFamily(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIFontFamily **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_put_FontFamily(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIFontFamily *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_get_FontWeight(IControl *iface, __x_ABI_CWindows_CUI_CText_CFontWeight *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    value->Weight = 400;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_put_FontWeight(IControl *iface, __x_ABI_CWindows_CUI_CText_CFontWeight value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_get_FontStyle(IControl *iface, __x_ABI_CWindows_CUI_CText_CFontStyle *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = 0; /* Normal */
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_put_FontStyle(IControl *iface, __x_ABI_CWindows_CUI_CText_CFontStyle value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_get_FontStretch(IControl *iface, __x_ABI_CWindows_CUI_CText_CFontStretch *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = 5; /* Normal */
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_put_FontStretch(IControl *iface, __x_ABI_CWindows_CUI_CText_CFontStretch value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_get_CharacterSpacing(IControl *iface, INT32 *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = 0;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_put_CharacterSpacing(IControl *iface, INT32 value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_get_IsTabStop(IControl *iface, boolean *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = TRUE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_put_IsTabStop(IControl *iface, boolean value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_get_IsEnabled(IControl *iface, boolean *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = TRUE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_put_IsEnabled(IControl *iface, boolean value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_get_TabIndex(IControl *iface, INT32 *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = 0x7fffffff;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_put_TabIndex(IControl *iface, INT32 value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_get_TabNavigation(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CKeyboardNavigationMode *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = 0; /* Local */
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_put_TabNavigation(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CKeyboardNavigationMode value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_get_Template(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CControls_CIControlTemplate **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_put_Template(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CControls_CIControlTemplate *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_get_HorizontalContentAlignment(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CHorizontalAlignment *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = 1; /* Center */
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_put_HorizontalContentAlignment(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CHorizontalAlignment value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_get_VerticalContentAlignment(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CVerticalAlignment *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = 1; /* Center */
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_put_VerticalContentAlignment(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CVerticalAlignment value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_get_BorderThickness(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CThickness *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    memset( value, 0, sizeof(*value) );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_put_BorderThickness(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CThickness value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_get_BorderBrush(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIBrush **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_put_BorderBrush(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIBrush *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_get_FocusState(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CFocusState *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = 0; /* Unfocused */
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_add_IsEnabledChanged(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CIDependencyPropertyChangedEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p, handler %p: never raised.\n", iface, handler );
++    if (!handler || !value) return E_POINTER;
++    value->value = 0x6965;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_remove_IsEnabledChanged(IControl *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI control_Focus(IControl *iface, __x_ABI_CWindows_CUI_CXaml_CFocusState value, boolean *result)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p, value %d: focus not moved.\n", iface, value );
++    if (result) *result = TRUE;
++    return S_OK;
+ }
+ 
+ static const struct IControlVtbl control_vtbl =
+diff --git a/dlls/windows.ui.xaml/definitions.c b/dlls/windows.ui.xaml/definitions.c
+index 7f82efc..8ea51f2 100644
+--- a/dlls/windows.ui.xaml/definitions.c
++++ b/dlls/windows.ui.xaml/definitions.c
+@@ -355,8 +355,7 @@ static HRESULT WINAPI definition_dependency_object_GetAnimationBaseValue(IDepend
+ 
+ static HRESULT WINAPI definition_dependency_object_get_Dispatcher(IDependencyObject *iface, __x_ABI_CWindows_CUI_CCore_CICoreDispatcher **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return xaml_get_dispatcher( value );
+ }
+ 
+ static const struct IDependencyObjectVtbl definition_dependency_object_vtbl =
+diff --git a/dlls/windows.ui.xaml/element.c b/dlls/windows.ui.xaml/element.c
+index 0b1ab72..10986cc 100644
+--- a/dlls/windows.ui.xaml/element.c
++++ b/dlls/windows.ui.xaml/element.c
+@@ -215,14 +215,16 @@ static HRESULT WINAPI uielement_UpdateLayout( IUIElement *iface )
+ 
+ static HRESULT WINAPI uielement_get_AllowDrop(IUIElement *iface, boolean *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    memset( value, 0, sizeof(*value) );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_put_AllowDrop(IUIElement *iface, boolean value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_get_Clip(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIRectangleGeometry **value)
+@@ -268,14 +270,16 @@ static HRESULT WINAPI uielement_put_RenderTransform(IUIElement *iface, __x_ABI_C
+ 
+ static HRESULT WINAPI uielement_get_Projection(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIProjection **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    memset( value, 0, sizeof(*value) );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_put_Projection(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CIProjection *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_get_RenderTransformOrigin(IUIElement *iface, __x_ABI_CWindows_CFoundation_CPoint *value)
+@@ -293,104 +297,122 @@ static HRESULT WINAPI uielement_put_RenderTransformOrigin(IUIElement *iface, __x
+ 
+ static HRESULT WINAPI uielement_get_UseLayoutRounding(IUIElement *iface, boolean *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = TRUE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_put_UseLayoutRounding(IUIElement *iface, boolean value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_get_Transitions(IUIElement *iface, __FIVector_1_Windows__CUI__CXaml__CMedia__CAnimation__CTransition **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    memset( value, 0, sizeof(*value) );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_put_Transitions(IUIElement *iface, __FIVector_1_Windows__CUI__CXaml__CMedia__CAnimation__CTransition *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_get_CacheMode(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CICacheMode **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    memset( value, 0, sizeof(*value) );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_put_CacheMode(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CMedia_CICacheMode *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_get_IsTapEnabled(IUIElement *iface, boolean *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = TRUE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_put_IsTapEnabled(IUIElement *iface, boolean value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_get_IsDoubleTapEnabled(IUIElement *iface, boolean *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = TRUE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_put_IsDoubleTapEnabled(IUIElement *iface, boolean value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_get_IsRightTapEnabled(IUIElement *iface, boolean *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = TRUE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_put_IsRightTapEnabled(IUIElement *iface, boolean value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_get_IsHoldingEnabled(IUIElement *iface, boolean *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = TRUE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_put_IsHoldingEnabled(IUIElement *iface, boolean value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_get_ManipulationMode(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CManipulationModes *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    *value = 1; /* System */
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_put_ManipulationMode(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CManipulationModes value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_get_PointerCaptures(IUIElement *iface, __FIVectorView_1_Windows__CUI__CXaml__CInput__CPointer **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    memset( value, 0, sizeof(*value) );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_add_KeyUp(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIKeyEventHandler *handler, EventRegistrationToken *value)
+@@ -439,254 +461,275 @@ static HRESULT WINAPI uielement_remove_LostFocus(IUIElement *iface, EventRegistr
+ 
+ static HRESULT WINAPI uielement_add_DragEnter(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CIDragEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: handler kept but never raised.\n", iface );
++    if (!value) return E_POINTER;
++    value->value = 0x6576;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_remove_DragEnter(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_add_DragLeave(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CIDragEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: handler kept but never raised.\n", iface );
++    if (!value) return E_POINTER;
++    value->value = 0x6576;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_remove_DragLeave(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_add_DragOver(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CIDragEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: handler kept but never raised.\n", iface );
++    if (!value) return E_POINTER;
++    value->value = 0x6576;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_remove_DragOver(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_add_Drop(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CIDragEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: handler kept but never raised.\n", iface );
++    if (!value) return E_POINTER;
++    value->value = 0x6576;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_remove_Drop(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_add_PointerPressed(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIPointerEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: handler kept but never raised.\n", iface );
++    if (!value) return E_POINTER;
++    value->value = 0x6576;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_remove_PointerPressed(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_add_PointerMoved(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIPointerEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: handler kept but never raised.\n", iface );
++    if (!value) return E_POINTER;
++    value->value = 0x6576;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_remove_PointerMoved(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_add_PointerReleased(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIPointerEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: handler kept but never raised.\n", iface );
++    if (!value) return E_POINTER;
++    value->value = 0x6576;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_remove_PointerReleased(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_add_PointerEntered(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIPointerEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: handler kept but never raised.\n", iface );
++    if (!value) return E_POINTER;
++    value->value = 0x6576;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_remove_PointerEntered(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_add_PointerExited(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIPointerEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: handler kept but never raised.\n", iface );
++    if (!value) return E_POINTER;
++    value->value = 0x6576;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_remove_PointerExited(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_add_PointerCaptureLost(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIPointerEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: handler kept but never raised.\n", iface );
++    if (!value) return E_POINTER;
++    value->value = 0x6576;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_remove_PointerCaptureLost(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_add_PointerCanceled(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIPointerEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: handler kept but never raised.\n", iface );
++    if (!value) return E_POINTER;
++    value->value = 0x6576;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_remove_PointerCanceled(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_add_PointerWheelChanged(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIPointerEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: handler kept but never raised.\n", iface );
++    if (!value) return E_POINTER;
++    value->value = 0x6576;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_remove_PointerWheelChanged(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_add_Tapped(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CITappedEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: handler kept but never raised.\n", iface );
++    if (!value) return E_POINTER;
++    value->value = 0x6576;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_remove_Tapped(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_add_DoubleTapped(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIDoubleTappedEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: handler kept but never raised.\n", iface );
++    if (!value) return E_POINTER;
++    value->value = 0x6576;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_remove_DoubleTapped(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_add_Holding(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIHoldingEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: handler kept but never raised.\n", iface );
++    if (!value) return E_POINTER;
++    value->value = 0x6576;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_remove_Holding(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_add_RightTapped(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIRightTappedEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: handler kept but never raised.\n", iface );
++    if (!value) return E_POINTER;
++    value->value = 0x6576;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_remove_RightTapped(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_add_ManipulationStarting(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIManipulationStartingEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: handler kept but never raised.\n", iface );
++    if (!value) return E_POINTER;
++    value->value = 0x6576;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_remove_ManipulationStarting(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_add_ManipulationInertiaStarting(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIManipulationInertiaStartingEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: handler kept but never raised.\n", iface );
++    if (!value) return E_POINTER;
++    value->value = 0x6576;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_remove_ManipulationInertiaStarting(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_add_ManipulationStarted(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIManipulationStartedEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: handler kept but never raised.\n", iface );
++    if (!value) return E_POINTER;
++    value->value = 0x6576;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_remove_ManipulationStarted(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_add_ManipulationDelta(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIManipulationDeltaEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: handler kept but never raised.\n", iface );
++    if (!value) return E_POINTER;
++    value->value = 0x6576;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_remove_ManipulationDelta(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_add_ManipulationCompleted(IUIElement *iface, __x_ABI_CWindows_CUI_CXaml_CInput_CIManipulationCompletedEventHandler *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: handler kept but never raised.\n", iface );
++    if (!value) return E_POINTER;
++    value->value = 0x6576;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_remove_ManipulationCompleted(IUIElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI uielement_Measure(IUIElement *iface, __x_ABI_CWindows_CFoundation_CSize availableSize)
+@@ -964,8 +1007,10 @@ static HRESULT WINAPI framework_element_get_Parent( IFrameworkElement *iface, ID
+ 
+ static HRESULT WINAPI framework_element_get_Triggers(IFrameworkElement *iface, __FIVector_1_Windows__CUI__CXaml__CTriggerBase **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    memset( value, 0, sizeof(*value) );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI framework_element_get_Resources(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CIResourceDictionary **value)
+@@ -989,80 +1034,94 @@ static HRESULT WINAPI framework_element_put_Resources(IFrameworkElement *iface,
+ 
+ static HRESULT WINAPI framework_element_get_Tag(IFrameworkElement *iface, IInspectable **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    memset( value, 0, sizeof(*value) );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI framework_element_put_Tag(IFrameworkElement *iface, IInspectable *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI framework_element_get_Language(IFrameworkElement *iface, HSTRING *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    memset( value, 0, sizeof(*value) );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI framework_element_put_Language(IFrameworkElement *iface, HSTRING value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI framework_element_get_MinWidth(IFrameworkElement *iface, DOUBLE *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    memset( value, 0, sizeof(*value) );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI framework_element_put_MinWidth(IFrameworkElement *iface, DOUBLE value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI framework_element_get_MaxWidth(IFrameworkElement *iface, DOUBLE *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    memset( value, 0, sizeof(*value) );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI framework_element_put_MaxWidth(IFrameworkElement *iface, DOUBLE value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI framework_element_get_MinHeight(IFrameworkElement *iface, DOUBLE *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    memset( value, 0, sizeof(*value) );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI framework_element_put_MinHeight(IFrameworkElement *iface, DOUBLE value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI framework_element_get_MaxHeight(IFrameworkElement *iface, DOUBLE *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    memset( value, 0, sizeof(*value) );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI framework_element_put_MaxHeight(IFrameworkElement *iface, DOUBLE value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI framework_element_get_BaseUri(IFrameworkElement *iface, __x_ABI_CWindows_CFoundation_CIUriRuntimeClass **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    memset( value, 0, sizeof(*value) );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI framework_element_get_DataContext(IFrameworkElement *iface, IInspectable **value)
+@@ -1108,14 +1167,16 @@ static HRESULT WINAPI framework_element_put_Style(IFrameworkElement *iface, __x_
+ 
+ static HRESULT WINAPI framework_element_get_FlowDirection(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CFlowDirection *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p: default.\n", iface );
++    if (!value) return E_POINTER;
++    memset( value, 0, sizeof(*value) );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI framework_element_put_FlowDirection(IFrameworkElement *iface, __x_ABI_CWindows_CUI_CXaml_CFlowDirection value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: ignored.\n", iface );
++    return S_OK;
+ }
+ 
+ /* Loaded after the element's first layout in the window, SizeChanged when its arranged size changes (both raised
+@@ -1155,14 +1216,15 @@ static HRESULT WINAPI framework_element_remove_SizeChanged( IFrameworkElement *i
+ 
+ static HRESULT WINAPI framework_element_add_LayoutUpdated(IFrameworkElement *iface, __FIEventHandler_1_IInspectable *handler, EventRegistrationToken *value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    FIXME( "iface %p: handler kept but never raised.\n", iface );
++    if (!value) return E_POINTER;
++    value->value = 0x6576;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI framework_element_remove_LayoutUpdated(IFrameworkElement *iface, EventRegistrationToken token)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static struct xaml_element *find_name( struct xaml_element *element, HSTRING name )
+@@ -1363,8 +1425,7 @@ static HRESULT WINAPI element_dependency_object_GetAnimationBaseValue(IDependenc
+ 
+ static HRESULT WINAPI element_dependency_object_get_Dispatcher(IDependencyObject *iface, __x_ABI_CWindows_CUI_CCore_CICoreDispatcher **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return xaml_get_dispatcher( value );
+ }
+ 
+ static const struct IDependencyObjectVtbl element_dependency_object_vtbl =
+diff --git a/dlls/windows.ui.xaml/helpers.c b/dlls/windows.ui.xaml/helpers.c
+new file mode 100644
+index 0000000..a888a41
+--- /dev/null
++++ b/dlls/windows.ui.xaml/helpers.c
+@@ -0,0 +1,185 @@
++/* WinRT Windows.UI.Xaml.SizeHelper and PointHelper
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <math.h>
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* ---- SizeHelper ---- */
++
++struct size_helper
++{
++    IActivationFactory IActivationFactory_iface;
++    ISizeHelperStatics ISizeHelperStatics_iface;
++};
++
++static inline struct size_helper *size_from_factory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct size_helper, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI size_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct size_helper *impl = size_from_factory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_ISizeHelperStatics ))
++        *out = &impl->ISizeHelperStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++static ULONG WINAPI helper_factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI helper_factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI helper_factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI helper_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI helper_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI helper_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance ) { return E_NOTIMPL; }
++
++static const IActivationFactoryVtbl size_factory_vtbl =
++{
++    size_factory_QueryInterface, helper_factory_AddRef, helper_factory_Release,
++    helper_factory_GetIids, helper_factory_GetRuntimeClassName, helper_factory_GetTrustLevel,
++    helper_factory_ActivateInstance,
++};
++
++static inline struct size_helper *size_from_statics( ISizeHelperStatics *iface )
++{
++    return CONTAINING_RECORD( iface, struct size_helper, ISizeHelperStatics_iface );
++}
++static HRESULT WINAPI size_QueryInterface( ISizeHelperStatics *iface, REFIID iid, void **out )
++{
++    return size_factory_QueryInterface( &size_from_statics( iface )->IActivationFactory_iface, iid, out );
++}
++static ULONG WINAPI size_AddRef( ISizeHelperStatics *iface ) { return 2; }
++static ULONG WINAPI size_Release( ISizeHelperStatics *iface ) { return 1; }
++static HRESULT WINAPI size_GetIids( ISizeHelperStatics *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI size_GetRuntimeClassName( ISizeHelperStatics *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI size_GetTrustLevel( ISizeHelperStatics *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++/* the empty size has both dimensions negative infinity, as in XAML */
++static HRESULT WINAPI size_get_Empty( ISizeHelperStatics *iface, Size *value )
++{
++    value->Width = value->Height = -INFINITY;
++    return S_OK;
++}
++static HRESULT WINAPI size_FromDimensions( ISizeHelperStatics *iface, FLOAT width, FLOAT height, Size *value )
++{
++    if (width < 0 || height < 0) return E_INVALIDARG;
++    value->Width = width;
++    value->Height = height;
++    return S_OK;
++}
++static HRESULT WINAPI size_GetIsEmpty( ISizeHelperStatics *iface, Size target, boolean *value )
++{
++    *value = target.Width < 0;
++    return S_OK;
++}
++static HRESULT WINAPI size_Equals( ISizeHelperStatics *iface, Size target, Size value, boolean *result )
++{
++    *result = target.Width == value.Width && target.Height == value.Height;
++    return S_OK;
++}
++
++static const ISizeHelperStaticsVtbl size_vtbl =
++{
++    size_QueryInterface, size_AddRef, size_Release,
++    size_GetIids, size_GetRuntimeClassName, size_GetTrustLevel,
++    size_get_Empty, size_FromDimensions, size_GetIsEmpty, size_Equals,
++};
++
++static struct size_helper size_helper = { {&size_factory_vtbl}, {&size_vtbl} };
++IActivationFactory *size_helper_factory = &size_helper.IActivationFactory_iface;
++
++/* ---- PointHelper ---- */
++
++struct point_helper
++{
++    IActivationFactory IActivationFactory_iface;
++    IPointHelperStatics IPointHelperStatics_iface;
++};
++
++static inline struct point_helper *point_from_factory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct point_helper, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI point_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct point_helper *impl = point_from_factory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IPointHelperStatics ))
++        *out = &impl->IPointHelperStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static const IActivationFactoryVtbl point_factory_vtbl =
++{
++    point_factory_QueryInterface, helper_factory_AddRef, helper_factory_Release,
++    helper_factory_GetIids, helper_factory_GetRuntimeClassName, helper_factory_GetTrustLevel,
++    helper_factory_ActivateInstance,
++};
++
++static inline struct point_helper *point_from_statics( IPointHelperStatics *iface )
++{
++    return CONTAINING_RECORD( iface, struct point_helper, IPointHelperStatics_iface );
++}
++static HRESULT WINAPI point_QueryInterface( IPointHelperStatics *iface, REFIID iid, void **out )
++{
++    return point_factory_QueryInterface( &point_from_statics( iface )->IActivationFactory_iface, iid, out );
++}
++static ULONG WINAPI point_AddRef( IPointHelperStatics *iface ) { return 2; }
++static ULONG WINAPI point_Release( IPointHelperStatics *iface ) { return 1; }
++static HRESULT WINAPI point_GetIids( IPointHelperStatics *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI point_GetRuntimeClassName( IPointHelperStatics *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI point_GetTrustLevel( IPointHelperStatics *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI point_FromCoordinates( IPointHelperStatics *iface, FLOAT x, FLOAT y, Point *value )
++{
++    value->X = x;
++    value->Y = y;
++    return S_OK;
++}
++
++static const IPointHelperStaticsVtbl point_vtbl =
++{
++    point_QueryInterface, point_AddRef, point_Release,
++    point_GetIids, point_GetRuntimeClassName, point_GetTrustLevel,
++    point_FromCoordinates,
++};
++
++static struct point_helper point_helper = { {&point_factory_vtbl}, {&point_vtbl} };
++IActivationFactory *point_helper_factory = &point_helper.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/main.c b/dlls/windows.ui.xaml/main.c
+index 1e76f31..9d41b8e 100644
+--- a/dlls/windows.ui.xaml/main.c
++++ b/dlls/windows.ui.xaml/main.c
+@@ -32,6 +32,10 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+ 
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_ColorHelper ))
+         IActivationFactory_QueryInterface( color_helper_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_SizeHelper ))
++        IActivationFactory_QueryInterface( size_helper_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_PointHelper ))
++        IActivationFactory_QueryInterface( point_helper_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Application ))
+         IActivationFactory_QueryInterface( application_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Window ))
+@@ -40,6 +44,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( text_block_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_SolidColorBrush ))
+         IActivationFactory_QueryInterface( solid_color_brush_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Canvas ))
++        IActivationFactory_QueryInterface( canvas_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_StackPanel ))
+         IActivationFactory_QueryInterface( stack_panel_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Grid ))
+diff --git a/dlls/windows.ui.xaml/panel.c b/dlls/windows.ui.xaml/panel.c
+index b4f89aa..0e0e93e 100644
+--- a/dlls/windows.ui.xaml/panel.c
++++ b/dlls/windows.ui.xaml/panel.c
+@@ -35,6 +35,7 @@ enum panel_kind
+     PANEL_ITEMS_STACK,
+     PANEL_WRAP,
+     PANEL_SWAPCHAIN,   /* swapchain.c: SwapChainPanel, a Grid */
++    PANEL_CANVAS,      /* children at their Canvas.Left/Top, at their desired size */
+ };
+ 
+ struct panel
+@@ -45,6 +46,7 @@ struct panel
+     IGrid IGrid_iface;
+     IItemsStackPanel IItemsStackPanel_iface;
+     IItemsWrapGrid IItemsWrapGrid_iface;
++    ICanvas ICanvas_iface;
+     struct swapchain_panel *swapchain;
+     enum panel_kind kind;
+     IInspectable *children;   /* IVector<UIElement *> */
+@@ -493,11 +495,37 @@ static HRESULT panel_query_interface( struct xaml_element *element, REFIID iid,
+     else if (impl->kind == PANEL_SWAPCHAIN) return swapchain_panel_query_interface( impl->swapchain, iid, out );
+     else if (impl->kind == PANEL_ITEMS_STACK && IsEqualGUID( iid, &IID_IItemsStackPanel )) *out = &impl->IItemsStackPanel_iface;
+     else if (impl->kind == PANEL_WRAP && IsEqualGUID( iid, &IID_IItemsWrapGrid )) *out = &impl->IItemsWrapGrid_iface;
++    else if (impl->kind == PANEL_CANVAS && IsEqualGUID( iid, &IID_ICanvas )) *out = &impl->ICanvas_iface;
+     else return E_NOINTERFACE;
+     IInspectable_AddRef( (IInspectable *)*out );
+     return S_OK;
+ }
+ 
++/* Canvas: each child gets its own desired size, at its Left/Top; the Canvas itself wants no room */
++static void canvas_measure( struct panel *impl, struct layout_context *ctx, float *width, float *height )
++{
++    UINT32 i, count = vector_size( impl->children );
++    struct xaml_element *child;
++
++    for (i = 0; i < count; i++)
++        if ((child = panel_child( impl, i ))) element_measure( child, ctx, INFINITY, INFINITY );
++    *width = *height = 0;
++}
++
++static void canvas_arrange( struct panel *impl, struct layout_context *ctx )
++{
++    UINT32 i, count = vector_size( impl->children );
++    const struct layout_rect *b = &impl->element.bounds;
++    struct xaml_element *child;
++
++    for (i = 0; i < count; i++)
++    {
++        if (!(child = panel_child( impl, i ))) continue;
++        element_arrange( child, ctx, b->x + (isnan( child->canvas_left ) ? 0 : child->canvas_left),
++                         b->y + (isnan( child->canvas_top ) ? 0 : child->canvas_top), child->desired_width, child->desired_height );
++    }
++}
++
+ static void panel_measure( struct xaml_element *element, struct layout_context *ctx, float avail_width,
+                            float avail_height, float *width, float *height )
+ {
+@@ -505,6 +533,7 @@ static void panel_measure( struct xaml_element *element, struct layout_context *
+ 
+     if (impl->kind == PANEL_STACK || impl->kind == PANEL_ITEMS_STACK) stack_measure( impl, ctx, avail_width, avail_height, width, height );
+     else if (impl->kind == PANEL_WRAP) wrap_measure( impl, ctx, avail_width, avail_height, width, height );
++    else if (impl->kind == PANEL_CANVAS) canvas_measure( impl, ctx, width, height );
+     else grid_measure( impl, ctx, avail_width, avail_height, width, height );
+ }
+ 
+@@ -514,6 +543,7 @@ static void panel_arrange( struct xaml_element *element, struct layout_context *
+ 
+     if (impl->kind == PANEL_STACK || impl->kind == PANEL_ITEMS_STACK) stack_arrange( impl, ctx );
+     else if (impl->kind == PANEL_WRAP) wrap_arrange( impl, ctx );
++    else if (impl->kind == PANEL_CANVAS) canvas_arrange( impl, ctx );
+     else grid_arrange( impl, ctx );
+ }
+ 
+@@ -638,6 +668,19 @@ static const struct IPanelVtbl panel_iface_vtbl =
+ 
+ /* IStackPanel */
+ 
++DEFINE_IINSPECTABLE_( canvas_iface, ICanvas, struct panel, impl_from_ICanvas, ICanvas_iface, impl->element.outer )
++
++static const struct ICanvasVtbl canvas_iface_vtbl =
++{
++    canvas_iface_QueryInterface,
++    canvas_iface_AddRef,
++    canvas_iface_Release,
++    /* IInspectable methods */
++    canvas_iface_GetIids,
++    canvas_iface_GetRuntimeClassName,
++    canvas_iface_GetTrustLevel,
++};
++
+ DEFINE_IINSPECTABLE_( stack_panel_iface, IStackPanel, struct panel, impl_from_IStackPanel, IStackPanel_iface, impl->element.outer )
+ 
+ static HRESULT WINAPI stack_panel_iface_get_AreScrollSnapPointsRegular( IStackPanel *iface, boolean *value )
+@@ -938,6 +981,7 @@ static HRESULT panel_create( enum panel_kind kind, IInspectable *outer, IInspect
+         RuntimeClass_Windows_UI_Xaml_Controls_ItemsStackPanel,
+         RuntimeClass_Windows_UI_Xaml_Controls_ItemsWrapGrid,
+         RuntimeClass_Windows_UI_Xaml_Controls_SwapChainPanel,
++        RuntimeClass_Windows_UI_Xaml_Controls_Canvas,
+     };
+     void *iface;
+ 
+@@ -948,6 +992,7 @@ static HRESULT panel_create( enum panel_kind kind, IInspectable *outer, IInspect
+     impl->IGrid_iface.lpVtbl = &grid_iface_vtbl;
+     impl->IItemsStackPanel_iface.lpVtbl = &items_stack_vtbl;
+     impl->IItemsWrapGrid_iface.lpVtbl = &items_wrap_vtbl;
++    impl->ICanvas_iface.lpVtbl = &canvas_iface_vtbl;
+     impl->kind = kind;
+     impl->orientation = Orientation_Vertical;
+     impl->item_width = impl->item_height = NAN;
+@@ -972,6 +1017,7 @@ static HRESULT panel_create( enum panel_kind kind, IInspectable *outer, IInspect
+     case PANEL_GRID: iface = &impl->IGrid_iface; break;
+     case PANEL_ITEMS_STACK: iface = &impl->IItemsStackPanel_iface; break;
+     case PANEL_SWAPCHAIN: iface = swapchain_panel_default_iface( impl->swapchain ); break;
++    case PANEL_CANVAS: iface = &impl->ICanvas_iface; break;
+     default: iface = &impl->IItemsWrapGrid_iface; break;
+     }
+     return element_compose( &impl->element, outer, inner, iface, value );
+@@ -993,6 +1039,8 @@ struct panel_statics
+     IGridStatics IGridStatics_iface;
+     enum panel_kind kind;
+     ISwapChainPanelFactory ISwapChainPanelFactory_iface;
++    ICanvasFactory ICanvasFactory_iface;
++    ICanvasStatics ICanvasStatics_iface;
+ };
+ 
+ static inline struct panel_statics *impl_from_IActivationFactory( IActivationFactory *iface )
+@@ -1017,6 +1065,10 @@ static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID
+         *out = &impl->ISwapChainPanelFactory_iface;
+     else if (impl->kind == PANEL_GRID && IsEqualGUID( iid, &IID_IGridStatics ))
+         *out = &impl->IGridStatics_iface;
++    else if (impl->kind == PANEL_CANVAS && IsEqualGUID( iid, &IID_ICanvasFactory ))
++        *out = &impl->ICanvasFactory_iface;
++    else if (impl->kind == PANEL_CANVAS && IsEqualGUID( iid, &IID_ICanvasStatics ))
++        *out = &impl->ICanvasStatics_iface;
+     else
+     {
+         FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
+@@ -1231,3 +1283,92 @@ static struct panel_statics swapchain_statics =
+ };
+ 
+ IActivationFactory *swapchain_panel_factory = &swapchain_statics.IActivationFactory_iface;
++
++/* Canvas: IActivationFactory, the composable ICanvasFactory, and ICanvasStatics (Left, Top and ZIndex) */
++
++DEFINE_IINSPECTABLE( canvas_factory_iface, ICanvasFactory, struct panel_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI canvas_factory_iface_CreateInstance( ICanvasFactory *iface, IInspectable *outer, IInspectable **inner,
++                                                           ICanvas **value )
++{
++    TRACE( "iface %p, outer %p, inner %p, value %p.\n", iface, outer, inner, value );
++    return panel_create( PANEL_CANVAS, outer, inner, (void **)value );
++}
++
++static const struct ICanvasFactoryVtbl canvas_factory_iface_vtbl =
++{
++    canvas_factory_iface_QueryInterface,
++    canvas_factory_iface_AddRef,
++    canvas_factory_iface_Release,
++    /* IInspectable methods */
++    canvas_factory_iface_GetIids,
++    canvas_factory_iface_GetRuntimeClassName,
++    canvas_factory_iface_GetTrustLevel,
++    /* ICanvasFactory methods */
++    canvas_factory_iface_CreateInstance,
++};
++
++DEFINE_IINSPECTABLE( canvas_statics, ICanvasStatics, struct panel_statics, IActivationFactory_iface )
++
++static struct xaml_element *canvas_target( IUIElement *element )
++{
++    return element_from_iinspectable( (IInspectable *)element );
++}
++
++static HRESULT WINAPI canvas_statics_get_property( ICanvasStatics *iface, IDependencyProperty **value )
++{
++    FIXME( "iface %p: no DependencyProperty objects yet.\n", iface );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++#define CANVAS_ATTACHED( Name, type, field ) \
++static HRESULT WINAPI canvas_statics_Get##Name( ICanvasStatics *iface, IUIElement *element, type *value ) \
++{ \
++    struct xaml_element *target = canvas_target( element ); \
++    if (!target || !value) return E_INVALIDARG; \
++    *value = target->field; \
++    return S_OK; \
++} \
++static HRESULT WINAPI canvas_statics_Set##Name( ICanvasStatics *iface, IUIElement *element, type value ) \
++{ \
++    struct xaml_element *target = canvas_target( element ); \
++    TRACE( "iface %p, element %p.\n", iface, element ); \
++    if (!target) return E_INVALIDARG; \
++    target->field = value; \
++    window_invalidate(); \
++    return S_OK; \
++}
++
++CANVAS_ATTACHED( Left, DOUBLE, canvas_left )
++CANVAS_ATTACHED( Top, DOUBLE, canvas_top )
++CANVAS_ATTACHED( ZIndex, INT32, z_index )
++
++static const struct ICanvasStaticsVtbl canvas_statics_vtbl =
++{
++    canvas_statics_QueryInterface,
++    canvas_statics_AddRef,
++    canvas_statics_Release,
++    /* IInspectable methods */
++    canvas_statics_GetIids,
++    canvas_statics_GetRuntimeClassName,
++    canvas_statics_GetTrustLevel,
++    /* ICanvasStatics methods */
++    canvas_statics_get_property,
++    canvas_statics_GetLeft,
++    canvas_statics_SetLeft,
++    canvas_statics_get_property,
++    canvas_statics_GetTop,
++    canvas_statics_SetTop,
++    canvas_statics_get_property,
++    canvas_statics_GetZIndex,
++    canvas_statics_SetZIndex,
++};
++
++static struct panel_statics canvas_statics =
++{
++    {&factory_vtbl}, {&stack_factory_vtbl}, {&grid_factory_iface_vtbl}, {&grid_statics_vtbl}, PANEL_CANVAS,
++    {&swapchain_factory_vtbl}, {&canvas_factory_iface_vtbl}, {&canvas_statics_vtbl}
++};
++
++IActivationFactory *canvas_factory = &canvas_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index 7c32398..0529c20 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -65,12 +65,15 @@
+ #include "windows.ui.xaml.h"
+ 
+ extern IActivationFactory *color_helper_factory;
++extern IActivationFactory *size_helper_factory;
++extern IActivationFactory *point_helper_factory;
+ extern IActivationFactory *application_factory;
+ extern IActivationFactory *window_factory;
+ extern IActivationFactory *text_block_factory;
+ extern IActivationFactory *solid_color_brush_factory;
+ extern IActivationFactory *stack_panel_factory;
+ extern IActivationFactory *grid_factory;
++extern IActivationFactory *canvas_factory;
+ extern IActivationFactory *border_factory;
+ extern IActivationFactory *button_factory;
+ extern IActivationFactory *toggle_button_factory;
+@@ -220,6 +223,7 @@ HRESULT window_create_for_core_window( ICoreWindow *core_window );
+ void window_destroy_current(void);
+ struct xaml_element *window_content_element(void);   /* Window.Current.Content, not referenced, or NULL */
+ struct xaml_element *window_input_root(void);        /* the topmost popup, or the content */
++HRESULT xaml_get_dispatcher( ICoreDispatcher **value );
+ ICoreWindow *window_core_window(void);               /* the view's CoreWindow, not referenced */
+ /* swapchain.c: SwapChainPanel */
+ struct swapchain_panel;
+@@ -358,6 +362,8 @@ struct xaml_element
+     boolean hit_test_visible;
+     HSTRING name;
+     INT32 row, column, row_span, column_span;  /* Grid attached properties */
++    double canvas_left, canvas_top;            /* Canvas attached properties */
++    INT32 z_index;
+     IInspectable *resources;                   /* FrameworkElement.Resources */
+     IInspectable *style;                       /* FrameworkElement.Style */
+     BOOL implicit_style_done;
+diff --git a/dlls/windows.ui.xaml/resources.c b/dlls/windows.ui.xaml/resources.c
+index 5d9d616..5fe6982 100644
+--- a/dlls/windows.ui.xaml/resources.c
++++ b/dlls/windows.ui.xaml/resources.c
+@@ -443,8 +443,7 @@ static HRESULT WINAPI dictionary_dependency_object_GetAnimationBaseValue(IDepend
+ 
+ static HRESULT WINAPI dictionary_dependency_object_get_Dispatcher(IDependencyObject *iface, __x_ABI_CWindows_CUI_CCore_CICoreDispatcher **value)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    return xaml_get_dispatcher( value );
+ }
+ 
+ static const struct IDependencyObjectVtbl dictionary_dependency_object_vtbl =
+diff --git a/dlls/windows.ui.xaml/window.c b/dlls/windows.ui.xaml/window.c
+index 6b1f7af..dc0bd6b 100644
+--- a/dlls/windows.ui.xaml/window.c
++++ b/dlls/windows.ui.xaml/window.c
+@@ -86,6 +86,15 @@ ICoreWindow *window_core_window(void)
+     return current_window ? current_window->core_window : NULL;
+ }
+ 
++/* DependencyObject.Dispatcher: every object belongs to the view's thread, so it is the CoreWindow's dispatcher */
++HRESULT xaml_get_dispatcher( ICoreDispatcher **value )
++{
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (!current_window || !current_window->core_window) return S_OK;   /* created before the window: none yet */
++    return ICoreWindow_get_Dispatcher( current_window->core_window, value );
++}
++
+ struct xaml_element *window_input_root(void)
+ {
+     UINT32 i;
+diff --git a/include/windows.ui.xaml.idl b/include/windows.ui.xaml.idl
+index 45c67f3..7b4afce 100644
+--- a/include/windows.ui.xaml.idl
++++ b/include/windows.ui.xaml.idl
+@@ -14806,3 +14806,144 @@ namespace Windows.UI.Xaml.Media {
+     }
+ 
+ }
++
++namespace Windows.UI.Xaml {
++    interface IPointHelper;
++    interface IPointHelperStatics;
++    interface ISizeHelper;
++    interface ISizeHelperStatics;
++    runtimeclass PointHelper;
++    runtimeclass SizeHelper;
++}
++
++namespace Windows.UI.Xaml {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.PointHelper),
++        uuid(727bdd92-64b0-49cf-a321-a9793e73e2e7)
++    ]
++    interface IPointHelper : IInspectable
++    {
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.PointHelper),
++        uuid(015aca75-76d8-4b7e-8a33-7d79204691ee)
++    ]
++    interface IPointHelperStatics : IInspectable
++    {
++        HRESULT FromCoordinates([in] FLOAT x, [in] FLOAT y, [out, retval] Windows.Foundation.Point *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.SizeHelper),
++        uuid(e7225a94-5d03-4a03-ba94-967fc68fcefe)
++    ]
++    interface ISizeHelper : IInspectable
++    {
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.SizeHelper),
++        uuid(6286c5b2-cf78-4915-aa40-76004a165f5e)
++    ]
++    interface ISizeHelperStatics : IInspectable
++    {
++        [propget] HRESULT Empty([out, retval] Windows.Foundation.Size *value);
++        HRESULT FromDimensions([in] FLOAT width, [in] FLOAT height, [out, retval] Windows.Foundation.Size *value);
++        HRESULT GetIsEmpty([in] Windows.Foundation.Size target, [out, retval] boolean *value);
++        HRESULT Equals([in] Windows.Foundation.Size target, [in] Windows.Foundation.Size value, [out, retval] boolean *result);
++    }
++
++}
++
++namespace Windows.UI.Xaml {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.UI.Xaml.IPointHelperStatics, Windows.Foundation.UniversalApiContract, 1.0),
++        threading(both)
++    ]
++    runtimeclass PointHelper
++    {
++        [default] interface Windows.UI.Xaml.IPointHelper;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.UI.Xaml.ISizeHelperStatics, Windows.Foundation.UniversalApiContract, 1.0),
++        threading(both)
++    ]
++    runtimeclass SizeHelper
++    {
++        [default] interface Windows.UI.Xaml.ISizeHelper;
++    }
++
++}
++
++namespace Windows.UI.Xaml.Controls {
++    runtimeclass Canvas;
++    interface ICanvas;
++    interface ICanvasFactory;
++    interface ICanvasStatics;
++}
++
++namespace Windows.UI.Xaml.Controls {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Controls.Canvas),
++        uuid(79190e19-cd38-4823-aeae-64a77132f519)
++    ]
++    interface ICanvas : IInspectable
++    {
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Controls.Canvas),
++        uuid(1b328bd1-b400-4a8e-943b-5ad2c45be0df)
++    ]
++    interface ICanvasFactory : IInspectable
++    {
++        HRESULT CreateInstance([in] IInspectable * baseInterface, [out] IInspectable * *innerInterface, [out, retval] Windows.UI.Xaml.Controls.Canvas * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Controls.Canvas),
++        uuid(40ce5c46-2962-446f-aafb-4cdc486939c9)
++    ]
++    interface ICanvasStatics : IInspectable
++    {
++        [propget] HRESULT LeftProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetLeft([in] Windows.UI.Xaml.UIElement * element, [out, retval] DOUBLE *value);
++        HRESULT SetLeft([in] Windows.UI.Xaml.UIElement * element, [in] DOUBLE length);
++        [propget] HRESULT TopProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetTop([in] Windows.UI.Xaml.UIElement * element, [out, retval] DOUBLE *value);
++        HRESULT SetTop([in] Windows.UI.Xaml.UIElement * element, [in] DOUBLE length);
++        [propget] HRESULT ZIndexProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetZIndex([in] Windows.UI.Xaml.UIElement * element, [out, retval] INT32 *value);
++        HRESULT SetZIndex([in] Windows.UI.Xaml.UIElement * element, [in] INT32 value);
++    }
++
++}
++
++namespace Windows.UI.Xaml.Controls {
++    [
++        composable(Windows.UI.Xaml.Controls.ICanvasFactory, public, Windows.Foundation.UniversalApiContract, 1.0),
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.UI.Xaml.Controls.ICanvasStatics, Windows.Foundation.UniversalApiContract, 1.0),
++        threading(both)
++    ]
++    runtimeclass Canvas : Windows.UI.Xaml.Controls.Panel
++    {
++        [default] interface Windows.UI.Xaml.Controls.ICanvas;
++    }
++
++}
++
