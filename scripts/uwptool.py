@@ -14,6 +14,8 @@
                                            link the DLLs of the frameworks the package depends on into APP_DIR, and print
                                            the ones the store doesn't have (MISSING<TAB>name<TAB>min version)
   uwptool.py timezone-mui EXPORTED_REG    print a REGEDIT4 file deleting the time zones' MUI_* names (IL2CPP apps)
+  uwptool.py link-package PACKAGE_DIR APP_DIR  link the package's files into APP_DIR, with percent-encoded names (from a
+                                           plain unzip of an .appx) under their real names
   uwptool.py download-framework NAME STORE  download and import one of FRAMEWORK_DOWNLOADS (Microsoft.VCLibs.140.00 ...)
   uwptool.py download-frameworks PACKAGE_DIR STORE
                                            download and import the frameworks the package needs that STORE lacks and
@@ -317,6 +319,64 @@ def download_frameworks(package_dir, store):
             print("DOWNLOADED\t%s\t%s" % (name, download_framework(name, store)), flush=True)
         except Exception as e:
             print("FAILED\t%s\t%s" % (name, e), flush=True)
+
+
+def blockmap_names(package_dir):
+    """the package's file names as AppxBlockMap.xml records them (decoded), lower-case with "/", or None"""
+    path = os.path.join(package_dir, "AppxBlockMap.xml")
+    if not os.path.exists(path):
+        return None
+    root = ET.parse(path).getroot()
+    return {f.get("Name").replace("\\", "/").lower() for ns in BLOCKMAP_NS for f in root.iter(ns + "File")}
+
+
+def link_package(package_dir, app_dir):
+    """Link the package's files into app_dir. Package archives store names percent-encoded ("edit%400.5x.png" for
+    "edit@0.5x.png") and Windows decodes them on install; a package unpacked by a plain unzip keeps the encoded names,
+    so apps can't find those files (Minecraft's menu icons). A name is linked decoded when AppxBlockMap.xml has the
+    decoded name. Folders holding such names become real folders of links; everything else is linked as it is."""
+    names = blockmap_names(package_dir)
+
+    def decoded(rel):
+        if names is None or "%" not in rel:
+            return None
+        name = urllib.parse.unquote(rel)
+        return name if name != rel and name.lower() in names else None
+
+    needs = set()   # relative folders holding (at any depth) a name to decode
+    for top, dirs, files in os.walk(package_dir):
+        for n in dirs + files:
+            rel = os.path.relpath(os.path.join(top, n), package_dir).replace(os.sep, "/")
+            if decoded(rel):
+                parent = os.path.dirname(rel)
+                while parent:
+                    needs.add(parent)
+                    parent = os.path.dirname(parent)
+
+    def link_folder(src, dest, rel):
+        for n in sorted(os.listdir(src)):
+            child_rel = (rel + "/" + n) if rel else n
+            target = os.path.join(dest, urllib.parse.unquote(n) if decoded(child_rel) else n)
+            if child_rel in needs and os.path.isdir(os.path.join(src, n)):
+                os.mkdir(target)
+                link_folder(os.path.join(src, n), target, child_rel)
+            else:
+                os.symlink(os.path.join(src, n), target)
+
+    os.makedirs(app_dir, exist_ok=True)
+    # what an earlier run linked: links, and folders of links (never anything else)
+    for n in os.listdir(app_dir):
+        path = os.path.join(app_dir, n)
+        if os.path.islink(path):
+            os.remove(path)
+        elif os.path.isdir(path) and os.path.exists(os.path.join(package_dir, n)) and \
+                all(os.path.islink(os.path.join(t, f)) for t, _, fs in os.walk(path) for f in fs):
+            shutil.rmtree(path)
+    link_folder(package_dir, app_dir, "")
+    renamed = sum(1 for top, _, files in os.walk(package_dir) for f in files
+                  if decoded(os.path.relpath(os.path.join(top, f), package_dir).replace(os.sep, "/")))
+    if renamed:
+        print("decoded %d file names" % renamed)
 
 
 def link_frameworks(package_dir, store, app_dir):
@@ -627,6 +687,8 @@ if __name__ == "__main__":
         registry(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) == 5 else None)
     elif len(sys.argv) == 4 and sys.argv[1] == "import-frameworks":
         import_frameworks(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) == 4 and sys.argv[1] == "link-package":
+        link_package(sys.argv[2], sys.argv[3])
     elif len(sys.argv) == 4 and sys.argv[1] == "download-framework" and sys.argv[2] in FRAMEWORK_DOWNLOADS:
         try:
             download_framework(sys.argv[2], sys.argv[3])

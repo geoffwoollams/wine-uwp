@@ -135,12 +135,8 @@ done
 APP="$PREFIX/drive_c/$APPS_DIR_NAME/$PKG_NAME"
 info "Linking the package into C:\\$APPS_DIR_NAME\\$PKG_NAME"
 mkdir -p "$APP"
-find "$APP" -maxdepth 1 -type l -delete
 find "$APP" -maxdepth 1 -type f -iname '*_app.dll' -delete   # the VC++ runtime an earlier version copied in
-for f in "$PKG_DIR"/*; do
-    name="$(basename "$f")"
-    ln -s "$f" "$APP/$name"
-done
+python3 -I "$REPO/scripts/uwptool.py" link-package "$PKG_DIR" "$APP" | sed 's/^/  /'
 # frameworks it needs that the store lacks, from Microsoft's public downloads
 if [ "$DOWNLOAD" = 1 ]; then
     while IFS=$'\t' read -r state name detail; do
