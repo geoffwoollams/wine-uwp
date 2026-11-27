@@ -1,0 +1,91 @@
+Subject: windows.networking.connectivity: ConnectionCost (unmetered), so Minecraft offers multiplayer
+
+diff --git a/dlls/windows.networking.connectivity/network_information.c b/dlls/windows.networking.connectivity/network_information.c
+index 1325ed1..a43887e 100644
+--- a/dlls/windows.networking.connectivity/network_information.c
++++ b/dlls/windows.networking.connectivity/network_information.c
+@@ -237,10 +237,65 @@ static HRESULT WINAPI connection_profile_GetNetworkNames( IConnectionProfile *if
+     return E_NOTIMPL;
+ }
+ 
++/* ConnectionCost: an unmetered connection (ethernet or home Wi-Fi), with IConnectionCost2 */
++static const GUID IID_IConnectionCost2_local = {0x8e113a05,0xe209,0x4549,{0xbb,0x25,0x5e,0x0d,0xb6,0x91,0xcb,0x05}};
++
++static HRESULT WINAPI cost_QueryInterface( IConnectionCost *iface, REFIID iid, void **out );
++static ULONG WINAPI cost_AddRef( IConnectionCost *iface ) { return 2; }
++static ULONG WINAPI cost_Release( IConnectionCost *iface ) { return 1; }
++static HRESULT WINAPI cost_GetIids( IConnectionCost *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI cost_GetRuntimeClassName( IConnectionCost *iface, HSTRING *name )
++{
++    static const WCHAR class_name[] = L"Windows.Networking.Connectivity.ConnectionCost";
++    return WindowsCreateString( class_name, wcslen( class_name ), name );
++}
++static HRESULT WINAPI cost_GetTrustLevel( IConnectionCost *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI cost_get_NetworkCostType( IConnectionCost *iface, NetworkCostType *value )
++{
++    *value = NetworkCostType_Unrestricted;
++    return S_OK;
++}
++static HRESULT WINAPI cost_get_false( IConnectionCost *iface, boolean *value )
++{
++    *value = FALSE;
++    return S_OK;
++}
++
++static const struct IConnectionCostVtbl cost_vtbl =
++{
++    cost_QueryInterface, cost_AddRef, cost_Release,
++    cost_GetIids, cost_GetRuntimeClassName, cost_GetTrustLevel,
++    cost_get_NetworkCostType, cost_get_false, cost_get_false, cost_get_false,
++};
++static IConnectionCost connection_cost = { &cost_vtbl };
++
++/* IConnectionCost2: BackgroundDataUsageRestricted (slot 6), same signature as the boolean getters */
++static HRESULT WINAPI cost2_QueryInterface( void *iface, REFIID iid, void **out ) { return cost_QueryInterface( &connection_cost, iid, out ); }
++static const void *const cost2_vtbl[] = { cost2_QueryInterface, cost_AddRef, cost_Release, cost_GetIids,
++    cost_GetRuntimeClassName, cost_GetTrustLevel, cost_get_false };
++static struct { const void *const *lpVtbl; } connection_cost2 = { cost2_vtbl };
++
++static HRESULT WINAPI cost_QueryInterface( IConnectionCost *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IConnectionCost ))
++        *out = &connection_cost;
++    else if (IsEqualGUID( iid, &IID_IConnectionCost2_local ))
++        *out = &connection_cost2;
++    else
++    {
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
+ static HRESULT WINAPI connection_profile_GetConnectionCost( IConnectionProfile *iface, IConnectionCost **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = &connection_cost;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI connection_profile_GetDataPlanStatus( IConnectionProfile *iface, IDataPlanStatus **value )
+@@ -337,14 +392,14 @@ static HRESULT WINAPI connection_profile2_GetTrustLevel( IConnectionProfile2 *if
+ 
+ HRESULT WINAPI connection_profile2_get_IsWwanConnectionProfile( IConnectionProfile2 *iface, boolean *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
++    TRACE( "iface %p, value %p: not a mobile or Wi-Fi profile.\n", iface, value );
+     *value = 0;
+     return S_OK;
+ }
+ 
+ HRESULT WINAPI connection_profile2_get_IsWlanConnectionProfile( IConnectionProfile2 *iface, boolean *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
++    TRACE( "iface %p, value %p: not a mobile or Wi-Fi profile.\n", iface, value );
+     *value = 0;
+     return S_OK;
+ }
