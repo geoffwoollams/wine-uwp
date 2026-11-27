@@ -17,6 +17,7 @@
 """
 import base64
 import hashlib
+import html
 import os
 import re
 import shutil
@@ -367,6 +368,7 @@ def appinfo(package_dir):
         m = re.search(r'\b%s="([^"]+)"' % attr, visual)
         if m and (icon := best_icon(package_dir, m.group(1))):
             break
+    name = html.unescape(name)   # "Solitaire &amp; Casual Games"
     print("%s\t%s" % (name.replace("\t", " "), os.path.abspath(icon) if icon else ""))
 
 

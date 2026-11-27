@@ -112,6 +112,15 @@ for dll in "$DXVK_D3D11" "$DXVK_D3D10CORE"; do
 done
 # a prefix made by an older build lacks classes our patches register (msxml6: FreeThreadedXMLHTTP60, for Xbox Live)
 wine regsvr32 /s msxml6.dll >/dev/null 2>&1 || echo "warning: could not register msxml6.dll" >&2
+# Controllers: games see a pad only if it is an XInput (Xbox-style) gamepad. Wine's SDL backend presents every
+# controller SDL knows that way, but takes Sony (054C: DualShock 4, DualSense) and Nintendo (057E: Switch Pro,
+# Joy-Con) pads through raw hidraw instead, where they stay plain HID devices. Send them through SDL too, unless the
+# prefix already says otherwise (set Hidraw to 1 there to get the raw device back).
+for vid in 054C 057E; do
+    key="HKLM\\System\\CurrentControlSet\\Services\\WineBus\\Devices\\$vid"
+    wine reg query "$key" /v Hidraw >/dev/null 2>&1 || wine reg add "$key" /v Hidraw /t REG_DWORD /d 0 /f >/dev/null 2>&1 ||
+        echo "warning: could not set up $vid controllers (WineBus\\Devices\\$vid)" >&2
+done
 
 APP="$PREFIX/drive_c/$APPS_DIR_NAME/$PKG_NAME"
 info "Linking the package into C:\\$APPS_DIR_NAME\\$PKG_NAME"

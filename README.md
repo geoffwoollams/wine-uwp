@@ -64,7 +64,7 @@ You need the app as an **unpacked package folder**: the folder with `AppxManifes
 If you installed a game with **Lutris**, its game folder works too. Lutris puts the files in its own Wine prefix, for example `~/Games/<game>/drive_c/Games/<game name>/`. Pass the folder that holds `AppxManifest.xml` to `setup-prefix.sh`. Starting the game from Lutris still won't work, because Lutris runs it with a Wine that has no UWP support. Start it with `run-app.sh` or the launcher `setup-prefix.sh` offers to add. The game's files are only linked, never changed, so the Lutris install is unaffected.
 
 Apps also need the **framework packages** their `AppxManifest.xml` lists as dependencies: the VC++ runtime (`Microsoft.VCLibs.140.00`) for C++/CX apps, and for some apps .NET Native (`Microsoft.NET.Native.Framework.2.2` and `Microsoft.NET.Native.Runtime.2.2`) or WinUI 2 (`Microsoft.UI.Xaml.2.8`). They are Microsoft's, so releases don't include them: you import your own copies once, and every app set up afterwards uses them.
-- **Where to get them:** a Windows 10/11 install has them in `C:\Program Files\WindowsApps` (folders such as `Microsoft.VCLibs.140.00_14.0.33519.0_x64__8wekyb3d8bbwe`). Copy the x64 ones you need into one folder and pass it with `--frameworks`; `.appx`/`.msix` files work too. Many games carry their VC++ package in a `redist/` folder (Halo Wars 2, Gears of War 4, Forza Motorsport 7), and those are imported automatically. Microsoft's own VCLibs download page only has the `UWPDesktop` package, which doesn't replace the UWP one; the UWP one also comes with the Windows 10 SDK (`ExtensionSDKs\Microsoft.VCLibs\14.0\Appx\Retail\x64`).
+- **Where to get them:** a Windows 10/11 install has them in `C:\Program Files\WindowsApps` (folders such as `Microsoft.VCLibs.140.00_14.0.33519.0_x64__8wekyb3d8bbwe`). Copy the x64 ones you need into one folder and pass it with `--frameworks`; `.appx`/`.msix` files work too. `fetch-release.sh` downloads the x64 `Microsoft.VCLibs.140.00` package (14.0.33519.0) into the store if it isn't there yet, and refuses it if its SHA-256 doesn't match the known file. Many games carry their VC++ package in a `redist/` folder (Halo Wars 2, Gears of War 4, Forza Motorsport 7), and those are imported automatically. Microsoft's own VCLibs download page only has the `UWPDesktop` package, which doesn't replace the UWP one; the UWP one also comes with the Windows 10 SDK (`ExtensionSDKs\Microsoft.VCLibs\14.0\Appx\Retail\x64`).
 - **.NET Native apps** also need `mrt100.dll` from `C:\Windows\System32` of a Windows install: put it in the `--frameworks` folder too.
 - **Where they go:** one copy of each, in `~/.local/share/wine-uwp/frameworks`. Each app gets the newest stored version of every framework it depends on, linked into its folder; nothing is copied per app. Setup names any framework an app needs that isn't there yet.
 
@@ -81,9 +81,13 @@ At the end it asks whether to **add a launcher** for the app: a `.desktop` file 
 Play, either from the launcher or from a terminal:
 
 ```bash
-scripts/run-app.sh                       # if only one app is set up
+scripts/run-app.sh                       # pick from a numbered list (or start the only app set up)
 scripts/run-app.sh Microsoft.HoganThreshold
 ```
+
+Without a package name and with several apps set up, `run-app.sh` lists them by name and package, one per line, and asks for a number.
+
+**Controllers:** games see a controller when it looks like an Xbox (XInput) gamepad. Wine's SDL backend presents every controller SDL recognises that way, including PlayStation and Switch pads, because `setup-prefix.sh` turns off Wine's raw-HID handling for Sony (`054C`) and Nintendo (`057E`) devices in the prefix. To get a raw device back, set `Hidraw` to 1 under `HKLM\System\CurrentControlSet\Services\WineBus\Devices\<vendor id>`. Steam's controller handling also works, since it presents an Xbox pad.
 
 The game window shows the app's icon in the taskbar, in Alt-Tab and in its title bar, and the desktop groups it under the launcher's icon. This works under X11 and under Wayland through XWayland, which is how Wine runs on a Wayland desktop by default. With Wine's own Wayland driver it needs a compositor that supports the `xdg-toplevel-icon` protocol (KDE Plasma 6.1 or later, for example). Elsewhere the launcher's icon still shows.
 

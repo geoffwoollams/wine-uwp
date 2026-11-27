@@ -1,7 +1,7 @@
 #!/bin/bash
 # Starts a UWP app set up with setup-prefix.sh.
-# Usage: scripts/run-app.sh [package-name] [seconds]   (the name can be left out if only one app is set up;
-#        seconds is an optional time limit, for testing)
+# Usage: scripts/run-app.sh [package-name] [seconds]   (without a name, the only app set up starts, or a numbered list
+#        of them asks which; seconds is an optional time limit, for testing)
 # Each run is logged to $LOGS/run-<time>.log (the last 8 are kept); a crash backtrace is saved next to it.
 # Environment: WINE_CORE_WINDOWED=1 keeps the app in a window; WINEDEBUG overrides the logging channels.
 set -uo pipefail
@@ -11,9 +11,19 @@ shopt -s nullglob
 mapfile -t apps < <(list_apps | sort -u)
 [ ${#apps[@]} -gt 0 ] || die "no app set up: run scripts/setup-prefix.sh /path/to/package-folder"
 NAME="${1:-}"
-if [ -z "$NAME" ]; then
-    [ ${#apps[@]} -eq 1 ] || die "several apps are set up, name one: ${apps[*]}"
+if [ -z "$NAME" ] && [ ${#apps[@]} -eq 1 ]; then
     NAME="${apps[0]}"
+elif [ -z "$NAME" ]; then
+    # several apps: number them with their display names and ask which to start
+    for i in "${!apps[@]}"; do
+        nice="$(python3 -I "$REPO/scripts/uwptool.py" appinfo "$(app_prefix "${apps[i]}")/drive_c/$APPS_DIR_NAME/${apps[i]}" 2>/dev/null | cut -f1)"
+        if [ -n "$nice" ] && [ "$nice" != "${apps[i]}" ]; then printf '%3d) %s (%s)\n' $((i + 1)) "$nice" "${apps[i]}" >&2
+        else printf '%3d) %s\n' $((i + 1)) "${apps[i]}" >&2; fi
+    done
+    [ -t 0 ] || die "several apps are set up: name one (scripts/run-app.sh <package-name>)"
+    read -r -p "Start which app? [1-${#apps[@]}] " choice || exit 1
+    [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#apps[@]} ] || die "no app numbered '$choice'"
+    NAME="${apps[choice - 1]}"
 else
     shift
 fi
