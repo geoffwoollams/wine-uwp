@@ -2,7 +2,7 @@
 # Creates the shared Wine prefix (once) and links one unpacked UWP package into it. The package folder is never modified.
 # An .appx/.msix file (or .appxbundle/.msixbundle) is first unpacked into ~/.local/share/wine-uwp/packages/<package name>.
 # Usage: scripts/setup-prefix.sh /path/to/package-folder|package.appx [--frameworks DIR] [--vclibs /path/to/Microsoft.VCLibs...appx|folder]
-#        [--verify] [--shortcut | --no-shortcut] [--prefix DIR]
+#        [--verify] [--shortcut | --no-shortcut] [--prefix DIR] [--no-download]
 #        scripts/setup-prefix.sh --update-all
 # Run it again for each app; they share the prefix. It offers to add a launcher (a .desktop file with the app's icon) to
 # the applications menu and the desktop; --shortcut adds it without asking, --no-shortcut skips it.
@@ -11,13 +11,15 @@
 # Microsoft.UI.Xaml ...) into the shared store ~/.local/share/wine-uwp/frameworks, once: DIR is an unpacked package folder,
 # an .appx/.msix, or a folder of them (copied from C:\Program Files\WindowsApps on Windows). --vclibs does the same for
 # one package, and framework .appx files in the app's redist folder are imported too. Each app gets the newest stored
-# version of every framework its manifest depends on, linked into its folder.
+# version of every framework its manifest depends on, linked into its folder. Frameworks it needs that the store lacks are
+# downloaded from Microsoft when there is a public copy (VC++ runtimes, .NET Native 2.2, WinUI 2.8; see uwptool.py
+# FRAMEWORK_DOWNLOADS, each checked against its SHA-256); --no-download turns that off.
 # --update-all sets up every app already in the prefix again, from the folders they were set up from (without the file
 # check or the launcher question): what an upgraded Wine build needs, and what fetch-release.sh runs.
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
 
-PKG_DIR="" VCLIBS="" FRAMEWORK_SRC=() VERIFY=0 SHORTCUT=ask UPDATE_ALL=0 OWN_PREFIX=""
+PKG_DIR="" VCLIBS="" FRAMEWORK_SRC=() VERIFY=0 SHORTCUT=ask UPDATE_ALL=0 OWN_PREFIX="" DOWNLOAD=1
 while [ $# -gt 0 ]; do
     case "$1" in
         --vclibs) VCLIBS="$2"; shift 2 ;;
@@ -27,6 +29,7 @@ while [ $# -gt 0 ]; do
         --shortcut) SHORTCUT=yes; shift ;;
         --no-shortcut) SHORTCUT=no; shift ;;
         --update-all) UPDATE_ALL=1; shift ;;
+        --no-download) DOWNLOAD=0; shift ;;
         --prefix) mkdir -p "$2"; OWN_PREFIX="$(cd "$2" && pwd)"; shift 2 ;;
         -*) die "unknown option $1" ;;
         *) if [ -f "$1" ]; then PKG_DIR="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"; else PKG_DIR="$(cd "$1" && pwd)"; fi; shift ;;
@@ -138,12 +141,26 @@ for f in "$PKG_DIR"/*; do
     name="$(basename "$f")"
     ln -s "$f" "$APP/$name"
 done
+# frameworks it needs that the store lacks, from Microsoft's public downloads
+if [ "$DOWNLOAD" = 1 ]; then
+    while IFS=$'\t' read -r state name detail; do
+        case "$state" in
+            DOWNLOADED) info "Downloaded the framework package $name $detail" ;;
+            FAILED) echo "warning: couldn't download the framework package $name: $detail" >&2 ;;
+        esac
+    done < <(python3 -I "$REPO/scripts/uwptool.py" download-frameworks "$PKG_DIR" "$FRAMEWORKS")
+fi
 # the frameworks it depends on, from the store
 while IFS=$'\t' read -r state name version; do
     case "$state" in
         LINKED) info "Framework $name" ;;
-        MISSING) echo "warning: $PKG_NAME needs the framework package $name (version $version or later), which isn't imported:" \
-                      "copy it from C:\\Program Files\\WindowsApps on a Windows PC and pass it with --frameworks (see README)" >&2
+        MISSING) case "$name" in
+                     mrt100.dll*) echo "warning: $PKG_NAME needs mrt100.dll, which has no public download: copy it from" \
+                                       "C:\\Windows\\System32 on a Windows PC and pass it with --frameworks (see README)" >&2 ;;
+                     *) echo "warning: $PKG_NAME needs the framework package $name (version $version or later), which isn't" \
+                             "imported: copy it from C:\\Program Files\\WindowsApps on a Windows PC and pass it with" \
+                             "--frameworks (see README)" >&2 ;;
+                 esac
                  ;;
     esac
 done < <(python3 -I "$REPO/scripts/uwptool.py" link-frameworks "$PKG_DIR" "$FRAMEWORKS" "$APP")

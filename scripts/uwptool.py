@@ -14,6 +14,10 @@
                                            link the DLLs of the frameworks the package depends on into APP_DIR, and print
                                            the ones the store doesn't have (MISSING<TAB>name<TAB>min version)
   uwptool.py timezone-mui EXPORTED_REG    print a REGEDIT4 file deleting the time zones' MUI_* names (IL2CPP apps)
+  uwptool.py download-framework NAME STORE  download and import one of FRAMEWORK_DOWNLOADS (Microsoft.VCLibs.140.00 ...)
+  uwptool.py download-frameworks PACKAGE_DIR STORE
+                                           download and import the frameworks the package needs that STORE lacks and
+                                           Microsoft publishes (FRAMEWORK_DOWNLOADS); print DOWNLOADED/FAILED<TAB>name
   uwptool.py extract-package FILE ROOT    unpack an .appx/.msix (or the x64 app package of an .appxbundle/.msixbundle) into
                                            ROOT/<package name> unless that version is already there; print the folder
 """
@@ -25,6 +29,7 @@ import urllib.parse
 import os
 import re
 import shutil
+import struct
 import sys
 import xml.etree.ElementTree as ET
 import zipfile
@@ -199,6 +204,119 @@ def matched_frameworks(package_dir, store):
                 best = (folder, rest[0])
         result.append((name, minimum, best[0] if best else None))
     return result
+
+
+# Framework packages with public downloads from Microsoft: name -> (version, URL, file inside it or None, SHA-256 of
+# the .appx). The VC++ runtimes come from winget's dependency bundle on GitHub, the others from Microsoft's NuGet
+# packages on nuget.org; only the .appx is read out of those (HTTP range requests), not the whole archive.
+WINGET_DEPS = "https://github.com/microsoft/winget-cli/releases/download/v1.29.380/DesktopAppInstaller_Dependencies.zip"
+NUGET = "https://api.nuget.org/v3-flatcontainer/"
+FRAMEWORK_DOWNLOADS = {
+    "Microsoft.VCLibs.140.00": (
+        "14.0.33519.0", WINGET_DEPS, "x64/Microsoft.VCLibs.140.00_14.0.33519.0_x64.appx",
+        "9c17b521f9d690a1f504da5108ed6eec5669eb3a8fd1331eef43e40d84e74283"),
+    "Microsoft.VCLibs.140.00.UWPDesktop": (
+        "14.0.33728.0", WINGET_DEPS, "x64/Microsoft.VCLibs.140.00.UWPDesktop_14.0.33728.0_x64.appx",
+        "077a3d1a5d0622bd3004dca85f5e192d6e98ec79b83d4aa06766759ea6c09c3d"),
+    "Microsoft.UI.Xaml.2.8": (
+        "8.2501.31001.0", NUGET + "microsoft.ui.xaml/2.8.7/microsoft.ui.xaml.2.8.7.nupkg",
+        "tools/AppX/x64/Release/Microsoft.UI.Xaml.2.8.appx",
+        "1421dba0b7f1da87e6ad52e17c25d38bcd2159bd7f91c85034cfa837238abaaa"),
+    "Microsoft.NET.Native.Framework.2.2": (
+        "2.2.29512.0",
+        NUGET + "runtime.win10-x64.microsoft.net.native.sharedlibrary/2.2.8-rel-29512-01/"
+        "runtime.win10-x64.microsoft.net.native.sharedlibrary.2.2.8-rel-29512-01.nupkg",
+        "tools/SharedLibrary/ret/Native/Microsoft.NET.Native.Framework.2.2.appx",
+        "c195047f4af9c3ff3d92c40e55a901cf7cfa08a679b8ca2543bb104bab2f7ff1"),
+    "Microsoft.NET.Native.Runtime.2.2": (
+        "2.2.28604.0",
+        NUGET + "runtime.win10-x64.microsoft.net.native.compiler/2.2.9-rel-29512-01/"
+        "runtime.win10-x64.microsoft.net.native.compiler.2.2.9-rel-29512-01.nupkg",
+        "tools/Runtime/x64/Microsoft.NET.Native.Runtime.2.2.appx",
+        "27fae660d8c609e020703bb463b6601e62811dc75db19975bcb7d68d959b527d"),
+}
+
+
+def http_range(url, start, end):
+    """bytes start..end (inclusive) of url, and the resource's total size"""
+    import urllib.request
+    req = urllib.request.Request(url, headers={"Range": "bytes=%d-%d" % (start, end), "User-Agent": "wine-uwp"})
+    with urllib.request.urlopen(req, timeout=60) as f:
+        if f.status != 206:
+            raise OSError("the server doesn't support range requests")
+        return f.read(), int(f.headers["Content-Range"].rsplit("/", 1)[1])
+
+
+def fetch_zip_member(url, member, out):
+    """copy one file out of a remote zip into out, reading only the zip's directory and that file"""
+    import zlib
+    _, total = http_range(url, 0, 0)
+    tail, _ = http_range(url, max(0, total - 65557), total - 1)
+    i = tail.rfind(b"PK\x05\x06")
+    if i < 0:
+        raise OSError("not a zip file")
+    cd_size, cd_offset = struct.unpack("<II", tail[i + 12:i + 20])
+    if cd_offset == 0xffffffff:   # zip64
+        j = tail.rfind(b"PK\x06\x06")
+        cd_size, cd_offset = struct.unpack("<QQ", tail[j + 40:j + 56])
+    cd, _ = http_range(url, cd_offset, cd_offset + cd_size - 1)
+    p = 0
+    while cd[p:p + 4] == b"PK\x01\x02":
+        method, = struct.unpack("<H", cd[p + 10:p + 12])
+        crc, csize, usize = struct.unpack("<III", cd[p + 16:p + 28])
+        n, e, c = struct.unpack("<HHH", cd[p + 28:p + 34])
+        offset, = struct.unpack("<I", cd[p + 42:p + 46])
+        if cd[p + 46:p + 46 + n].decode("utf-8", "replace") == member:
+            if 0xffffffff in (csize, usize, offset):
+                raise OSError("zip64 members aren't supported")
+            head, _ = http_range(url, offset, offset + 29)
+            ln, le = struct.unpack("<HH", head[26:30])
+            start = offset + 30 + ln + le
+            data, _ = http_range(url, start, start + csize - 1)
+            if method == 8:
+                data = zlib.decompress(data, -15)
+            elif method != 0:
+                raise OSError("unsupported compression %d" % method)
+            if len(data) != usize or zlib.crc32(data) != crc:
+                raise OSError("%s is damaged" % member)
+            with open(out, "wb") as f:
+                f.write(data)
+            return
+        p += 46 + n + e + c
+    raise OSError("%s not found" % member)
+
+
+def download_framework(name, store):
+    """download one FRAMEWORK_DOWNLOADS package, check it and import it into the store; raises on failure"""
+    import contextlib
+    import tempfile
+    import urllib.request
+    version, url, member, sha256 = FRAMEWORK_DOWNLOADS[name]
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, name + ".appx")
+        if member:
+            fetch_zip_member(url, member, out)
+        else:
+            req = urllib.request.Request(url, headers={"User-Agent": "wine-uwp"})
+            with urllib.request.urlopen(req, timeout=60) as f, open(out, "wb") as o:
+                shutil.copyfileobj(f, o)
+        with open(out, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        if digest != sha256:
+            raise OSError("checksum mismatch (%s)" % digest)
+        with contextlib.redirect_stdout(io.StringIO()):
+            import_frameworks(out, store)
+    return version
+
+
+def download_frameworks(package_dir, store):
+    for name, minimum, folder in matched_frameworks(package_dir, store):
+        if folder or name not in FRAMEWORK_DOWNLOADS or version_key(FRAMEWORK_DOWNLOADS[name][0]) < version_key(minimum):
+            continue
+        try:
+            print("DOWNLOADED\t%s\t%s" % (name, download_framework(name, store)), flush=True)
+        except Exception as e:
+            print("FAILED\t%s\t%s" % (name, e), flush=True)
 
 
 def link_frameworks(package_dir, store, app_dir):
@@ -509,6 +627,13 @@ if __name__ == "__main__":
         registry(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) == 5 else None)
     elif len(sys.argv) == 4 and sys.argv[1] == "import-frameworks":
         import_frameworks(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) == 4 and sys.argv[1] == "download-framework" and sys.argv[2] in FRAMEWORK_DOWNLOADS:
+        try:
+            download_framework(sys.argv[2], sys.argv[3])
+        except Exception as e:
+            sys.exit("%s: %s" % (sys.argv[2], e))
+    elif len(sys.argv) == 4 and sys.argv[1] == "download-frameworks":
+        download_frameworks(sys.argv[2], sys.argv[3])
     elif len(sys.argv) == 5 and sys.argv[1] == "link-frameworks":
         link_frameworks(sys.argv[2], sys.argv[3], sys.argv[4])
     else:
