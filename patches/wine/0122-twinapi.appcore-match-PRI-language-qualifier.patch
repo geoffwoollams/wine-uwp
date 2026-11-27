@@ -1,0 +1,216 @@
+Subject: twinapi.appcore: Match the Language qualifier of resources.pri candidates
+
+A resource's candidates each have a qualifier set (the [mrm_decn_info] section the resource map names). The
+candidate whose Language qualifier best matches the user's UI languages is used: an exact match first, then the
+same language with another region or script, then the package's default language (its fallback score), then a
+candidate with no language qualifier. Other qualifiers are still not looked at. Before this the first candidate
+was used, which for Xbox Accessories was Traditional Chinese.
+
+diff --git a/dlls/twinapi.appcore/resource_manager.c b/dlls/twinapi.appcore/resource_manager.c
+index 9629708..10a4868 100644
+--- a/dlls/twinapi.appcore/resource_manager.c
++++ b/dlls/twinapi.appcore/resource_manager.c
+@@ -1,9 +1,11 @@
+ /* WinRT Windows.ApplicationModel.Resources.Core.ResourceManager
+  *
+  * The package's resources.pri, read directly: the resource maps are its named resources ("Resources/AppName",
+- * "MyLibrary.Resources.Strings/Message", "Files/Assets/Logo.png"), and a resource's value is its first candidate.
+- * Qualifiers (language, scale, contrast) are not matched yet: for a resource with candidates in several languages,
+- * the first is used. .NET Native looks up every resx string this way, through ResourceManager.Current.
++ * "MyLibrary.Resources.Strings/Message", "Files/Assets/Logo.png"). A resource's candidates come with qualifier
++ * sets (the decision info section); the Language qualifier is matched against the user's UI languages (an exact
++ * match first, then the same language in another region, then the package's default language, then a candidate
++ * with no language). Other qualifiers (scale, contrast, ...) are not looked at: among equally good candidates the
++ * first is used. .NET Native looks up every resx string this way, through ResourceManager.Current.
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -58,6 +60,7 @@ struct pri_file
+     char (*ids)[16];
+     UINT16 count;
+     int map;            /* the resource map section */
++    int decisions;      /* the decision info section, or -1 */
+     struct pri_name *names;
+     UINT32 name_count;
+     WCHAR package[256]; /* the package's simple name, from the schema */
+@@ -239,13 +242,142 @@ static BOOL data_item( const struct pri_section *s, UINT32 index, const BYTE **d
+     return TRUE;
+ }
+ 
+-/* the first candidate of an item of the resource map, and its value type */
++/* ---- qualifiers: the user's languages against a candidate's Language qualifier ---- */
++
++#define QUALIFIER_LANGUAGE 0
++
++static WCHAR languages[8][LOCALE_NAME_MAX_LENGTH];
++static UINT32 language_count;
++static INIT_ONCE languages_once = INIT_ONCE_STATIC_INIT;
++
++static BOOL CALLBACK languages_init( INIT_ONCE *once, void *param, void **context )
++{
++    WCHAR buffer[512], *p;
++    ULONG count = 0, size = ARRAY_SIZE(buffer);
++
++    if (GetUserPreferredUILanguages( MUI_LANGUAGE_NAME, &count, buffer, &size ))
++        for (p = buffer; *p && language_count < ARRAY_SIZE(languages); p += wcslen( p ) + 1)
++            lstrcpynW( languages[language_count++], p, LOCALE_NAME_MAX_LENGTH );
++    if (language_count < ARRAY_SIZE(languages) &&
++        GetUserDefaultLocaleName( languages[language_count], LOCALE_NAME_MAX_LENGTH ))
++        language_count++;
++    if (!language_count) wcscpy( languages[language_count++], L"en-US" );
++    TRACE( "first language %s, %u in all.\n", debugstr_w(languages[0]), language_count );
++    return TRUE;
++}
++
++/* how well a qualifier value ("EN-US", "zh-Hant-TW") suits one language: the number of leading subtags that
++ * match, if at least the language does */
++static UINT32 language_match( const WCHAR *value, const WCHAR *language )
++{
++    UINT32 n = 0;
++
++    for (;;)
++    {
++        const WCHAR *a = value, *b = language;
++        size_t la, lb;
++
++        while (*a && *a != '-') a++;
++        while (*b && *b != '-') b++;
++        la = a - value;
++        lb = b - language;
++        if (!la || la != lb || _wcsnicmp( value, language, la )) return n;
++        n++;
++        if (!*a && !*b) return n + 8;   /* all of it */
++        if (!*a || !*b) return n;
++        value = a + 1;
++        language = b + 1;
++    }
++}
++
++/* a qualifier value may list several languages, separated by ';' */
++static UINT32 language_score( const WCHAR *value )
++{
++    WCHAR one[LOCALE_NAME_MAX_LENGTH];
++    UINT32 i, best = 0, m;
++    const WCHAR *end;
++
++    InitOnceExecuteOnce( &languages_once, languages_init, NULL, NULL );
++    for (; *value; value = *end ? end + 1 : end)
++    {
++        if (!(end = wcschr( value, ';' ))) end = value + wcslen( value );
++        lstrcpynW( one, value, min( end - value + 1, ARRAY_SIZE(one) ) );
++        for (i = 0; i < language_count; i++)
++            if ((m = language_match( one, languages[i] ))) best = max( best, (ARRAY_SIZE(languages) - i) * 16 + m );
++    }
++    return best;
++}
++
++/* the decision's candidate that best suits the user's languages: its index in the decision */
++static UINT32 choose_candidate( struct pri_file *file, UINT32 decision, UINT32 count )
++{
++    const struct pri_section *s;
++    UINT32 distinct, qualifiers, sets, decisions, index_entries, quals, set_infos, qual_infos, distinct_infos;
++    UINT32 index_table, strings, data_length, first_set, set_count, i, j, best = 0, best_score = 0;
++
++    if (file->decisions < 0 || count <= 1) return 0;
++    s = &file->sections[file->decisions];
++    if (s->size < 12) return 0;
++    distinct = get16( s->data );
++    qualifiers = get16( s->data + 2 );
++    sets = get16( s->data + 4 );
++    decisions = get16( s->data + 6 );
++    index_entries = get16( s->data + 8 );
++    data_length = get16( s->data + 10 ) * 2;
++    quals = 12;
++    set_infos = quals + decisions * 4;
++    qual_infos = set_infos + sets * 4;
++    distinct_infos = qual_infos + qualifiers * 8;
++    index_table = distinct_infos + distinct * 12;
++    strings = index_table + index_entries * 2;
++    if ((UINT64)strings + data_length > s->size || decision >= decisions) return 0;
++    first_set = get16( s->data + quals + decision * 4 );
++    set_count = get16( s->data + quals + decision * 4 + 2 );
++
++    for (i = 0; i < min( count, set_count ); i++)
++    {
++        UINT32 set, first_qual, qual_count, score = 1;   /* no Language qualifier: neutral */
++        if (first_set + i >= index_entries) break;
++        set = get16( s->data + index_table + (first_set + i) * 2 );
++        if (set >= sets) break;
++        first_qual = get16( s->data + set_infos + set * 4 );
++        qual_count = get16( s->data + set_infos + set * 4 + 2 );
++        for (j = 0; j < qual_count; j++)
++        {
++            UINT32 qual, dq, type, fallback, offset, m;
++            const WCHAR *value;
++
++            if (first_qual + j >= index_entries) break;
++            qual = get16( s->data + index_table + (first_qual + j) * 2 );
++            if (qual >= qualifiers) break;
++            dq = get16( s->data + qual_infos + qual * 8 );
++            fallback = get16( s->data + qual_infos + qual * 8 + 4 );
++            if (dq >= distinct) break;
++            type = get16( s->data + distinct_infos + dq * 12 + 2 );
++            offset = get32( s->data + distinct_infos + dq * 12 + 8 ) * 2;
++            if (type != QUALIFIER_LANGUAGE || offset >= data_length) continue;
++            value = (const WCHAR *)(s->data + strings + offset);
++            if (wcsnlen( value, (data_length - offset) / 2 ) == (data_length - offset) / 2) break;
++            /* another language is no match, unless it is the package's default (it has a fallback score) */
++            if ((m = language_score( value ))) score = 1024 + m;
++            else score = fallback ? 2 : 0;
++        }
++        if (score > best_score)
++        {
++            best_score = score;
++            best = i;
++        }
++    }
++    return best;
++}
++
++/* the best candidate of an item of the resource map, and its value type */
+ static BOOL map_find( struct pri_file *file, UINT32 item, const BYTE **data, UINT32 *size, UINT32 *type )
+ {
+     const struct pri_section *s = &file->sections[file->map];
+     UINT16 env_length, schema_ref_length, types, map_count, group_count;
+     UINT32 info_count, candidates, data_length, large_length, pos, i, j, types_pos;
+-    UINT32 first_item, group, group_size, first_info, info, string_data;
++    UINT32 first_item, group, group_size, first_info, info, decision, string_data;
+     UINT32 maps, groups, infos, large_maps = 0, large_groups = 0, large_infos = 0, total_maps, total_groups;
+     const BYTE *large = NULL, *c;
+ 
+@@ -308,10 +440,21 @@ static BOOL map_find( struct pri_file *file, UINT32 item, const BYTE **data, UIN
+         }
+         if (item < first_item || item >= first_item + group_size) continue;
+         j = first_info + (item - first_item);
+-        if (j < info_count) info = get16( s->data + infos + j * 4 + 2 );
+-        else if (j - info_count < large_infos) info = get32( large + 12 + large_maps * 8 + large_groups * 8 + (j - info_count) * 8 + 4 );
++        if (j < info_count)
++        {
++            decision = get16( s->data + infos + j * 4 );
++            info = get16( s->data + infos + j * 4 + 2 );
++        }
++        else if (j - info_count < large_infos)
++        {
++            const BYTE *e = large + 12 + large_maps * 8 + large_groups * 8 + (j - info_count) * 8;
++            decision = get32( e );
++            info = get32( e + 4 );
++        }
+         else return FALSE;
+         if (info >= candidates) return FALSE;
++        info += choose_candidate( file, decision, candidates - info );
++        if (info >= candidates) return FALSE;
+         c = s->data + pos + info * 8;
+         *type = c[1] < types ? get32( s->data + types_pos + c[1] * 8 + 4 ) : VALUE_EMBEDDED;
+         if (c[0] == 1)
+@@ -372,6 +515,11 @@ static BOOL CALLBACK pri_load( INIT_ONCE *once, void *param, void **context )
+         goto fail;
+     if ((file->map = find_section( file, "[mrm_res_map2_]" )) < 0 && (file->map = find_section( file, "[mrm_res_map__]" )) < 0)
+         goto fail;
++    /* the map names its decision info section */
++    file->decisions = get16( file->sections[file->map].data + 8 );
++    if (file->sections[file->map].size < 32 || file->decisions >= file->count || !file->sections[file->decisions].data ||
++        memcmp( file->ids[file->decisions], "[mrm_decn_info]", 15 ))
++        file->decisions = find_section( file, "[mrm_decn_info]" );
+     if (!schema_read( file, &file->sections[schema], !memcmp( file->ids[schema], "[mrm_hschemaex]", 15 ) )) goto fail;
+     TRACE( "%s: package %s, %u resources.\n", debugstr_w(path), debugstr_w(file->package), file->name_count );
+     pri = file;

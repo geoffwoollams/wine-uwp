@@ -1,0 +1,4454 @@
+Subject: windows.ui.xaml: Frame navigation history, DispatcherTimer, AutomationProperties, Flyout and VisualTreeHelper
+
+Frame now keeps a back and a forward stack of PageStackEntry objects (IFrame2.BackStack/ForwardStack,
+IFrame2.Navigate with a transition, IFrame3.GoBack, GoBack/GoForward, CanGoBack/CanGoForward, BackStackDepth) and
+navigates in WinUI's order: Navigating and the old page's OnNavigatingFrom (either may cancel), the new page, the
+history, OnNavigatedFrom, the new content, Navigated, then the new page's OnNavigatedTo, each with the right
+NavigationMode. Page implements IPageOverrides (the base versions do nothing), so apps' OnNavigatedTo now runs.
+A page whose NavigationCacheMode is not Disabled is kept in its stack entry and shown again on Back/Forward.
+A page that can't be created raises NavigationFailed. Transitions are kept, not played.
+
+DispatcherTimer raises Tick from a thread timer on the thread that started it and keeps itself alive while it
+runs. AutomationProperties (statics 1-9) are attached properties kept in the property store, so what an app sets
+it reads back; nothing is exposed to UI Automation yet. Flyout shows its Content in a light-dismiss popup next to
+its ShowAt target, placed by Placement. VisualTreeHelper walks our element tree (GetChild, GetChildrenCount,
+GetParent, FindElementsInHostCoordinates by arranged bounds); GetOpenPopups lists none, as there is no Popup class.
+
+Xbox Accessories needs all of these to build its LandingPage and its error dialogs. The IDL is generated from
+Windows.winmd.
+
+diff --git a/dlls/windows.ui.xaml/Makefile.in b/dlls/windows.ui.xaml/Makefile.in
+index e35889e..0accff2 100644
+--- a/dlls/windows.ui.xaml/Makefile.in
++++ b/dlls/windows.ui.xaml/Makefile.in
+@@ -4,6 +4,7 @@ IMPORTS = combase user32 gdi32 advapi32 d2d1 dwrite ole32 uuid
+ SOURCES = \
+ 	animation.c \
+ 	application.c \
++	automation.c \
+ 	binding.c \
+ 	border.c \
+ 	brush.c \
+@@ -18,6 +19,7 @@ SOURCES = \
+ 	dependency.c \
+ 	dialog.c \
+ 	element.c \
++	flyout.c \
+ 	focus.c \
+ 	helpers.c \
+ 	image.c \
+@@ -26,6 +28,7 @@ SOURCES = \
+ 	listview.c \
+ 	main.c \
+ 	media.c \
++	navigation.c \
+ 	panel.c \
+ 	presenter.c \
+ 	pri.c \
+@@ -38,6 +41,8 @@ SOURCES = \
+ 	resources.c \
+ 	text_block.c \
+ 	textbox.c \
++	timer.c \
++	visual_tree.c \
+ 	window.c \
+ 	windows.ui.xaml.rc \
+ 	xbf.c
+diff --git a/dlls/windows.ui.xaml/automation.c b/dlls/windows.ui.xaml/automation.c
+new file mode 100644
+index 0000000..fa2a527
+--- /dev/null
++++ b/dlls/windows.ui.xaml/automation.c
+@@ -0,0 +1,1001 @@
++/* WinRT Windows.UI.Xaml.Automation.AutomationProperties implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#define WIDL_using_Windows_UI_Xaml_Automation
++#define WIDL_using_Windows_UI_Xaml_Automation_Peers
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* AutomationProperties are attached properties kept in the property store, so that what an app sets it reads
++ * back. There is no UI Automation provider yet: nothing outside the app sees them. */
++
++static const WCHAR owner_name[] = L"Windows.UI.Xaml.Automation.AutomationProperties";
++
++static const struct vector_iids dependency_object_vector_iids =
++{
++    &IID___FIVector_1_Windows__CUI__CXaml__CDependencyObject,
++    &IID___FIVectorView_1_Windows__CUI__CXaml__CDependencyObject,
++    &IID___FIIterable_1_Windows__CUI__CXaml__CDependencyObject,
++    &IID___FIIterator_1_Windows__CUI__CXaml__CDependencyObject,
++    &IID_IDependencyObject,
++};
++
++static const struct vector_iids annotation_vector_iids =
++{
++    &IID___FIVector_1_Windows__CUI__CXaml__CAutomation__CAutomationAnnotation,
++    &IID___FIVectorView_1_Windows__CUI__CXaml__CAutomation__CAutomationAnnotation,
++    &IID___FIIterable_1_Windows__CUI__CXaml__CAutomation__CAutomationAnnotation,
++    &IID___FIIterator_1_Windows__CUI__CXaml__CAutomation__CAutomationAnnotation,
++    &IID_IAutomationAnnotation,
++};
++
++static HRESULT get_property( const WCHAR *name, const WCHAR *type, IDependencyProperty **value )
++{
++    if (!value) return E_POINTER;
++    if (!(*value = dp_attached( owner_name, name, type ))) return E_OUTOFMEMORY;
++    IDependencyProperty_AddRef( *value );
++    return S_OK;
++}
++
++static IDependencyObject *key_of( IInspectable *element )
++{
++    IDependencyObject *key;
++    if (!element || FAILED(IInspectable_QueryInterface( element, &IID_IDependencyObject, (void **)&key ))) return NULL;
++    return key;
++}
++
++static HRESULT get_value( IInspectable *element, const WCHAR *name, IInspectable **value )
++{
++    IDependencyProperty *dp = dp_attached( owner_name, name, NULL );
++    IDependencyObject *key;
++    HRESULT hr;
++
++    *value = NULL;
++    if (!dp) return E_OUTOFMEMORY;
++    if (!(key = key_of( element ))) return E_INVALIDARG;
++    hr = dp_get_value( key, dp, value );
++    IDependencyObject_Release( key );
++    return hr;
++}
++
++static HRESULT set_value( IInspectable *element, const WCHAR *name, IInspectable *value )
++{
++    IDependencyProperty *dp = dp_attached( owner_name, name, NULL );
++    IDependencyObject *key;
++    HRESULT hr;
++
++    TRACE( "element %p, %s = %p.\n", element, debugstr_w(name), value );
++    if (!dp) return E_OUTOFMEMORY;
++    if (!(key = key_of( element ))) return E_INVALIDARG;
++    hr = dp_set_value( key, dp, value );
++    IDependencyObject_Release( key );
++    return hr;
++}
++
++static IPropertyValueStatics *property_value_statics(void)
++{
++    static const WCHAR name[] = L"Windows.Foundation.PropertyValue";
++    IPropertyValueStatics *statics;
++    HSTRING_HEADER header;
++    HSTRING class_name;
++
++    WindowsCreateStringReference( name, wcslen( name ), &header, &class_name );
++    if (FAILED(RoGetActivationFactory( class_name, &IID_IPropertyValueStatics, (void **)&statics ))) return NULL;
++    return statics;
++}
++
++static IPropertyValue *get_property_value( IInspectable *element, const WCHAR *name, HRESULT *hr )
++{
++    IInspectable *value;
++    IPropertyValue *pv = NULL;
++
++    if (FAILED(*hr = get_value( element, name, &value )) || !value) return NULL;
++    if (FAILED(IInspectable_QueryInterface( value, &IID_IPropertyValue, (void **)&pv ))) pv = NULL;
++    IInspectable_Release( value );
++    return pv;
++}
++
++static HRESULT get_string( IInspectable *element, const WCHAR *name, HSTRING *value )
++{
++    IPropertyValue *pv;
++    HRESULT hr;
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (!(pv = get_property_value( element, name, &hr ))) return hr;
++    if (FAILED(IPropertyValue_GetString( pv, value ))) *value = NULL;
++    IPropertyValue_Release( pv );
++    return S_OK;
++}
++
++static HRESULT set_string( IInspectable *element, const WCHAR *name, HSTRING value )
++{
++    IPropertyValueStatics *statics = property_value_statics();
++    IInspectable *boxed = NULL;
++    HRESULT hr;
++
++    if (!statics) return E_FAIL;
++    hr = IPropertyValueStatics_CreateString( statics, value, &boxed );
++    IPropertyValueStatics_Release( statics );
++    if (FAILED(hr)) return hr;
++    hr = set_value( element, name, boxed );
++    IInspectable_Release( boxed );
++    return hr;
++}
++
++static HRESULT get_bool( IInspectable *element, const WCHAR *name, boolean *value )
++{
++    IPropertyValue *pv;
++    HRESULT hr;
++
++    if (!value) return E_POINTER;
++    *value = FALSE;
++    if (!(pv = get_property_value( element, name, &hr ))) return hr;
++    if (FAILED(IPropertyValue_GetBoolean( pv, value ))) *value = FALSE;
++    IPropertyValue_Release( pv );
++    return S_OK;
++}
++
++static HRESULT set_bool( IInspectable *element, const WCHAR *name, boolean value )
++{
++    IPropertyValueStatics *statics = property_value_statics();
++    IInspectable *boxed = NULL;
++    HRESULT hr;
++
++    if (!statics) return E_FAIL;
++    hr = IPropertyValueStatics_CreateBoolean( statics, value, &boxed );
++    IPropertyValueStatics_Release( statics );
++    if (FAILED(hr)) return hr;
++    hr = set_value( element, name, boxed );
++    IInspectable_Release( boxed );
++    return hr;
++}
++
++static HRESULT get_int( IInspectable *element, const WCHAR *name, INT32 def, INT32 *value )
++{
++    IPropertyValue *pv;
++    HRESULT hr;
++
++    if (!value) return E_POINTER;
++    *value = def;
++    if (!(pv = get_property_value( element, name, &hr ))) return hr;
++    if (FAILED(IPropertyValue_GetInt32( pv, value ))) *value = def;
++    IPropertyValue_Release( pv );
++    return S_OK;
++}
++
++static HRESULT set_int( IInspectable *element, const WCHAR *name, INT32 value )
++{
++    IPropertyValueStatics *statics = property_value_statics();
++    IInspectable *boxed = NULL;
++    HRESULT hr;
++
++    if (!statics) return E_FAIL;
++    hr = IPropertyValueStatics_CreateInt32( statics, value, &boxed );
++    IPropertyValueStatics_Release( statics );
++    if (FAILED(hr)) return hr;
++    hr = set_value( element, name, boxed );
++    IInspectable_Release( boxed );
++    return hr;
++}
++
++static HRESULT get_object( IInspectable *element, const WCHAR *name, const IID *iid, void **value )
++{
++    IInspectable *object;
++    HRESULT hr;
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (FAILED(hr = get_value( element, name, &object )) || !object) return hr;
++    hr = IInspectable_QueryInterface( object, iid, value );
++    IInspectable_Release( object );
++    return hr;
++}
++
++static HRESULT set_object( IInspectable *element, const WCHAR *name, IInspectable *value )
++{
++    return set_value( element, name, value );
++}
++
++/* the read-only collections: an empty one on first use, kept on the element */
++static HRESULT get_vector( IInspectable *element, const WCHAR *name, const struct vector_iids *iids, void **value )
++{
++    static const struct vector_callbacks callbacks;
++    IInspectable *vector;
++    HRESULT hr;
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (FAILED(hr = get_value( element, name, &vector ))) return hr;
++    if (!vector)
++    {
++        if (FAILED(hr = vector_create( iids, &callbacks, NULL, &vector ))) return hr;
++        if (FAILED(hr = set_value( element, name, vector )))
++        {
++            IInspectable_Release( vector );
++            return hr;
++        }
++    }
++    hr = IInspectable_QueryInterface( vector, iids->vector, value );
++    IInspectable_Release( vector );
++    return hr;
++}
++
++struct automation_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IAutomationPropertiesStatics IAutomationPropertiesStatics_iface;
++    IAutomationPropertiesStatics2 IAutomationPropertiesStatics2_iface;
++    IAutomationPropertiesStatics3 IAutomationPropertiesStatics3_iface;
++    IAutomationPropertiesStatics4 IAutomationPropertiesStatics4_iface;
++    IAutomationPropertiesStatics5 IAutomationPropertiesStatics5_iface;
++    IAutomationPropertiesStatics6 IAutomationPropertiesStatics6_iface;
++    IAutomationPropertiesStatics7 IAutomationPropertiesStatics7_iface;
++    IAutomationPropertiesStatics8 IAutomationPropertiesStatics8_iface;
++    IAutomationPropertiesStatics9 IAutomationPropertiesStatics9_iface;
++};
++
++static inline struct automation_statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct automation_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct automation_statics *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IAutomationPropertiesStatics )) *out = &impl->IAutomationPropertiesStatics_iface;
++    else if (IsEqualGUID( iid, &IID_IAutomationPropertiesStatics2 )) *out = &impl->IAutomationPropertiesStatics2_iface;
++    else if (IsEqualGUID( iid, &IID_IAutomationPropertiesStatics3 )) *out = &impl->IAutomationPropertiesStatics3_iface;
++    else if (IsEqualGUID( iid, &IID_IAutomationPropertiesStatics4 )) *out = &impl->IAutomationPropertiesStatics4_iface;
++    else if (IsEqualGUID( iid, &IID_IAutomationPropertiesStatics5 )) *out = &impl->IAutomationPropertiesStatics5_iface;
++    else if (IsEqualGUID( iid, &IID_IAutomationPropertiesStatics6 )) *out = &impl->IAutomationPropertiesStatics6_iface;
++    else if (IsEqualGUID( iid, &IID_IAutomationPropertiesStatics7 )) *out = &impl->IAutomationPropertiesStatics7_iface;
++    else if (IsEqualGUID( iid, &IID_IAutomationPropertiesStatics8 )) *out = &impl->IAutomationPropertiesStatics8_iface;
++    else if (IsEqualGUID( iid, &IID_IAutomationPropertiesStatics9 )) *out = &impl->IAutomationPropertiesStatics9_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    return 2;
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    return 1;
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    /* AutomationProperties has no constructor */
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++/* IAutomationPropertiesStatics */
++
++DEFINE_IINSPECTABLE( statics1, IAutomationPropertiesStatics, struct automation_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI statics1_get_AcceleratorKeyProperty( IAutomationPropertiesStatics *iface, IDependencyProperty **value )
++{
++    return get_property( L"AcceleratorKey", L"String", value );
++}
++
++static HRESULT WINAPI statics1_GetAcceleratorKey( IAutomationPropertiesStatics *iface, IDependencyObject *element, HSTRING *value )
++{
++    return get_string( (IInspectable *)element, L"AcceleratorKey", value );
++}
++
++static HRESULT WINAPI statics1_SetAcceleratorKey( IAutomationPropertiesStatics *iface, IDependencyObject *element, HSTRING value )
++{
++    return set_string( (IInspectable *)element, L"AcceleratorKey", value );
++}
++
++static HRESULT WINAPI statics1_get_AccessKeyProperty( IAutomationPropertiesStatics *iface, IDependencyProperty **value )
++{
++    return get_property( L"AccessKey", L"String", value );
++}
++
++static HRESULT WINAPI statics1_GetAccessKey( IAutomationPropertiesStatics *iface, IDependencyObject *element, HSTRING *value )
++{
++    return get_string( (IInspectable *)element, L"AccessKey", value );
++}
++
++static HRESULT WINAPI statics1_SetAccessKey( IAutomationPropertiesStatics *iface, IDependencyObject *element, HSTRING value )
++{
++    return set_string( (IInspectable *)element, L"AccessKey", value );
++}
++
++static HRESULT WINAPI statics1_get_AutomationIdProperty( IAutomationPropertiesStatics *iface, IDependencyProperty **value )
++{
++    return get_property( L"AutomationId", L"String", value );
++}
++
++static HRESULT WINAPI statics1_GetAutomationId( IAutomationPropertiesStatics *iface, IDependencyObject *element, HSTRING *value )
++{
++    return get_string( (IInspectable *)element, L"AutomationId", value );
++}
++
++static HRESULT WINAPI statics1_SetAutomationId( IAutomationPropertiesStatics *iface, IDependencyObject *element, HSTRING value )
++{
++    return set_string( (IInspectable *)element, L"AutomationId", value );
++}
++
++static HRESULT WINAPI statics1_get_HelpTextProperty( IAutomationPropertiesStatics *iface, IDependencyProperty **value )
++{
++    return get_property( L"HelpText", L"String", value );
++}
++
++static HRESULT WINAPI statics1_GetHelpText( IAutomationPropertiesStatics *iface, IDependencyObject *element, HSTRING *value )
++{
++    return get_string( (IInspectable *)element, L"HelpText", value );
++}
++
++static HRESULT WINAPI statics1_SetHelpText( IAutomationPropertiesStatics *iface, IDependencyObject *element, HSTRING value )
++{
++    return set_string( (IInspectable *)element, L"HelpText", value );
++}
++
++static HRESULT WINAPI statics1_get_IsRequiredForFormProperty( IAutomationPropertiesStatics *iface, IDependencyProperty **value )
++{
++    return get_property( L"IsRequiredForForm", L"Boolean", value );
++}
++
++static HRESULT WINAPI statics1_GetIsRequiredForForm( IAutomationPropertiesStatics *iface, IDependencyObject *element, boolean *value )
++{
++    return get_bool( (IInspectable *)element, L"IsRequiredForForm", value );
++}
++
++static HRESULT WINAPI statics1_SetIsRequiredForForm( IAutomationPropertiesStatics *iface, IDependencyObject *element, boolean value )
++{
++    return set_bool( (IInspectable *)element, L"IsRequiredForForm", value );
++}
++
++static HRESULT WINAPI statics1_get_ItemStatusProperty( IAutomationPropertiesStatics *iface, IDependencyProperty **value )
++{
++    return get_property( L"ItemStatus", L"String", value );
++}
++
++static HRESULT WINAPI statics1_GetItemStatus( IAutomationPropertiesStatics *iface, IDependencyObject *element, HSTRING *value )
++{
++    return get_string( (IInspectable *)element, L"ItemStatus", value );
++}
++
++static HRESULT WINAPI statics1_SetItemStatus( IAutomationPropertiesStatics *iface, IDependencyObject *element, HSTRING value )
++{
++    return set_string( (IInspectable *)element, L"ItemStatus", value );
++}
++
++static HRESULT WINAPI statics1_get_ItemTypeProperty( IAutomationPropertiesStatics *iface, IDependencyProperty **value )
++{
++    return get_property( L"ItemType", L"String", value );
++}
++
++static HRESULT WINAPI statics1_GetItemType( IAutomationPropertiesStatics *iface, IDependencyObject *element, HSTRING *value )
++{
++    return get_string( (IInspectable *)element, L"ItemType", value );
++}
++
++static HRESULT WINAPI statics1_SetItemType( IAutomationPropertiesStatics *iface, IDependencyObject *element, HSTRING value )
++{
++    return set_string( (IInspectable *)element, L"ItemType", value );
++}
++
++static HRESULT WINAPI statics1_get_LabeledByProperty( IAutomationPropertiesStatics *iface, IDependencyProperty **value )
++{
++    return get_property( L"LabeledBy", L"Windows.UI.Xaml.UIElement", value );
++}
++
++static HRESULT WINAPI statics1_GetLabeledBy( IAutomationPropertiesStatics *iface, IDependencyObject *element, IUIElement **value )
++{
++    return get_object( (IInspectable *)element, L"LabeledBy", &IID_IUIElement, (void **)value );
++}
++
++static HRESULT WINAPI statics1_SetLabeledBy( IAutomationPropertiesStatics *iface, IDependencyObject *element, IUIElement *value )
++{
++    return set_object( (IInspectable *)element, L"LabeledBy", (IInspectable *)value );
++}
++
++static HRESULT WINAPI statics1_get_NameProperty( IAutomationPropertiesStatics *iface, IDependencyProperty **value )
++{
++    return get_property( L"Name", L"String", value );
++}
++
++static HRESULT WINAPI statics1_GetName( IAutomationPropertiesStatics *iface, IDependencyObject *element, HSTRING *value )
++{
++    return get_string( (IInspectable *)element, L"Name", value );
++}
++
++static HRESULT WINAPI statics1_SetName( IAutomationPropertiesStatics *iface, IDependencyObject *element, HSTRING value )
++{
++    return set_string( (IInspectable *)element, L"Name", value );
++}
++
++static HRESULT WINAPI statics1_get_LiveSettingProperty( IAutomationPropertiesStatics *iface, IDependencyProperty **value )
++{
++    return get_property( L"LiveSetting", L"Int32", value );
++}
++
++static HRESULT WINAPI statics1_GetLiveSetting( IAutomationPropertiesStatics *iface, IDependencyObject *element, AutomationLiveSetting *value )
++{
++    INT32 v;
++    HRESULT hr = get_int( (IInspectable *)element, L"LiveSetting", 0, &v );
++    if (SUCCEEDED(hr)) *value = v;
++    return hr;
++}
++
++static HRESULT WINAPI statics1_SetLiveSetting( IAutomationPropertiesStatics *iface, IDependencyObject *element, AutomationLiveSetting value )
++{
++    return set_int( (IInspectable *)element, L"LiveSetting", value );
++}
++
++static const struct IAutomationPropertiesStaticsVtbl statics1_vtbl =
++{
++    statics1_QueryInterface,
++    statics1_AddRef,
++    statics1_Release,
++    /* IInspectable methods */
++    statics1_GetIids,
++    statics1_GetRuntimeClassName,
++    statics1_GetTrustLevel,
++    /* IAutomationPropertiesStatics methods */
++    statics1_get_AcceleratorKeyProperty,
++    statics1_GetAcceleratorKey,
++    statics1_SetAcceleratorKey,
++    statics1_get_AccessKeyProperty,
++    statics1_GetAccessKey,
++    statics1_SetAccessKey,
++    statics1_get_AutomationIdProperty,
++    statics1_GetAutomationId,
++    statics1_SetAutomationId,
++    statics1_get_HelpTextProperty,
++    statics1_GetHelpText,
++    statics1_SetHelpText,
++    statics1_get_IsRequiredForFormProperty,
++    statics1_GetIsRequiredForForm,
++    statics1_SetIsRequiredForForm,
++    statics1_get_ItemStatusProperty,
++    statics1_GetItemStatus,
++    statics1_SetItemStatus,
++    statics1_get_ItemTypeProperty,
++    statics1_GetItemType,
++    statics1_SetItemType,
++    statics1_get_LabeledByProperty,
++    statics1_GetLabeledBy,
++    statics1_SetLabeledBy,
++    statics1_get_NameProperty,
++    statics1_GetName,
++    statics1_SetName,
++    statics1_get_LiveSettingProperty,
++    statics1_GetLiveSetting,
++    statics1_SetLiveSetting,
++};
++
++/* IAutomationPropertiesStatics2 */
++
++DEFINE_IINSPECTABLE( statics2, IAutomationPropertiesStatics2, struct automation_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI statics2_get_AccessibilityViewProperty( IAutomationPropertiesStatics2 *iface, IDependencyProperty **value )
++{
++    return get_property( L"AccessibilityView", L"Int32", value );
++}
++
++static HRESULT WINAPI statics2_GetAccessibilityView( IAutomationPropertiesStatics2 *iface, IDependencyObject *element, AccessibilityView *value )
++{
++    INT32 v;
++    HRESULT hr = get_int( (IInspectable *)element, L"AccessibilityView", 2, &v );
++    if (SUCCEEDED(hr)) *value = v;
++    return hr;
++}
++
++static HRESULT WINAPI statics2_SetAccessibilityView( IAutomationPropertiesStatics2 *iface, IDependencyObject *element, AccessibilityView value )
++{
++    return set_int( (IInspectable *)element, L"AccessibilityView", value );
++}
++
++static HRESULT WINAPI statics2_get_ControlledPeersProperty( IAutomationPropertiesStatics2 *iface, IDependencyProperty **value )
++{
++    return get_property( L"ControlledPeers", L"Object", value );
++}
++
++static HRESULT WINAPI statics2_GetControlledPeers( IAutomationPropertiesStatics2 *iface, IDependencyObject *element, IVector_UIElement **value )
++{
++    return get_vector( (IInspectable *)element, L"ControlledPeers", &uielement_collection_iids, (void **)value );
++}
++
++static const struct IAutomationPropertiesStatics2Vtbl statics2_vtbl =
++{
++    statics2_QueryInterface,
++    statics2_AddRef,
++    statics2_Release,
++    /* IInspectable methods */
++    statics2_GetIids,
++    statics2_GetRuntimeClassName,
++    statics2_GetTrustLevel,
++    /* IAutomationPropertiesStatics2 methods */
++    statics2_get_AccessibilityViewProperty,
++    statics2_GetAccessibilityView,
++    statics2_SetAccessibilityView,
++    statics2_get_ControlledPeersProperty,
++    statics2_GetControlledPeers,
++};
++
++/* IAutomationPropertiesStatics3 */
++
++DEFINE_IINSPECTABLE( statics3, IAutomationPropertiesStatics3, struct automation_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI statics3_get_PositionInSetProperty( IAutomationPropertiesStatics3 *iface, IDependencyProperty **value )
++{
++    return get_property( L"PositionInSet", L"Int32", value );
++}
++
++static HRESULT WINAPI statics3_GetPositionInSet( IAutomationPropertiesStatics3 *iface, IDependencyObject *element, INT32 *value )
++{
++    INT32 v;
++    HRESULT hr = get_int( (IInspectable *)element, L"PositionInSet", -1, &v );
++    if (SUCCEEDED(hr)) *value = v;
++    return hr;
++}
++
++static HRESULT WINAPI statics3_SetPositionInSet( IAutomationPropertiesStatics3 *iface, IDependencyObject *element, INT32 value )
++{
++    return set_int( (IInspectable *)element, L"PositionInSet", value );
++}
++
++static HRESULT WINAPI statics3_get_SizeOfSetProperty( IAutomationPropertiesStatics3 *iface, IDependencyProperty **value )
++{
++    return get_property( L"SizeOfSet", L"Int32", value );
++}
++
++static HRESULT WINAPI statics3_GetSizeOfSet( IAutomationPropertiesStatics3 *iface, IDependencyObject *element, INT32 *value )
++{
++    INT32 v;
++    HRESULT hr = get_int( (IInspectable *)element, L"SizeOfSet", -1, &v );
++    if (SUCCEEDED(hr)) *value = v;
++    return hr;
++}
++
++static HRESULT WINAPI statics3_SetSizeOfSet( IAutomationPropertiesStatics3 *iface, IDependencyObject *element, INT32 value )
++{
++    return set_int( (IInspectable *)element, L"SizeOfSet", value );
++}
++
++static HRESULT WINAPI statics3_get_LevelProperty( IAutomationPropertiesStatics3 *iface, IDependencyProperty **value )
++{
++    return get_property( L"Level", L"Int32", value );
++}
++
++static HRESULT WINAPI statics3_GetLevel( IAutomationPropertiesStatics3 *iface, IDependencyObject *element, INT32 *value )
++{
++    INT32 v;
++    HRESULT hr = get_int( (IInspectable *)element, L"Level", -1, &v );
++    if (SUCCEEDED(hr)) *value = v;
++    return hr;
++}
++
++static HRESULT WINAPI statics3_SetLevel( IAutomationPropertiesStatics3 *iface, IDependencyObject *element, INT32 value )
++{
++    return set_int( (IInspectable *)element, L"Level", value );
++}
++
++static HRESULT WINAPI statics3_get_AnnotationsProperty( IAutomationPropertiesStatics3 *iface, IDependencyProperty **value )
++{
++    return get_property( L"Annotations", L"Object", value );
++}
++
++static HRESULT WINAPI statics3_GetAnnotations( IAutomationPropertiesStatics3 *iface, IDependencyObject *element, IVector_AutomationAnnotation **value )
++{
++    return get_vector( (IInspectable *)element, L"Annotations", &annotation_vector_iids, (void **)value );
++}
++
++static const struct IAutomationPropertiesStatics3Vtbl statics3_vtbl =
++{
++    statics3_QueryInterface,
++    statics3_AddRef,
++    statics3_Release,
++    /* IInspectable methods */
++    statics3_GetIids,
++    statics3_GetRuntimeClassName,
++    statics3_GetTrustLevel,
++    /* IAutomationPropertiesStatics3 methods */
++    statics3_get_PositionInSetProperty,
++    statics3_GetPositionInSet,
++    statics3_SetPositionInSet,
++    statics3_get_SizeOfSetProperty,
++    statics3_GetSizeOfSet,
++    statics3_SetSizeOfSet,
++    statics3_get_LevelProperty,
++    statics3_GetLevel,
++    statics3_SetLevel,
++    statics3_get_AnnotationsProperty,
++    statics3_GetAnnotations,
++};
++
++/* IAutomationPropertiesStatics4 */
++
++DEFINE_IINSPECTABLE( statics4, IAutomationPropertiesStatics4, struct automation_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI statics4_get_LandmarkTypeProperty( IAutomationPropertiesStatics4 *iface, IDependencyProperty **value )
++{
++    return get_property( L"LandmarkType", L"Int32", value );
++}
++
++static HRESULT WINAPI statics4_GetLandmarkType( IAutomationPropertiesStatics4 *iface, IDependencyObject *element, AutomationLandmarkType *value )
++{
++    INT32 v;
++    HRESULT hr = get_int( (IInspectable *)element, L"LandmarkType", 0, &v );
++    if (SUCCEEDED(hr)) *value = v;
++    return hr;
++}
++
++static HRESULT WINAPI statics4_SetLandmarkType( IAutomationPropertiesStatics4 *iface, IDependencyObject *element, AutomationLandmarkType value )
++{
++    return set_int( (IInspectable *)element, L"LandmarkType", value );
++}
++
++static HRESULT WINAPI statics4_get_LocalizedLandmarkTypeProperty( IAutomationPropertiesStatics4 *iface, IDependencyProperty **value )
++{
++    return get_property( L"LocalizedLandmarkType", L"String", value );
++}
++
++static HRESULT WINAPI statics4_GetLocalizedLandmarkType( IAutomationPropertiesStatics4 *iface, IDependencyObject *element, HSTRING *value )
++{
++    return get_string( (IInspectable *)element, L"LocalizedLandmarkType", value );
++}
++
++static HRESULT WINAPI statics4_SetLocalizedLandmarkType( IAutomationPropertiesStatics4 *iface, IDependencyObject *element, HSTRING value )
++{
++    return set_string( (IInspectable *)element, L"LocalizedLandmarkType", value );
++}
++
++static const struct IAutomationPropertiesStatics4Vtbl statics4_vtbl =
++{
++    statics4_QueryInterface,
++    statics4_AddRef,
++    statics4_Release,
++    /* IInspectable methods */
++    statics4_GetIids,
++    statics4_GetRuntimeClassName,
++    statics4_GetTrustLevel,
++    /* IAutomationPropertiesStatics4 methods */
++    statics4_get_LandmarkTypeProperty,
++    statics4_GetLandmarkType,
++    statics4_SetLandmarkType,
++    statics4_get_LocalizedLandmarkTypeProperty,
++    statics4_GetLocalizedLandmarkType,
++    statics4_SetLocalizedLandmarkType,
++};
++
++/* IAutomationPropertiesStatics5 */
++
++DEFINE_IINSPECTABLE( statics5, IAutomationPropertiesStatics5, struct automation_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI statics5_get_IsPeripheralProperty( IAutomationPropertiesStatics5 *iface, IDependencyProperty **value )
++{
++    return get_property( L"IsPeripheral", L"Boolean", value );
++}
++
++static HRESULT WINAPI statics5_GetIsPeripheral( IAutomationPropertiesStatics5 *iface, IDependencyObject *element, boolean *value )
++{
++    return get_bool( (IInspectable *)element, L"IsPeripheral", value );
++}
++
++static HRESULT WINAPI statics5_SetIsPeripheral( IAutomationPropertiesStatics5 *iface, IDependencyObject *element, boolean value )
++{
++    return set_bool( (IInspectable *)element, L"IsPeripheral", value );
++}
++
++static HRESULT WINAPI statics5_get_IsDataValidForFormProperty( IAutomationPropertiesStatics5 *iface, IDependencyProperty **value )
++{
++    return get_property( L"IsDataValidForForm", L"Boolean", value );
++}
++
++static HRESULT WINAPI statics5_GetIsDataValidForForm( IAutomationPropertiesStatics5 *iface, IDependencyObject *element, boolean *value )
++{
++    return get_bool( (IInspectable *)element, L"IsDataValidForForm", value );
++}
++
++static HRESULT WINAPI statics5_SetIsDataValidForForm( IAutomationPropertiesStatics5 *iface, IDependencyObject *element, boolean value )
++{
++    return set_bool( (IInspectable *)element, L"IsDataValidForForm", value );
++}
++
++static HRESULT WINAPI statics5_get_FullDescriptionProperty( IAutomationPropertiesStatics5 *iface, IDependencyProperty **value )
++{
++    return get_property( L"FullDescription", L"String", value );
++}
++
++static HRESULT WINAPI statics5_GetFullDescription( IAutomationPropertiesStatics5 *iface, IDependencyObject *element, HSTRING *value )
++{
++    return get_string( (IInspectable *)element, L"FullDescription", value );
++}
++
++static HRESULT WINAPI statics5_SetFullDescription( IAutomationPropertiesStatics5 *iface, IDependencyObject *element, HSTRING value )
++{
++    return set_string( (IInspectable *)element, L"FullDescription", value );
++}
++
++static HRESULT WINAPI statics5_get_LocalizedControlTypeProperty( IAutomationPropertiesStatics5 *iface, IDependencyProperty **value )
++{
++    return get_property( L"LocalizedControlType", L"String", value );
++}
++
++static HRESULT WINAPI statics5_GetLocalizedControlType( IAutomationPropertiesStatics5 *iface, IDependencyObject *element, HSTRING *value )
++{
++    return get_string( (IInspectable *)element, L"LocalizedControlType", value );
++}
++
++static HRESULT WINAPI statics5_SetLocalizedControlType( IAutomationPropertiesStatics5 *iface, IDependencyObject *element, HSTRING value )
++{
++    return set_string( (IInspectable *)element, L"LocalizedControlType", value );
++}
++
++static HRESULT WINAPI statics5_get_DescribedByProperty( IAutomationPropertiesStatics5 *iface, IDependencyProperty **value )
++{
++    return get_property( L"DescribedBy", L"Object", value );
++}
++
++static HRESULT WINAPI statics5_GetDescribedBy( IAutomationPropertiesStatics5 *iface, IDependencyObject *element, IVector_DependencyObject **value )
++{
++    return get_vector( (IInspectable *)element, L"DescribedBy", &dependency_object_vector_iids, (void **)value );
++}
++
++static HRESULT WINAPI statics5_get_FlowsToProperty( IAutomationPropertiesStatics5 *iface, IDependencyProperty **value )
++{
++    return get_property( L"FlowsTo", L"Object", value );
++}
++
++static HRESULT WINAPI statics5_GetFlowsTo( IAutomationPropertiesStatics5 *iface, IDependencyObject *element, IVector_DependencyObject **value )
++{
++    return get_vector( (IInspectable *)element, L"FlowsTo", &dependency_object_vector_iids, (void **)value );
++}
++
++static HRESULT WINAPI statics5_get_FlowsFromProperty( IAutomationPropertiesStatics5 *iface, IDependencyProperty **value )
++{
++    return get_property( L"FlowsFrom", L"Object", value );
++}
++
++static HRESULT WINAPI statics5_GetFlowsFrom( IAutomationPropertiesStatics5 *iface, IDependencyObject *element, IVector_DependencyObject **value )
++{
++    return get_vector( (IInspectable *)element, L"FlowsFrom", &dependency_object_vector_iids, (void **)value );
++}
++
++static const struct IAutomationPropertiesStatics5Vtbl statics5_vtbl =
++{
++    statics5_QueryInterface,
++    statics5_AddRef,
++    statics5_Release,
++    /* IInspectable methods */
++    statics5_GetIids,
++    statics5_GetRuntimeClassName,
++    statics5_GetTrustLevel,
++    /* IAutomationPropertiesStatics5 methods */
++    statics5_get_IsPeripheralProperty,
++    statics5_GetIsPeripheral,
++    statics5_SetIsPeripheral,
++    statics5_get_IsDataValidForFormProperty,
++    statics5_GetIsDataValidForForm,
++    statics5_SetIsDataValidForForm,
++    statics5_get_FullDescriptionProperty,
++    statics5_GetFullDescription,
++    statics5_SetFullDescription,
++    statics5_get_LocalizedControlTypeProperty,
++    statics5_GetLocalizedControlType,
++    statics5_SetLocalizedControlType,
++    statics5_get_DescribedByProperty,
++    statics5_GetDescribedBy,
++    statics5_get_FlowsToProperty,
++    statics5_GetFlowsTo,
++    statics5_get_FlowsFromProperty,
++    statics5_GetFlowsFrom,
++};
++
++/* IAutomationPropertiesStatics6 */
++
++DEFINE_IINSPECTABLE( statics6, IAutomationPropertiesStatics6, struct automation_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI statics6_get_CultureProperty( IAutomationPropertiesStatics6 *iface, IDependencyProperty **value )
++{
++    return get_property( L"Culture", L"Int32", value );
++}
++
++static HRESULT WINAPI statics6_GetCulture( IAutomationPropertiesStatics6 *iface, IDependencyObject *element, INT32 *value )
++{
++    INT32 v;
++    HRESULT hr = get_int( (IInspectable *)element, L"Culture", 0, &v );
++    if (SUCCEEDED(hr)) *value = v;
++    return hr;
++}
++
++static HRESULT WINAPI statics6_SetCulture( IAutomationPropertiesStatics6 *iface, IDependencyObject *element, INT32 value )
++{
++    return set_int( (IInspectable *)element, L"Culture", value );
++}
++
++static const struct IAutomationPropertiesStatics6Vtbl statics6_vtbl =
++{
++    statics6_QueryInterface,
++    statics6_AddRef,
++    statics6_Release,
++    /* IInspectable methods */
++    statics6_GetIids,
++    statics6_GetRuntimeClassName,
++    statics6_GetTrustLevel,
++    /* IAutomationPropertiesStatics6 methods */
++    statics6_get_CultureProperty,
++    statics6_GetCulture,
++    statics6_SetCulture,
++};
++
++/* IAutomationPropertiesStatics7 */
++
++DEFINE_IINSPECTABLE( statics7, IAutomationPropertiesStatics7, struct automation_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI statics7_get_HeadingLevelProperty( IAutomationPropertiesStatics7 *iface, IDependencyProperty **value )
++{
++    return get_property( L"HeadingLevel", L"Int32", value );
++}
++
++static HRESULT WINAPI statics7_GetHeadingLevel( IAutomationPropertiesStatics7 *iface, IDependencyObject *element, AutomationHeadingLevel *value )
++{
++    INT32 v;
++    HRESULT hr = get_int( (IInspectable *)element, L"HeadingLevel", 0, &v );
++    if (SUCCEEDED(hr)) *value = v;
++    return hr;
++}
++
++static HRESULT WINAPI statics7_SetHeadingLevel( IAutomationPropertiesStatics7 *iface, IDependencyObject *element, AutomationHeadingLevel value )
++{
++    return set_int( (IInspectable *)element, L"HeadingLevel", value );
++}
++
++static const struct IAutomationPropertiesStatics7Vtbl statics7_vtbl =
++{
++    statics7_QueryInterface,
++    statics7_AddRef,
++    statics7_Release,
++    /* IInspectable methods */
++    statics7_GetIids,
++    statics7_GetRuntimeClassName,
++    statics7_GetTrustLevel,
++    /* IAutomationPropertiesStatics7 methods */
++    statics7_get_HeadingLevelProperty,
++    statics7_GetHeadingLevel,
++    statics7_SetHeadingLevel,
++};
++
++/* IAutomationPropertiesStatics8 */
++
++DEFINE_IINSPECTABLE( statics8, IAutomationPropertiesStatics8, struct automation_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI statics8_get_IsDialogProperty( IAutomationPropertiesStatics8 *iface, IDependencyProperty **value )
++{
++    return get_property( L"IsDialog", L"Boolean", value );
++}
++
++static HRESULT WINAPI statics8_GetIsDialog( IAutomationPropertiesStatics8 *iface, IDependencyObject *element, boolean *value )
++{
++    return get_bool( (IInspectable *)element, L"IsDialog", value );
++}
++
++static HRESULT WINAPI statics8_SetIsDialog( IAutomationPropertiesStatics8 *iface, IDependencyObject *element, boolean value )
++{
++    return set_bool( (IInspectable *)element, L"IsDialog", value );
++}
++
++static const struct IAutomationPropertiesStatics8Vtbl statics8_vtbl =
++{
++    statics8_QueryInterface,
++    statics8_AddRef,
++    statics8_Release,
++    /* IInspectable methods */
++    statics8_GetIids,
++    statics8_GetRuntimeClassName,
++    statics8_GetTrustLevel,
++    /* IAutomationPropertiesStatics8 methods */
++    statics8_get_IsDialogProperty,
++    statics8_GetIsDialog,
++    statics8_SetIsDialog,
++};
++
++/* IAutomationPropertiesStatics9 */
++
++DEFINE_IINSPECTABLE( statics9, IAutomationPropertiesStatics9, struct automation_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI statics9_get_AutomationControlTypeProperty( IAutomationPropertiesStatics9 *iface, IDependencyProperty **value )
++{
++    return get_property( L"AutomationControlType", L"Int32", value );
++}
++
++static HRESULT WINAPI statics9_GetAutomationControlType( IAutomationPropertiesStatics9 *iface, IUIElement *element, AutomationControlType *value )
++{
++    INT32 v;
++    HRESULT hr = get_int( (IInspectable *)element, L"AutomationControlType", 25, &v );
++    if (SUCCEEDED(hr)) *value = v;
++    return hr;
++}
++
++static HRESULT WINAPI statics9_SetAutomationControlType( IAutomationPropertiesStatics9 *iface, IUIElement *element, AutomationControlType value )
++{
++    return set_int( (IInspectable *)element, L"AutomationControlType", value );
++}
++
++static const struct IAutomationPropertiesStatics9Vtbl statics9_vtbl =
++{
++    statics9_QueryInterface,
++    statics9_AddRef,
++    statics9_Release,
++    /* IInspectable methods */
++    statics9_GetIids,
++    statics9_GetRuntimeClassName,
++    statics9_GetTrustLevel,
++    /* IAutomationPropertiesStatics9 methods */
++    statics9_get_AutomationControlTypeProperty,
++    statics9_GetAutomationControlType,
++    statics9_SetAutomationControlType,
++};
++
++static struct automation_statics automation_statics =
++{
++    {&factory_vtbl}, {&statics1_vtbl}, {&statics2_vtbl}, {&statics3_vtbl}, {&statics4_vtbl}, {&statics5_vtbl},
++    {&statics6_vtbl}, {&statics7_vtbl}, {&statics8_vtbl}, {&statics9_vtbl},
++};
++
++IActivationFactory *automation_properties_factory = &automation_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/classes.idl b/dlls/windows.ui.xaml/classes.idl
+index cf7b596..fb6515b 100644
+--- a/dlls/windows.ui.xaml/classes.idl
++++ b/dlls/windows.ui.xaml/classes.idl
+@@ -32,6 +32,7 @@ namespace Windows.UI.Xaml {
+     runtimeclass Application;
+     runtimeclass DependencyObject;
+     runtimeclass DependencyProperty;
++    runtimeclass DispatcherTimer;
+     runtimeclass PointHelper;
+     runtimeclass PropertyMetadata;
+     runtimeclass SizeHelper;
+@@ -39,12 +40,17 @@ namespace Windows.UI.Xaml {
+     runtimeclass Window;
+ }
+ 
++namespace Windows.UI.Xaml.Automation {
++    runtimeclass AutomationProperties;
++}
++
+ namespace Windows.UI.Xaml.Controls {
+     runtimeclass AppBarButton;
+     runtimeclass AppBarSeparator;
+     runtimeclass AppBarToggleButton;
+     runtimeclass Border;
+     runtimeclass Button;
++    runtimeclass Flyout;
+     runtimeclass CheckBox;
+     runtimeclass ColumnDefinition;
+     runtimeclass CommandBar;
+@@ -118,4 +124,5 @@ namespace Windows.UI.Xaml.Media {
+     runtimeclass ScaleTransform;
+     runtimeclass SolidColorBrush;
+     runtimeclass TranslateTransform;
++    runtimeclass VisualTreeHelper;
+ }
+diff --git a/dlls/windows.ui.xaml/content.c b/dlls/windows.ui.xaml/content.c
+index d4dbc61..e99a486 100644
+--- a/dlls/windows.ui.xaml/content.c
++++ b/dlls/windows.ui.xaml/content.c
+@@ -25,7 +25,9 @@ WINE_DEFAULT_DEBUG_CHANNEL(xaml);
+ 
+ /* UserControl, Page (a UserControl) and Frame (a ContentControl) all host one content element, so they share one
+  * object type. Apps derive their pages from Page by aggregation; Frame.Navigate creates them through the app's
+- * IXamlMetadataProvider. Navigation history, OnNavigatedTo and transitions are not implemented. */
++ * IXamlMetadataProvider. A Frame keeps a back and a forward stack of PageStackEntry objects and raises Navigating,
++ * Navigated and NavigationFailed and the page's OnNavigatingFrom/OnNavigatedFrom/OnNavigatedTo, in WinUI's order.
++ * Transitions are kept in the entries but not played. */
+ 
+ enum content_kind
+ {
+@@ -40,6 +42,9 @@ struct content_host
+     IUserControl IUserControl_iface;
+     IPage IPage_iface;
+     IFrame IFrame_iface;
++    IFrame2 IFrame2_iface;
++    IFrame3 IFrame3_iface;
++    IPageOverrides IPageOverrides_iface;
+     INavigate INavigate_iface;
+     IContentControl IContentControl_iface;
+     IControl IControl_iface;
+@@ -50,6 +55,11 @@ struct content_host
+     double font_size;
+     Thickness padding;
+     TypeName page_type;           /* Frame: the current page's type */
++    IInspectable *page_parameter; /* Frame: the current page's navigation parameter */
++    INavigationTransitionInfo *page_transition;
++    IInspectable *back_stack, *forward_stack;   /* Frame: IVector<PageStackEntry>; the next one back is last,
++                                                 * the next one forward is first */
++    INT32 cache_size;
+     IFrame *frame;                /* Page: the frame showing it (not referenced) */
+     IAppBar *bars[2];             /* Page: TopAppBar and BottomAppBar */
+     NavigationCacheMode cache_mode;   /* Page */
+@@ -70,7 +80,10 @@ static HRESULT content_query_interface( struct xaml_element *element, REFIID iid
+     if (IsEqualGUID( iid, &IID_IControl )) *out = &impl->IControl_iface;
+     else if (impl->kind != CONTENT_FRAME && IsEqualGUID( iid, &IID_IUserControl )) *out = &impl->IUserControl_iface;
+     else if (impl->kind == CONTENT_PAGE && IsEqualGUID( iid, &IID_IPage )) *out = &impl->IPage_iface;
++    else if (impl->kind == CONTENT_PAGE && IsEqualGUID( iid, &IID_IPageOverrides )) *out = &impl->IPageOverrides_iface;
+     else if (impl->kind == CONTENT_FRAME && IsEqualGUID( iid, &IID_IFrame )) *out = &impl->IFrame_iface;
++    else if (impl->kind == CONTENT_FRAME && IsEqualGUID( iid, &IID_IFrame2 )) *out = &impl->IFrame2_iface;
++    else if (impl->kind == CONTENT_FRAME && IsEqualGUID( iid, &IID_IFrame3 )) *out = &impl->IFrame3_iface;
+     else if (impl->kind == CONTENT_FRAME && IsEqualGUID( iid, &IID_INavigate )) *out = &impl->INavigate_iface;
+     else if (impl->kind == CONTENT_FRAME && IsEqualGUID( iid, &IID_IContentControl )) *out = &impl->IContentControl_iface;
+     else return E_NOINTERFACE;
+@@ -205,6 +218,10 @@ static void content_destroy( struct xaml_element *element )
+     if (impl->background) IBrush_Release( impl->background );
+     if (impl->foreground) IBrush_Release( impl->foreground );
+     WindowsDeleteString( impl->page_type.Name );
++    if (impl->page_parameter) IInspectable_Release( impl->page_parameter );
++    if (impl->page_transition) INavigationTransitionInfo_Release( impl->page_transition );
++    if (impl->back_stack) IInspectable_Release( impl->back_stack );
++    if (impl->forward_stack) IInspectable_Release( impl->forward_stack );
+     event_list_clear( &impl->navigated );
+     event_list_clear( &impl->navigating );
+     event_list_clear( &impl->navigation_failed );
+@@ -224,43 +241,299 @@ static const struct element_ops content_ops =
+     .destroy = content_destroy,
+ };
+ 
+-/* Frame.Navigate: create the page through the app's metadata provider, or a built-in type, and show it */
+-static HRESULT frame_navigate( struct content_host *impl, TypeName type, IInspectable *parameter, boolean *success )
++static IPageOverrides *overrides_of( IInspectable *page )
+ {
+-    IInspectable *page = NULL;
+     struct xaml_element *element;
+-    struct content_host *host;
++    IPageOverrides *overrides;
++
++    /* only our Page has the overrides; the app's derived page answers for them through its outer object */
++    if (!page || !(element = element_from_object( page )) || element->ops != &content_ops ||
++        impl_from_element( element )->kind != CONTENT_PAGE)
++        return NULL;
++    if (FAILED(IInspectable_QueryInterface( element->outer, &IID_IPageOverrides, (void **)&overrides ))) return NULL;
++    return overrides;
++}
++
++static IUnknown **copy_handlers( struct event_list *list, UINT32 *count )
++{
++    IUnknown **handlers;
++    UINT32 i;
++
++    *count = list->count;
++    if (!list->count || !(handlers = calloc( list->count, sizeof(*handlers) ))) return NULL;
++    for (i = 0; i < list->count; i++) if ((handlers[i] = list->handlers[i])) IUnknown_AddRef( handlers[i] );
++    return handlers;
++}
++
++static void release_handlers( IUnknown **handlers, UINT32 count )
++{
++    UINT32 i;
++    for (i = 0; i < count; i++) if (handlers[i]) IUnknown_Release( handlers[i] );
++    free( handlers );
++}
++
++static void raise_navigating( struct content_host *impl, INavigatingCancelEventArgs *args )
++{
++    UINT32 i, count;
++    IUnknown **handlers = copy_handlers( &impl->navigating, &count );
+     HRESULT hr;
+ 
+-    TRACE( "frame %p, type %s (kind %d), parameter %p.\n", impl, debugstr_hstring(type.Name), type.Kind, parameter );
++    for (i = 0; handlers && i < count; i++)
++    {
++        if (!handlers[i]) continue;
++        hr = INavigatingCancelEventHandler_Invoke( (INavigatingCancelEventHandler *)handlers[i], impl->element.outer, args );
++        if (FAILED(hr)) WARN( "Navigating handler %p failed, hr %#lx.\n", handlers[i], hr );
++    }
++    release_handlers( handlers, count );
++}
++
++static void raise_navigated( struct content_host *impl, INavigationEventArgs *args )
++{
++    UINT32 i, count;
++    IUnknown **handlers = copy_handlers( &impl->navigated, &count );
++    HRESULT hr;
+ 
+-    *success = FALSE;
+-    if (type.Kind == TypeKind_Custom) hr = app_create_instance_from_type( type, &page );
++    for (i = 0; handlers && i < count; i++)
++    {
++        if (!handlers[i]) continue;
++        hr = INavigatedEventHandler_Invoke( (INavigatedEventHandler *)handlers[i], impl->element.outer, args );
++        if (FAILED(hr)) WARN( "Navigated handler %p failed, hr %#lx.\n", handlers[i], hr );
++    }
++    release_handlers( handlers, count );
++}
++
++static BOOL raise_navigation_failed( struct content_host *impl, const TypeName *type, HRESULT error )
++{
++    INavigationFailedEventArgs *args;
++    UINT32 i, count;
++    IUnknown **handlers;
++    BOOL handled;
++    HRESULT hr;
++
++    if (FAILED(navigation_failed_args_create( type, error, &args ))) return FALSE;
++    handlers = copy_handlers( &impl->navigation_failed, &count );
++    for (i = 0; handlers && i < count; i++)
++    {
++        if (!handlers[i]) continue;
++        hr = INavigationFailedEventHandler_Invoke( (INavigationFailedEventHandler *)handlers[i], impl->element.outer, args );
++        if (FAILED(hr)) WARN( "NavigationFailed handler %p failed, hr %#lx.\n", handlers[i], hr );
++    }
++    release_handlers( handlers, count );
++    handled = navigation_failed_args_handled( args );
++    INavigationFailedEventArgs_Release( args );
++    return handled;
++}
++
++static HRESULT frame_stacks( struct content_host *impl )
++{
++    static const struct vector_iids iids =
++    {
++        &IID___FIVector_1_Windows__CUI__CXaml__CNavigation__CPageStackEntry,
++        &IID___FIVectorView_1_Windows__CUI__CXaml__CNavigation__CPageStackEntry,
++        &IID___FIIterable_1_Windows__CUI__CXaml__CNavigation__CPageStackEntry,
++        &IID___FIIterator_1_Windows__CUI__CXaml__CNavigation__CPageStackEntry,
++        &IID_IPageStackEntry,
++    };
++    static const struct vector_callbacks callbacks;
++    HRESULT hr;
++
++    if (!impl->back_stack && FAILED(hr = vector_create( &iids, &callbacks, NULL, &impl->back_stack ))) return hr;
++    if (!impl->forward_stack && FAILED(hr = vector_create( &iids, &callbacks, NULL, &impl->forward_stack ))) return hr;
++    return S_OK;
++}
++
++static IVector_PageStackEntry *back_stack( struct content_host *impl )
++{
++    return (IVector_PageStackEntry *)impl->back_stack;
++}
++
++static IVector_PageStackEntry *forward_stack( struct content_host *impl )
++{
++    return (IVector_PageStackEntry *)impl->forward_stack;
++}
++
++static UINT32 stack_size( IVector_PageStackEntry *stack )
++{
++    UINT32 size = 0;
++    if (FAILED(IVector_PageStackEntry_get_Size( stack, &size ))) size = 0;
++    return size;
++}
++
++static HRESULT create_page( TypeName type, IInspectable **page )
++{
++    HRESULT hr;
++
++    *page = NULL;
++    if (type.Kind == TypeKind_Custom) hr = app_create_instance_from_type( type, page );
+     else if (type.Kind == TypeKind_Metadata && wcsncmp( WindowsGetStringRawBuffer( type.Name, NULL ), L"Windows.", 8 ))
+     {
+         /* C++/CX's typeid(MainPage): a WinRT class of the app's own, from its metadata provider or activation */
+-        hr = app_create_instance_from_type( type, &page );
+-        if (FAILED(hr) || !page) hr = RoActivateInstance( type.Name, &page );
++        hr = app_create_instance_from_type( type, page );
++        if (FAILED(hr) || !*page) hr = RoActivateInstance( type.Name, page );
++    }
++    else hr = (*page = create_builtin( WindowsGetStringRawBuffer( type.Name, NULL ) )) ? S_OK : E_FAIL;
++    if (SUCCEEDED(hr) && !*page) hr = E_FAIL;
++    return hr;
++}
++
++/* the entry for the page being left, keeping its instance when its NavigationCacheMode asks for that */
++static HRESULT current_entry( struct content_host *impl, IPageStackEntry **entry )
++{
++    struct xaml_element *element = impl->child;
++    IInspectable *keep = NULL;
++
++    *entry = NULL;
++    if (!impl->content || !impl->page_type.Name) return S_OK;
++    if (element && element->ops == &content_ops && impl_from_element( element )->kind == CONTENT_PAGE &&
++        impl_from_element( element )->cache_mode != NavigationCacheMode_Disabled)
++        keep = impl->content;
++    return page_entry_create( &impl->page_type, impl->page_parameter, impl->page_transition, keep, entry );
++}
++
++/* Frame navigation, in WinUI's order: Navigating and the old page's OnNavigatingFrom (either may cancel), the new
++ * page, the history, the old page's OnNavigatedFrom, the new content, Navigated, then the new page's OnNavigatedTo.
++ * For Back and Forward, target is the entry being returned to (the last back or first forward one). */
++static HRESULT frame_navigate_mode( struct content_host *impl, TypeName type, IInspectable *parameter,
++                                    INavigationTransitionInfo *transition, NavigationMode mode,
++                                    IPageStackEntry *target, boolean *success )
++{
++    IPageOverrides *old_overrides = overrides_of( impl->content ), *new_overrides;
++    INavigatingCancelEventArgs *navigating;
++    INavigationEventArgs *navigated;
++    IPageStackEntry *old_entry = NULL;
++    IInspectable *page = NULL;
++    struct xaml_element *element;
++    boolean cancel = FALSE;
++    HRESULT hr;
++
++    TRACE( "frame %p, type %s (kind %d), parameter %p, mode %d.\n", impl, debugstr_hstring(type.Name), type.Kind,
++           parameter, mode );
++
++    *success = FALSE;
++    if (FAILED(hr = frame_stacks( impl ))) goto done;
++
++    if (FAILED(hr = navigating_args_create( &type, mode, &navigating ))) goto done;
++    raise_navigating( impl, navigating );
++    INavigatingCancelEventArgs_get_Cancel( navigating, &cancel );
++    if (!cancel && old_overrides)
++    {
++        hr = IPageOverrides_OnNavigatingFrom( old_overrides, navigating );
++        if (FAILED(hr)) WARN( "OnNavigatingFrom failed, hr %#lx.\n", hr );
++        INavigatingCancelEventArgs_get_Cancel( navigating, &cancel );
+     }
+-    else hr = (page = create_builtin( WindowsGetStringRawBuffer( type.Name, NULL ) )) ? S_OK : E_FAIL;
+-    if (FAILED(hr) || !page)
++    INavigatingCancelEventArgs_Release( navigating );
++    if (cancel)
++    {
++        TRACE( "navigation to %s cancelled.\n", debugstr_hstring(type.Name) );
++        hr = S_OK;
++        goto done;
++    }
++
++    hr = S_OK;
++    if (!target || !(page = page_entry_cached_page( target ))) hr = create_page( type, &page );
++    if (FAILED(hr))
+     {
+         ERR( "could not create page %s, hr %#lx.\n", debugstr_hstring(type.Name), hr );
+-        return S_OK;   /* Navigate reports failure through its result (and NavigationFailed) */
++        /* Navigate reports failure through its result and NavigationFailed */
++        raise_navigation_failed( impl, &type, hr );
++        hr = S_OK;
++        goto done;
+     }
+-    if (parameter) FIXME( "the navigation parameter is not passed to OnNavigatedTo.\n" );
+-    if ((element = element_from_object( page )) && element->ops == &content_ops)
++
++    /* the history */
++    if (mode != NavigationMode_Refresh && FAILED(hr = current_entry( impl, &old_entry ))) goto done;
++    switch (mode)
+     {
+-        host = impl_from_element( element );
+-        if (host->kind == CONTENT_PAGE) host->frame = &impl->IFrame_iface;
++    case NavigationMode_New:
++        IVector_PageStackEntry_Clear( forward_stack( impl ) );
++        if (old_entry) IVector_PageStackEntry_Append( back_stack( impl ), old_entry );
++        break;
++    case NavigationMode_Back:
++        if (stack_size( back_stack( impl ) )) IVector_PageStackEntry_RemoveAtEnd( back_stack( impl ) );
++        if (old_entry) IVector_PageStackEntry_InsertAt( forward_stack( impl ), 0, old_entry );
++        break;
++    case NavigationMode_Forward:
++        if (stack_size( forward_stack( impl ) )) IVector_PageStackEntry_RemoveAt( forward_stack( impl ), 0 );
++        if (old_entry) IVector_PageStackEntry_Append( back_stack( impl ), old_entry );
++        break;
++    default:
++        break;
+     }
++    if (old_entry) IPageStackEntry_Release( old_entry );
++
++    if (FAILED(hr = navigation_args_create( page, parameter, &type, mode, &navigated ))) goto done;
++    if (old_overrides)
++    {
++        hr = IPageOverrides_OnNavigatedFrom( old_overrides, navigated );
++        if (FAILED(hr)) WARN( "OnNavigatedFrom failed, hr %#lx.\n", hr );
++    }
++
++    if ((element = element_from_object( page )) && element->ops == &content_ops &&
++        impl_from_element( element )->kind == CONTENT_PAGE)
++        impl_from_element( element )->frame = &impl->IFrame_iface;
+     content_set( impl, page );
+-    IInspectable_Release( page );
+     WindowsDeleteString( impl->page_type.Name );
+     impl->page_type.Kind = type.Kind;
+     WindowsDuplicateString( type.Name, &impl->page_type.Name );
++    if (parameter) IInspectable_AddRef( parameter );
++    if (impl->page_parameter) IInspectable_Release( impl->page_parameter );
++    impl->page_parameter = parameter;
++    if (transition) INavigationTransitionInfo_AddRef( transition );
++    if (impl->page_transition) INavigationTransitionInfo_Release( impl->page_transition );
++    impl->page_transition = transition;
+     *success = TRUE;
+-    return S_OK;
++
++    raise_navigated( impl, navigated );
++    if ((new_overrides = overrides_of( page )))
++    {
++        hr = IPageOverrides_OnNavigatedTo( new_overrides, navigated );
++        if (FAILED(hr)) WARN( "OnNavigatedTo failed, hr %#lx.\n", hr );
++        IPageOverrides_Release( new_overrides );
++    }
++    INavigationEventArgs_Release( navigated );
++    hr = S_OK;
++
++done:
++    if (page) IInspectable_Release( page );
++    if (old_overrides) IPageOverrides_Release( old_overrides );
++    return hr;
++}
++
++static HRESULT frame_navigate( struct content_host *impl, TypeName type, IInspectable *parameter, boolean *success )
++{
++    return frame_navigate_mode( impl, type, parameter, NULL, NavigationMode_New, NULL, success );
++}
++
++/* GoBack / GoForward: to the next entry of a stack, which must not be empty */
++static HRESULT frame_go( struct content_host *impl, BOOL back, INavigationTransitionInfo *transition )
++{
++    IVector_PageStackEntry *stack;
++    IPageStackEntry *entry;
++    IInspectable *parameter = NULL;
++    INavigationTransitionInfo *info = NULL;
++    TypeName type = {0};
++    boolean success;
++    UINT32 size;
++    HRESULT hr;
++
++    if (FAILED(hr = frame_stacks( impl ))) return hr;
++    stack = back ? back_stack( impl ) : forward_stack( impl );
++    if (!(size = stack_size( stack )))
++    {
++        WARN( "frame %p: nothing to go %s to.\n", impl, back ? "back" : "forward" );
++        return E_FAIL;
++    }
++    if (FAILED(hr = IVector_PageStackEntry_GetAt( stack, back ? size - 1 : 0, &entry ))) return hr;
++    IPageStackEntry_get_SourcePageType( entry, &type );
++    IPageStackEntry_get_Parameter( entry, &parameter );
++    if (!transition) IPageStackEntry_get_NavigationTransitionInfo( entry, &info );
++    hr = frame_navigate_mode( impl, type, parameter, transition ? transition : info,
++                              back ? NavigationMode_Back : NavigationMode_Forward, entry, &success );
++    WindowsDeleteString( type.Name );
++    if (parameter) IInspectable_Release( parameter );
++    if (info) INavigationTransitionInfo_Release( info );
++    IPageStackEntry_Release( entry );
++    return hr;
+ }
+ 
+ /* IUserControl */
+@@ -308,7 +581,7 @@ static HRESULT WINAPI page_get_Frame( IPage *iface, IFrame **value )
+     return S_OK;
+ }
+ 
+-/* kept, but pages aren't cached: there is no navigation history */
++/* a page whose mode is not Disabled is kept in its back or forward stack entry */
+ static HRESULT WINAPI page_get_NavigationCacheMode( IPage *iface, NavigationCacheMode *value )
+ {
+     *value = impl_from_IPage( iface )->cache_mode;
+@@ -385,13 +658,15 @@ DEFINE_IINSPECTABLE_( frame, IFrame, struct content_host, impl_from_IFrame, IFra
+ 
+ static HRESULT WINAPI frame_get_CanGoBack( IFrame *iface, boolean *value )
+ {
+-    *value = FALSE;
++    struct content_host *impl = impl_from_IFrame( iface );
++    *value = impl->back_stack && stack_size( back_stack( impl ) );
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI frame_get_CanGoForward( IFrame *iface, boolean *value )
+ {
+-    *value = FALSE;
++    struct content_host *impl = impl_from_IFrame( iface );
++    *value = impl->forward_stack && stack_size( forward_stack( impl ) );
+     return S_OK;
+ }
+ 
+@@ -415,7 +690,8 @@ static HRESULT WINAPI frame_put_SourcePageType( IFrame *iface, TypeName value )
+ 
+ static HRESULT WINAPI frame_get_BackStackDepth( IFrame *iface, INT32 *value )
+ {
+-    *value = 0;
++    struct content_host *impl = impl_from_IFrame( iface );
++    *value = impl->back_stack ? stack_size( back_stack( impl ) ) : 0;
+     return S_OK;
+ }
+ 
+@@ -437,14 +713,14 @@ FRAME_EVENT( NavigationStopped, navigation_stopped, __x_ABI_CWindows_CUI_CXaml_C
+ 
+ static HRESULT WINAPI frame_GoBack( IFrame *iface )
+ {
+-    FIXME( "iface %p: there is no navigation history.\n", iface );
+-    return E_FAIL;
++    TRACE( "iface %p.\n", iface );
++    return frame_go( impl_from_IFrame( iface ), TRUE, NULL );
+ }
+ 
+ static HRESULT WINAPI frame_GoForward( IFrame *iface )
+ {
+-    FIXME( "iface %p: there is no navigation history.\n", iface );
+-    return E_FAIL;
++    TRACE( "iface %p.\n", iface );
++    return frame_go( impl_from_IFrame( iface ), FALSE, NULL );
+ }
+ 
+ static HRESULT WINAPI frame_Navigate( IFrame *iface, TypeName type, IInspectable *parameter, boolean *value )
+@@ -452,16 +728,19 @@ static HRESULT WINAPI frame_Navigate( IFrame *iface, TypeName type, IInspectable
+     return frame_navigate( impl_from_IFrame( iface ), type, parameter, value );
+ }
+ 
+-static HRESULT WINAPI frame_get_CacheSize(IFrame *iface, INT32 *value)
++/* kept; pages are only cached in their back and forward stack entries */
++static HRESULT WINAPI frame_get_CacheSize( IFrame *iface, INT32 *value )
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    *value = impl_from_IFrame( iface )->cache_size;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI frame_put_CacheSize(IFrame *iface, INT32 value)
++static HRESULT WINAPI frame_put_CacheSize( IFrame *iface, INT32 value )
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %d.\n", iface, value );
++    if (value < 0) return E_INVALIDARG;
++    impl_from_IFrame( iface )->cache_size = value;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI frame_GetNavigationState(IFrame *iface, HSTRING *value)
+@@ -509,6 +788,111 @@ static const struct IFrameVtbl frame_vtbl =
+     frame_SetNavigationState
+ };
+ 
++/* IFrame2 */
++
++DEFINE_IINSPECTABLE_( frame2, IFrame2, struct content_host, impl_from_IFrame2, IFrame2_iface, impl->element.outer )
++
++static HRESULT WINAPI frame2_get_BackStack( IFrame2 *iface, IVector_PageStackEntry **value )
++{
++    struct content_host *impl = impl_from_IFrame2( iface );
++    HRESULT hr;
++
++    if (FAILED(hr = frame_stacks( impl ))) return hr;
++    *value = back_stack( impl );
++    IVector_PageStackEntry_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI frame2_get_ForwardStack( IFrame2 *iface, IVector_PageStackEntry **value )
++{
++    struct content_host *impl = impl_from_IFrame2( iface );
++    HRESULT hr;
++
++    if (FAILED(hr = frame_stacks( impl ))) return hr;
++    *value = forward_stack( impl );
++    IVector_PageStackEntry_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI frame2_Navigate( IFrame2 *iface, TypeName type, IInspectable *parameter,
++                                       INavigationTransitionInfo *info, boolean *value )
++{
++    return frame_navigate_mode( impl_from_IFrame2( iface ), type, parameter, info, NavigationMode_New, NULL, value );
++}
++
++static const struct IFrame2Vtbl frame2_vtbl =
++{
++    frame2_QueryInterface,
++    frame2_AddRef,
++    frame2_Release,
++    /* IInspectable methods */
++    frame2_GetIids,
++    frame2_GetRuntimeClassName,
++    frame2_GetTrustLevel,
++    /* IFrame2 methods */
++    frame2_get_BackStack,
++    frame2_get_ForwardStack,
++    frame2_Navigate,
++};
++
++/* IFrame3 */
++
++DEFINE_IINSPECTABLE_( frame3, IFrame3, struct content_host, impl_from_IFrame3, IFrame3_iface, impl->element.outer )
++
++static HRESULT WINAPI frame3_GoBack( IFrame3 *iface, INavigationTransitionInfo *info )
++{
++    TRACE( "iface %p, info %p.\n", iface, info );
++    return frame_go( impl_from_IFrame3( iface ), TRUE, info );
++}
++
++static const struct IFrame3Vtbl frame3_vtbl =
++{
++    frame3_QueryInterface,
++    frame3_AddRef,
++    frame3_Release,
++    /* IInspectable methods */
++    frame3_GetIids,
++    frame3_GetRuntimeClassName,
++    frame3_GetTrustLevel,
++    /* IFrame3 methods */
++    frame3_GoBack,
++};
++
++/* IPageOverrides: the base class implementations, which do nothing */
++
++DEFINE_IINSPECTABLE_( page_overrides, IPageOverrides, struct content_host, impl_from_IPageOverrides,
++                      IPageOverrides_iface, impl->element.outer )
++
++static HRESULT WINAPI page_overrides_OnNavigatedFrom( IPageOverrides *iface, INavigationEventArgs *args )
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI page_overrides_OnNavigatedTo( IPageOverrides *iface, INavigationEventArgs *args )
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI page_overrides_OnNavigatingFrom( IPageOverrides *iface, INavigatingCancelEventArgs *args )
++{
++    return S_OK;
++}
++
++static const struct IPageOverridesVtbl page_overrides_vtbl =
++{
++    page_overrides_QueryInterface,
++    page_overrides_AddRef,
++    page_overrides_Release,
++    /* IInspectable methods */
++    page_overrides_GetIids,
++    page_overrides_GetRuntimeClassName,
++    page_overrides_GetTrustLevel,
++    /* IPageOverrides methods */
++    page_overrides_OnNavigatedFrom,
++    page_overrides_OnNavigatedTo,
++    page_overrides_OnNavigatingFrom,
++};
++
+ /* INavigate */
+ 
+ DEFINE_IINSPECTABLE_( navigate, INavigate, struct content_host, impl_from_INavigate, INavigate_iface, impl->element.outer )
+@@ -965,6 +1349,9 @@ static HRESULT content_create( enum content_kind kind, IInspectable *outer, IIns
+     impl->IUserControl_iface.lpVtbl = &user_control_vtbl;
+     impl->IPage_iface.lpVtbl = &page_vtbl;
+     impl->IFrame_iface.lpVtbl = &frame_vtbl;
++    impl->IFrame2_iface.lpVtbl = &frame2_vtbl;
++    impl->IFrame3_iface.lpVtbl = &frame3_vtbl;
++    impl->IPageOverrides_iface.lpVtbl = &page_overrides_vtbl;
+     impl->INavigate_iface.lpVtbl = &navigate_vtbl;
+     impl->IContentControl_iface.lpVtbl = &content_control_vtbl;
+     impl->IControl_iface.lpVtbl = &control_vtbl;
+diff --git a/dlls/windows.ui.xaml/dependency.c b/dlls/windows.ui.xaml/dependency.c
+index 6f9b436..fee32d0 100644
+--- a/dlls/windows.ui.xaml/dependency.c
++++ b/dlls/windows.ui.xaml/dependency.c
+@@ -457,6 +457,20 @@ IDependencyProperty *dp_builtin( const WCHAR *owner, const WCHAR *name )
+     return &impl->IDependencyProperty_iface;
+ }
+ 
++/* an attached property of a built-in class whose values live in the property store (AutomationProperties), the
++ * same object each time; not referenced (it is never freed) */
++IDependencyProperty *dp_attached( const WCHAR *owner, const WCHAR *name, const WCHAR *type )
++{
++    struct dependency_property *impl;
++
++    EnterCriticalSection( &dp_cs );
++    for (impl = properties; impl; impl = impl->next)
++        if (!impl->builtin && impl->attached && !wcscmp( impl->owner, owner ) && !wcscmp( impl->name, name )) break;
++    LeaveCriticalSection( &dp_cs );
++    if (!impl && !(impl = dp_new( owner, name, type, NULL, TRUE, FALSE ))) return NULL;
++    return &impl->IDependencyProperty_iface;
++}
++
+ /* the property's name and, for built-ins, its owner's short name; NULL if it isn't ours */
+ const WCHAR *dp_name( IDependencyProperty *iface, const WCHAR **owner, BOOL *builtin )
+ {
+diff --git a/dlls/windows.ui.xaml/flyout.c b/dlls/windows.ui.xaml/flyout.c
+new file mode 100644
+index 0000000..14e7a88
+--- /dev/null
++++ b/dlls/windows.ui.xaml/flyout.c
+@@ -0,0 +1,769 @@
++/* WinRT Windows.UI.Xaml.Controls.Flyout implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <math.h>
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* A Flyout (a FlyoutBase, which is a DependencyObject, not a UIElement) shows its Content in a light-dismiss popup
++ * next to the element ShowAt is given: a box like WinUI's FlyoutPresenter (transient background, 1 px border,
++ * 12 px padding, at most 456 x 758 px), placed by Placement (Top by default) and moved inside the window. A press
++ * outside the box closes it; Opening, Opened and Closed are raised. FlyoutPresenterStyle is kept
++ * but not applied, and there are no transitions. */
++
++#define FLYOUT_PADDING 12.0f
++#define FLYOUT_MAX_WIDTH 456.0f
++#define FLYOUT_MAX_HEIGHT 758.0f
++#define FLYOUT_GAP 4.0f
++
++struct flyout_layer
++{
++    struct xaml_element element;
++    struct flyout *flyout;           /* while open, not referenced */
++    struct layout_rect box;
++};
++
++struct flyout
++{
++    IInspectable IInspectable_inner;
++    IFlyout IFlyout_iface;
++    IFlyoutBase IFlyoutBase_iface;
++    IDependencyObject IDependencyObject_iface;
++    IInspectable *outer;
++    LONG ref;
++    IUIElement *content;
++    IStyle *presenter_style;
++    FlyoutPlacementMode placement;
++    struct event_list opening, opened, closed;
++    struct flyout_layer *layer;      /* while open (referenced through layer_object) */
++    IInspectable *layer_object;
++    IInspectable *target;            /* the placement target while open, referenced */
++    BOOL held;                       /* the open flyout holds a reference to itself */
++};
++
++static inline struct flyout *impl_from_IInspectable( IInspectable *iface )
++{
++    return CONTAINING_RECORD( iface, struct flyout, IInspectable_inner );
++}
++
++static struct xaml_element *flyout_content( struct flyout *impl )
++{
++    return impl->content ? element_from_object( (IInspectable *)impl->content ) : NULL;
++}
++
++static void raise_flyout_event( struct flyout *impl, struct event_list *list, const char *name )
++{
++    IUnknown **handlers;
++    UINT32 i, count = list->count;
++    HRESULT hr;
++
++    TRACE( "%p: %s.\n", impl, name );
++    if (!count || !(handlers = calloc( count, sizeof(*handlers) ))) return;
++    for (i = 0; i < count; i++) if ((handlers[i] = list->handlers[i])) IUnknown_AddRef( handlers[i] );
++    for (i = 0; i < count; i++)
++    {
++        if (!handlers[i]) continue;
++        hr = IEventHandler_IInspectable_Invoke( (IEventHandler_IInspectable *)handlers[i], impl->outer, NULL );
++        if (FAILED(hr)) WARN( "%s handler %p failed, hr %#lx.\n", name, handlers[i], hr );
++    }
++    for (i = 0; i < count; i++) if (handlers[i]) IUnknown_Release( handlers[i] );
++    free( handlers );
++}
++
++/* ---- the popup layer ---- */
++
++static inline struct flyout_layer *layer_from_element( struct xaml_element *element )
++{
++    return CONTAINING_RECORD( element, struct flyout_layer, element );
++}
++
++static void layer_measure( struct xaml_element *element, struct layout_context *ctx, float avail_width,
++                           float avail_height, float *width, float *height )
++{
++    struct flyout_layer *layer = layer_from_element( element );
++    struct xaml_element *content = layer->flyout ? flyout_content( layer->flyout ) : NULL;
++    float w = isfinite( avail_width ) ? avail_width : FLYOUT_MAX_WIDTH;
++    float h = isfinite( avail_height ) ? avail_height : FLYOUT_MAX_HEIGHT;
++
++    *width = isfinite( avail_width ) ? avail_width : 0;
++    *height = isfinite( avail_height ) ? avail_height : 0;
++    if (!content) return;
++    element_measure( content, ctx, max( 0.0f, min( w, FLYOUT_MAX_WIDTH ) - 2 * FLYOUT_PADDING ),
++                     max( 0.0f, min( h, FLYOUT_MAX_HEIGHT ) - 2 * FLYOUT_PADDING ) );
++}
++
++static void layer_arrange( struct xaml_element *element, struct layout_context *ctx )
++{
++    struct flyout_layer *layer = layer_from_element( element );
++    const struct layout_rect *window = &element->bounds;
++    struct xaml_element *content, *target;
++    struct layout_rect anchor, *box = &layer->box;
++    struct flyout *flyout = layer->flyout;
++
++    if (!flyout) return;
++    content = flyout_content( flyout );
++    box->width = min( (content ? content->desired_width : 0) + 2 * FLYOUT_PADDING, min( window->width, FLYOUT_MAX_WIDTH ) );
++    box->height = min( (content ? content->desired_height : 0) + 2 * FLYOUT_PADDING, min( window->height, FLYOUT_MAX_HEIGHT ) );
++    if (flyout->target && (target = element_from_object( flyout->target ))) anchor = target->bounds;
++    else
++    {
++        anchor.x = window->x + window->width / 2;
++        anchor.y = window->y + window->height / 2;
++        anchor.width = anchor.height = 0;
++    }
++
++    switch (flyout->placement)
++    {
++    case FlyoutPlacementMode_Full:
++        box->width = min( window->width, FLYOUT_MAX_WIDTH );
++        box->height = min( window->height, FLYOUT_MAX_HEIGHT );
++        box->x = window->x + (window->width - box->width) / 2;
++        box->y = window->y + (window->height - box->height) / 2;
++        break;
++    case FlyoutPlacementMode_Bottom:
++        box->x = anchor.x + (anchor.width - box->width) / 2;
++        box->y = anchor.y + anchor.height + FLYOUT_GAP;
++        /* where there is no room below, above */
++        if (box->y + box->height > window->y + window->height) box->y = anchor.y - FLYOUT_GAP - box->height;
++        break;
++    case FlyoutPlacementMode_Left:
++        box->x = anchor.x - FLYOUT_GAP - box->width;
++        box->y = anchor.y + (anchor.height - box->height) / 2;
++        if (box->x < window->x) box->x = anchor.x + anchor.width + FLYOUT_GAP;
++        break;
++    case FlyoutPlacementMode_Right:
++        box->x = anchor.x + anchor.width + FLYOUT_GAP;
++        box->y = anchor.y + (anchor.height - box->height) / 2;
++        if (box->x + box->width > window->x + window->width) box->x = anchor.x - FLYOUT_GAP - box->width;
++        break;
++    default:   /* Top, and the edge-aligned modes, which are near enough */
++        box->x = anchor.x + (anchor.width - box->width) / 2;
++        box->y = anchor.y - FLYOUT_GAP - box->height;
++        if (box->y < window->y) box->y = anchor.y + anchor.height + FLYOUT_GAP;
++        break;
++    }
++    /* inside the window */
++    box->x = max( window->x, min( box->x, window->x + window->width - box->width ) );
++    box->y = max( window->y, min( box->y, window->y + window->height - box->height ) );
++    if (content)
++        element_arrange( content, ctx, box->x + FLYOUT_PADDING, box->y + FLYOUT_PADDING,
++                         max( 0.0f, box->width - 2 * FLYOUT_PADDING ), max( 0.0f, box->height - 2 * FLYOUT_PADDING ) );
++}
++
++static void layer_render( struct xaml_element *element, struct layout_context *ctx )
++{
++    struct flyout_layer *layer = layer_from_element( element );
++    static const Thickness one = { 1, 1, 1, 1 };
++    Color background = { 0xff, 0xf2, 0xf2, 0xf2 };
++    struct xaml_element *content;
++
++    if (!layer->flyout) return;
++    if (ctx->dark) background.R = background.G = background.B = 0x2b;
++    element_fill_argb( ctx, &layer->box, background );
++    element_frame_color( ctx, &layer->box, &one, ctx->dark ? RGB(0x76, 0x76, 0x76) : RGB(0xcc, 0xcc, 0xcc) );
++    if ((content = flyout_content( layer->flyout ))) element_render( content, ctx );
++}
++
++static UINT32 layer_child_count( struct xaml_element *element )
++{
++    struct flyout_layer *layer = layer_from_element( element );
++    return layer->flyout && flyout_content( layer->flyout ) ? 1 : 0;
++}
++
++static struct xaml_element *layer_child_at( struct xaml_element *element, UINT32 index )
++{
++    struct flyout_layer *layer = layer_from_element( element );
++    return !index && layer->flyout ? flyout_content( layer->flyout ) : NULL;
++}
++
++/* the whole window, so that a press outside the box dismisses it */
++static BOOL layer_hit_self( struct xaml_element *element, float x, float y )
++{
++    return layer_from_element( element )->flyout != NULL;
++}
++
++static void flyout_hide( struct flyout *impl );
++
++static void layer_pointer( struct xaml_element *element, UINT msg, float x, float y )
++{
++    struct flyout_layer *layer = layer_from_element( element );
++    const struct layout_rect *b = &layer->box;
++
++    if (msg != WM_LBUTTONDOWN || !layer->flyout) return;
++    if (x >= b->x && y >= b->y && x < b->x + b->width && y < b->y + b->height) return;
++    TRACE( "light dismiss.\n" );
++    flyout_hide( layer->flyout );
++}
++
++static BOOL layer_key( struct xaml_element *element, BOOL down, WPARAM vk )
++{
++    struct flyout_layer *layer = layer_from_element( element );
++
++    if (!down || vk != VK_ESCAPE || !layer->flyout) return FALSE;
++    flyout_hide( layer->flyout );
++    return TRUE;
++}
++
++static void layer_destroy( struct xaml_element *element )
++{
++    free( layer_from_element( element ) );
++}
++
++static const struct element_ops layer_ops =
++{
++    .measure = layer_measure,
++    .arrange = layer_arrange,
++    .render = layer_render,
++    .child_count = layer_child_count,
++    .child_at = layer_child_at,
++    .hit_self = layer_hit_self,
++    .pointer = layer_pointer,
++    .key = layer_key,
++    .destroy = layer_destroy,
++};
++
++/* ---- opening and closing ---- */
++
++static HRESULT flyout_show( struct flyout *impl, IInspectable *target )
++{
++    struct xaml_element *content;
++    struct flyout_layer *layer;
++    HRESULT hr;
++
++    if (impl->layer)
++    {
++        /* ShowAt on an open flyout moves it */
++        if (target) IInspectable_AddRef( target );
++        if (impl->target) IInspectable_Release( impl->target );
++        impl->target = target;
++        window_invalidate();
++        return S_OK;
++    }
++    raise_flyout_event( impl, &impl->opening, "Opening" );
++    if (!(layer = calloc( 1, sizeof(*layer) ))) return E_OUTOFMEMORY;
++    element_init( &layer->element, &layer_ops, L"Windows.UI.Xaml.Controls.FlyoutPresenter", NULL );
++    if (FAILED(hr = element_compose( &layer->element, NULL, NULL, &layer->element.IInspectable_inner,
++                                     (void **)&impl->layer_object )))
++    {
++        free( layer );
++        return hr;
++    }
++    layer->flyout = impl;
++    impl->layer = layer;
++    if (target) IInspectable_AddRef( target );
++    impl->target = target;
++    if ((content = flyout_content( impl ))) element_set_parent( content, &layer->element );
++    if (!window_popup_show( &layer->element, FALSE ))
++    {
++        WARN( "no room for another popup.\n" );
++        flyout_hide( impl );
++        return E_FAIL;
++    }
++    IInspectable_AddRef( impl->outer );   /* an open flyout stays alive until it closes */
++    impl->held = TRUE;
++    window_invalidate();
++    raise_flyout_event( impl, &impl->opened, "Opened" );
++    return S_OK;
++}
++
++static void flyout_hide( struct flyout *impl )
++{
++    struct flyout_layer *layer = impl->layer;
++    struct xaml_element *content;
++    BOOL held = impl->held;
++
++    if (!layer) return;
++    impl->held = FALSE;
++    window_popup_hide( &layer->element );
++    if ((content = flyout_content( impl )) && content->parent == &layer->element) element_set_parent( content, NULL );
++    layer->flyout = NULL;
++    impl->layer = NULL;
++    IInspectable_Release( impl->layer_object );
++    impl->layer_object = NULL;
++    if (impl->target) IInspectable_Release( impl->target );
++    impl->target = NULL;
++    window_invalidate();
++    raise_flyout_event( impl, &impl->closed, "Closed" );
++    if (held) IInspectable_Release( impl->outer );
++}
++
++/* ---- IInspectable (the inner, non-delegating one) ---- */
++
++static HRESULT WINAPI inner_QueryInterface( IInspectable *iface, REFIID iid, void **out )
++{
++    struct flyout *impl = impl_from_IInspectable( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ))
++        *out = &impl->IInspectable_inner;
++    else if (IsEqualGUID( iid, &IID_IFlyout ))
++        *out = &impl->IFlyout_iface;
++    else if (IsEqualGUID( iid, &IID_IFlyoutBase ))
++        *out = &impl->IFlyoutBase_iface;
++    else if (IsEqualGUID( iid, &IID_IDependencyObject ))
++        *out = &impl->IDependencyObject_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI inner_AddRef( IInspectable *iface )
++{
++    return InterlockedIncrement( &impl_from_IInspectable( iface )->ref );
++}
++
++static ULONG WINAPI inner_Release( IInspectable *iface )
++{
++    struct flyout *impl = impl_from_IInspectable( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        dp_store_free( &impl->IDependencyObject_iface );
++        if (impl->content) IUIElement_Release( impl->content );
++        if (impl->presenter_style) IStyle_Release( impl->presenter_style );
++        event_list_clear( &impl->opening );
++        event_list_clear( &impl->opened );
++        event_list_clear( &impl->closed );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI inner_GetIids( IInspectable *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI inner_GetRuntimeClassName( IInspectable *iface, HSTRING *class_name )
++{
++    const WCHAR *name = RuntimeClass_Windows_UI_Xaml_Controls_Flyout;
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI inner_GetTrustLevel( IInspectable *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static const struct IInspectableVtbl inner_vtbl =
++{
++    inner_QueryInterface,
++    inner_AddRef,
++    inner_Release,
++    /* IInspectable methods */
++    inner_GetIids,
++    inner_GetRuntimeClassName,
++    inner_GetTrustLevel,
++};
++
++/* ---- IFlyout ---- */
++
++DEFINE_IINSPECTABLE_( flyout_iface, IFlyout, struct flyout, impl_from_IFlyout, IFlyout_iface, impl->outer )
++
++static HRESULT WINAPI flyout_iface_get_Content( IFlyout *iface, IUIElement **value )
++{
++    if (!value) return E_POINTER;
++    if ((*value = impl_from_IFlyout( iface )->content)) IUIElement_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI flyout_iface_put_Content( IFlyout *iface, IUIElement *value )
++{
++    struct flyout *impl = impl_from_IFlyout( iface );
++    struct xaml_element *old = flyout_content( impl ), *content;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (old && impl->layer && old->parent == &impl->layer->element) element_set_parent( old, NULL );
++    if (value) IUIElement_AddRef( value );
++    if (impl->content) IUIElement_Release( impl->content );
++    impl->content = value;
++    if (impl->layer && (content = flyout_content( impl ))) element_set_parent( content, &impl->layer->element );
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI flyout_iface_get_FlyoutPresenterStyle( IFlyout *iface, IStyle **value )
++{
++    if (!value) return E_POINTER;
++    if ((*value = impl_from_IFlyout( iface )->presenter_style)) IStyle_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI flyout_iface_put_FlyoutPresenterStyle( IFlyout *iface, IStyle *value )
++{
++    struct flyout *impl = impl_from_IFlyout( iface );
++
++    FIXME( "iface %p, value %p: kept, not applied.\n", iface, value );
++    if (value) IStyle_AddRef( value );
++    if (impl->presenter_style) IStyle_Release( impl->presenter_style );
++    impl->presenter_style = value;
++    return S_OK;
++}
++
++static const struct IFlyoutVtbl flyout_iface_vtbl =
++{
++    flyout_iface_QueryInterface,
++    flyout_iface_AddRef,
++    flyout_iface_Release,
++    /* IInspectable methods */
++    flyout_iface_GetIids,
++    flyout_iface_GetRuntimeClassName,
++    flyout_iface_GetTrustLevel,
++    /* IFlyout methods */
++    flyout_iface_get_Content,
++    flyout_iface_put_Content,
++    flyout_iface_get_FlyoutPresenterStyle,
++    flyout_iface_put_FlyoutPresenterStyle,
++};
++
++/* ---- IFlyoutBase ---- */
++
++DEFINE_IINSPECTABLE_( flyout_base, IFlyoutBase, struct flyout, impl_from_IFlyoutBase, IFlyoutBase_iface, impl->outer )
++
++static HRESULT WINAPI flyout_base_get_Placement( IFlyoutBase *iface, FlyoutPlacementMode *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IFlyoutBase( iface )->placement;
++    return S_OK;
++}
++
++static HRESULT WINAPI flyout_base_put_Placement( IFlyoutBase *iface, FlyoutPlacementMode value )
++{
++    TRACE( "iface %p, value %d.\n", iface, value );
++    impl_from_IFlyoutBase( iface )->placement = value;
++    window_invalidate();
++    return S_OK;
++}
++
++#define FLYOUT_EVENT( Name, field ) \
++static HRESULT WINAPI flyout_base_add_##Name( IFlyoutBase *iface, IEventHandler_IInspectable *handler, \
++                                              EventRegistrationToken *token ) \
++{ \
++    TRACE( "iface %p, handler %p.\n", iface, handler ); \
++    if (!handler || !token) return E_POINTER; \
++    return event_list_add( &impl_from_IFlyoutBase( iface )->field, (IUnknown *)handler, token ); \
++} \
++static HRESULT WINAPI flyout_base_remove_##Name( IFlyoutBase *iface, EventRegistrationToken token ) \
++{ \
++    return event_list_remove( &impl_from_IFlyoutBase( iface )->field, token ); \
++}
++
++FLYOUT_EVENT( Opened, opened )
++FLYOUT_EVENT( Closed, closed )
++FLYOUT_EVENT( Opening, opening )
++
++static HRESULT WINAPI flyout_base_ShowAt( IFlyoutBase *iface, IFrameworkElement *target )
++{
++    TRACE( "iface %p, target %p.\n", iface, target );
++    return flyout_show( impl_from_IFlyoutBase( iface ), (IInspectable *)target );
++}
++
++static HRESULT WINAPI flyout_base_Hide( IFlyoutBase *iface )
++{
++    TRACE( "iface %p.\n", iface );
++    flyout_hide( impl_from_IFlyoutBase( iface ) );
++    return S_OK;
++}
++
++static const struct IFlyoutBaseVtbl flyout_base_vtbl =
++{
++    flyout_base_QueryInterface,
++    flyout_base_AddRef,
++    flyout_base_Release,
++    /* IInspectable methods */
++    flyout_base_GetIids,
++    flyout_base_GetRuntimeClassName,
++    flyout_base_GetTrustLevel,
++    /* IFlyoutBase methods */
++    flyout_base_get_Placement,
++    flyout_base_put_Placement,
++    flyout_base_add_Opened,
++    flyout_base_remove_Opened,
++    flyout_base_add_Closed,
++    flyout_base_remove_Closed,
++    flyout_base_add_Opening,
++    flyout_base_remove_Opening,
++    flyout_base_ShowAt,
++    flyout_base_Hide,
++};
++
++/* ---- IDependencyObject: values in the property store ---- */
++
++DEFINE_IINSPECTABLE_( flyout_do, IDependencyObject, struct flyout, impl_from_IDependencyObject, IDependencyObject_iface,
++                      impl->outer )
++
++static HRESULT WINAPI flyout_do_GetValue( IDependencyObject *iface, IDependencyProperty *dp, IInspectable **result )
++{
++    return dp_get_value( iface, dp, result );
++}
++
++static HRESULT WINAPI flyout_do_SetValue( IDependencyObject *iface, IDependencyProperty *dp, IInspectable *value )
++{
++    return dp_set_value( iface, dp, value );
++}
++
++static HRESULT WINAPI flyout_do_ClearValue( IDependencyObject *iface, IDependencyProperty *dp )
++{
++    return dp_clear_value( iface, dp );
++}
++
++static HRESULT WINAPI flyout_do_ReadLocalValue( IDependencyObject *iface, IDependencyProperty *dp, IInspectable **result )
++{
++    return dp_read_local_value( iface, dp, result );
++}
++
++static HRESULT WINAPI flyout_do_GetAnimationBaseValue( IDependencyObject *iface, IDependencyProperty *dp,
++                                                       IInspectable **result )
++{
++    return dp_get_value( iface, dp, result );
++}
++
++static HRESULT WINAPI flyout_do_get_Dispatcher( IDependencyObject *iface, ICoreDispatcher **value )
++{
++    return xaml_get_dispatcher( value );
++}
++
++static const struct IDependencyObjectVtbl flyout_do_vtbl =
++{
++    flyout_do_QueryInterface,
++    flyout_do_AddRef,
++    flyout_do_Release,
++    /* IInspectable methods */
++    flyout_do_GetIids,
++    flyout_do_GetRuntimeClassName,
++    flyout_do_GetTrustLevel,
++    /* IDependencyObject methods */
++    flyout_do_GetValue,
++    flyout_do_SetValue,
++    flyout_do_ClearValue,
++    flyout_do_ReadLocalValue,
++    flyout_do_GetAnimationBaseValue,
++    flyout_do_get_Dispatcher,
++};
++
++static HRESULT flyout_create( IInspectable *outer, IInspectable **inner, IFlyout **value )
++{
++    struct flyout *impl;
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (inner) *inner = NULL;
++    if (outer && !inner) return E_INVALIDARG;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IInspectable_inner.lpVtbl = &inner_vtbl;
++    impl->IFlyout_iface.lpVtbl = &flyout_iface_vtbl;
++    impl->IFlyoutBase_iface.lpVtbl = &flyout_base_vtbl;
++    impl->IDependencyObject_iface.lpVtbl = &flyout_do_vtbl;
++    impl->ref = 1;
++    impl->placement = FlyoutPlacementMode_Top;
++    impl->outer = outer ? outer : &impl->IInspectable_inner;
++    *value = &impl->IFlyout_iface;
++    if (outer)
++    {
++        *inner = &impl->IInspectable_inner;
++        IInspectable_AddRef( outer );
++    }
++    TRACE( "created %p, outer %p.\n", impl, outer );
++    return S_OK;
++}
++
++/* markup: <Flyout> content and Placement */
++BOOL flyout_set_markup( IInspectable *target, const WCHAR *name, IInspectable *object, const WCHAR *str, INT32 number )
++{
++    IFlyout *flyout;
++    IFlyoutBase *base;
++    IUIElement *element;
++    BOOL done = FALSE;
++
++    if (!target || FAILED(IInspectable_QueryInterface( target, &IID_IFlyout, (void **)&flyout ))) return FALSE;
++    if (!wcscmp( name, L"Content" ) && object &&
++        SUCCEEDED(IInspectable_QueryInterface( object, &IID_IUIElement, (void **)&element )))
++    {
++        IFlyout_put_Content( flyout, element );
++        IUIElement_Release( element );
++        done = TRUE;
++    }
++    else if (!wcscmp( name, L"Placement" ) && (str || number >= 0) &&
++             SUCCEEDED(IFlyout_QueryInterface( flyout, &IID_IFlyoutBase, (void **)&base )))
++    {
++        static const WCHAR *const names[] =
++        {
++            L"Top", L"Bottom", L"Left", L"Right", L"Full", L"TopEdgeAlignedLeft", L"TopEdgeAlignedRight",
++            L"BottomEdgeAlignedLeft", L"BottomEdgeAlignedRight", L"LeftEdgeAlignedTop", L"LeftEdgeAlignedBottom",
++            L"RightEdgeAlignedTop", L"RightEdgeAlignedBottom", L"Auto",
++        };
++        UINT32 i;
++        if (str) for (i = 0; i < ARRAY_SIZE(names); i++) { if (!wcscmp( str, names[i] )) break; }
++        else i = number;
++        if (i < ARRAY_SIZE(names))
++        {
++            IFlyoutBase_put_Placement( base, i );
++            done = TRUE;
++        }
++        IFlyoutBase_Release( base );
++    }
++    IFlyout_Release( flyout );
++    return done;
++}
++
++/* ---- the factory: IActivationFactory, IFlyoutFactory and IFlyoutStatics ---- */
++
++struct flyout_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IFlyoutFactory IFlyoutFactory_iface;
++    IFlyoutStatics IFlyoutStatics_iface;
++};
++
++static inline struct flyout_statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct flyout_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct flyout_statics *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IFlyoutFactory ))
++        *out = &impl->IFlyoutFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IFlyoutStatics ))
++        *out = &impl->IFlyoutStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    return 2;
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    return 1;
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    return flyout_create( NULL, NULL, (IFlyout **)instance );
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( flyout_factory_iface, IFlyoutFactory, struct flyout_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI flyout_factory_iface_CreateInstance( IFlyoutFactory *iface, IInspectable *outer, IInspectable **inner,
++                                                           IFlyout **value )
++{
++    TRACE( "iface %p, outer %p, inner %p, value %p.\n", iface, outer, inner, value );
++    return flyout_create( outer, inner, value );
++}
++
++static const struct IFlyoutFactoryVtbl flyout_factory_iface_vtbl =
++{
++    flyout_factory_iface_QueryInterface,
++    flyout_factory_iface_AddRef,
++    flyout_factory_iface_Release,
++    /* IInspectable methods */
++    flyout_factory_iface_GetIids,
++    flyout_factory_iface_GetRuntimeClassName,
++    flyout_factory_iface_GetTrustLevel,
++    /* IFlyoutFactory methods */
++    flyout_factory_iface_CreateInstance,
++};
++
++DEFINE_IINSPECTABLE( flyout_statics_iface, IFlyoutStatics, struct flyout_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI flyout_statics_iface_get_ContentProperty( IFlyoutStatics *iface, IDependencyProperty **value )
++{
++    *value = dp_builtin( L"Flyout", L"Content" );
++    if (*value) IDependencyProperty_AddRef( *value );
++    return *value ? S_OK : E_OUTOFMEMORY;
++}
++
++static HRESULT WINAPI flyout_statics_iface_get_FlyoutPresenterStyleProperty( IFlyoutStatics *iface, IDependencyProperty **value )
++{
++    *value = dp_builtin( L"Flyout", L"FlyoutPresenterStyle" );
++    if (*value) IDependencyProperty_AddRef( *value );
++    return *value ? S_OK : E_OUTOFMEMORY;
++}
++
++static const struct IFlyoutStaticsVtbl flyout_statics_iface_vtbl =
++{
++    flyout_statics_iface_QueryInterface,
++    flyout_statics_iface_AddRef,
++    flyout_statics_iface_Release,
++    /* IInspectable methods */
++    flyout_statics_iface_GetIids,
++    flyout_statics_iface_GetRuntimeClassName,
++    flyout_statics_iface_GetTrustLevel,
++    /* IFlyoutStatics methods */
++    flyout_statics_iface_get_ContentProperty,
++    flyout_statics_iface_get_FlyoutPresenterStyleProperty,
++};
++
++static struct flyout_statics flyout_statics = { {&factory_vtbl}, {&flyout_factory_iface_vtbl}, {&flyout_statics_iface_vtbl} };
++
++IActivationFactory *flyout_factory = &flyout_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/main.c b/dlls/windows.ui.xaml/main.c
+index 515d3c0..897b247 100644
+--- a/dlls/windows.ui.xaml/main.c
++++ b/dlls/windows.ui.xaml/main.c
+@@ -126,6 +126,14 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( page_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Frame ))
+         IActivationFactory_QueryInterface( frame_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Flyout ))
++        IActivationFactory_QueryInterface( flyout_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_VisualTreeHelper ))
++        IActivationFactory_QueryInterface( visual_tree_helper_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_DispatcherTimer ))
++        IActivationFactory_QueryInterface( dispatcher_timer_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, L"Windows.UI.Xaml.Automation.AutomationProperties" ))
++        IActivationFactory_QueryInterface( automation_properties_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Shapes_Rectangle ))
+         IActivationFactory_QueryInterface( rectangle_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Shapes_Ellipse ))
+diff --git a/dlls/windows.ui.xaml/navigation.c b/dlls/windows.ui.xaml/navigation.c
+new file mode 100644
+index 0000000..65f5ade
+--- /dev/null
++++ b/dlls/windows.ui.xaml/navigation.c
+@@ -0,0 +1,555 @@
++/* WinRT Windows.UI.Xaml.Navigation PageStackEntry and navigation event arguments
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++static void type_name_copy( TypeName *dst, const TypeName *src )
++{
++    dst->Kind = src->Kind;
++    WindowsDuplicateString( src->Name, &dst->Name );
++}
++
++static HRESULT type_name_get( const TypeName *src, TypeName *value )
++{
++    if (!value) return E_POINTER;
++    value->Kind = src->Kind;
++    return WindowsDuplicateString( src->Name, &value->Name );
++}
++
++static HRESULT class_name( const WCHAR *name, HSTRING *value )
++{
++    return WindowsCreateString( name, wcslen( name ), value );
++}
++
++static HRESULT get_object( IInspectable *object, IInspectable **value )
++{
++    if (!value) return E_POINTER;
++    if ((*value = object)) IInspectable_AddRef( object );
++    return S_OK;
++}
++
++/* PageStackEntry: one page in a Frame's back or forward stack. The frame may keep the page itself (its
++ * NavigationCacheMode is not Disabled), so that going back shows the same instance. */
++
++struct page_entry
++{
++    IPageStackEntry IPageStackEntry_iface;
++    LONG ref;
++    TypeName type;
++    IInspectable *parameter;
++    INavigationTransitionInfo *transition;
++    IInspectable *page;
++};
++
++static inline struct page_entry *impl_from_IPageStackEntry( IPageStackEntry *iface )
++{
++    return CONTAINING_RECORD( iface, struct page_entry, IPageStackEntry_iface );
++}
++
++static HRESULT WINAPI entry_QueryInterface( IPageStackEntry *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IPageStackEntry ))
++    {
++        *out = iface;
++        IPageStackEntry_AddRef( iface );
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI entry_AddRef( IPageStackEntry *iface )
++{
++    return InterlockedIncrement( &impl_from_IPageStackEntry( iface )->ref );
++}
++
++static ULONG WINAPI entry_Release( IPageStackEntry *iface )
++{
++    struct page_entry *impl = impl_from_IPageStackEntry( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        WindowsDeleteString( impl->type.Name );
++        if (impl->parameter) IInspectable_Release( impl->parameter );
++        if (impl->transition) INavigationTransitionInfo_Release( impl->transition );
++        if (impl->page) IInspectable_Release( impl->page );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI entry_GetIids( IPageStackEntry *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI entry_GetRuntimeClassName( IPageStackEntry *iface, HSTRING *value )
++{
++    return class_name( RuntimeClass_Windows_UI_Xaml_Navigation_PageStackEntry, value );
++}
++
++static HRESULT WINAPI entry_GetTrustLevel( IPageStackEntry *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI entry_get_SourcePageType( IPageStackEntry *iface, TypeName *value )
++{
++    return type_name_get( &impl_from_IPageStackEntry( iface )->type, value );
++}
++
++static HRESULT WINAPI entry_get_Parameter( IPageStackEntry *iface, IInspectable **value )
++{
++    return get_object( impl_from_IPageStackEntry( iface )->parameter, value );
++}
++
++static HRESULT WINAPI entry_get_NavigationTransitionInfo( IPageStackEntry *iface, INavigationTransitionInfo **value )
++{
++    return get_object( (IInspectable *)impl_from_IPageStackEntry( iface )->transition, (IInspectable **)value );
++}
++
++static const struct IPageStackEntryVtbl entry_vtbl =
++{
++    entry_QueryInterface,
++    entry_AddRef,
++    entry_Release,
++    /* IInspectable methods */
++    entry_GetIids,
++    entry_GetRuntimeClassName,
++    entry_GetTrustLevel,
++    /* IPageStackEntry methods */
++    entry_get_SourcePageType,
++    entry_get_Parameter,
++    entry_get_NavigationTransitionInfo,
++};
++
++HRESULT page_entry_create( const TypeName *type, IInspectable *parameter, INavigationTransitionInfo *transition,
++                           IInspectable *page, IPageStackEntry **out )
++{
++    struct page_entry *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IPageStackEntry_iface.lpVtbl = &entry_vtbl;
++    impl->ref = 1;
++    type_name_copy( &impl->type, type );
++    if ((impl->parameter = parameter)) IInspectable_AddRef( parameter );
++    if ((impl->transition = transition)) INavigationTransitionInfo_AddRef( transition );
++    if ((impl->page = page)) IInspectable_AddRef( page );
++    *out = &impl->IPageStackEntry_iface;
++    return S_OK;
++}
++
++/* the page an entry kept (a reference), or NULL; entries the app made itself keep none */
++IInspectable *page_entry_cached_page( IPageStackEntry *entry )
++{
++    struct page_entry *impl;
++
++    if (entry->lpVtbl != &entry_vtbl) return NULL;
++    impl = impl_from_IPageStackEntry( entry );
++    if (impl->page) IInspectable_AddRef( impl->page );
++    return impl->page;
++}
++
++/* NavigationEventArgs: Navigated, OnNavigatedTo and OnNavigatedFrom */
++
++struct navigation_args
++{
++    INavigationEventArgs INavigationEventArgs_iface;
++    LONG ref;
++    IInspectable *content;
++    IInspectable *parameter;
++    TypeName type;
++    NavigationMode mode;
++    IUriRuntimeClass *uri;
++};
++
++static inline struct navigation_args *impl_from_INavigationEventArgs( INavigationEventArgs *iface )
++{
++    return CONTAINING_RECORD( iface, struct navigation_args, INavigationEventArgs_iface );
++}
++
++static HRESULT WINAPI navigation_args_QueryInterface( INavigationEventArgs *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_INavigationEventArgs ))
++    {
++        *out = iface;
++        INavigationEventArgs_AddRef( iface );
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI navigation_args_AddRef( INavigationEventArgs *iface )
++{
++    return InterlockedIncrement( &impl_from_INavigationEventArgs( iface )->ref );
++}
++
++static ULONG WINAPI navigation_args_Release( INavigationEventArgs *iface )
++{
++    struct navigation_args *impl = impl_from_INavigationEventArgs( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        if (impl->content) IInspectable_Release( impl->content );
++        if (impl->parameter) IInspectable_Release( impl->parameter );
++        if (impl->uri) IUriRuntimeClass_Release( impl->uri );
++        WindowsDeleteString( impl->type.Name );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI navigation_args_GetIids( INavigationEventArgs *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI navigation_args_GetRuntimeClassName( INavigationEventArgs *iface, HSTRING *value )
++{
++    return class_name( RuntimeClass_Windows_UI_Xaml_Navigation_NavigationEventArgs, value );
++}
++
++static HRESULT WINAPI navigation_args_GetTrustLevel( INavigationEventArgs *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI navigation_args_get_Content( INavigationEventArgs *iface, IInspectable **value )
++{
++    return get_object( impl_from_INavigationEventArgs( iface )->content, value );
++}
++
++static HRESULT WINAPI navigation_args_get_Parameter( INavigationEventArgs *iface, IInspectable **value )
++{
++    return get_object( impl_from_INavigationEventArgs( iface )->parameter, value );
++}
++
++static HRESULT WINAPI navigation_args_get_SourcePageType( INavigationEventArgs *iface, TypeName *value )
++{
++    return type_name_get( &impl_from_INavigationEventArgs( iface )->type, value );
++}
++
++static HRESULT WINAPI navigation_args_get_NavigationMode( INavigationEventArgs *iface, NavigationMode *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_INavigationEventArgs( iface )->mode;
++    return S_OK;
++}
++
++static HRESULT WINAPI navigation_args_get_Uri( INavigationEventArgs *iface, IUriRuntimeClass **value )
++{
++    return get_object( (IInspectable *)impl_from_INavigationEventArgs( iface )->uri, (IInspectable **)value );
++}
++
++static HRESULT WINAPI navigation_args_put_Uri( INavigationEventArgs *iface, IUriRuntimeClass *value )
++{
++    struct navigation_args *impl = impl_from_INavigationEventArgs( iface );
++
++    if (value) IUriRuntimeClass_AddRef( value );
++    if (impl->uri) IUriRuntimeClass_Release( impl->uri );
++    impl->uri = value;
++    return S_OK;
++}
++
++static const struct INavigationEventArgsVtbl navigation_args_vtbl =
++{
++    navigation_args_QueryInterface,
++    navigation_args_AddRef,
++    navigation_args_Release,
++    /* IInspectable methods */
++    navigation_args_GetIids,
++    navigation_args_GetRuntimeClassName,
++    navigation_args_GetTrustLevel,
++    /* INavigationEventArgs methods */
++    navigation_args_get_Content,
++    navigation_args_get_Parameter,
++    navigation_args_get_SourcePageType,
++    navigation_args_get_NavigationMode,
++    navigation_args_get_Uri,
++    navigation_args_put_Uri,
++};
++
++HRESULT navigation_args_create( IInspectable *content, IInspectable *parameter, const TypeName *type,
++                                NavigationMode mode, INavigationEventArgs **out )
++{
++    struct navigation_args *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->INavigationEventArgs_iface.lpVtbl = &navigation_args_vtbl;
++    impl->ref = 1;
++    if ((impl->content = content)) IInspectable_AddRef( content );
++    if ((impl->parameter = parameter)) IInspectable_AddRef( parameter );
++    type_name_copy( &impl->type, type );
++    impl->mode = mode;
++    *out = &impl->INavigationEventArgs_iface;
++    return S_OK;
++}
++
++/* NavigatingCancelEventArgs: Navigating and OnNavigatingFrom, which may cancel */
++
++struct navigating_args
++{
++    INavigatingCancelEventArgs INavigatingCancelEventArgs_iface;
++    LONG ref;
++    boolean cancel;
++    TypeName type;
++    NavigationMode mode;
++};
++
++static inline struct navigating_args *impl_from_INavigatingCancelEventArgs( INavigatingCancelEventArgs *iface )
++{
++    return CONTAINING_RECORD( iface, struct navigating_args, INavigatingCancelEventArgs_iface );
++}
++
++static HRESULT WINAPI navigating_args_QueryInterface( INavigatingCancelEventArgs *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_INavigatingCancelEventArgs ))
++    {
++        *out = iface;
++        INavigatingCancelEventArgs_AddRef( iface );
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI navigating_args_AddRef( INavigatingCancelEventArgs *iface )
++{
++    return InterlockedIncrement( &impl_from_INavigatingCancelEventArgs( iface )->ref );
++}
++
++static ULONG WINAPI navigating_args_Release( INavigatingCancelEventArgs *iface )
++{
++    struct navigating_args *impl = impl_from_INavigatingCancelEventArgs( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        WindowsDeleteString( impl->type.Name );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI navigating_args_GetIids( INavigatingCancelEventArgs *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI navigating_args_GetRuntimeClassName( INavigatingCancelEventArgs *iface, HSTRING *value )
++{
++    return class_name( RuntimeClass_Windows_UI_Xaml_Navigation_NavigatingCancelEventArgs, value );
++}
++
++static HRESULT WINAPI navigating_args_GetTrustLevel( INavigatingCancelEventArgs *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI navigating_args_get_Cancel( INavigatingCancelEventArgs *iface, boolean *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_INavigatingCancelEventArgs( iface )->cancel;
++    return S_OK;
++}
++
++static HRESULT WINAPI navigating_args_put_Cancel( INavigatingCancelEventArgs *iface, boolean value )
++{
++    TRACE( "iface %p, value %d.\n", iface, value );
++    impl_from_INavigatingCancelEventArgs( iface )->cancel = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI navigating_args_get_NavigationMode( INavigatingCancelEventArgs *iface, NavigationMode *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_INavigatingCancelEventArgs( iface )->mode;
++    return S_OK;
++}
++
++static HRESULT WINAPI navigating_args_get_SourcePageType( INavigatingCancelEventArgs *iface, TypeName *value )
++{
++    return type_name_get( &impl_from_INavigatingCancelEventArgs( iface )->type, value );
++}
++
++static const struct INavigatingCancelEventArgsVtbl navigating_args_vtbl =
++{
++    navigating_args_QueryInterface,
++    navigating_args_AddRef,
++    navigating_args_Release,
++    /* IInspectable methods */
++    navigating_args_GetIids,
++    navigating_args_GetRuntimeClassName,
++    navigating_args_GetTrustLevel,
++    /* INavigatingCancelEventArgs methods */
++    navigating_args_get_Cancel,
++    navigating_args_put_Cancel,
++    navigating_args_get_NavigationMode,
++    navigating_args_get_SourcePageType,
++};
++
++HRESULT navigating_args_create( const TypeName *type, NavigationMode mode, INavigatingCancelEventArgs **out )
++{
++    struct navigating_args *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->INavigatingCancelEventArgs_iface.lpVtbl = &navigating_args_vtbl;
++    impl->ref = 1;
++    type_name_copy( &impl->type, type );
++    impl->mode = mode;
++    *out = &impl->INavigatingCancelEventArgs_iface;
++    return S_OK;
++}
++
++/* NavigationFailedEventArgs: NavigationFailed, when the page can't be created */
++
++struct failed_args
++{
++    INavigationFailedEventArgs INavigationFailedEventArgs_iface;
++    LONG ref;
++    HRESULT error;
++    boolean handled;
++    TypeName type;
++};
++
++static inline struct failed_args *impl_from_INavigationFailedEventArgs( INavigationFailedEventArgs *iface )
++{
++    return CONTAINING_RECORD( iface, struct failed_args, INavigationFailedEventArgs_iface );
++}
++
++static HRESULT WINAPI failed_args_QueryInterface( INavigationFailedEventArgs *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_INavigationFailedEventArgs ))
++    {
++        *out = iface;
++        INavigationFailedEventArgs_AddRef( iface );
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI failed_args_AddRef( INavigationFailedEventArgs *iface )
++{
++    return InterlockedIncrement( &impl_from_INavigationFailedEventArgs( iface )->ref );
++}
++
++static ULONG WINAPI failed_args_Release( INavigationFailedEventArgs *iface )
++{
++    struct failed_args *impl = impl_from_INavigationFailedEventArgs( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        WindowsDeleteString( impl->type.Name );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI failed_args_GetIids( INavigationFailedEventArgs *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI failed_args_GetRuntimeClassName( INavigationFailedEventArgs *iface, HSTRING *value )
++{
++    return class_name( RuntimeClass_Windows_UI_Xaml_Navigation_NavigationFailedEventArgs, value );
++}
++
++static HRESULT WINAPI failed_args_GetTrustLevel( INavigationFailedEventArgs *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI failed_args_get_Exception( INavigationFailedEventArgs *iface, HRESULT *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_INavigationFailedEventArgs( iface )->error;
++    return S_OK;
++}
++
++static HRESULT WINAPI failed_args_get_Handled( INavigationFailedEventArgs *iface, boolean *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_INavigationFailedEventArgs( iface )->handled;
++    return S_OK;
++}
++
++static HRESULT WINAPI failed_args_put_Handled( INavigationFailedEventArgs *iface, boolean value )
++{
++    impl_from_INavigationFailedEventArgs( iface )->handled = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI failed_args_get_SourcePageType( INavigationFailedEventArgs *iface, TypeName *value )
++{
++    return type_name_get( &impl_from_INavigationFailedEventArgs( iface )->type, value );
++}
++
++static const struct INavigationFailedEventArgsVtbl failed_args_vtbl =
++{
++    failed_args_QueryInterface,
++    failed_args_AddRef,
++    failed_args_Release,
++    /* IInspectable methods */
++    failed_args_GetIids,
++    failed_args_GetRuntimeClassName,
++    failed_args_GetTrustLevel,
++    /* INavigationFailedEventArgs methods */
++    failed_args_get_Exception,
++    failed_args_get_Handled,
++    failed_args_put_Handled,
++    failed_args_get_SourcePageType,
++};
++
++HRESULT navigation_failed_args_create( const TypeName *type, HRESULT error, INavigationFailedEventArgs **out )
++{
++    struct failed_args *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->INavigationFailedEventArgs_iface.lpVtbl = &failed_args_vtbl;
++    impl->ref = 1;
++    impl->error = error;
++    type_name_copy( &impl->type, type );
++    *out = &impl->INavigationFailedEventArgs_iface;
++    return S_OK;
++}
++
++BOOL navigation_failed_args_handled( INavigationFailedEventArgs *args )
++{
++    return impl_from_INavigationFailedEventArgs( args )->handled;
++}
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index 1ef626f..136a109 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -128,6 +128,11 @@ extern IActivationFactory *resource_dictionary_factory;
+ extern IActivationFactory *user_control_factory;
+ extern IActivationFactory *page_factory;
+ extern IActivationFactory *frame_factory;
++extern IActivationFactory *dispatcher_timer_factory;
++extern IActivationFactory *flyout_factory;
++extern IActivationFactory *visual_tree_helper_factory;
++BOOL flyout_set_markup( IInspectable *target, const WCHAR *name, IInspectable *object, const WCHAR *str, INT32 number );
++extern IActivationFactory *automation_properties_factory;
+ extern IActivationFactory *content_presenter_factory;
+ extern IActivationFactory *xaml_reader_factory;
+ extern IActivationFactory *rectangle_factory;
+@@ -139,6 +144,16 @@ extern IActivationFactory *rectangle_geometry_factory;
+ extern IActivationFactory *ellipse_geometry_factory;
+ extern IActivationFactory *line_geometry_factory;
+ 
++/* navigation.c: Frame navigation history and event arguments */
++HRESULT page_entry_create( const TypeName *type, IInspectable *parameter, INavigationTransitionInfo *transition,
++                           IInspectable *page, IPageStackEntry **out );
++IInspectable *page_entry_cached_page( IPageStackEntry *entry );
++HRESULT navigation_args_create( IInspectable *content, IInspectable *parameter, const TypeName *type,
++                                NavigationMode mode, INavigationEventArgs **out );
++HRESULT navigating_args_create( const TypeName *type, NavigationMode mode, INavigatingCancelEventArgs **out );
++HRESULT navigation_failed_args_create( const TypeName *type, HRESULT error, INavigationFailedEventArgs **out );
++BOOL navigation_failed_args_handled( INavigationFailedEventArgs *args );
++
+ /* event handler lists (handlers are kept, tokens are indices + 1) */
+ struct event_list
+ {
+@@ -195,6 +210,7 @@ extern IActivationFactory *property_metadata_factory;
+ extern IActivationFactory *dependency_object_factory;
+ IInspectable *dp_unset_value(void);
+ IDependencyProperty *dp_builtin( const WCHAR *owner, const WCHAR *name );   /* not referenced */
++IDependencyProperty *dp_attached( const WCHAR *owner, const WCHAR *name, const WCHAR *type );   /* not referenced */
+ const WCHAR *dp_name( IDependencyProperty *dp, const WCHAR **owner, BOOL *builtin );
+ void dp_store_free( IDependencyObject *key );
+ void dp_notify_builtin( IDependencyObject *key, const WCHAR *owner, const WCHAR *name );
+diff --git a/dlls/windows.ui.xaml/timer.c b/dlls/windows.ui.xaml/timer.c
+new file mode 100644
+index 0000000..74f5793
+--- /dev/null
++++ b/dlls/windows.ui.xaml/timer.c
+@@ -0,0 +1,438 @@
++/* WinRT Windows.UI.Xaml.DispatcherTimer implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++#undef Duration   /* Windows.UI.Xaml.Duration, not the TimeSpan field */
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* A DispatcherTimer raises Tick on the thread that started it (the UI thread), from a thread timer that the message
++ * loop dispatches. A running timer keeps itself alive, as in WinUI, until it is stopped. */
++
++struct dispatcher_timer
++{
++    IInspectable IInspectable_inner;
++    IDispatcherTimer IDispatcherTimer_iface;
++    IInspectable *outer;
++    LONG ref;
++    TimeSpan interval;
++    UINT_PTR id;               /* the thread timer while running, or 0 */
++    struct event_list tick;
++    struct dispatcher_timer *next;
++};
++
++static CRITICAL_SECTION timers_cs;
++static CRITICAL_SECTION_DEBUG timers_cs_debug =
++{
++    0, 0, &timers_cs,
++    { &timers_cs_debug.ProcessLocksList, &timers_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": timers_cs") }
++};
++static CRITICAL_SECTION timers_cs = { &timers_cs_debug, -1, 0, 0, 0, 0 };
++static struct dispatcher_timer *running;
++
++static inline struct dispatcher_timer *impl_from_IInspectable( IInspectable *iface )
++{
++    return CONTAINING_RECORD( iface, struct dispatcher_timer, IInspectable_inner );
++}
++
++static inline struct dispatcher_timer *impl_from_IDispatcherTimer( IDispatcherTimer *iface )
++{
++    return CONTAINING_RECORD( iface, struct dispatcher_timer, IDispatcherTimer_iface );
++}
++
++static UINT timer_ms( const TimeSpan *interval )
++{
++    /* TimeSpan is in 100 ns units; Tick comes no sooner than the next message loop pass */
++    INT64 ms = interval->Duration / 10000;
++    if (ms < USER_TIMER_MINIMUM) ms = USER_TIMER_MINIMUM;
++    if (ms > USER_TIMER_MAXIMUM) ms = USER_TIMER_MAXIMUM;
++    return ms;
++}
++
++static void raise_tick( struct dispatcher_timer *impl )
++{
++    IUnknown **handlers;
++    UINT32 i, count;
++    HRESULT hr;
++
++    EnterCriticalSection( &timers_cs );
++    count = impl->tick.count;
++    if (!count || !(handlers = calloc( count, sizeof(*handlers) )))
++    {
++        LeaveCriticalSection( &timers_cs );
++        return;
++    }
++    for (i = 0; i < count; i++) if ((handlers[i] = impl->tick.handlers[i])) IUnknown_AddRef( handlers[i] );
++    LeaveCriticalSection( &timers_cs );
++
++    for (i = 0; i < count; i++)
++    {
++        if (!handlers[i]) continue;
++        hr = IEventHandler_IInspectable_Invoke( (IEventHandler_IInspectable *)handlers[i], impl->outer, NULL );
++        if (FAILED(hr)) WARN( "Tick handler %p failed, hr %#lx.\n", handlers[i], hr );
++    }
++    for (i = 0; i < count; i++) if (handlers[i]) IUnknown_Release( handlers[i] );
++    free( handlers );
++}
++
++static void CALLBACK timer_proc( HWND hwnd, UINT msg, UINT_PTR id, DWORD time )
++{
++    struct dispatcher_timer *impl;
++
++    EnterCriticalSection( &timers_cs );
++    for (impl = running; impl; impl = impl->next) if (impl->id == id) break;
++    if (impl) IInspectable_AddRef( impl->outer );
++    LeaveCriticalSection( &timers_cs );
++    if (!impl)
++    {
++        KillTimer( NULL, id );
++        return;
++    }
++    raise_tick( impl );
++    IInspectable_Release( impl->outer );
++}
++
++/* takes timers_cs */
++static void timer_stop( struct dispatcher_timer *impl )
++{
++    struct dispatcher_timer **p;
++
++    if (!impl->id) return;
++    KillTimer( NULL, impl->id );
++    impl->id = 0;
++    for (p = &running; *p; p = &(*p)->next) if (*p == impl) { *p = impl->next; break; }
++    impl->next = NULL;
++}
++
++static HRESULT WINAPI inner_QueryInterface( IInspectable *iface, REFIID iid, void **out )
++{
++    struct dispatcher_timer *impl = impl_from_IInspectable( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ))
++        *out = &impl->IInspectable_inner;
++    else if (IsEqualGUID( iid, &IID_IDispatcherTimer ))
++        *out = &impl->IDispatcherTimer_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI inner_AddRef( IInspectable *iface )
++{
++    return InterlockedIncrement( &impl_from_IInspectable( iface )->ref );
++}
++
++static ULONG WINAPI inner_Release( IInspectable *iface )
++{
++    struct dispatcher_timer *impl = impl_from_IInspectable( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        EnterCriticalSection( &timers_cs );
++        timer_stop( impl );
++        LeaveCriticalSection( &timers_cs );
++        event_list_clear( &impl->tick );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI inner_GetIids( IInspectable *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI inner_GetRuntimeClassName( IInspectable *iface, HSTRING *class_name )
++{
++    const WCHAR *name = RuntimeClass_Windows_UI_Xaml_DispatcherTimer;
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI inner_GetTrustLevel( IInspectable *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static const struct IInspectableVtbl inner_vtbl =
++{
++    inner_QueryInterface,
++    inner_AddRef,
++    inner_Release,
++    /* IInspectable methods */
++    inner_GetIids,
++    inner_GetRuntimeClassName,
++    inner_GetTrustLevel,
++};
++
++DEFINE_IINSPECTABLE_( timer, IDispatcherTimer, struct dispatcher_timer, impl_from_IDispatcherTimer_, IDispatcherTimer_iface,
++                      impl->outer )
++
++static HRESULT WINAPI timer_get_Interval( IDispatcherTimer *iface, TimeSpan *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IDispatcherTimer( iface )->interval;
++    return S_OK;
++}
++
++static HRESULT WINAPI timer_put_Interval( IDispatcherTimer *iface, TimeSpan value )
++{
++    struct dispatcher_timer *impl = impl_from_IDispatcherTimer( iface );
++
++    TRACE( "iface %p, value %I64d.\n", iface, value.Duration );
++    if (value.Duration < 0) return E_INVALIDARG;
++    EnterCriticalSection( &timers_cs );
++    impl->interval = value;
++    /* a running timer goes on at the new interval */
++    if (impl->id) SetTimer( NULL, impl->id, timer_ms( &value ), timer_proc );
++    LeaveCriticalSection( &timers_cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI timer_get_IsEnabled( IDispatcherTimer *iface, boolean *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IDispatcherTimer( iface )->id != 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI timer_add_Tick( IDispatcherTimer *iface, IEventHandler_IInspectable *handler,
++                                      EventRegistrationToken *token )
++{
++    struct dispatcher_timer *impl = impl_from_IDispatcherTimer( iface );
++    HRESULT hr;
++
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    if (!handler || !token) return E_POINTER;
++    EnterCriticalSection( &timers_cs );
++    hr = event_list_add( &impl->tick, (IUnknown *)handler, token );
++    LeaveCriticalSection( &timers_cs );
++    return hr;
++}
++
++static HRESULT WINAPI timer_remove_Tick( IDispatcherTimer *iface, EventRegistrationToken token )
++{
++    struct dispatcher_timer *impl = impl_from_IDispatcherTimer( iface );
++    HRESULT hr;
++
++    EnterCriticalSection( &timers_cs );
++    hr = event_list_remove( &impl->tick, token );
++    LeaveCriticalSection( &timers_cs );
++    return hr;
++}
++
++static HRESULT WINAPI timer_Start( IDispatcherTimer *iface )
++{
++    struct dispatcher_timer *impl = impl_from_IDispatcherTimer( iface );
++    UINT_PTR id;
++
++    TRACE( "iface %p, interval %I64d.\n", iface, impl->interval.Duration );
++
++    EnterCriticalSection( &timers_cs );
++    if (impl->id)
++    {
++        /* Start on a running timer restarts the interval */
++        SetTimer( NULL, impl->id, timer_ms( &impl->interval ), timer_proc );
++        LeaveCriticalSection( &timers_cs );
++        return S_OK;
++    }
++    if (!(id = SetTimer( NULL, 0, timer_ms( &impl->interval ), timer_proc )))
++    {
++        LeaveCriticalSection( &timers_cs );
++        return HRESULT_FROM_WIN32( GetLastError() );
++    }
++    impl->id = id;
++    impl->next = running;
++    running = impl;
++    LeaveCriticalSection( &timers_cs );
++    IInspectable_AddRef( impl->outer );   /* kept alive while running */
++    return S_OK;
++}
++
++static HRESULT WINAPI timer_Stop( IDispatcherTimer *iface )
++{
++    struct dispatcher_timer *impl = impl_from_IDispatcherTimer( iface );
++    BOOL was_running;
++
++    TRACE( "iface %p.\n", iface );
++
++    EnterCriticalSection( &timers_cs );
++    was_running = impl->id != 0;
++    timer_stop( impl );
++    LeaveCriticalSection( &timers_cs );
++    if (was_running) IInspectable_Release( impl->outer );
++    return S_OK;
++}
++
++static const struct IDispatcherTimerVtbl timer_vtbl =
++{
++    timer_QueryInterface,
++    timer_AddRef,
++    timer_Release,
++    /* IInspectable methods */
++    timer_GetIids,
++    timer_GetRuntimeClassName,
++    timer_GetTrustLevel,
++    /* IDispatcherTimer methods */
++    timer_get_Interval,
++    timer_put_Interval,
++    timer_get_IsEnabled,
++    timer_add_Tick,
++    timer_remove_Tick,
++    timer_Start,
++    timer_Stop,
++};
++
++static HRESULT timer_create( IInspectable *outer, IInspectable **inner, IDispatcherTimer **value )
++{
++    struct dispatcher_timer *impl;
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (inner) *inner = NULL;
++    if (outer && !inner) return E_INVALIDARG;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IInspectable_inner.lpVtbl = &inner_vtbl;
++    impl->IDispatcherTimer_iface.lpVtbl = &timer_vtbl;
++    impl->ref = 1;
++    impl->outer = outer ? outer : &impl->IInspectable_inner;
++    if (outer)
++    {
++        /* the outer object holds the inner one; our default interface refers to the outer */
++        *inner = &impl->IInspectable_inner;
++        *value = &impl->IDispatcherTimer_iface;
++        IInspectable_AddRef( outer );
++    }
++    else *value = &impl->IDispatcherTimer_iface;
++    TRACE( "created %p, outer %p.\n", impl, outer );
++    return S_OK;
++}
++
++/* the factory: IActivationFactory and the composable IDispatcherTimerFactory */
++
++struct timer_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IDispatcherTimerFactory IDispatcherTimerFactory_iface;
++};
++
++static inline struct timer_statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct timer_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct timer_statics *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IDispatcherTimerFactory ))
++        *out = &impl->IDispatcherTimerFactory_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    return 2;
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    return 1;
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    return timer_create( NULL, NULL, (IDispatcherTimer **)instance );
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( timer_factory, IDispatcherTimerFactory, struct timer_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI timer_factory_CreateInstance( IDispatcherTimerFactory *iface, IInspectable *outer,
++                                                    IInspectable **inner, IDispatcherTimer **value )
++{
++    TRACE( "iface %p, outer %p, inner %p, value %p.\n", iface, outer, inner, value );
++    return timer_create( outer, inner, value );
++}
++
++static const struct IDispatcherTimerFactoryVtbl timer_factory_vtbl =
++{
++    timer_factory_QueryInterface,
++    timer_factory_AddRef,
++    timer_factory_Release,
++    /* IInspectable methods */
++    timer_factory_GetIids,
++    timer_factory_GetRuntimeClassName,
++    timer_factory_GetTrustLevel,
++    /* IDispatcherTimerFactory methods */
++    timer_factory_CreateInstance,
++};
++
++static struct timer_statics timer_statics = { {&factory_vtbl}, {&timer_factory_vtbl} };
++
++IActivationFactory *dispatcher_timer_factory = &timer_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/visual_tree.c b/dlls/windows.ui.xaml/visual_tree.c
+new file mode 100644
+index 0000000..2b62b19
+--- /dev/null
++++ b/dlls/windows.ui.xaml/visual_tree.c
+@@ -0,0 +1,296 @@
++/* WinRT Windows.UI.Xaml.Media.VisualTreeHelper implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* VisualTreeHelper walks our element tree: a template's parts are children of their control, as in WinUI.
++ * Hit tests use the arranged bounds (render transforms are not applied). There is no Popup class yet, so
++ * GetOpenPopups lists none: ContentDialogs and flyouts show in window layers of their own. */
++
++static IDependencyObject *dependency_object_of( struct xaml_element *element )
++{
++    IDependencyObject *object;
++
++    if (!element || FAILED(IInspectable_QueryInterface( element->outer, &IID_IDependencyObject, (void **)&object )))
++        return NULL;
++    return object;
++}
++
++static BOOL rect_hit( const struct layout_rect *b, const Rect *r )
++{
++    return r->X < b->x + b->width && r->Y < b->y + b->height && r->X + r->Width >= b->x && r->Y + r->Height >= b->y;
++}
++
++/* the elements at r, topmost first: children before their parent, later children before earlier ones */
++static void collect_hits( struct xaml_element *element, const Rect *r, BOOL all, IVector_UIElement *list )
++{
++    UINT32 i;
++
++    if (element->visibility != Visibility_Visible) return;
++    if (!all && !element->hit_test_visible) return;
++    if (element->ops->child_count)
++    {
++        for (i = element->ops->child_count( element ); i > 0; i--)
++        {
++            struct xaml_element *child = element->ops->child_at( element, i - 1 );
++            if (child) collect_hits( child, r, all, list );
++        }
++    }
++    if (rect_hit( &element->bounds, r )) IVector_UIElement_Append( list, &element->IUIElement_iface );
++}
++
++static HRESULT find_elements( Rect r, IUIElement *subtree, BOOL all, IIterable_UIElement **value )
++{
++    static const struct vector_callbacks callbacks;
++    struct xaml_element *root;
++    IInspectable *vector;
++    HRESULT hr;
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (FAILED(hr = vector_create( &uielement_collection_iids, &callbacks, NULL, &vector ))) return hr;
++    if (subtree && (root = element_from_iinspectable( (IInspectable *)subtree )))
++        collect_hits( root, &r, all, (IVector_UIElement *)vector );
++    hr = IInspectable_QueryInterface( vector, &IID___FIIterable_1_Windows__CUI__CXaml__CUIElement, (void **)value );
++    IInspectable_Release( vector );
++    return hr;
++}
++
++struct visual_tree_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IVisualTreeHelperStatics IVisualTreeHelperStatics_iface;
++    IVisualTreeHelperStatics2 IVisualTreeHelperStatics2_iface;
++};
++
++static inline struct visual_tree_statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct visual_tree_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct visual_tree_statics *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IVisualTreeHelperStatics ))
++        *out = &impl->IVisualTreeHelperStatics_iface;
++    else if (IsEqualGUID( iid, &IID_IVisualTreeHelperStatics2 ))
++        *out = &impl->IVisualTreeHelperStatics2_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    return 2;
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    return 1;
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    /* VisualTreeHelper only has static methods */
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( statics, IVisualTreeHelperStatics, struct visual_tree_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI statics_FindElementsInHostCoordinatesPoint( IVisualTreeHelperStatics *iface, Point point,
++                                                                  IUIElement *subtree, IIterable_UIElement **value )
++{
++    Rect r = { point.X, point.Y, 0, 0 };
++    TRACE( "iface %p, point (%f,%f), subtree %p.\n", iface, point.X, point.Y, subtree );
++    return find_elements( r, subtree, FALSE, value );
++}
++
++static HRESULT WINAPI statics_FindElementsInHostCoordinatesRect( IVisualTreeHelperStatics *iface, Rect rect,
++                                                                 IUIElement *subtree, IIterable_UIElement **value )
++{
++    TRACE( "iface %p, subtree %p.\n", iface, subtree );
++    return find_elements( rect, subtree, FALSE, value );
++}
++
++static HRESULT WINAPI statics_FindAllElementsInHostCoordinatesPoint( IVisualTreeHelperStatics *iface, Point point,
++                                                                     IUIElement *subtree, boolean all,
++                                                                     IIterable_UIElement **value )
++{
++    Rect r = { point.X, point.Y, 0, 0 };
++    TRACE( "iface %p, point (%f,%f), subtree %p, all %d.\n", iface, point.X, point.Y, subtree, all );
++    return find_elements( r, subtree, all, value );
++}
++
++static HRESULT WINAPI statics_FindAllElementsInHostCoordinatesRect( IVisualTreeHelperStatics *iface, Rect rect,
++                                                                    IUIElement *subtree, boolean all,
++                                                                    IIterable_UIElement **value )
++{
++    TRACE( "iface %p, subtree %p, all %d.\n", iface, subtree, all );
++    return find_elements( rect, subtree, all, value );
++}
++
++static HRESULT WINAPI statics_GetChild( IVisualTreeHelperStatics *iface, IDependencyObject *reference, INT32 index,
++                                        IDependencyObject **value )
++{
++    struct xaml_element *element = reference ? element_from_object( (IInspectable *)reference ) : NULL;
++    UINT32 count = element && element->ops->child_count ? element->ops->child_count( element ) : 0;
++
++    TRACE( "iface %p, reference %p, index %d.\n", iface, reference, index );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (!reference) return E_INVALIDARG;
++    if (index < 0 || index >= count) return E_INVALIDARG;   /* WinUI: ArgumentOutOfRange */
++    *value = dependency_object_of( element->ops->child_at( element, index ) );
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_GetChildrenCount( IVisualTreeHelperStatics *iface, IDependencyObject *reference, INT32 *value )
++{
++    struct xaml_element *element = reference ? element_from_object( (IInspectable *)reference ) : NULL;
++
++    if (!value) return E_POINTER;
++    if (!reference) return E_INVALIDARG;
++    *value = element && element->ops->child_count ? element->ops->child_count( element ) : 0;
++    TRACE( "iface %p, reference %p -> %d.\n", iface, reference, *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_GetParent( IVisualTreeHelperStatics *iface, IDependencyObject *reference,
++                                         IDependencyObject **value )
++{
++    struct xaml_element *element = reference ? element_from_object( (IInspectable *)reference ) : NULL;
++
++    TRACE( "iface %p, reference %p.\n", iface, reference );
++    if (!value) return E_POINTER;
++    if (!reference) return E_INVALIDARG;
++    *value = element ? dependency_object_of( element->parent ) : NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_DisconnectChildrenRecursive( IVisualTreeHelperStatics *iface, IUIElement *element )
++{
++    /* for leak hunting in WinUI; our tree holds no cycles to break */
++    TRACE( "iface %p, element %p.\n", iface, element );
++    return S_OK;
++}
++
++static const struct IVisualTreeHelperStaticsVtbl statics_vtbl =
++{
++    statics_QueryInterface,
++    statics_AddRef,
++    statics_Release,
++    /* IInspectable methods */
++    statics_GetIids,
++    statics_GetRuntimeClassName,
++    statics_GetTrustLevel,
++    /* IVisualTreeHelperStatics methods */
++    statics_FindElementsInHostCoordinatesPoint,
++    statics_FindElementsInHostCoordinatesRect,
++    statics_FindAllElementsInHostCoordinatesPoint,
++    statics_FindAllElementsInHostCoordinatesRect,
++    statics_GetChild,
++    statics_GetChildrenCount,
++    statics_GetParent,
++    statics_DisconnectChildrenRecursive,
++};
++
++DEFINE_IINSPECTABLE( statics2, IVisualTreeHelperStatics2, struct visual_tree_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI statics2_GetOpenPopups( IVisualTreeHelperStatics2 *iface, IWindow *window,
++                                              IVectorView_Popup **value )
++{
++    static const struct vector_iids iids =
++    {
++        &IID___FIVector_1_Windows__CUI__CXaml__CControls__CPrimitives__CPopup,
++        &IID___FIVectorView_1_Windows__CUI__CXaml__CControls__CPrimitives__CPopup,
++        &IID___FIIterable_1_Windows__CUI__CXaml__CControls__CPrimitives__CPopup,
++        &IID___FIIterator_1_Windows__CUI__CXaml__CControls__CPrimitives__CPopup,
++        &IID_IPopup,
++    };
++    static const struct vector_callbacks callbacks;
++    IInspectable *vector;
++    HRESULT hr;
++
++    TRACE( "iface %p, window %p: none.\n", iface, window );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (FAILED(hr = vector_create( &iids, &callbacks, NULL, &vector ))) return hr;
++    hr = IVector_Popup_GetView( (IVector_Popup *)vector, value );
++    IInspectable_Release( vector );
++    return hr;
++}
++
++static const struct IVisualTreeHelperStatics2Vtbl statics2_vtbl =
++{
++    statics2_QueryInterface,
++    statics2_AddRef,
++    statics2_Release,
++    /* IInspectable methods */
++    statics2_GetIids,
++    statics2_GetRuntimeClassName,
++    statics2_GetTrustLevel,
++    /* IVisualTreeHelperStatics2 methods */
++    statics2_GetOpenPopups,
++};
++
++static struct visual_tree_statics visual_tree_statics = { {&factory_vtbl}, {&statics_vtbl}, {&statics2_vtbl} };
++
++IActivationFactory *visual_tree_helper_factory = &visual_tree_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/xbf.c b/dlls/windows.ui.xaml/xbf.c
+index ad450e0..a6dec64 100644
+--- a/dlls/windows.ui.xaml/xbf.c
++++ b/dlls/windows.ui.xaml/xbf.c
+@@ -2177,6 +2177,12 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+         }
+     }
+ 
++    /* Flyout: its Content and Placement */
++    if ((value->kind == XV_OBJECT || value->kind == XV_STRING || value->kind == XV_ENUM) &&
++        flyout_set_markup( target, prop->name, value->kind == XV_OBJECT ? value->object : NULL,
++                           value->kind == XV_STRING ? value->s : NULL, value->kind == XV_ENUM ? value->e.value : -1 ))
++        return S_OK;
++
+     /* TextBox and PasswordBox */
+     {
+         INT32 number = value->kind == XV_ENUM ? value->e.value : value->kind == XV_BOOL ? value->b :
+@@ -2992,6 +2998,7 @@ IInspectable *create_builtin( const WCHAR *name )
+         { L"ItemsStackPanel", &items_stack_panel_factory },
+         { L"ItemsWrapGrid", &items_wrap_grid_factory },
+         { L"UserControl", &user_control_factory },
++        { L"Flyout", &flyout_factory },
+     };
+     IInspectable *object;
+     UINT32 i;
+diff --git a/include/windows.ui.xaml.idl b/include/windows.ui.xaml.idl
+index 7b4afce..3248696 100644
+--- a/include/windows.ui.xaml.idl
++++ b/include/windows.ui.xaml.idl
+@@ -14947,3 +14947,577 @@ namespace Windows.UI.Xaml.Controls {
+ 
+ }
+ 
++
++/* Xbox Accessories, generated by scripts/winmd2idl.py: DispatcherTimer and Automation.AutomationProperties. */
++
++namespace Windows.UI.Xaml {
++    runtimeclass DispatcherTimer;
++    interface IDispatcherTimer;
++    interface IDispatcherTimerFactory;
++}
++
++namespace Windows.UI.Xaml.Automation {
++    typedef enum AnnotationType AnnotationType;
++    runtimeclass AutomationAnnotation;
++    runtimeclass AutomationProperties;
++    interface IAutomationAnnotation;
++    interface IAutomationProperties;
++    interface IAutomationPropertiesStatics;
++    interface IAutomationPropertiesStatics2;
++    interface IAutomationPropertiesStatics3;
++    interface IAutomationPropertiesStatics4;
++    interface IAutomationPropertiesStatics5;
++    interface IAutomationPropertiesStatics6;
++    interface IAutomationPropertiesStatics7;
++    interface IAutomationPropertiesStatics8;
++    interface IAutomationPropertiesStatics9;
++}
++
++namespace Windows.UI.Xaml.Automation.Peers {
++    typedef enum AccessibilityView AccessibilityView;
++    typedef enum AutomationHeadingLevel AutomationHeadingLevel;
++    typedef enum AutomationLandmarkType AutomationLandmarkType;
++}
++
++namespace Windows.UI.Xaml {
++    declare {
++        interface Windows.Foundation.Collections.IIterator<Windows.UI.Xaml.Automation.AutomationAnnotation *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.UI.Xaml.Automation.AutomationAnnotation *>;
++        interface Windows.Foundation.Collections.IVectorView<Windows.UI.Xaml.Automation.AutomationAnnotation *>;
++        interface Windows.Foundation.Collections.IVector<Windows.UI.Xaml.Automation.AutomationAnnotation *>;
++        interface Windows.Foundation.Collections.IIterator<Windows.UI.Xaml.DependencyObject *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.UI.Xaml.DependencyObject *>;
++        interface Windows.Foundation.Collections.IVectorView<Windows.UI.Xaml.DependencyObject *>;
++        interface Windows.Foundation.Collections.IVector<Windows.UI.Xaml.DependencyObject *>;
++    }
++}
++
++namespace Windows.UI.Xaml.Automation {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum AnnotationType
++    {
++        Unknown = 60000,
++        SpellingError = 60001,
++        GrammarError = 60002,
++        Comment = 60003,
++        FormulaError = 60004,
++        TrackChanges = 60005,
++        Header = 60006,
++        Footer = 60007,
++        Highlighted = 60008,
++        Endnote = 60009,
++        Footnote = 60010,
++        InsertionChange = 60011,
++        DeletionChange = 60012,
++        MoveChange = 60013,
++        FormatChange = 60014,
++        UnsyncedChange = 60015,
++        EditingLockedChange = 60016,
++        ExternalChange = 60017,
++        ConflictingChange = 60018,
++        Author = 60019,
++        AdvancedProofingIssue = 60020,
++        DataValidationError = 60021,
++        CircularReferenceError = 60022
++    };
++
++}
++
++namespace Windows.UI.Xaml.Automation.Peers {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum AccessibilityView
++    {
++        Raw = 0,
++        Control = 1,
++        Content = 2
++    };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 6.0)
++    ]
++    enum AutomationHeadingLevel
++    {
++        None = 0,
++        Level1 = 1,
++        Level2 = 2,
++        Level3 = 3,
++        Level4 = 4,
++        Level5 = 5,
++        Level6 = 6,
++        Level7 = 7,
++        Level8 = 8,
++        Level9 = 9
++    };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 2.0)
++    ]
++    enum AutomationLandmarkType
++    {
++        None = 0,
++        Custom = 1,
++        Form = 2,
++        Main = 3,
++        Navigation = 4,
++        Search = 5
++    };
++
++}
++
++namespace Windows.UI.Xaml {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.DispatcherTimer),
++        uuid(d160ce46-cd22-4f5f-8c97-40e61da3e2dc)
++    ]
++    interface IDispatcherTimer : IInspectable
++    {
++        [propget] HRESULT Interval([out, retval] Windows.Foundation.TimeSpan *value);
++        [propput] HRESULT Interval([in] Windows.Foundation.TimeSpan value);
++        [propget] HRESULT IsEnabled([out, retval] boolean *value);
++        [eventadd] HRESULT Tick([in] Windows.Foundation.EventHandler<IInspectable *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT Tick([in] Windows.Foundation.EventRegistrationToken token);
++        HRESULT Start();
++        HRESULT Stop();
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.DispatcherTimer),
++        uuid(e9961e6e-3626-403a-afe0-040d58165632)
++    ]
++    interface IDispatcherTimerFactory : IInspectable
++    {
++        HRESULT CreateInstance([in] IInspectable * baseInterface, [out] IInspectable * *innerInterface, [out, retval] Windows.UI.Xaml.DispatcherTimer * *value);
++    }
++
++}
++
++namespace Windows.UI.Xaml.Automation {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Automation.AutomationAnnotation),
++        uuid(fb3c30ca-03d8-4618-91bf-e4d84f4af318)
++    ]
++    interface IAutomationAnnotation : IInspectable
++    {
++        [propget] HRESULT Type([out, retval] Windows.UI.Xaml.Automation.AnnotationType *value);
++        [propput] HRESULT Type([in] Windows.UI.Xaml.Automation.AnnotationType value);
++        [propget] HRESULT Element([out, retval] Windows.UI.Xaml.UIElement * *value);
++        [propput] HRESULT Element([in] Windows.UI.Xaml.UIElement * value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Automation.AutomationProperties),
++        uuid(68d7232c-e622-48e9-af0b-1ffa33cc5cba)
++    ]
++    interface IAutomationProperties : IInspectable
++    {
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Automation.AutomationProperties),
++        uuid(b618fd7b-32d0-4970-9c42-7c039ac7be78)
++    ]
++    interface IAutomationPropertiesStatics : IInspectable
++    {
++        [propget] HRESULT AcceleratorKeyProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetAcceleratorKey([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] HSTRING *value);
++        HRESULT SetAcceleratorKey([in] Windows.UI.Xaml.DependencyObject * element, [in] HSTRING value);
++        [propget] HRESULT AccessKeyProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetAccessKey([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] HSTRING *value);
++        HRESULT SetAccessKey([in] Windows.UI.Xaml.DependencyObject * element, [in] HSTRING value);
++        [propget] HRESULT AutomationIdProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetAutomationId([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] HSTRING *value);
++        HRESULT SetAutomationId([in] Windows.UI.Xaml.DependencyObject * element, [in] HSTRING value);
++        [propget] HRESULT HelpTextProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetHelpText([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] HSTRING *value);
++        HRESULT SetHelpText([in] Windows.UI.Xaml.DependencyObject * element, [in] HSTRING value);
++        [propget] HRESULT IsRequiredForFormProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetIsRequiredForForm([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] boolean *value);
++        HRESULT SetIsRequiredForForm([in] Windows.UI.Xaml.DependencyObject * element, [in] boolean value);
++        [propget] HRESULT ItemStatusProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetItemStatus([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] HSTRING *value);
++        HRESULT SetItemStatus([in] Windows.UI.Xaml.DependencyObject * element, [in] HSTRING value);
++        [propget] HRESULT ItemTypeProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetItemType([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] HSTRING *value);
++        HRESULT SetItemType([in] Windows.UI.Xaml.DependencyObject * element, [in] HSTRING value);
++        [propget] HRESULT LabeledByProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetLabeledBy([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] Windows.UI.Xaml.UIElement * *value);
++        HRESULT SetLabeledBy([in] Windows.UI.Xaml.DependencyObject * element, [in] Windows.UI.Xaml.UIElement * value);
++        [propget] HRESULT NameProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetName([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] HSTRING *value);
++        HRESULT SetName([in] Windows.UI.Xaml.DependencyObject * element, [in] HSTRING value);
++        [propget] HRESULT LiveSettingProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetLiveSetting([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] Windows.UI.Xaml.Automation.Peers.AutomationLiveSetting *value);
++        HRESULT SetLiveSetting([in] Windows.UI.Xaml.DependencyObject * element, [in] Windows.UI.Xaml.Automation.Peers.AutomationLiveSetting value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Automation.AutomationProperties),
++        uuid(3976547f-7089-4801-8f1d-aab78090d1a0)
++    ]
++    interface IAutomationPropertiesStatics2 : IInspectable
++    {
++        [propget] HRESULT AccessibilityViewProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetAccessibilityView([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] Windows.UI.Xaml.Automation.Peers.AccessibilityView *value);
++        HRESULT SetAccessibilityView([in] Windows.UI.Xaml.DependencyObject * element, [in] Windows.UI.Xaml.Automation.Peers.AccessibilityView value);
++        [propget] HRESULT ControlledPeersProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetControlledPeers([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] Windows.Foundation.Collections.IVector<Windows.UI.Xaml.UIElement *> * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Automation.AutomationProperties),
++        uuid(7b75d735-5cb1-42ad-9b57-5faba8c1867f)
++    ]
++    interface IAutomationPropertiesStatics3 : IInspectable
++    {
++        [propget] HRESULT PositionInSetProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetPositionInSet([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] INT32 *value);
++        HRESULT SetPositionInSet([in] Windows.UI.Xaml.DependencyObject * element, [in] INT32 value);
++        [propget] HRESULT SizeOfSetProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetSizeOfSet([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] INT32 *value);
++        HRESULT SetSizeOfSet([in] Windows.UI.Xaml.DependencyObject * element, [in] INT32 value);
++        [propget] HRESULT LevelProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetLevel([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] INT32 *value);
++        HRESULT SetLevel([in] Windows.UI.Xaml.DependencyObject * element, [in] INT32 value);
++        [propget] HRESULT AnnotationsProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetAnnotations([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] Windows.Foundation.Collections.IVector<Windows.UI.Xaml.Automation.AutomationAnnotation *> * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 2.0),
++        exclusiveto(Windows.UI.Xaml.Automation.AutomationProperties),
++        uuid(f7d62655-311a-4b7c-a131-524e89cd3cf9)
++    ]
++    interface IAutomationPropertiesStatics4 : IInspectable
++    {
++        [propget] HRESULT LandmarkTypeProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetLandmarkType([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] Windows.UI.Xaml.Automation.Peers.AutomationLandmarkType *value);
++        HRESULT SetLandmarkType([in] Windows.UI.Xaml.DependencyObject * element, [in] Windows.UI.Xaml.Automation.Peers.AutomationLandmarkType value);
++        [propget] HRESULT LocalizedLandmarkTypeProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetLocalizedLandmarkType([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] HSTRING *value);
++        HRESULT SetLocalizedLandmarkType([in] Windows.UI.Xaml.DependencyObject * element, [in] HSTRING value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 3.0),
++        exclusiveto(Windows.UI.Xaml.Automation.AutomationProperties),
++        uuid(0be35b26-c8f9-41a2-b4db-e6a7a32b0c34)
++    ]
++    interface IAutomationPropertiesStatics5 : IInspectable
++    {
++        [propget] HRESULT IsPeripheralProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetIsPeripheral([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] boolean *value);
++        HRESULT SetIsPeripheral([in] Windows.UI.Xaml.DependencyObject * element, [in] boolean value);
++        [propget] HRESULT IsDataValidForFormProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetIsDataValidForForm([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] boolean *value);
++        HRESULT SetIsDataValidForForm([in] Windows.UI.Xaml.DependencyObject * element, [in] boolean value);
++        [propget] HRESULT FullDescriptionProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetFullDescription([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] HSTRING *value);
++        HRESULT SetFullDescription([in] Windows.UI.Xaml.DependencyObject * element, [in] HSTRING value);
++        [propget] HRESULT LocalizedControlTypeProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetLocalizedControlType([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] HSTRING *value);
++        HRESULT SetLocalizedControlType([in] Windows.UI.Xaml.DependencyObject * element, [in] HSTRING value);
++        [propget] HRESULT DescribedByProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetDescribedBy([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] Windows.Foundation.Collections.IVector<Windows.UI.Xaml.DependencyObject *> * *value);
++        [propget] HRESULT FlowsToProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetFlowsTo([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] Windows.Foundation.Collections.IVector<Windows.UI.Xaml.DependencyObject *> * *value);
++        [propget] HRESULT FlowsFromProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetFlowsFrom([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] Windows.Foundation.Collections.IVector<Windows.UI.Xaml.DependencyObject *> * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 4.0),
++        exclusiveto(Windows.UI.Xaml.Automation.AutomationProperties),
++        uuid(c61e030f-eb49-4e5d-b012-4c1c96c3901b)
++    ]
++    interface IAutomationPropertiesStatics6 : IInspectable
++    {
++        [propget] HRESULT CultureProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetCulture([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] INT32 *value);
++        HRESULT SetCulture([in] Windows.UI.Xaml.DependencyObject * element, [in] INT32 value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 6.0),
++        exclusiveto(Windows.UI.Xaml.Automation.AutomationProperties),
++        uuid(f7e98bf3-8f91-4068-a4ad-b7b402d10a2c)
++    ]
++    interface IAutomationPropertiesStatics7 : IInspectable
++    {
++        [propget] HRESULT HeadingLevelProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetHeadingLevel([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] Windows.UI.Xaml.Automation.Peers.AutomationHeadingLevel *value);
++        HRESULT SetHeadingLevel([in] Windows.UI.Xaml.DependencyObject * element, [in] Windows.UI.Xaml.Automation.Peers.AutomationHeadingLevel value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 7.0),
++        exclusiveto(Windows.UI.Xaml.Automation.AutomationProperties),
++        uuid(432eca20-171a-560d-8524-3e651d3ad6ca)
++    ]
++    interface IAutomationPropertiesStatics8 : IInspectable
++    {
++        [propget] HRESULT IsDialogProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetIsDialog([in] Windows.UI.Xaml.DependencyObject * element, [out, retval] boolean *value);
++        HRESULT SetIsDialog([in] Windows.UI.Xaml.DependencyObject * element, [in] boolean value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 14.0),
++        exclusiveto(Windows.UI.Xaml.Automation.AutomationProperties),
++        uuid(2f20b1d1-87b2-5562-8077-da593edafd2d)
++    ]
++    interface IAutomationPropertiesStatics9 : IInspectable
++    {
++        [propget] HRESULT AutomationControlTypeProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        HRESULT GetAutomationControlType([in] Windows.UI.Xaml.UIElement * element, [out, retval] Windows.UI.Xaml.Automation.Peers.AutomationControlType *value);
++        HRESULT SetAutomationControlType([in] Windows.UI.Xaml.UIElement * element, [in] Windows.UI.Xaml.Automation.Peers.AutomationControlType value);
++    }
++
++}
++
++namespace Windows.UI.Xaml {
++    [
++        composable(Windows.UI.Xaml.IDispatcherTimerFactory, public, Windows.Foundation.UniversalApiContract, 1.0),
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        threading(both)
++    ]
++    runtimeclass DispatcherTimer
++    {
++        [default] interface Windows.UI.Xaml.IDispatcherTimer;
++    }
++
++}
++
++namespace Windows.UI.Xaml.Automation {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.UI.Xaml.Automation.IAutomationPropertiesStatics, Windows.Foundation.UniversalApiContract, 1.0),
++        static(Windows.UI.Xaml.Automation.IAutomationPropertiesStatics2, Windows.Foundation.UniversalApiContract, 1.0),
++        static(Windows.UI.Xaml.Automation.IAutomationPropertiesStatics3, Windows.Foundation.UniversalApiContract, 1.0),
++        static(Windows.UI.Xaml.Automation.IAutomationPropertiesStatics4, Windows.Foundation.UniversalApiContract, 2.0),
++        static(Windows.UI.Xaml.Automation.IAutomationPropertiesStatics5, Windows.Foundation.UniversalApiContract, 3.0),
++        static(Windows.UI.Xaml.Automation.IAutomationPropertiesStatics6, Windows.Foundation.UniversalApiContract, 4.0),
++        static(Windows.UI.Xaml.Automation.IAutomationPropertiesStatics7, Windows.Foundation.UniversalApiContract, 6.0),
++        static(Windows.UI.Xaml.Automation.IAutomationPropertiesStatics8, Windows.Foundation.UniversalApiContract, 7.0),
++        static(Windows.UI.Xaml.Automation.IAutomationPropertiesStatics9, Windows.Foundation.UniversalApiContract, 14.0),
++        threading(both)
++    ]
++    runtimeclass AutomationProperties
++    {
++        [default] interface Windows.UI.Xaml.Automation.IAutomationProperties;
++    }
++
++}
++
++namespace Windows.UI.Xaml.Automation {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass AutomationAnnotation
++    {
++        [default] interface Windows.UI.Xaml.Automation.IAutomationAnnotation;
++    }
++
++}
++
++
++/* Xbox Accessories, generated by scripts/winmd2idl.py: Controls.Flyout, Primitives.Popup and Media.VisualTreeHelper
++ * (IVector<Popup> added for VisualTreeHelper.GetOpenPopups). */
++
++namespace Windows.UI.Xaml.Controls {
++    runtimeclass Flyout;
++    interface IFlyout;
++    interface IFlyoutFactory;
++    interface IFlyoutStatics;
++}
++
++namespace Windows.UI.Xaml.Controls.Primitives {
++    interface IPopup;
++    runtimeclass Popup;
++}
++
++namespace Windows.UI.Xaml.Media {
++    interface IVisualTreeHelper;
++    interface IVisualTreeHelperStatics;
++    interface IVisualTreeHelperStatics2;
++    interface IVisualTreeHelperStatics3;
++    runtimeclass VisualTreeHelper;
++}
++
++namespace Windows.UI.Xaml {
++    declare {
++        interface Windows.Foundation.Collections.IIterator<Windows.UI.Xaml.Controls.Primitives.Popup *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.UI.Xaml.Controls.Primitives.Popup *>;
++        interface Windows.Foundation.Collections.IVectorView<Windows.UI.Xaml.Controls.Primitives.Popup *>;
++        interface Windows.Foundation.Collections.IVector<Windows.UI.Xaml.Controls.Primitives.Popup *>;
++    }
++}
++
++namespace Windows.UI.Xaml.Controls {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Controls.Flyout),
++        uuid(6584ebdf-cbc7-4e19-843a-a14f24a793ea)
++    ]
++    interface IFlyout : IInspectable
++    {
++        [propget] HRESULT Content([out, retval] Windows.UI.Xaml.UIElement * *value);
++        [propput] HRESULT Content([in] Windows.UI.Xaml.UIElement * value);
++        [propget] HRESULT FlyoutPresenterStyle([out, retval] Windows.UI.Xaml.Style * *value);
++        [propput] HRESULT FlyoutPresenterStyle([in] Windows.UI.Xaml.Style * value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Controls.Flyout),
++        uuid(4bed4933-008e-4b03-a385-79fe5266ddba)
++    ]
++    interface IFlyoutFactory : IInspectable
++    {
++        HRESULT CreateInstance([in] IInspectable * baseInterface, [out] IInspectable * *innerInterface, [out, retval] Windows.UI.Xaml.Controls.Flyout * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Controls.Flyout),
++        uuid(61364e0b-db75-47e1-b2c3-5b901c3d74b6)
++    ]
++    interface IFlyoutStatics : IInspectable
++    {
++        [propget] HRESULT ContentProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        [propget] HRESULT FlyoutPresenterStyleProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++    }
++
++}
++
++namespace Windows.UI.Xaml.Controls.Primitives {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Controls.Primitives.Popup),
++        uuid(62418240-e6d3-4705-a1dc-39156456ee29)
++    ]
++    interface IPopup : IInspectable
++    {
++        [propget] HRESULT Child([out, retval] Windows.UI.Xaml.UIElement * *value);
++        [propput] HRESULT Child([in] Windows.UI.Xaml.UIElement * value);
++        [propget] HRESULT IsOpen([out, retval] boolean *value);
++        [propput] HRESULT IsOpen([in] boolean value);
++        [propget] HRESULT HorizontalOffset([out, retval] DOUBLE *value);
++        [propput] HRESULT HorizontalOffset([in] DOUBLE value);
++        [propget] HRESULT VerticalOffset([out, retval] DOUBLE *value);
++        [propput] HRESULT VerticalOffset([in] DOUBLE value);
++        [propget] HRESULT ChildTransitions([out, retval] Windows.UI.Xaml.Media.Animation.TransitionCollection * *value);
++        [propput] HRESULT ChildTransitions([in] Windows.UI.Xaml.Media.Animation.TransitionCollection * value);
++        [propget] HRESULT IsLightDismissEnabled([out, retval] boolean *value);
++        [propput] HRESULT IsLightDismissEnabled([in] boolean value);
++        [eventadd] HRESULT Opened([in] Windows.Foundation.EventHandler<IInspectable *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT Opened([in] Windows.Foundation.EventRegistrationToken token);
++        [eventadd] HRESULT Closed([in] Windows.Foundation.EventHandler<IInspectable *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT Closed([in] Windows.Foundation.EventRegistrationToken token);
++    }
++
++}
++
++namespace Windows.UI.Xaml.Media {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Media.VisualTreeHelper),
++        uuid(24b935e3-52c7-4141-8bac-a73d06130569)
++    ]
++    interface IVisualTreeHelper : IInspectable
++    {
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Media.VisualTreeHelper),
++        uuid(e75758c4-d25d-4b1d-971f-596f17f12baa)
++    ]
++    interface IVisualTreeHelperStatics : IInspectable
++    {
++        [default_overload] [overload("FindElementsInHostCoordinates")] HRESULT FindElementsInHostCoordinatesPoint([in] Windows.Foundation.Point intersectingPoint, [in] Windows.UI.Xaml.UIElement * subtree, [out, retval] Windows.Foundation.Collections.IIterable<Windows.UI.Xaml.UIElement *> * *value);
++        [overload("FindElementsInHostCoordinates")] HRESULT FindElementsInHostCoordinatesRect([in] Windows.Foundation.Rect intersectingRect, [in] Windows.UI.Xaml.UIElement * subtree, [out, retval] Windows.Foundation.Collections.IIterable<Windows.UI.Xaml.UIElement *> * *value);
++        [default_overload] [overload("FindElementsInHostCoordinates")] HRESULT FindAllElementsInHostCoordinatesPoint([in] Windows.Foundation.Point intersectingPoint, [in] Windows.UI.Xaml.UIElement * subtree, [in] boolean includeAllElements, [out, retval] Windows.Foundation.Collections.IIterable<Windows.UI.Xaml.UIElement *> * *value);
++        [overload("FindElementsInHostCoordinates")] HRESULT FindAllElementsInHostCoordinatesRect([in] Windows.Foundation.Rect intersectingRect, [in] Windows.UI.Xaml.UIElement * subtree, [in] boolean includeAllElements, [out, retval] Windows.Foundation.Collections.IIterable<Windows.UI.Xaml.UIElement *> * *value);
++        HRESULT GetChild([in] Windows.UI.Xaml.DependencyObject * reference, [in] INT32 childIndex, [out, retval] Windows.UI.Xaml.DependencyObject * *value);
++        HRESULT GetChildrenCount([in] Windows.UI.Xaml.DependencyObject * reference, [out, retval] INT32 *value);
++        HRESULT GetParent([in] Windows.UI.Xaml.DependencyObject * reference, [out, retval] Windows.UI.Xaml.DependencyObject * *value);
++        HRESULT DisconnectChildrenRecursive([in] Windows.UI.Xaml.UIElement * element);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Media.VisualTreeHelper),
++        uuid(07bcd176-869f-44a7-8797-2103a4c3e47a)
++    ]
++    interface IVisualTreeHelperStatics2 : IInspectable
++    {
++        HRESULT GetOpenPopups([in] Windows.UI.Xaml.Window * window, [out, retval] Windows.Foundation.Collections.IVectorView<Windows.UI.Xaml.Controls.Primitives.Popup *> * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 8.0),
++        exclusiveto(Windows.UI.Xaml.Media.VisualTreeHelper),
++        uuid(40420d50-ca16-57da-8aac-944c8af577fd)
++    ]
++    interface IVisualTreeHelperStatics3 : IInspectable
++    {
++        HRESULT GetOpenPopupsForXamlRoot([in] Windows.UI.Xaml.XamlRoot * xamlRoot, [out, retval] Windows.Foundation.Collections.IVectorView<Windows.UI.Xaml.Controls.Primitives.Popup *> * *value);
++    }
++
++}
++
++namespace Windows.UI.Xaml.Controls {
++    [
++        composable(Windows.UI.Xaml.Controls.IFlyoutFactory, public, Windows.Foundation.UniversalApiContract, 1.0),
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.UI.Xaml.Controls.IFlyoutStatics, Windows.Foundation.UniversalApiContract, 1.0),
++        threading(both)
++    ]
++    runtimeclass Flyout : Windows.UI.Xaml.Controls.Primitives.FlyoutBase
++    {
++        [default] interface Windows.UI.Xaml.Controls.IFlyout;
++    }
++
++}
++
++namespace Windows.UI.Xaml.Media {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.UI.Xaml.Media.IVisualTreeHelperStatics, Windows.Foundation.UniversalApiContract, 1.0),
++        static(Windows.UI.Xaml.Media.IVisualTreeHelperStatics2, Windows.Foundation.UniversalApiContract, 1.0),
++        static(Windows.UI.Xaml.Media.IVisualTreeHelperStatics3, Windows.Foundation.UniversalApiContract, 8.0),
++        threading(both)
++    ]
++    runtimeclass VisualTreeHelper
++    {
++        [default] interface Windows.UI.Xaml.Media.IVisualTreeHelper;
++    }
++
++}
++
++namespace Windows.UI.Xaml.Controls.Primitives {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass Popup
++    {
++        [default] interface Windows.UI.Xaml.Controls.Primitives.IPopup;
++    }
++
++}
++
