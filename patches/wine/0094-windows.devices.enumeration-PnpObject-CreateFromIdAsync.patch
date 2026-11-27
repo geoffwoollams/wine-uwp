@@ -1,0 +1,148 @@
+Subject: windows.devices.enumeration: PnpObject.CreateFromIdAsync (the object, without properties)
+
+diff --git a/dlls/windows.devices.enumeration/information.c b/dlls/windows.devices.enumeration/information.c
+index 0620975..7b7d983 100644
+--- a/dlls/windows.devices.enumeration/information.c
++++ b/dlls/windows.devices.enumeration/information.c
+@@ -186,7 +186,7 @@ static const char *debugstr_DEVPROPKEY( const DEVPROPKEY *key )
+     return wine_dbg_sprintf( "{%s, %04lx}", debugstr_guid( &key->fmtid ), key->pid );
+ }
+ 
+-static HRESULT create_device_properties( const DEVPROPERTY *props, ULONG len, IMap_HSTRING_IInspectable **map )
++HRESULT create_device_properties( const DEVPROPERTY *props, ULONG len, IMap_HSTRING_IInspectable **map )
+ {
+     static const WCHAR *propertyset_name = RuntimeClass_Windows_Foundation_Collections_PropertySet;
+     static const WCHAR *propertyvalue_name = RuntimeClass_Windows_Foundation_PropertyValue;
+diff --git a/dlls/windows.devices.enumeration/pnp.c b/dlls/windows.devices.enumeration/pnp.c
+index 1a7621c..898f443 100644
+--- a/dlls/windows.devices.enumeration/pnp.c
++++ b/dlls/windows.devices.enumeration/pnp.c
+@@ -88,12 +88,113 @@ static const struct IActivationFactoryVtbl factory_vtbl =
+ 
+ DEFINE_IINSPECTABLE( pnp, IPnpObjectStatics, struct pnp_statics, IActivationFactory_iface )
+ 
++/* ---- PnpObject: its type and id; no properties are known (Minecraft asks for this PC's own device
++ * container, {00000000-0000-0000-FFFF-FFFFFFFFFFFF}) ---- */
++struct pnp_object
++{
++    IPnpObject IPnpObject_iface;
++    LONG ref;
++    PnpObjectType type;
++    HSTRING id;
++    IMap_HSTRING_IInspectable *properties;
++};
++
++static inline struct pnp_object *impl_from_IPnpObject( IPnpObject *iface )
++{
++    return CONTAINING_RECORD( iface, struct pnp_object, IPnpObject_iface );
++}
++
++static HRESULT WINAPI object_QueryInterface( IPnpObject *iface, REFIID iid, void **out )
++{
++    struct pnp_object *impl = impl_from_IPnpObject( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IPnpObject ))
++    {
++        InterlockedIncrement( &impl->ref );
++        *out = iface;
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI object_AddRef( IPnpObject *iface ) { return InterlockedIncrement( &impl_from_IPnpObject( iface )->ref ); }
++static ULONG WINAPI object_Release( IPnpObject *iface )
++{
++    struct pnp_object *impl = impl_from_IPnpObject( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        WindowsDeleteString( impl->id );
++        IMap_HSTRING_IInspectable_Release( impl->properties );
++        free( impl );
++    }
++    return ref;
++}
++static HRESULT WINAPI object_GetIids( IPnpObject *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI object_GetRuntimeClassName( IPnpObject *iface, HSTRING *name )
++{
++    return WindowsCreateString( L"Windows.Devices.Enumeration.Pnp.PnpObject", 41, name );
++}
++static HRESULT WINAPI object_GetTrustLevel( IPnpObject *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI object_get_Type( IPnpObject *iface, PnpObjectType *value )
++{
++    *value = impl_from_IPnpObject( iface )->type;
++    return S_OK;
++}
++static HRESULT WINAPI object_get_Id( IPnpObject *iface, HSTRING *value )
++{
++    return WindowsDuplicateString( impl_from_IPnpObject( iface )->id, value );
++}
++static HRESULT WINAPI object_get_Properties( IPnpObject *iface, IMapView_HSTRING_IInspectable **value )
++{
++    return IMap_HSTRING_IInspectable_GetView( impl_from_IPnpObject( iface )->properties, value );
++}
++static HRESULT WINAPI object_Update( IPnpObject *iface, IPnpObjectUpdate *update )
++{
++    FIXME( "iface %p, update %p stub!\n", iface, update );
++    return S_OK;
++}
++static const struct IPnpObjectVtbl object_vtbl =
++{
++    object_QueryInterface, object_AddRef, object_Release,
++    object_GetIids, object_GetRuntimeClassName, object_GetTrustLevel,
++    object_get_Type, object_get_Id, object_get_Properties, object_Update,
++};
++
++static HRESULT create_from_id_async( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
++{
++    if (!called_async) return STATUS_PENDING;
++    IUnknown_AddRef( param );
++    result->vt = VT_UNKNOWN;
++    result->punkVal = param;
++    return S_OK;
++}
++
+ static HRESULT WINAPI pnp_CreateFromIdAsync( IPnpObjectStatics *iface, PnpObjectType type, HSTRING id,
+                                              IIterable_HSTRING *properties, IAsyncOperation_PnpObject **value )
+ {
+-    FIXME( "iface %p, type %d, id %s, properties %p stub!\n", iface, type, debugstr_hstring(id), properties );
+-    *value = NULL;
+-    return E_NOTIMPL;
++    struct pnp_object *impl;
++    HRESULT hr;
++
++    FIXME( "iface %p, type %d, id %s, properties %p: no properties.\n", iface, type, debugstr_hstring(id), properties );
++
++    if (!value) return E_POINTER;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IPnpObject_iface.lpVtbl = &object_vtbl;
++    impl->ref = 1;
++    impl->type = type;
++    if (FAILED(hr = WindowsDuplicateString( id, &impl->id )) || FAILED(hr = create_device_properties( NULL, 0, &impl->properties )))
++    {
++        WindowsDeleteString( impl->id );
++        free( impl );
++        return hr;
++    }
++    hr = async_operation_inspectable_create( &IID_IAsyncOperation_PnpObject, (IUnknown *)iface, (IUnknown *)&impl->IPnpObject_iface,
++                                             create_from_id_async, (IAsyncOperation_IInspectable **)value );
++    IPnpObject_Release( &impl->IPnpObject_iface );
++    return hr;
+ }
+ 
+ /* an empty PnpObjectCollection */
+diff --git a/dlls/windows.devices.enumeration/private.h b/dlls/windows.devices.enumeration/private.h
+index e360375..7bf3844 100644
+--- a/dlls/windows.devices.enumeration/private.h
++++ b/dlls/windows.devices.enumeration/private.h
+@@ -58,6 +58,7 @@ struct vector_iids
+ extern IActivationFactory *device_access_factory;
+ extern IActivationFactory *pnp_object_factory;
+ 
++HRESULT create_device_properties( const DEVPROPERTY *props, ULONG len, IMap_HSTRING_IInspectable **map );
+ HRESULT typed_event_handlers_append( struct list *list, ITypedEventHandler_IInspectable_IInspectable *handler, EventRegistrationToken *token );
+ HRESULT typed_event_handlers_remove( struct list *list, EventRegistrationToken *token );
+ HRESULT typed_event_handlers_notify( struct list *list, IInspectable *sender, IInspectable *args );

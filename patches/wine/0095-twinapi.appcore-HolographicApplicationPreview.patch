@@ -1,0 +1,158 @@
+Subject: twinapi.appcore: HolographicApplicationPreview (never on a holographic display)
+
+diff --git a/dlls/twinapi.appcore/Makefile.in b/dlls/twinapi.appcore/Makefile.in
+index ed91354..9a030b9 100644
+--- a/dlls/twinapi.appcore/Makefile.in
++++ b/dlls/twinapi.appcore/Makefile.in
+@@ -38,6 +38,7 @@ SOURCES = \
+ 	pointer_visualization.c \
+ 	resource_context.c \
+ 	hardware_identification.c \
++	holographic.c \
+ 	input_capabilities.c \
+ 	main.c \
+ 	manifest.c
+diff --git a/dlls/twinapi.appcore/holographic.c b/dlls/twinapi.appcore/holographic.c
+new file mode 100644
+index 0000000..1173dc8
+--- /dev/null
++++ b/dlls/twinapi.appcore/holographic.c
+@@ -0,0 +1,98 @@
++/* WinRT Windows.ApplicationModel.Preview.Holographic.HolographicApplicationPreview (hand-declared)
++ *
++ * There is no Mixed Reality headset: the app is never shown on one, nor activated for one.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
++
++static const GUID IID_IHolographicApplicationPreviewStatics_local =
++    { 0xfe038691, 0x2a3a, 0x45a9, { 0xa2, 0x08, 0x7b, 0xed, 0x69, 0x19, 0x19, 0xf3 } };
++
++struct holographic
++{
++    IActivationFactory IActivationFactory_iface;
++    struct { const void *const *lpVtbl; } statics;
++};
++
++static struct holographic holographic;
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s.\n", iface, debugstr_guid( iid ) );
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        *out = &holographic.IActivationFactory_iface;
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_IHolographicApplicationPreviewStatics_local ))
++    {
++        *out = &holographic.statics;
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance ) { return E_NOTIMPL; }
++static const IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface, factory_AddRef, factory_Release,
++    factory_GetIids, factory_GetRuntimeClassName, factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++static HRESULT WINAPI statics_QueryInterface( void *iface, REFIID iid, void **out )
++{
++    return factory_QueryInterface( &holographic.IActivationFactory_iface, iid, out );
++}
++static ULONG WINAPI statics_AddRef( void *iface ) { return 2; }
++static ULONG WINAPI statics_Release( void *iface ) { return 1; }
++static HRESULT WINAPI statics_GetIids( void *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI statics_GetRuntimeClassName( void *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI statics_GetTrustLevel( void *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI statics_IsCurrentViewPresentedOnHolographicDisplay( void *iface, boolean *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = FALSE;
++    return S_OK;
++}
++static HRESULT WINAPI statics_IsHolographicActivation( void *iface, IInspectable *args, boolean *value )
++{
++    TRACE( "iface %p, args %p, value %p.\n", iface, args, value );
++    if (!value) return E_POINTER;
++    *value = FALSE;
++    return S_OK;
++}
++static const void *const statics_vtbl[] =
++{
++    statics_QueryInterface, statics_AddRef, statics_Release,
++    statics_GetIids, statics_GetRuntimeClassName, statics_GetTrustLevel,
++    statics_IsCurrentViewPresentedOnHolographicDisplay, statics_IsHolographicActivation,
++};
++
++static struct holographic holographic = { {&factory_vtbl}, {statics_vtbl} };
++
++IActivationFactory *holographic_factory = &holographic.IActivationFactory_iface;
+diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
+index 15077b1..99757a8 100644
+--- a/dlls/twinapi.appcore/main.c
++++ b/dlls/twinapi.appcore/main.c
+@@ -152,6 +152,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( message_dialog_factory, &IID_IActivationFactory, (void **)factory );
+     }
+ 
++    else if (!wcscmp( buffer, L"Windows.ApplicationModel.Preview.Holographic.HolographicApplicationPreview" ))
++        IActivationFactory_QueryInterface( holographic_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, L"Windows.ApplicationModel.Resources.Core.ResourceContext" ))
+         IActivationFactory_QueryInterface( resource_context_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, L"Windows.System.Profile.HardwareIdentification" ))
+diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
+index 8c6aa4c..2264b32 100644
+--- a/dlls/twinapi.appcore/private.h
++++ b/dlls/twinapi.appcore/private.h
+@@ -78,6 +78,7 @@ extern IActivationFactory *diagnostics_settings_factory;
+ extern IActivationFactory *clipboard_factory;
+ extern IActivationFactory *api_information_factory;
+ extern IActivationFactory *resource_context_factory;
++extern IActivationFactory *holographic_factory;
+ extern IActivationFactory *web_token_manager_factory, *web_token_request_factory, *web_account_provider_factory, *user_picker_factory, *system_user_factory, *launcher_factory, *web_account_factory, *web_token_response_factory, *thread_pool_timer_factory, *user_statics_factory, *store_context_real_factory, *message_websocket_factory, *store_context_factory, *logging_options_factory, *logging_fields_factory, *push_manager_factory, *logging_channel_factory, *loggingchanneloptions_factory, *loggingactivity_factory, *loggingsession_factory;
+ extern IActivationFactory *async_causality_tracer_factory;   /* causality.c */
+ extern IActivationFactory *mouse_device_factory;   /* mouse.c */
+diff --git a/dlls/twinapi.appcore/twinapi.appcore.rgs b/dlls/twinapi.appcore/twinapi.appcore.rgs
+index bbcd3dc..e775566 100644
+--- a/dlls/twinapi.appcore/twinapi.appcore.rgs
++++ b/dlls/twinapi.appcore/twinapi.appcore.rgs
+@@ -92,6 +92,10 @@ HKLM
+                     {
+                         val 'DllPath' = s '%MODULE%'
+                     }
++                    ForceRemove Windows.ApplicationModel.Preview.Holographic.HolographicApplicationPreview
++                    {
++                        val 'DllPath' = s '%MODULE%'
++                    }
+                     ForceRemove Windows.ApplicationModel.Resources.Core.ResourceContext
+                     {
+                         val 'DllPath' = s '%MODULE%'
