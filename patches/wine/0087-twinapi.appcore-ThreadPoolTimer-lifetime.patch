@@ -1,0 +1,108 @@
+Subject: twinapi.appcore: ThreadPoolTimer keeps a pending timer alive and never waits on its own callback
+
+diff --git a/dlls/twinapi.appcore/thread_pool_timer.c b/dlls/twinapi.appcore/thread_pool_timer.c
+index 2e4328d..6130c62 100644
+--- a/dlls/twinapi.appcore/thread_pool_timer.c
++++ b/dlls/twinapi.appcore/thread_pool_timer.c
+@@ -10,8 +10,19 @@ struct timer_obj
+     IUnknown *handler;
+     INT64 period, delay;
+     HANDLE queue_timer;
++    BOOL periodic;
++    LONG armed;          /* holds the pending timer's own reference until it fires or is cancelled */
+ };
+ 
++/* set on a thread while it runs a timer's handler: a cancel from there mustn't wait for itself */
++static DWORD in_callback_tls = TLS_OUT_OF_INDEXES;
++static INIT_ONCE tls_once = INIT_ONCE_STATIC_INIT;
++static BOOL CALLBACK init_tls( INIT_ONCE *once, void *param, void **context )
++{
++    in_callback_tls = TlsAlloc();
++    return TRUE;
++}
++
+ static const GUID iid_timer = {0x594ebe78,0x55ea,0x4a88,{0xa5,0x0d,0x34,0x02,0xae,0x1f,0x9c,0xf2}};
+ static const GUID iid_timer_statics = {0x1a8a9d02,0xe482,0x461b,{0xb8,0xc7,0x8e,0xfa,0xd1,0xcc,0xe5,0x90}};
+ 
+@@ -37,7 +48,7 @@ static ULONG WINAPI timer_Release(struct timer_obj *t)
+     ULONG ref = InterlockedDecrement(&t->ref);
+     if (!ref)
+     {
+-        if (t->queue_timer) DeleteTimerQueueTimer(NULL, t->queue_timer, INVALID_HANDLE_VALUE);
++        /* the last reference goes only after the timer fired or was cancelled, so it is no longer queued */
+         if (t->handler) IUnknown_Release(t->handler);
+         free(t);
+     }
+@@ -48,10 +59,19 @@ static HRESULT WINAPI timer_GetRuntimeClassName(struct timer_obj *t, HSTRING *n)
+ static HRESULT WINAPI timer_GetTrustLevel(struct timer_obj *t, TrustLevel *l) { *l = BaseTrust; return S_OK; }
+ static HRESULT WINAPI timer_get_Period(struct timer_obj *t, INT64 *v) { *v = t->period; return S_OK; }
+ static HRESULT WINAPI timer_get_Delay(struct timer_obj *t, INT64 *v) { *v = t->delay; return S_OK; }
++/* the queued timer is gone: delete it without waiting, and drop the reference it held */
++static void timer_disarm(struct timer_obj *t, BOOL wait)
++{
++    HANDLE queue_timer = InterlockedExchangePointer(&t->queue_timer, NULL);
++    if (queue_timer) DeleteTimerQueueTimer(NULL, queue_timer, wait ? INVALID_HANDLE_VALUE : NULL);
++    timer_Release(t);
++}
++
+ static HRESULT WINAPI timer_Cancel(struct timer_obj *t)
+ {
+     TRACE("timer %p cancel.\n", t);
+-    if (t->queue_timer) { DeleteTimerQueueTimer(NULL, t->queue_timer, NULL); t->queue_timer = NULL; }
++    /* wait for a handler that is running, unless this is it (or another timer's) */
++    if (InterlockedExchange(&t->armed, 0)) timer_disarm(t, !TlsGetValue(in_callback_tls));
+     return S_OK;
+ }
+ static const void *const timer_vtbl[] = { timer_QI, timer_AddRef, timer_Release, timer_GetIids, timer_GetRuntimeClassName,
+@@ -60,9 +80,19 @@ static const void *const timer_vtbl[] = { timer_QI, timer_AddRef, timer_Release,
+ static VOID CALLBACK timer_cb(void *ctx, BOOLEAN fired)
+ {
+     struct timer_obj *t = ctx;
+-    InterlockedIncrement(&t->ref);
+-    ((struct handler_vtbl *)*(void **)t->handler)->Invoke(t->handler, t);
+-    timer_Release(t);
++
++    TlsSetValue(in_callback_tls, (void *)1);
++    if (t->periodic)
++    {
++        /* a cancel waits for this to finish, so the timer is alive while it runs */
++        if (t->armed) ((struct handler_vtbl *)*(void **)t->handler)->Invoke(t->handler, t);
++    }
++    else if (InterlockedExchange(&t->armed, 0))
++    {
++        ((struct handler_vtbl *)*(void **)t->handler)->Invoke(t->handler, t);
++        timer_disarm(t, FALSE);
++    }
++    TlsSetValue(in_callback_tls, NULL);
+ }
+ 
+ static HRESULT create_timer(void *handler, INT64 period, INT64 delay, BOOL periodic, void **out)
+@@ -70,9 +100,13 @@ static HRESULT create_timer(void *handler, INT64 period, INT64 delay, BOOL perio
+     struct timer_obj *t;
+     DWORD due, per;
+ 
++    InitOnceExecuteOnce(&tls_once, init_tls, NULL, NULL);
++    if (!handler) return E_POINTER;
+     if (!(t = calloc(1, sizeof(*t)))) return E_OUTOFMEMORY;
+     t->lpVtbl = timer_vtbl;
+-    t->ref = 1;
++    t->ref = 2;          /* the app's, and the pending timer's own (as on Windows, releasing a timer doesn't cancel it) */
++    t->armed = 1;
++    t->periodic = periodic;
+     t->period = period;
+     t->delay = delay;
+     t->handler = handler;
+@@ -82,10 +116,11 @@ static HRESULT create_timer(void *handler, INT64 period, INT64 delay, BOOL perio
+     TRACE("timer %p due %lu ms period %lu ms.\n", t, due, per);
+     if (!CreateTimerQueueTimer(&t->queue_timer, NULL, timer_cb, t, due, per, WT_EXECUTEDEFAULT))
+     {
++        HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
++        t->ref = 1;
+         timer_Release(t);
+-        return HRESULT_FROM_WIN32(GetLastError());
++        return hr;
+     }
+-    /* the queue keeps a reference through ctx; released when the object is released */
+     *out = t;
+     return S_OK;
+ }
