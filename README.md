@@ -315,7 +315,8 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 relative paths in StorageFolder.GetFileAsync and the like, 0102-0105 for Mahjong: AppInfo,
                 DateTimeFormatter, KeyRoutedEventArgs.OriginalKey, and a title bar for apps launched windowed, 0106-0108
                 for Wordament: Store and user vectors answer only their own interfaces, Xbox Live hosts don't
-                resolve in apps (their placeholder token was refused with 401), WINE_UWP_OFFLINE
+                resolve in apps (their placeholder token was refused with 401), WINE_UWP_OFFLINE, 0109
+                CoreWindow.Activated raised again once the app has subscribed (the first click was ignored)
 patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings

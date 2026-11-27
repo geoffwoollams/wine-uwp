@@ -1,0 +1,36 @@
+Subject: twinapi.appcore: raise CoreWindow.Activated again after Activate() returns
+
+diff --git a/dlls/twinapi.appcore/core_gen.c b/dlls/twinapi.appcore/core_gen.c
+index 8c969e0..5977f89 100644
+--- a/dlls/twinapi.appcore/core_gen.c
++++ b/dlls/twinapi.appcore/core_gen.c
+@@ -880,6 +880,7 @@ static HRESULT WINAPI core_window_put_IsInputEnabled(ICoreWindow *iface, boolean
+ }
+ 
+ #define WM_CORE_APPLY_CURSOR (WM_APP + 0x7c3)
++#define WM_CORE_RAISE_ACTIVATED (WM_APP + 0x7c4)   /* Activated again, once the app has subscribed */
+ 
+ /* the system cursor for a CoreCursorType; a Custom cursor (a resource of the app) shows as the arrow */
+ static HCURSOR cursor_for_type(int type)
+@@ -950,6 +951,7 @@ static HRESULT WINAPI core_window_Activate(ICoreWindow *iface)
+         /* tell the app its real size before it sizes its swapchain (the window was sized before it subscribed) */
+         GetClientRect(impl->hwnd, &client);
+         core_input_raise_size(&impl->ICoreWindow_iface, client.right, client.bottom);
++        PostMessageW(impl->hwnd, WM_CORE_RAISE_ACTIVATED, 0, 0);
+     }
+     return S_OK;
+ }
+@@ -2203,6 +2205,13 @@ static LRESULT CALLBACK core_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPA
+     case WM_CORE_SET_FULLSCREEN:
+         apply_fullscreen(hwnd, wparam != 0);
+         return 0;
++    case WM_CORE_RAISE_ACTIVATED:
++        /* Activate() showed and focused the window at once, raising Activated before the app had subscribed (it
++         * subscribes after calling Activate, as activation is asynchronous on Windows); raise it again now. Unity,
++         * for one, ignores input until it has been told its window is active, which lost the first click. */
++        if (window && GetActiveWindow() == hwnd)
++            core_input_raise_activated(&window->ICoreWindow_iface, CoreWindowActivationState_CodeActivated);
++        return 0;
+     case WM_CORE_RAISE_SIZE:
+         if (window)
+         {
