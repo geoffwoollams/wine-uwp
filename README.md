@@ -304,7 +304,8 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
                 Mahjong (not working yet): XAML SizeHelper, PointHelper, Canvas and more FrameworkElement members,
                 SpatialAudio classes, device information, CoreTextEditContext2, 0099 game controllers: a
                 controller's User and its events (Minecraft stopped when a pad was connected), 0100 ResourceManager over
-                the package's resources.pri (.NET Native's resx strings; Mahjong stopped after "Play Offline")
+                the package's resources.pri (.NET Native's resx strings; Mahjong stopped after "Play Offline"), 0101
+                relative paths in StorageFolder.GetFileAsync and the like
 patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings

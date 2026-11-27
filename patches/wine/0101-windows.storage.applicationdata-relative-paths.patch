@@ -1,0 +1,36 @@
+Subject: windows.storage.applicationdata: relative paths in a folder's Get/Create calls
+
+diff --git a/dlls/windows.storage.applicationdata/storagefolder_gen.c b/dlls/windows.storage.applicationdata/storagefolder_gen.c
+index c13f19c..1729dd0 100644
+--- a/dlls/windows.storage.applicationdata/storagefolder_gen.c
++++ b/dlls/windows.storage.applicationdata/storagefolder_gen.c
+@@ -176,15 +176,25 @@ static HRESULT folder_op_create(HRESULT hr, IStorageFolder *result, IAsyncOperat
+     return S_OK;
+ }
+ 
+-/* the subfolder name of this folder, as a host path, or an error */
++/* a name in this folder, as a path. As on Windows it may be a relative path ("user_data\Guest\file.json", with
++ * either separator), but nothing that leaves the folder: no root, drive, "." or ".." part, or empty part. */
+ static HRESULT child_path(struct storage_folder *impl, HSTRING name, WCHAR *path)
+ {
+-    const WCHAR *str = WindowsGetStringRawBuffer(name, NULL);
++    const WCHAR *str = WindowsGetStringRawBuffer(name, NULL), *part;
++    WCHAR *p;
++    SIZE_T len;
+ 
+-    if (!str || !*str || wcschr(str, '\\') || wcschr(str, '/') || !wcscmp(str, L"..") || !wcscmp(str, L"."))
+-        return E_INVALIDARG;
++    if (!str || !*str || wcschr(str, ':')) return E_INVALIDARG;
++    for (part = str; ; part += len + 1)
++    {
++        len = wcscspn(part, L"\\/");
++        if (!len || (len == 1 && part[0] == '.') || (len == 2 && part[0] == '.' && part[1] == '.'))
++            return E_INVALIDARG;
++        if (!part[len]) break;
++    }
+     if (wcslen(impl->path) + wcslen(str) + 2 >= MAX_PATH) return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
+     swprintf(path, MAX_PATH, L"%s\\%s", impl->path, str);
++    for (p = path; *p; p++) if (*p == '/') *p = '\\';
+     return S_OK;
+ }
+ 
