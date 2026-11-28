@@ -1,0 +1,822 @@
+Subject: windows.ui.xaml: OnWindowCreated, LeavingBackground, Window.VisibilityChanged and Windows.UI.Text.FontWeights
+
+Application.OnWindowCreated is called with WindowCreatedEventArgs once the main window exists (in
+IFrameworkView.SetWindow, before OnLaunched), as WinUI does. Xbox Accessories starts its device layer there; with
+it never called, its DeviceManager stayed "NotReady" and its pages waited for device discovery forever.
+
+Application.LeavingBackground is raised after the first activation (OnLaunched) with LeavingBackgroundEventArgs
+whose deferral completes at once. Window.VisibilityChanged (Visible) is raised when Activate shows the window, just
+before Activated. Windows.UI.Text.FontWeights gives the named weights.
+
+diff --git a/dlls/windows.ui.xaml/application.c b/dlls/windows.ui.xaml/application.c
+index a7ef396..45f09fd 100644
+--- a/dlls/windows.ui.xaml/application.c
++++ b/dlls/windows.ui.xaml/application.c
+@@ -40,6 +40,7 @@ struct application
+     IResourceDictionary *resources;
+     struct event_list suspending, resuming, unhandled_exception;
+     struct event_list leaving_background, entered_background;
++    BOOL left_background;             /* LeavingBackground has been raised */
+     FocusVisualKind focus_visual_kind;
+     ApplicationRequiresPointerMode requires_pointer_mode;
+     ApplicationHighContrastAdjustment high_contrast_adjustment;
+@@ -480,6 +481,7 @@ static HRESULT WINAPI application2_put_RequiresPointerMode( IApplication2 *iface
+ static HRESULT WINAPI application2_add_LeavingBackground( IApplication2 *iface, ILeavingBackgroundEventHandler *handler,
+                                                           EventRegistrationToken *token )
+ {
++    TRACE( "iface %p, handler %p.\n", iface, handler );
+     return event_list_add( &impl_from_IApplication2( iface )->leaving_background, (IUnknown *)handler, token );
+ }
+ 
+@@ -605,6 +607,239 @@ static HRESULT application_create( IInspectable *outer, IInspectable **inner, IA
+     return S_OK;
+ }
+ 
++/* LeavingBackground: raised once the app has been launched, as its UI is about to show. Deferrals complete at once
++ * (nothing waits for them: the UI shows regardless). */
++
++struct background_args
++{
++    ILeavingBackgroundEventArgs ILeavingBackgroundEventArgs_iface;
++    IDeferral IDeferral_iface;
++    IClosable IClosable_iface;
++    LONG ref;
++};
++
++static inline struct background_args *impl_from_ILeavingBackgroundEventArgs( ILeavingBackgroundEventArgs *iface )
++{
++    return CONTAINING_RECORD( iface, struct background_args, ILeavingBackgroundEventArgs_iface );
++}
++
++static HRESULT WINAPI background_args_QueryInterface( ILeavingBackgroundEventArgs *iface, REFIID iid, void **out )
++{
++    struct background_args *impl = impl_from_ILeavingBackgroundEventArgs( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_ILeavingBackgroundEventArgs ))
++        *out = &impl->ILeavingBackgroundEventArgs_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI background_args_AddRef( ILeavingBackgroundEventArgs *iface )
++{
++    return InterlockedIncrement( &impl_from_ILeavingBackgroundEventArgs( iface )->ref );
++}
++
++static ULONG WINAPI background_args_Release( ILeavingBackgroundEventArgs *iface )
++{
++    struct background_args *impl = impl_from_ILeavingBackgroundEventArgs( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI background_args_GetIids( ILeavingBackgroundEventArgs *iface, ULONG *count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI background_args_GetRuntimeClassName( ILeavingBackgroundEventArgs *iface, HSTRING *value )
++{
++    const WCHAR *name = RuntimeClass_Windows_ApplicationModel_LeavingBackgroundEventArgs;
++    return WindowsCreateString( name, wcslen( name ), value );
++}
++
++static HRESULT WINAPI background_args_GetTrustLevel( ILeavingBackgroundEventArgs *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI background_args_GetDeferral( ILeavingBackgroundEventArgs *iface, IDeferral **value )
++{
++    struct background_args *impl = impl_from_ILeavingBackgroundEventArgs( iface );
++
++    if (!value) return E_POINTER;
++    *value = &impl->IDeferral_iface;
++    IDeferral_AddRef( *value );
++    return S_OK;
++}
++
++static const struct ILeavingBackgroundEventArgsVtbl background_args_vtbl =
++{
++    background_args_QueryInterface,
++    background_args_AddRef,
++    background_args_Release,
++    background_args_GetIids,
++    background_args_GetRuntimeClassName,
++    background_args_GetTrustLevel,
++    background_args_GetDeferral,
++};
++
++/* the deferral: a Windows.Foundation.Deferral of its own (it keeps the arguments alive) */
++static inline struct background_args *impl_from_IDeferral( IDeferral *iface )
++{
++    return CONTAINING_RECORD( iface, struct background_args, IDeferral_iface );
++}
++
++static HRESULT WINAPI deferral_QueryInterface( IDeferral *iface, REFIID iid, void **out )
++{
++    struct background_args *impl = impl_from_IDeferral( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IDeferral ))
++        *out = &impl->IDeferral_iface;
++    else if (IsEqualGUID( iid, &IID_IClosable ))
++        *out = &impl->IClosable_iface;
++    else
++    {
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI deferral_AddRef( IDeferral *iface )
++{
++    return background_args_AddRef( &impl_from_IDeferral( iface )->ILeavingBackgroundEventArgs_iface );
++}
++
++static ULONG WINAPI deferral_Release( IDeferral *iface )
++{
++    return background_args_Release( &impl_from_IDeferral( iface )->ILeavingBackgroundEventArgs_iface );
++}
++
++static HRESULT WINAPI deferral_GetIids( IDeferral *iface, ULONG *count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI deferral_GetRuntimeClassName( IDeferral *iface, HSTRING *value )
++{
++    const WCHAR *name = RuntimeClass_Windows_Foundation_Deferral;
++    return WindowsCreateString( name, wcslen( name ), value );
++}
++
++static HRESULT WINAPI deferral_GetTrustLevel( IDeferral *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI deferral_Complete( IDeferral *iface )
++{
++    TRACE( "iface %p.\n", iface );
++    return S_OK;
++}
++
++static const struct IDeferralVtbl deferral_vtbl =
++{
++    deferral_QueryInterface,
++    deferral_AddRef,
++    deferral_Release,
++    deferral_GetIids,
++    deferral_GetRuntimeClassName,
++    deferral_GetTrustLevel,
++    deferral_Complete,
++};
++
++static inline struct background_args *impl_from_IClosable( IClosable *iface )
++{
++    return CONTAINING_RECORD( iface, struct background_args, IClosable_iface );
++}
++
++static HRESULT WINAPI deferral_closable_QueryInterface( IClosable *iface, REFIID iid, void **out )
++{
++    return deferral_QueryInterface( &impl_from_IClosable( iface )->IDeferral_iface, iid, out );
++}
++
++static ULONG WINAPI deferral_closable_AddRef( IClosable *iface )
++{
++    return deferral_AddRef( &impl_from_IClosable( iface )->IDeferral_iface );
++}
++
++static ULONG WINAPI deferral_closable_Release( IClosable *iface )
++{
++    return deferral_Release( &impl_from_IClosable( iface )->IDeferral_iface );
++}
++
++static HRESULT WINAPI deferral_closable_GetIids( IClosable *iface, ULONG *count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI deferral_closable_GetRuntimeClassName( IClosable *iface, HSTRING *value )
++{
++    return deferral_GetRuntimeClassName( &impl_from_IClosable( iface )->IDeferral_iface, value );
++}
++
++static HRESULT WINAPI deferral_closable_GetTrustLevel( IClosable *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI deferral_closable_Close( IClosable *iface )
++{
++    return S_OK;
++}
++
++static const struct IClosableVtbl deferral_closable_vtbl =
++{
++    deferral_closable_QueryInterface,
++    deferral_closable_AddRef,
++    deferral_closable_Release,
++    deferral_closable_GetIids,
++    deferral_closable_GetRuntimeClassName,
++    deferral_closable_GetTrustLevel,
++    deferral_closable_Close,
++};
++
++static void raise_leaving_background( struct application *app )
++{
++    struct background_args *args;
++    IUnknown **handlers;
++    UINT32 i, count = app->leaving_background.count;
++    HRESULT hr;
++
++    TRACE( "%u handler slots.\n", count );
++    if (!count || !(args = calloc( 1, sizeof(*args) ))) return;
++    args->ILeavingBackgroundEventArgs_iface.lpVtbl = &background_args_vtbl;
++    args->IDeferral_iface.lpVtbl = &deferral_vtbl;
++    args->IClosable_iface.lpVtbl = &deferral_closable_vtbl;
++    args->ref = 1;
++    if ((handlers = calloc( count, sizeof(*handlers) )))
++    {
++        for (i = 0; i < count; i++) if ((handlers[i] = app->leaving_background.handlers[i])) IUnknown_AddRef( handlers[i] );
++        for (i = 0; i < count; i++)
++        {
++            if (!handlers[i]) continue;
++            hr = ILeavingBackgroundEventHandler_Invoke( (ILeavingBackgroundEventHandler *)handlers[i], app->outer,
++                                                        &args->ILeavingBackgroundEventArgs_iface );
++            if (FAILED(hr)) WARN( "LeavingBackground handler %p failed, hr %#lx.\n", handlers[i], hr );
++        }
++        for (i = 0; i < count; i++) if (handlers[i]) IUnknown_Release( handlers[i] );
++        free( handlers );
++    }
++    ILeavingBackgroundEventArgs_Release( &args->ILeavingBackgroundEventArgs_iface );
++}
++
+ /* the CoreApplicationView Activated handler: raises OnLaunched / OnActivated on the app */
+ 
+ struct activated_handler
+@@ -666,6 +901,14 @@ static HRESULT WINAPI activated_Invoke( ITypedEventHandler_CoreApplicationView_I
+     }
+     IApplicationOverrides_Release( overrides );
+     if (FAILED(hr)) ERR( "activation handler failed, hr %#lx.\n", hr );
++    /* the first activation brings the app out of the background, as its window shows */
++    if (current_app && !current_app->left_background)
++    {
++        current_app->left_background = TRUE;
++        IInspectable_AddRef( current_app->outer );
++        raise_leaving_background( current_app );
++        IInspectable_Release( current_app->outer );
++    }
+     return S_OK;
+ }
+ 
+@@ -851,15 +1094,123 @@ static HRESULT WINAPI view_Initialize( IFrameworkView *iface, ICoreApplicationVi
+     return hr;
+ }
+ 
++/* WindowCreatedEventArgs, for OnWindowCreated */
++
++struct window_created_args
++{
++    IWindowCreatedEventArgs IWindowCreatedEventArgs_iface;
++    LONG ref;
++    IWindow *window;
++};
++
++static inline struct window_created_args *impl_from_IWindowCreatedEventArgs( IWindowCreatedEventArgs *iface )
++{
++    return CONTAINING_RECORD( iface, struct window_created_args, IWindowCreatedEventArgs_iface );
++}
++
++static HRESULT WINAPI window_created_args_QueryInterface( IWindowCreatedEventArgs *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IWindowCreatedEventArgs ))
++    {
++        *out = iface;
++        IWindowCreatedEventArgs_AddRef( iface );
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI window_created_args_AddRef( IWindowCreatedEventArgs *iface )
++{
++    return InterlockedIncrement( &impl_from_IWindowCreatedEventArgs( iface )->ref );
++}
++
++static ULONG WINAPI window_created_args_Release( IWindowCreatedEventArgs *iface )
++{
++    struct window_created_args *impl = impl_from_IWindowCreatedEventArgs( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        IWindow_Release( impl->window );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI window_created_args_GetIids( IWindowCreatedEventArgs *iface, ULONG *count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI window_created_args_GetRuntimeClassName( IWindowCreatedEventArgs *iface, HSTRING *value )
++{
++    const WCHAR *name = RuntimeClass_Windows_UI_Xaml_WindowCreatedEventArgs;
++    return WindowsCreateString( name, wcslen( name ), value );
++}
++
++static HRESULT WINAPI window_created_args_GetTrustLevel( IWindowCreatedEventArgs *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI window_created_args_get_Window( IWindowCreatedEventArgs *iface, IWindow **value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IWindowCreatedEventArgs( iface )->window;
++    IWindow_AddRef( *value );
++    return S_OK;
++}
++
++static const struct IWindowCreatedEventArgsVtbl window_created_args_vtbl =
++{
++    window_created_args_QueryInterface,
++    window_created_args_AddRef,
++    window_created_args_Release,
++    window_created_args_GetIids,
++    window_created_args_GetRuntimeClassName,
++    window_created_args_GetTrustLevel,
++    window_created_args_get_Window,
++};
++
++/* Application.OnWindowCreated: once the app's main window exists, before it is launched */
++static void raise_window_created(void)
++{
++    IApplicationOverrides *overrides = application_get_overrides();
++    struct window_created_args *args;
++    IWindow *window;
++    HRESULT hr;
++
++    if (!overrides) return;
++    if ((window = window_current()) && (args = calloc( 1, sizeof(*args) )))
++    {
++        args->IWindowCreatedEventArgs_iface.lpVtbl = &window_created_args_vtbl;
++        args->ref = 1;
++        args->window = window;
++        TRACE( "OnWindowCreated\n" );
++        hr = IApplicationOverrides_OnWindowCreated( overrides, &args->IWindowCreatedEventArgs_iface );
++        if (FAILED(hr)) WARN( "OnWindowCreated failed, hr %#lx.\n", hr );
++        IWindowCreatedEventArgs_Release( &args->IWindowCreatedEventArgs_iface );
++    }
++    else if (window) IWindow_Release( window );
++    IApplicationOverrides_Release( overrides );
++}
++
+ static HRESULT WINAPI view_SetWindow( IFrameworkView *iface, ICoreWindow *window )
+ {
+     struct framework_view *impl = impl_from_IFrameworkView( iface );
++    HRESULT hr;
+ 
+     TRACE( "iface %p, window %p.\n", iface, window );
+ 
+     impl->core_window = window;
+     ICoreWindow_AddRef( window );
+-    return window_create_for_core_window( window );
++    if (FAILED(hr = window_create_for_core_window( window ))) return hr;
++    raise_window_created();
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI view_Load( IFrameworkView *iface, HSTRING entry_point )
+diff --git a/dlls/windows.ui.xaml/classes.idl b/dlls/windows.ui.xaml/classes.idl
+index 4a48126..0c95ad1 100644
+--- a/dlls/windows.ui.xaml/classes.idl
++++ b/dlls/windows.ui.xaml/classes.idl
+@@ -40,6 +40,10 @@ namespace Windows.UI.Xaml {
+     runtimeclass Window;
+ }
+ 
++namespace Windows.UI.Text {
++    runtimeclass FontWeights;
++}
++
+ namespace Windows.UI.Xaml.Automation {
+     runtimeclass AutomationProperties;
+ }
+diff --git a/dlls/windows.ui.xaml/font_family.c b/dlls/windows.ui.xaml/font_family.c
+index 73adaae..06814a3 100644
+--- a/dlls/windows.ui.xaml/font_family.c
++++ b/dlls/windows.ui.xaml/font_family.c
+@@ -310,3 +310,103 @@ static const struct IFontFamilyStatics2Vtbl family_statics2_vtbl =
+ static struct family_statics family_statics = { {&factory_vtbl}, {&family_factory_vtbl}, {&family_statics2_vtbl} };
+ 
+ IActivationFactory *font_family_factory = &family_statics.IActivationFactory_iface;
++
++/* Windows.UI.Text.FontWeights: the named weights */
++
++struct weights_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IFontWeightsStatics IFontWeightsStatics_iface;
++};
++
++static inline struct weights_statics *weights_from_factory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct weights_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI weights_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct weights_statics *impl = weights_from_factory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IFontWeightsStatics ))
++        *out = &impl->IFontWeightsStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI weights_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    /* FontWeights only has static properties */
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl weights_factory_vtbl =
++{
++    weights_factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    weights_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( weights, IFontWeightsStatics, struct weights_statics, IActivationFactory_iface )
++
++#define FONT_WEIGHT( name, weight ) \
++static HRESULT WINAPI weights_get_##name( IFontWeightsStatics *iface, FontWeight *value ) \
++{ \
++    if (!value) return E_POINTER; \
++    value->Weight = weight; \
++    return S_OK; \
++}
++FONT_WEIGHT( Black, 900 )
++FONT_WEIGHT( Bold, 700 )
++FONT_WEIGHT( ExtraBlack, 950 )
++FONT_WEIGHT( ExtraBold, 800 )
++FONT_WEIGHT( ExtraLight, 200 )
++FONT_WEIGHT( Light, 300 )
++FONT_WEIGHT( Medium, 500 )
++FONT_WEIGHT( Normal, 400 )
++FONT_WEIGHT( SemiBold, 600 )
++FONT_WEIGHT( SemiLight, 350 )
++FONT_WEIGHT( Thin, 100 )
++
++static const struct IFontWeightsStaticsVtbl weights_vtbl =
++{
++    weights_QueryInterface,
++    weights_AddRef,
++    weights_Release,
++    /* IInspectable methods */
++    weights_GetIids,
++    weights_GetRuntimeClassName,
++    weights_GetTrustLevel,
++    /* IFontWeightsStatics methods */
++    weights_get_Black,
++    weights_get_Bold,
++    weights_get_ExtraBlack,
++    weights_get_ExtraBold,
++    weights_get_ExtraLight,
++    weights_get_Light,
++    weights_get_Medium,
++    weights_get_Normal,
++    weights_get_SemiBold,
++    weights_get_SemiLight,
++    weights_get_Thin,
++};
++
++static struct weights_statics weights_statics = { {&weights_factory_vtbl}, {&weights_vtbl} };
++
++IActivationFactory *font_weights_factory = &weights_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/main.c b/dlls/windows.ui.xaml/main.c
+index e214a0c..c453902 100644
+--- a/dlls/windows.ui.xaml/main.c
++++ b/dlls/windows.ui.xaml/main.c
+@@ -126,6 +126,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( page_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Frame ))
+         IActivationFactory_QueryInterface( frame_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Text_FontWeights ))
++        IActivationFactory_QueryInterface( font_weights_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_FontFamily ))
+         IActivationFactory_QueryInterface( font_family_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Flyout ))
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index 80b314f..d5da5a1 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -131,6 +131,8 @@ extern IActivationFactory *frame_factory;
+ extern IActivationFactory *dispatcher_timer_factory;
+ extern IActivationFactory *flyout_factory;
+ extern IActivationFactory *font_family_factory;
++extern IActivationFactory *font_weights_factory;
++IWindow *window_current(void);   /* window.c: referenced, or NULL */
+ WCHAR *uid_string( const WCHAR *uid, const WCHAR *property );   /* uid.c: x:Uid's localized value, or NULL */
+ HRESULT font_family_create( const WCHAR *name, IFontFamily **value );
+ void element_set_font_family( struct xaml_element *element, const WCHAR *source );
+diff --git a/dlls/windows.ui.xaml/window.c b/dlls/windows.ui.xaml/window.c
+index 0fb020e..2c31243 100644
+--- a/dlls/windows.ui.xaml/window.c
++++ b/dlls/windows.ui.xaml/window.c
+@@ -39,6 +39,7 @@ struct xaml_window
+     struct event_list activated, closed, size_changed, visibility_changed;
+     /* popups over the content, the topmost last (referenced): a ContentDialog's layer, a menu */
+     int activation;                 /* the CoreWindowActivationState last raised, or -1 */
++    BOOL visible;                   /* VisibilityChanged has said it is visible */
+     struct xaml_element *popups[8];
+     BOOL modal[8];                  /* a modal popup gets all the input; others what they hit */
+     UINT32 popup_count;
+@@ -436,6 +437,152 @@ static const struct ICoreWindowEventArgsVtbl activated_core_args_vtbl =
+     activated_core_args_put_Handled,
+ };
+ 
++/* Window.VisibilityChanged: VisibilityChangedEventArgs */
++
++struct visibility_args
++{
++    IVisibilityChangedEventArgs IVisibilityChangedEventArgs_iface;
++    ICoreWindowEventArgs ICoreWindowEventArgs_iface;
++    LONG ref;
++    boolean visible;
++    boolean handled;
++};
++
++static inline struct visibility_args *impl_from_IVisibilityChangedEventArgs( IVisibilityChangedEventArgs *iface )
++{
++    return CONTAINING_RECORD( iface, struct visibility_args, IVisibilityChangedEventArgs_iface );
++}
++
++static HRESULT WINAPI visibility_args_QueryInterface( IVisibilityChangedEventArgs *iface, REFIID iid, void **out )
++{
++    struct visibility_args *impl = impl_from_IVisibilityChangedEventArgs( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IVisibilityChangedEventArgs ))
++        *out = &impl->IVisibilityChangedEventArgs_iface;
++    else if (IsEqualGUID( iid, &IID_ICoreWindowEventArgs ))
++        *out = &impl->ICoreWindowEventArgs_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI visibility_args_AddRef( IVisibilityChangedEventArgs *iface )
++{
++    return InterlockedIncrement( &impl_from_IVisibilityChangedEventArgs( iface )->ref );
++}
++
++static ULONG WINAPI visibility_args_Release( IVisibilityChangedEventArgs *iface )
++{
++    struct visibility_args *impl = impl_from_IVisibilityChangedEventArgs( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI visibility_args_GetIids( IVisibilityChangedEventArgs *iface, ULONG *count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI visibility_args_GetRuntimeClassName( IVisibilityChangedEventArgs *iface, HSTRING *value )
++{
++    const WCHAR *name = RuntimeClass_Windows_UI_Core_VisibilityChangedEventArgs;
++    return WindowsCreateString( name, wcslen( name ), value );
++}
++
++static HRESULT WINAPI visibility_args_GetTrustLevel( IVisibilityChangedEventArgs *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI visibility_args_get_Visible( IVisibilityChangedEventArgs *iface, boolean *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IVisibilityChangedEventArgs( iface )->visible;
++    return S_OK;
++}
++
++static const struct IVisibilityChangedEventArgsVtbl visibility_args_vtbl =
++{
++    visibility_args_QueryInterface,
++    visibility_args_AddRef,
++    visibility_args_Release,
++    visibility_args_GetIids,
++    visibility_args_GetRuntimeClassName,
++    visibility_args_GetTrustLevel,
++    visibility_args_get_Visible,
++};
++
++DEFINE_IINSPECTABLE_( visibility_core_args, ICoreWindowEventArgs, struct visibility_args, visibility_from_core_args,
++                      ICoreWindowEventArgs_iface, &impl->IVisibilityChangedEventArgs_iface )
++
++static HRESULT WINAPI visibility_core_args_get_Handled( ICoreWindowEventArgs *iface, boolean *value )
++{
++    if (!value) return E_POINTER;
++    *value = visibility_from_core_args( iface )->handled;
++    return S_OK;
++}
++
++static HRESULT WINAPI visibility_core_args_put_Handled( ICoreWindowEventArgs *iface, boolean value )
++{
++    visibility_from_core_args( iface )->handled = value;
++    return S_OK;
++}
++
++static const struct ICoreWindowEventArgsVtbl visibility_core_args_vtbl =
++{
++    visibility_core_args_QueryInterface,
++    visibility_core_args_AddRef,
++    visibility_core_args_Release,
++    visibility_core_args_GetIids,
++    visibility_core_args_GetRuntimeClassName,
++    visibility_core_args_GetTrustLevel,
++    visibility_core_args_get_Handled,
++    visibility_core_args_put_Handled,
++};
++
++/* raise VisibilityChanged when the window shows or hides */
++static void window_raise_visibility( struct xaml_window *window, BOOL visible )
++{
++    struct visibility_args *args;
++    IUnknown **handlers;
++    UINT32 i, count = window->visibility_changed.count;
++    HRESULT hr;
++
++    if (window->visible == visible) return;
++    window->visible = visible;
++    TRACE( "window %p: visible %d, %u handler slots.\n", window, visible, count );
++    if (!count || !(args = calloc( 1, sizeof(*args) ))) return;
++    args->IVisibilityChangedEventArgs_iface.lpVtbl = &visibility_args_vtbl;
++    args->ICoreWindowEventArgs_iface.lpVtbl = &visibility_core_args_vtbl;
++    args->ref = 1;
++    args->visible = visible;
++    if ((handlers = calloc( count, sizeof(*handlers) )))
++    {
++        for (i = 0; i < count; i++) if ((handlers[i] = window->visibility_changed.handlers[i])) IUnknown_AddRef( handlers[i] );
++        IWindow_AddRef( &window->IWindow_iface );
++        for (i = 0; i < count; i++)
++        {
++            if (!handlers[i]) continue;
++            hr = IWindowVisibilityChangedEventHandler_Invoke( (IWindowVisibilityChangedEventHandler *)handlers[i],
++                                                              (IInspectable *)&window->IWindow_iface,
++                                                              &args->IVisibilityChangedEventArgs_iface );
++            if (FAILED(hr)) WARN( "VisibilityChanged handler %p failed, hr %#lx.\n", handlers[i], hr );
++        }
++        for (i = 0; i < count; i++) if (handlers[i]) IUnknown_Release( handlers[i] );
++        IWindow_Release( &window->IWindow_iface );
++        free( handlers );
++    }
++    IVisibilityChangedEventArgs_Release( &args->IVisibilityChangedEventArgs_iface );
++}
++
+ /* raise Activated when the window's activation changes */
+ static void window_raise_activated( struct xaml_window *window, CoreWindowActivationState state )
+ {
+@@ -481,7 +628,9 @@ static LRESULT CALLBACK window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM
+     case WM_ERASEBKGND:
+         return 1;
+     case WM_XAML_ACTIVATED:
+-        /* Activate() activated the window, even if the desktop (a locked screen, say) didn't bring it forward */
++        /* Activate() showed and activated the window, even if the desktop (a locked screen, say) didn't bring it
++         * forward */
++        window_raise_visibility( window, TRUE );
+         window_raise_activated( window, CoreWindowActivationState_CodeActivated );
+         return 0;
+     case WM_ACTIVATE:
+@@ -701,7 +850,7 @@ static HRESULT WINAPI window_remove_SizeChanged( IWindow *iface, EventRegistrati
+ 
+ static HRESULT WINAPI window_add_VisibilityChanged( IWindow *iface, IWindowVisibilityChangedEventHandler *handler, EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, handler %p: handler is kept but never raised.\n", iface, handler );
++    TRACE( "iface %p, handler %p.\n", iface, handler );
+     return event_list_add( &impl_from_IWindow( iface )->visibility_changed, (IUnknown *)handler, token );
+ }
+ 
+@@ -768,6 +917,14 @@ static const struct IWindowVtbl window_vtbl =
+ };
+ 
+ 
++/* the XAML window, referenced, or NULL */
++IWindow *window_current(void)
++{
++    if (!current_window) return NULL;
++    IWindow_AddRef( &current_window->IWindow_iface );
++    return &current_window->IWindow_iface;
++}
++
+ HRESULT window_create_for_core_window( ICoreWindow *core_window )
+ {
+     struct xaml_window *impl;
+diff --git a/include/windows.ui.xaml.idl b/include/windows.ui.xaml.idl
+index 7bb71ce..1f08dec 100644
+--- a/include/windows.ui.xaml.idl
++++ b/include/windows.ui.xaml.idl
+@@ -15558,3 +15558,58 @@ namespace Windows.UI.Xaml.Media {
+ 
+ }
+ 
++
++/* Xbox Accessories, generated by scripts/winmd2idl.py: Windows.UI.Text.FontWeights. */
++
++namespace Windows.UI.Text {
++    runtimeclass FontWeights;
++    interface IFontWeights;
++    interface IFontWeightsStatics;
++}
++
++namespace Windows.UI.Text {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Text.FontWeights),
++        uuid(7880a444-01ab-4997-8517-df822a0c45f1)
++    ]
++    interface IFontWeights : IInspectable
++    {
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Text.FontWeights),
++        uuid(b3b579d5-1ba9-48eb-9dad-c095e8c23ba3)
++    ]
++    interface IFontWeightsStatics : IInspectable
++    {
++        [propget] HRESULT Black([out, retval] Windows.UI.Text.FontWeight *value);
++        [propget] HRESULT Bold([out, retval] Windows.UI.Text.FontWeight *value);
++        [propget] HRESULT ExtraBlack([out, retval] Windows.UI.Text.FontWeight *value);
++        [propget] HRESULT ExtraBold([out, retval] Windows.UI.Text.FontWeight *value);
++        [propget] HRESULT ExtraLight([out, retval] Windows.UI.Text.FontWeight *value);
++        [propget] HRESULT Light([out, retval] Windows.UI.Text.FontWeight *value);
++        [propget] HRESULT Medium([out, retval] Windows.UI.Text.FontWeight *value);
++        [propget] HRESULT Normal([out, retval] Windows.UI.Text.FontWeight *value);
++        [propget] HRESULT SemiBold([out, retval] Windows.UI.Text.FontWeight *value);
++        [propget] HRESULT SemiLight([out, retval] Windows.UI.Text.FontWeight *value);
++        [propget] HRESULT Thin([out, retval] Windows.UI.Text.FontWeight *value);
++    }
++
++}
++
++namespace Windows.UI.Text {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.UI.Text.IFontWeightsStatics, Windows.Foundation.UniversalApiContract, 1.0),
++        threading(both)
++    ]
++    runtimeclass FontWeights
++    {
++        [default] interface Windows.UI.Text.IFontWeights;
++    }
++
++}
++

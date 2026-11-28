@@ -1,0 +1,103 @@
+Subject: windows.gaming.input: Keep custom game controller factory registrations
+
+GameControllerFactoryManager.RegisterCustomFactoryForGipInterface, RegisterCustomFactoryForHardwareId and
+RegisterCustomFactoryForXusbType returned E_NOTIMPL, which stopped Xbox Accessories' device layer from starting.
+The registrations are now kept for the life of the process, as on Windows. Wine has no GIP driver, so no device
+matches a GIP registration. Hardware id and XUSB registrations are kept but not yet given devices: that would
+hand the app's own code the controller to send reports to, which needs its own review first.
+
+diff --git a/dlls/windows.gaming.input/manager.c b/dlls/windows.gaming.input/manager.c
+index 4561892..b3c913a 100644
+--- a/dlls/windows.gaming.input/manager.c
++++ b/dlls/windows.gaming.input/manager.c
+@@ -376,13 +376,53 @@ static const struct IActivationFactoryVtbl factory_vtbl =
+ 
+ DEFINE_IINSPECTABLE( statics, IGameControllerFactoryManagerStatics, struct manager_statics, IActivationFactory_iface )
+ 
++/* Custom factories (apps' own controller classes) are registered for GIP interfaces, hardware ids or XUSB types,
++ * and kept for the life of the process, as on Windows. Wine has no GIP driver, so no device ever matches a GIP
++ * registration. Hardware id and XUSB registrations are kept but not yet given devices: that would hand an app's
++ * own code the controller to send reports to, which needs its own review (Xbox Accessories writes settings and
++ * firmware that way). */
++
++enum custom_kind { CUSTOM_GIP, CUSTOM_HARDWARE_ID, CUSTOM_XUSB };
++
++struct custom_registration
++{
++    struct list entry;
++    enum custom_kind kind;
++    ICustomGameControllerFactory *factory;
++    GUID interface_id;
++    UINT16 vendor_id, product_id;
++    XusbDeviceType xusb_type;
++    XusbDeviceSubtype xusb_subtype;
++};
++
++static struct list custom_registrations = LIST_INIT( custom_registrations );
++
++static HRESULT add_registration( struct custom_registration *reg, ICustomGameControllerFactory *factory )
++{
++    if (!factory)
++    {
++        free( reg );
++        return E_INVALIDARG;
++    }
++    ICustomGameControllerFactory_AddRef( (reg->factory = factory) );
++    EnterCriticalSection( &manager_cs );
++    list_add_tail( &custom_registrations, &reg->entry );
++    LeaveCriticalSection( &manager_cs );
++    return S_OK;
++}
++
+ static HRESULT WINAPI
+ statics_RegisterCustomFactoryForGipInterface( IGameControllerFactoryManagerStatics *iface,
+                                               ICustomGameControllerFactory *factory,
+                                               GUID interface_id )
+ {
+-    FIXME( "iface %p, factory %p, interface_id %s stub!\n", iface, factory, debugstr_guid(&interface_id) );
+-    return E_NOTIMPL;
++    struct custom_registration *reg;
++
++    TRACE( "iface %p, factory %p, interface_id %s: no GIP devices.\n", iface, factory, debugstr_guid(&interface_id) );
++    if (!(reg = calloc( 1, sizeof(*reg) ))) return E_OUTOFMEMORY;
++    reg->kind = CUSTOM_GIP;
++    reg->interface_id = interface_id;
++    return add_registration( reg, factory );
+ }
+ 
+ static HRESULT WINAPI
+@@ -390,8 +430,15 @@ statics_RegisterCustomFactoryForHardwareId( IGameControllerFactoryManagerStatics
+                                             ICustomGameControllerFactory *factory,
+                                             UINT16 vendor_id, UINT16 product_id )
+ {
+-    FIXME( "iface %p, factory %p, vendor_id %u, product_id %u stub!\n", iface, factory, vendor_id, product_id );
+-    return E_NOTIMPL;
++    struct custom_registration *reg;
++
++    FIXME( "iface %p, factory %p, vendor_id %04x, product_id %04x: kept, but given no devices.\n", iface, factory,
++           vendor_id, product_id );
++    if (!(reg = calloc( 1, sizeof(*reg) ))) return E_OUTOFMEMORY;
++    reg->kind = CUSTOM_HARDWARE_ID;
++    reg->vendor_id = vendor_id;
++    reg->product_id = product_id;
++    return add_registration( reg, factory );
+ }
+ 
+ static HRESULT WINAPI
+@@ -399,8 +446,14 @@ statics_RegisterCustomFactoryForXusbType( IGameControllerFactoryManagerStatics *
+                                           ICustomGameControllerFactory *factory,
+                                           XusbDeviceType type, XusbDeviceSubtype subtype )
+ {
+-    FIXME( "iface %p, factory %p, type %d, subtype %d stub!\n", iface, factory, type, subtype );
+-    return E_NOTIMPL;
++    struct custom_registration *reg;
++
++    FIXME( "iface %p, factory %p, type %d, subtype %d: kept, but given no devices.\n", iface, factory, type, subtype );
++    if (!(reg = calloc( 1, sizeof(*reg) ))) return E_OUTOFMEMORY;
++    reg->kind = CUSTOM_XUSB;
++    reg->xusb_type = type;
++    reg->xusb_subtype = subtype;
++    return add_registration( reg, factory );
+ }
+ 
+ static const struct IGameControllerFactoryManagerStaticsVtbl statics_vtbl =
