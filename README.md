@@ -1,6 +1,6 @@
 # wine-uwp
 
-Run unpacked **UWP (Microsoft Store) apps and games** on Linux with a patched Wine 11.22 (development release).
+Run **UWP (Microsoft Store) apps and games** on Linux with a patched Wine 11.22 (development release).
 
 UWP apps don't create a normal Win32 window. They ask Windows for a `CoreApplication`, get a `CoreWindow`, and read their identity, storage, licence and sign-in from WinRT classes that Wine 11.22 mostly lacks. This project adds the missing pieces, without touching the app's files:
 
@@ -10,22 +10,22 @@ UWP apps don't create a normal Win32 window. They ask Windows for a `CoreApplica
 - an offline Xbox sign-in for your Linux user, and an offline Store licence for the app itself (`StoreContext` and the older `CurrentApp`); Xbox Live web requests fail cleanly as "no network", and a local Xbox Live device address lets games create their sessions
 - `MessageDialog` (shown as a small window of its own) and other everyday WinRT classes games ask for
 - a partial `Windows.UI.Xaml`, so simple XAML apps start and draw; see [XAML apps](#xaml-apps)
-- a DXVK `dxgi.dll` with `CreateSwapChainForCoreWindow`, so D3D12 apps can draw into the CoreWindow
+- a DXVK `dxgi.dll` with `CreateSwapChainForCoreWindow`, so D3D12 apps (through vkd3d-proton) and D3D11 apps (through DXVK's `d3d11.dll`) can draw into the CoreWindow
 
 **Tested apps:**
 
 | | App | Status |
 |---|---|---|
+| ✅ | Minecraft for Windows (`Microsoft.MinecraftUWP`, D3D11) | Starts and plays offline: menus, worlds. Xbox sign-in and online features (Servers tab, Realms) fail as offline. LAN games work between computers (tested with two Linux PCs; firewall must let UDP 19132, 19133 and 7551 through). Players are named after the Linux user (see [its `apps/` file](apps/Microsoft.MinecraftUWP.conf)).<br><br>✅ 1.21.114<br>✅ 1.19.83<br>✅ 1.16.221.1<br>❌ 1.0.0.16<br>❓ 0.14.0.1|
 | ✅ | Halo Wars 2 (`Microsoft.HoganThreshold`, D3D12) | Playable offline: videos, menus, skirmish, native-resolution fullscreen, mouse and keyboard, settings and local saves. See [the example](#example-halo-wars-2). |
 | ✅ | Gears of War 4 (`Microsoft.SpartaUWP`, Unreal Engine 4, D3D12) | Campaign playable offline in fullscreen: menus, videos, mouse look and aiming, keyboard; the built-in benchmark runs. No multiplayer or co-op. See [the example](#example-gears-of-war-4). |
 | ✅ | Crackdown 3 (`Microsoft.48248D2C77101`, Unreal Engine 4) | Campaign playable offline: menus with the mouse, keyboard movement, mouse look; saves kept locally. Holding the mouse button doesn't skip the intro video; let it play. Its online services fail as offline. |
 | ✅ | Microsoft Minesweeper (`Microsoft.MicrosoftMinesweeper`, Unity, XAML, .NET Native) | Playable offline: menus and Classic games with mouse clicks, flags and local saves. Needs `mrt100.dll` (see [framework packages](#set-up-an-app)). After the tutorial, each start waits about 30 seconds on "Downloading Game Data" while its Xbox cloud saves fail as offline. No ads, achievements or cloud saves. |
 | ✅ | Microsoft Sudoku (`Microsoft.MicrosoftSudoku`, Unity 6, XAML, .NET Native) | Playable offline: the tutorial and puzzles with the mouse. Its Xbox cloud sync and ads fail as offline. |
-| ✅ | Minecraft for Windows 1.21.114 and 1.19.83 (`Microsoft.MinecraftUWP`, D3D11) | Starts and plays offline: menus, worlds. Xbox sign-in and online features (Servers tab, Realms) fail as offline. LAN games work between computers (tested with two Linux PCs; both need this build or later, and a firewall must let UDP 19132, 19133 and 7551 through). Players are named after the Linux user (see [its `apps/` file](apps/Microsoft.MinecraftUWP.conf)). |
 | ✅ | Microsoft Mahjong (`Microsoft.MicrosoftMahjong`, XAML, .NET Native) | Playable offline: answer "OK" and "Play Offline" at the download questions, then menus and games with the mouse and keyboard. Its Xbox sign-in, downloads and ads fail as offline. |
 | ✅ | Microsoft Ultimate Word Games / Wordament (`Microsoft.Studios.Wordament`, Unity, XAML, .NET Native) | Playable offline. Its [`apps/` file](apps/Microsoft.Studios.Wordament.conf) reports no internet connection, so it doesn't keep asking about Xbox cloud saves. |
-| ❌ | Microsoft Solitaire Collection (`Microsoft.MicrosoftSolitaireCollection`, XAML, WinUI 2.8) | Not working: a blank window. Its interface is all XAML with WinUI 2 controls, which the partial XAML doesn't support yet (like Calculator). |
 | ❌ | Forza Motorsport 7 (`Microsoft.ApolloBaseGame`, D3D12) | Not working: it starts and its hardware warning is answered, but it isn't playable yet. |
+| ❌ | Microsoft Solitaire Collection (`Microsoft.MicrosoftSolitaireCollection`, XAML, WinUI 2.8) | Not working: a blank window. Its interface is all XAML with WinUI 2 controls, which the partial XAML doesn't support yet (like Calculator). |
 | ❌ | Windows Calculator (`Microsoft.WindowsCalculator`, XAML, WinUI 2.8) | Not working yet: it now gets through start-up and into its main page, then stops because WinUI 2 controls (NavigationView and others) can't yet derive from the XAML Control and ContentControl classes. Work in progress. |
 
 Other native C++ UWP apps may work; many will need WinRT classes this project doesn't have yet. XAML apps (built with `Windows.UI.Xaml` pages and markup) have partial support: simple ones start and work, real Store apps will often still stop or look wrong; see [XAML apps](#xaml-apps). Reports and patches are welcome.
@@ -119,41 +119,23 @@ An app whose package folder has moved or is gone is skipped with a warning. Set 
 
 ## XAML apps
 
-Wine has no `Windows.UI.Xaml`, the UI framework most non-game UWP apps are built on. This project adds a **partial** implementation, in stages; what works so far is listed below.
+Wine has no `Windows.UI.Xaml`, the UI framework most non-game UWP apps are built on. This project adds a **partial** implementation: enough for Visual Studio-style XAML apps, Unity games hosted in XAML, and several Microsoft casual games. Larger Store apps may still stop or look wrong where they need something missing.
 
-**Milestone 1 (done): code-only XAML apps.** `Application.Start`, an app's own `App` class deriving from `Application` (with `OnLaunched` called on launch), `Application.Current`, `RequestedTheme` (light or dark background), `Window.Current` (`Content`, `Activate`, `Bounds`, `Dispatcher`, `Close`), and a `TextBlock` (`Text`, `FontSize`, `FontWeight`, `FontStyle`, `Foreground`, `TextWrapping`, `TextAlignment`, `Padding`) with `Margin`, `Width`/`Height` and alignment, drawn in the CoreWindow. Brushes are `SolidColorBrush` only. Rendering is GDI, so text is anti-aliased but there are no transforms or opacity yet.
+**App model.** `Application` (start-up, `OnLaunched`, `OnWindowCreated`, `LeavingBackground`, `Application.Current`, `Resources`, `RequestedTheme`) and `Window` (`Current`, `Content`, `Activate`, `Activated`, `VisibilityChanged`, `Bounds`, `Dispatcher`). Apps' own classes can derive from the framework's (`App`, pages, user controls, controls). `DispatcherTimer`, `CompositionTarget` and `SwapChainPanel` (how Unity draws inside a XAML page).
 
-**Milestone 2 (done): layout and buttons.** Measure/arrange layout with `StackPanel`, `Grid` (Auto, pixel and star rows and columns, spans), `Border`, and `Button` with the Windows 10 look, hover and pressed states, and `Click` from the mouse. Elements can be subclassed by apps (aggregation), and `Panel.Children` and Grid row/column definitions are real collections.
+**Markup and resources.** Compiled XAML (`.xbf`) from the package's files or `resources.pri`, loose `.xaml` files, `XamlReader.Load` and `Application.LoadComponent`. `x:Name`, event handlers, localized `x:Uid` strings, `{StaticResource}` and `{ThemeResource}`, explicit and implicit styles with `BasedOn`, theme and merged dictionaries, and a built-in `generic.xaml` with Windows 10's theme colours, text styles and default control styles. `{Binding}` (DataContext, ElementName, TwoWay, converters, `INotifyPropertyChanged`), `x:Bind` through its generated code, dependency properties and attached properties registered by apps, and app-defined properties reached through the app's XAML metadata.
 
-**Milestone 3 (done): compiled markup.** `Application.LoadComponent` loads the app's `.xbf` files (compiled XAML, version 2), so an app laid out like Visual Studio's Blank App starts. The markup can use the controls above, `Page`, `UserControl` and `Frame` (with `Navigate` creating the app's pages through its `IXamlMetadataProvider`), `x:Name` and `Click` handlers, `Application.Resources` and `{StaticResource}`, and common `{ThemeResource}` brushes. Microsoft's own compiler-made test files load.
+**Layout.** `StackPanel`, `Grid` (Auto, pixel and star sizes, spans), `Canvas`, `Border`, `Viewbox`, `ScrollViewer` (mouse wheel, keys, scroll bars, `ChangeView`), margins, alignment, and minimum and maximum sizes.
 
-**Milestone 4, part 1 (done): styles.** Explicit and implicit `Style`s with `BasedOn` (local values still win), theme dictionaries for `{ThemeResource}`, merged dictionaries and `ResourceDictionary Source="ms-appx:///Styles.xaml"`.
+**Controls.** `TextBlock`, `Button`, `ToggleButton`, `CheckBox`, `RadioButton`, `ToggleSwitch`, `Slider`, `ProgressBar`, `TextBox` and `PasswordBox` (selection, clipboard, multi-line), `Image` with `BitmapImage` (formats WIC reads), `ItemsControl`, `ListView` and `GridView` (selection modes, item templates, keyboard navigation), `ContentDialog`, `Flyout`, `CommandBar` with app bar buttons, `SymbolIcon` and `FontIcon`, and `Page`, `UserControl` and `Frame` (navigation with back and forward history).
 
-**Milestone 4, part 2 (done): control templates.** `ControlTemplate` (directly or from a style), `TemplateBinding`, `ContentPresenter`, and `VisualStateManager` states with setters and storyboards (which jump to their final values), so a templated Button changes look on hover and press.
+**Templates and states.** `ControlTemplate`, `TemplateBinding`, `ContentPresenter`, `DataTemplate`, and `VisualStateManager` states for templates and user controls (`GoToState`), with setters and storyboards that run over time.
 
-**Milestone 4, part 3 (done): toggle controls.** `ToggleButton`, `CheckBox` (including three-state) and `RadioButton` (groups by parent or `GroupName`), with `Checked`/`Unchecked`/`Indeterminate` events and templates whose check states follow WinUI's naming. `TemplateBinding` now follows later changes on the control. Built-in looks use the WinUI resource keys an app overrides, such as `ButtonBackgroundPointerOver` or `CheckBoxCheckBackgroundFillChecked`.
+**Drawing.** Direct2D and DirectWrite through DXVK, with GDI as a fallback: shapes, paths and geometries, solid, gradient and image brushes (`AcrylicBrush` as its fallback colour), corner radii, opacity, render transforms and clips. Fonts include the ones an app ships in its package, and icon glyphs fall back to Segoe Fluent Icons or Segoe MDL2 Assets. Light and dark themes, including changes while the app runs.
 
-**Milestone 4, part 4 (done): XAML text and default styles.** `XamlReader.Load` reads XAML text. A `generic.xaml` built into the DLL supplies Windows 10's theme brushes, the standard text styles (`TitleTextBlockStyle` and the rest) and default styles. Button and ToggleButton get real default templates, so apps that override their resource keys or restyle them see the right result. Translucent theme brushes are blended.
+**Input.** Mouse, keyboard focus with Tab navigation and a focus visual, routed key and focus events, `FocusManager`, `VisualTreeHelper` and `AutomationProperties`.
 
-**Milestone 4, part 5 (done): shapes, corners and themes.** `Rectangle`, `Ellipse` and `Path`, `CornerRadius`, and default CheckBox and RadioButton templates built from shapes. Theme changes while the app runs take effect: `RequestedTheme` on an element (the usual in-app dark mode switch) and the system's light or dark setting, when the app hasn't fixed its theme. `LoadComponent` reads loose `.xaml` files when there is no compiled `.xbf`.
-
-**Milestone 4, part 6 (done): data and motion.** `{Binding}` (DataContext, ElementName, TwoWay, converters, `INotifyPropertyChanged`), `DataTemplate` (ContentTemplate, `ItemsControl` with `ItemsSource` and `ItemTemplate`), `ToggleSwitch`, `Slider` and `ProgressBar`, storyboards that run over time (visual states, and `Storyboard.Begin` from code), `Opacity`, and Path curves and geometries.
-
-**Direct2D (done):** frames are drawn with Direct2D and DirectWrite (anti-aliased shapes and text), with `RenderTransform`, `Clip` and `LinearGradientBrush`; GDI remains the fallback.
-
-**Milestone 5, part 1 (done): scrolling and the keyboard.** `ScrollViewer` with the mouse wheel, keys, Windows 10 scroll bars, `ChangeView` and `ViewChanged`. Keyboard focus with `Focus`, `IsTabStop`, `TabIndex`, a focus visual and Tab / Shift+Tab, routed `KeyDown`/`KeyUp`/`GotFocus`/`LostFocus`, Space and Enter on buttons, keys on sliders and toggle switches, and `FocusManager`.
-
-**Milestone 5, part 2 (done): text entry.** `TextBox` and `PasswordBox` with typing, selection, the caret, the clipboard, multi-line text with `AcceptsReturn`, `MaxLength`, `IsReadOnly`, `Header`, `PlaceholderText`, `TextChanged` and `PasswordChanged`. No IME or undo yet.
-
-**Milestone 5, part 3 (done): pictures.** `Image` with `Stretch`, `BitmapImage` from `ms-appx:` files (PNG, JPEG, BMP, GIF and the other formats WIC reads) with `DecodePixelWidth`/`Height`, `ImageOpened`/`ImageFailed`, and `ImageBrush` backgrounds and fills.
-
-**Milestone 5, part 4 (done): lists.** `ListView` and `GridView` with item containers, scrolling, `SelectionMode` (single, multiple, extended with Ctrl and Shift), `SelectedIndex`/`SelectedItem`/`SelectedItems`, `SelectionChanged`, `ItemClick`, arrow-key navigation, and the `ItemsStackPanel` and `ItemsWrapGrid` panels. No virtualization, grouping or drag and drop yet.
-
-**Milestone 5, part 5a (done): dialogs.** `ContentDialog` with `ShowAsync`, title, content, up to three buttons, `DefaultButton`, Enter and Escape, `Closing`/`Closed` with `Cancel`, over a modal layer.
-
-**Milestone 5, part 5b (done): command bars.** `CommandBar` with primary commands, a "..." overflow menu of secondary commands and light dismiss, `AppBarButton`, `AppBarToggleButton`, `AppBarSeparator`, `SymbolIcon` and `FontIcon` (Segoe MDL2 Assets glyphs, or Unicode stand-ins without that font), and `Page.TopAppBar`/`BottomAppBar`. That completes milestone 5.
-
-**Not yet:** flyouts, menus and the rest of milestone 6, `x:Bind` beyond what its generated code calls, localized `x:Uid` strings and navigation history. Real Store apps will still often stop or look wrong where they need these.
+**Not yet:** WinUI 2 controls (the `Microsoft.UI.Xaml` library Calculator and Solitaire Collection use), menus (`MenuFlyout`), list virtualization, grouping and drag and drop, IME input and undo in text boxes, transitions, automation peers (Narrator), SVG images, and composition brushes such as `XamlCompositionBrushBase`.
 
 To try it, build the test clients and run them in a throwaway prefix (each opens a window for a few seconds and checks what was drawn):
 
@@ -187,13 +169,13 @@ Local files and settings are written where Windows would put them, inside the pr
 
 ## Limitations
 
-- **Offline only.** You are signed in as your Linux user name; there is no Xbox Live, multiplayer or LAN.
+- **Offline only.** You are signed in as your Linux user name; there is no Xbox Live. Multiplayer and LAN may work for some games.
 - **No add-ons.** Wine has no Store client, so only the app's own licence is reported; add-ons and DLC that require a licence are unavailable.
 - **Xbox cloud saves stay on this PC.** Nothing is synchronised with Xbox Live, so saves from Windows or Xbox do not appear, and the reverse.
 - **The screen can still blank.** `DisplayRequest` asks Wine to keep the display on, but Wine 11.22 does not pass that on to the desktop, so a screensaver or display power-off may still happen.
 - **Fullscreen or windowed is chosen at launch.** The window is created borderless at your screen's resolution, or as a 1280x720 window with a title bar with `WINE_CORE_WINDOWED=1` or when the app last asked to launch windowed (its `PreferredLaunchWindowingMode`, which casual games such as Minesweeper set; it is kept per app in `HKCU\Software\Wine\WindowsRuntime\Packages\<package name>`). Its style is not changed while you play, because resizing a mapped window under its Vulkan swapchain can leave it without mouse input under XWayland. An app's own windowed-mode option may lose the mouse the same way; set `WINE_CORE_WINDOWED=1` instead.
 - **Resource strings.** `ms-resource:` names in the manifest are not resolved (no `resources.pri` support), so an app with such a display name gets its package name as the window title.
-- **Only D3D12 apps are covered** by the graphics setup; D3D11 or other renderers on a CoreWindow are untested.
+- **D3D12 and D3D11 only.** The graphics setup covers D3D12 (vkd3d-proton) and D3D11 (DXVK, tested with Minecraft and the Unity games); other renderers on a CoreWindow are untested.
 
 ## Example: Halo Wars 2
 
