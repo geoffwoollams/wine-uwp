@@ -21,7 +21,7 @@ else
 fi
 
 # Wine's version (wine --version, winecfg) comes from git describe in the source tree: an annotated tag on the same
-# commit, newer than Wine's own, makes it wine-11.22-uwp4
+# commit, newer than Wine's own, makes it wine-11.22-uwp5
 if [ "$(git describe HEAD 2>/dev/null)" != "wine-$RELEASE_VERSION" ]; then
     git -c user.name=wine-uwp -c user.email=wine-uwp@localhost tag -a -f "wine-$RELEASE_VERSION" -m "wine-uwp $RELEASE_VERSION" HEAD >/dev/null
 fi

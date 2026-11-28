@@ -24,6 +24,7 @@ UWP apps don't create a normal Win32 window. They ask Windows for a `CoreApplica
 | ✅ | Microsoft Sudoku (`Microsoft.MicrosoftSudoku`, Unity 6, XAML, .NET Native) | Playable offline: the tutorial and puzzles with the mouse. Its Xbox cloud sync and ads fail as offline. |
 | ✅ | Microsoft Mahjong (`Microsoft.MicrosoftMahjong`, XAML, .NET Native) | Playable offline: answer "OK" and "Play Offline" at the download questions, then menus and games with the mouse and keyboard. Its Xbox sign-in, downloads and ads fail as offline. |
 | ✅ | Microsoft Ultimate Word Games / Wordament (`Microsoft.Studios.Wordament`, Unity, XAML, .NET Native) | Playable offline. Its [`apps/` file](apps/Microsoft.Studios.Wordament.conf) reports no internet connection, so it doesn't keep asking about Xbox cloud saves. |
+| ✅ | Asphalt 7: Heat (`GAMELOFTSA.Asphalt7HeatByGameloft`, D3D11, XAML `SwapChainBackgroundPanel`) | Playable offline: menus, races and keyboard driving (choose "Keyboard" under controls in its settings: there's no tilt sensor). Xbox Live and its network features fail as offline. Its [`apps/` file](apps/GAMELOFTSA.Asphalt7HeatByGameloft.conf) makes it use the package's own `msvcr110.dll`/`msvcp110.dll`. |
 | ❌ | Forza Motorsport 7 (`Microsoft.ApolloBaseGame`, D3D12) | Not working: it starts and its hardware warning is answered, but it isn't playable yet. |
 | ❌ | Microsoft Solitaire Collection (`Microsoft.MicrosoftSolitaireCollection`, XAML, WinUI 2.8) | Not working: a blank window. Its interface is all XAML with WinUI 2 controls, which the partial XAML doesn't support yet (like Calculator). |
 | ❌ | Windows Calculator (`Microsoft.WindowsCalculator`, XAML, WinUI 2.8) | Not working yet: it now gets through start-up and into its main page, then stops because WinUI 2 controls (NavigationView and others) can't yet derive from the XAML Control and ContentControl classes. Work in progress. |
@@ -222,7 +223,7 @@ For maintainers. After building (see above) and committing, with GE-Proton 11-14
 ```bash
 scripts/build-wine.sh
 scripts/package-release.sh
-gh release create 11.22-uwp4 --title wine-11.22-uwp4 dist/wine-uwp-x86_64.tar.xz dist/wine-uwp-x86_64.tar.xz.sha256 --notes-file dist/NOTES.md
+gh release create 11.22-uwp5 --title wine-11.22-uwp5 dist/wine-uwp-x86_64.tar.xz dist/wine-uwp-x86_64.tar.xz.sha256 --notes-file dist/NOTES.md
 ```
 
 **Version numbers** look like `11.22-uwp4`: the Wine release the patches are based on, then wine-uwp's own version, a whole number. Raise `UWP_VERSION` in `scripts/common.sh` by one for each GitHub release (`4`, `5`, ...; releases before 4 were `3.0`, `v2.1` and so on) and change `WINE_TAG` when moving to a newer Wine; `RELEASE_VERSION` is made from both. `build-wine.sh` tags its source checkout so that `wine --version` reports `wine-11.22-uwp4`, and `package-release.sh` refuses a build whose version doesn't match. The download keeps the same file name, `wine-uwp-x86_64.tar.xz`, in every release, which is what lets `fetch-release.sh` find the latest one.

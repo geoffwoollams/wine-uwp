@@ -44,6 +44,8 @@ BLOCKMAP_NS = ("{http://schemas.microsoft.com/appx/2015/blockmap}", "{http://sch
 WINE_CLASSES = {
     "uwp-wintypes.dll": ["Windows.Storage.Streams.DataReader"],
     "windows.storage.dll": ["Windows.Storage.Streams.InMemoryRandomAccessStream"],
+    # stand-ins for managed WinRT components that Windows hosts with its own CLRHost.dll (not in the package)
+    "wpnapps.dll": ["NotificationsExtensions.TileContent.TileContentFactory", "GA.GoogleAnalytics"],
 }
 
 
@@ -434,10 +436,28 @@ def registry(game_dir, app_dir, store=None):
     for server in re.findall(r"<InProcessServer>(.*?)</InProcessServer>", manifest, re.S):
         dll = re.search(r"<Path>([^<]+)</Path>", server).group(1)
         for cls in re.findall(r'ActivatableClassId="([^"]+)"', server):
+            if dll.lower() == "clrhost.dll" and any(cls in c for c in WINE_CLASSES.values()):
+                out += ["[-" + package_reg_key(package, cls)[1:], ""]
+                continue
             # the manifest's Path (GearGame\Binaries\x.dll) is a Windows path relative to the package: escape it
             # for .reg. The global key an older setup wrote for the class is removed.
             out += ["[-" + reg_key(cls)[1:], "", package_reg_key(package, cls),
                     '"DllPath"="%s"' % dll.replace("\\", "\\\\"), ""]
+    # marshaling of the app's own interfaces between apartments: a windows.activatableClass.proxyStub extension names
+    # a DLL whose DllGetClassObject makes the proxy and stub (Asphalt 7's Microsoft.Xbox.dll, for ICallbackInvoker)
+    for proxy in re.findall(r"<ProxyStub\b(.*?)</ProxyStub>", manifest, re.S):
+        clsid = re.search(r'ClassId="([^"]+)"', proxy)
+        path = re.search(r"<Path>([^<]+)</Path>", proxy)
+        if not clsid or not path:
+            continue
+        clsid = "{" + clsid.group(1).strip("{}").upper() + "}"
+        out += ["[HKEY_LOCAL_MACHINE\\Software\\Classes\\CLSID\\%s\\InprocServer32]" % clsid,
+                '@="%s"' % (app_dir + "\\" + path.group(1)).replace("\\", "\\\\"),
+                '"ThreadingModel"="Both"', ""]
+        for iid in re.findall(r'InterfaceId="([^"]+)"', proxy):
+            iid = "{" + iid.strip("{}").upper() + "}"
+            out += ["[HKEY_LOCAL_MACHINE\\Software\\Classes\\Interface\\%s\\ProxyStubClsid32]" % iid,
+                    '@="%s"' % clsid, ""]
     for dll, classes in WINE_CLASSES.items():
         for cls in classes:
             out += [reg_key(cls), '"DllPath"="C:\\\\windows\\\\system32\\\\%s"' % dll, ""]
@@ -650,8 +670,18 @@ def extract_package(source, root):
     tmp = dest + ".tmp"
     shutil.rmtree(tmp, ignore_errors=True)
     base = os.path.normpath(tmp) + os.sep
+    # Windows' file system doesn't tell upper from lower case: a package can have both data/SWF/a.swf and
+    # data/Swf/b.swf (Asphalt 7 does) and mean one folder. Linux would make two, and the app asks for b.swf in SWF.
+    # A folder keeps the case it was first written with.
+    folders, paths = {}, {}
     for info in infos:
-        target = os.path.normpath(os.path.join(tmp, urllib.parse.unquote(info.filename)))
+        parts = urllib.parse.unquote(info.filename).replace("\\", "/").split("/")
+        for i in range(len(parts) - 1):
+            key = tuple(p.lower() for p in parts[:i + 1])
+            parts[i] = folders.setdefault(key, parts[i])
+        paths[info.filename] = "/".join(parts)
+    for info in infos:
+        target = os.path.normpath(os.path.join(tmp, paths[info.filename]))
         if not target.startswith(base):
             continue   # nothing outside the folder
         os.makedirs(os.path.dirname(target), exist_ok=True)

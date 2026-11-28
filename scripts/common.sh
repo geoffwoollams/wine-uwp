@@ -15,8 +15,8 @@ SOURCES="$DATA/apps"   # <package>.source: the package folder, its VCLibs packag
 PACKAGES="$DATA/packages"   # apps set up from .appx/.msix files, unpacked: one folder per package name
 
 WINE_TAG="wine-11.22"
-UWP_VERSION="4"                                              # wine-uwp's own version, a whole number: raise it by one for each GitHub release
-RELEASE_VERSION="${WINE_TAG#wine-}-uwp$UWP_VERSION"          # e.g. 11.22-uwp4: the release tag, and Wine's version as wine-11.22-uwp4
+UWP_VERSION="5"                                              # wine-uwp's own version, a whole number: raise it by one for each GitHub release
+RELEASE_VERSION="${WINE_TAG#wine-}-uwp$UWP_VERSION"          # e.g. 11.22-uwp5: the release tag, and Wine's version as wine-11.22-uwp5
 WINE_GIT="https://gitlab.winehq.org/wine/wine.git"
 DXVK_COMMIT="f90f1bf180f41356695ddf3df6af62119fb64a3e"     # DXVK master the patch was made against (v3.1.1-235)
 DXVK_GIT="https://github.com/doitsujin/dxvk.git"

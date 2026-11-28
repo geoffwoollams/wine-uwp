@@ -1,0 +1,4884 @@
+Subject: Asphalt 7: Heat starts and runs (tiles, managed component stand-ins, SettingsPane, DisplayProperties, StreamSocket, SwapChainBackgroundPanel, IInspectable proxy)
+
+What Asphalt 7 (a Windows 8.1 XAML app with a SwapChainBackgroundPanel) needed:
+- wpnapps: TileUpdateManager, TileUpdater and TileNotification; stand-ins for its managed components that Windows hosts
+  with CLRHost.dll (NotificationsExtensions' tile content for a wide and a square image tile, and GA.GoogleAnalytics);
+  an Accelerometer that is absent (GetDefault gives null)
+- windows.ui: Windows.UI.ApplicationSettings.SettingsPane
+- windows.ui.xaml: SwapChainBackgroundPanel (a SwapChainPanel with ISwapChainBackgroundPanelNative), Window.SizeChanged
+  raised, and SizeChanged and VisibilityChanged raised a moment after Activate() as on Windows (the game sets itself
+  up on other threads from its Activated handler and its VisibilityChanged handler uses what they make)
+- windows.graphics: Windows.Graphics.Display.DisplayProperties
+- windows.networking: StreamSocket (connecting fails as offline) and StreamSocketListener (binds, never connects)
+- windows.storage.applicationdata: ApplicationDataContainer.CreateContainer
+- twinapi.appcore: ApplicationView.Value and TryUnsnap
+- actxprxy: IInspectable's proxy and stub, which the proxy/stub DLLs that apps declare delegate to
+
+diff --git a/dlls/actxprxy/Makefile.in b/dlls/actxprxy/Makefile.in
+index 0397f7c..23a313b 100644
+--- a/dlls/actxprxy/Makefile.in
++++ b/dlls/actxprxy/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE    = actxprxy.dll
+-IMPORTS   = uuid oleaut32 ole32 rpcrt4
++IMPORTS   = uuid oleaut32 ole32 rpcrt4 combase
+ 
+ SOURCES = \
+ 	actxprxy_activscp.idl \
+@@ -8,12 +8,14 @@ SOURCES = \
+ 	actxprxy_hlink.idl \
+ 	actxprxy_htiface.idl \
+ 	actxprxy_htiframe.idl \
++	actxprxy_inspectable.idl \
+ 	actxprxy_objsafe.idl \
+ 	actxprxy_ocmm.idl \
+ 	actxprxy_servprov.idl \
+ 	actxprxy_shldisp.idl \
+ 	actxprxy_shobjidl.idl \
+ 	actxprxy_urlhist.idl \
++	inspectable.c \
+ 	usrmarshal.c
+ 
+ dlldata_EXTRADEFS = -DWINE_REGISTER_DLL -DPROXY_DELEGATION
+diff --git a/dlls/actxprxy/actxprxy_inspectable.idl b/dlls/actxprxy/actxprxy_inspectable.idl
+new file mode 100644
+index 0000000..0a893e0
+--- /dev/null
++++ b/dlls/actxprxy/actxprxy_inspectable.idl
+@@ -0,0 +1,10 @@
++#pragma makedep proxy
++#pragma makedep register
++
++#include "inspectable.idl"
++
++[
++    threading(both),
++    uuid(af86e2e0-b12d-4c6a-9c5a-d7aa65101e90)  /* IInspectable's own IID, as the other proxy files do: the proxy and stub that WinRT interfaces marshal through */
++]
++coclass PSFactoryBuffer { interface IPSFactoryBuffer; }
+diff --git a/dlls/actxprxy/inspectable.c b/dlls/actxprxy/inspectable.c
+new file mode 100644
+index 0000000..3bff3cd
+--- /dev/null
++++ b/dlls/actxprxy/inspectable.c
+@@ -0,0 +1,7 @@
++/* the IID that IInspectable's proxy refers to */
++
++#include <stdarg.h>
++#include "windef.h"
++#include "initguid.h"
++
++DEFINE_GUID( IID_IInspectable, 0xaf86e2e0, 0xb12d, 0x4c6a, 0x9c, 0x5a, 0xd7, 0xaa, 0x65, 0x10, 0x1e, 0x90 );
+diff --git a/dlls/twinapi.appcore/application_view.c b/dlls/twinapi.appcore/application_view.c
+index 763bd8f..1f8ad18 100644
+--- a/dlls/twinapi.appcore/application_view.c
++++ b/dlls/twinapi.appcore/application_view.c
+@@ -667,14 +667,17 @@ DEFINE_IINSPECTABLE(statics, IApplicationViewStatics, struct factory, IActivatio
+ 
+ static HRESULT WINAPI statics_Value(IApplicationViewStatics *iface, ApplicationViewState *value)
+ {
+-    FIXME("iface %p, value %p stub!\n", iface, value);
+-    return E_NOTIMPL;
++    /* Windows 8's snapped and filled layouts: this window is always the full screen's */
++    FIXME("iface %p, value %p semi-stub!\n", iface, value);
++    *value = ApplicationViewState_FullScreenLandscape;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI statics_TryUnsnap(IApplicationViewStatics *iface, boolean *success)
+ {
+-    FIXME("iface %p, success %p stub!\n", iface, success);
+-    return E_NOTIMPL;
++    FIXME("iface %p, success %p semi-stub!\n", iface, success);
++    *success = FALSE;
++    return S_OK;
+ }
+ 
+ static const struct IApplicationViewStaticsVtbl statics_vtbl =
+diff --git a/dlls/windows.graphics/classes.idl b/dlls/windows.graphics/classes.idl
+index cc62a79..6695f84 100644
+--- a/dlls/windows.graphics/classes.idl
++++ b/dlls/windows.graphics/classes.idl
+@@ -25,5 +25,6 @@ import "windows.graphics.display.idl";
+ 
+ namespace Windows.Graphics.Display {
+     runtimeclass AdvancedColorInfo;
++    runtimeclass DisplayProperties;
+     /* DisplayInformation is registered by twinapi.appcore, which implements it (as on Windows) */
+ }
+diff --git a/dlls/windows.graphics/main.c b/dlls/windows.graphics/main.c
+index 25a5719..124f7d3 100644
+--- a/dlls/windows.graphics/main.c
++++ b/dlls/windows.graphics/main.c
+@@ -177,6 +177,241 @@ static struct display_info_statics display_info_statics =
+ 
+ static IActivationFactory *display_info_factory = &display_info_statics.IActivationFactory_iface;
+ 
++/* Windows.Graphics.Display.DisplayProperties: Windows 8's static display API, DisplayInformation's predecessor.
++ * The display is a landscape, 96 dpi one that never changes. */
++
++struct display_props_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IDisplayPropertiesStatics IDisplayPropertiesStatics_iface;
++    DisplayOrientations auto_rotation;
++    LONG next_token;
++};
++
++static inline struct display_props_statics *impl_from_props_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct display_props_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI props_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct display_props_statics *impl = impl_from_props_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IDisplayPropertiesStatics ))
++        *out = &impl->IDisplayPropertiesStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI props_factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI props_factory_Release( IActivationFactory *iface ) { return 1; }
++
++static HRESULT WINAPI props_factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p, count %p, iids %p stub!\n", iface, count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI props_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name )
++{
++    FIXME( "iface %p, name %p stub!\n", iface, name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI props_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
++{
++    FIXME( "iface %p, level %p stub!\n", iface, level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI props_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    FIXME( "iface %p, instance %p stub!\n", iface, instance );
++    return E_NOTIMPL;
++}
++
++static const IActivationFactoryVtbl props_factory_vtbl =
++{
++    props_factory_QueryInterface,
++    props_factory_AddRef,
++    props_factory_Release,
++    props_factory_GetIids,
++    props_factory_GetRuntimeClassName,
++    props_factory_GetTrustLevel,
++    props_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( props_statics, IDisplayPropertiesStatics, struct display_props_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI props_statics_get_CurrentOrientation( IDisplayPropertiesStatics *iface, DisplayOrientations *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = DisplayOrientations_Landscape;
++    return S_OK;
++}
++
++static HRESULT WINAPI props_statics_get_NativeOrientation( IDisplayPropertiesStatics *iface, DisplayOrientations *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = DisplayOrientations_Landscape;
++    return S_OK;
++}
++
++static HRESULT WINAPI props_statics_get_AutoRotationPreferences( IDisplayPropertiesStatics *iface, DisplayOrientations *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = impl_from_IDisplayPropertiesStatics( iface )->auto_rotation;
++    return S_OK;
++}
++
++static HRESULT WINAPI props_statics_put_AutoRotationPreferences( IDisplayPropertiesStatics *iface, DisplayOrientations value )
++{
++    TRACE( "iface %p, value %#x.\n", iface, value );
++    impl_from_IDisplayPropertiesStatics( iface )->auto_rotation = value;
++    return S_OK;
++}
++
++static HRESULT props_add_event( IDisplayPropertiesStatics *iface, const char *name, EventRegistrationToken *token )
++{
++    FIXME( "iface %p, %s: the display never changes, the handler is not kept.\n", iface, name );
++    token->value = InterlockedIncrement( &impl_from_IDisplayPropertiesStatics( iface )->next_token );
++    return S_OK;
++}
++
++static HRESULT WINAPI props_statics_add_OrientationChanged( IDisplayPropertiesStatics *iface,
++        IDisplayPropertiesEventHandler *handler, EventRegistrationToken *token )
++{
++    return props_add_event( iface, "OrientationChanged", token );
++}
++
++static HRESULT WINAPI props_statics_remove_OrientationChanged( IDisplayPropertiesStatics *iface, EventRegistrationToken token )
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI props_statics_get_ResolutionScale( IDisplayPropertiesStatics *iface, ResolutionScale *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = ResolutionScale_Scale100Percent;
++    return S_OK;
++}
++
++static HRESULT WINAPI props_statics_get_LogicalDpi( IDisplayPropertiesStatics *iface, FLOAT *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = 96.0f;
++    return S_OK;
++}
++
++static HRESULT WINAPI props_statics_add_LogicalDpiChanged( IDisplayPropertiesStatics *iface,
++        IDisplayPropertiesEventHandler *handler, EventRegistrationToken *token )
++{
++    return props_add_event( iface, "LogicalDpiChanged", token );
++}
++
++static HRESULT WINAPI props_statics_remove_LogicalDpiChanged( IDisplayPropertiesStatics *iface, EventRegistrationToken token )
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI props_statics_get_StereoEnabled( IDisplayPropertiesStatics *iface, boolean *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI props_statics_add_StereoEnabledChanged( IDisplayPropertiesStatics *iface,
++        IDisplayPropertiesEventHandler *handler, EventRegistrationToken *token )
++{
++    return props_add_event( iface, "StereoEnabledChanged", token );
++}
++
++static HRESULT WINAPI props_statics_remove_StereoEnabledChanged( IDisplayPropertiesStatics *iface, EventRegistrationToken token )
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI props_statics_GetColorProfileAsync( IDisplayPropertiesStatics *iface,
++        IAsyncOperation_IRandomAccessStream **value )
++{
++    FIXME( "iface %p, value %p stub!\n", iface, value );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI props_statics_add_ColorProfileChanged( IDisplayPropertiesStatics *iface,
++        IDisplayPropertiesEventHandler *handler, EventRegistrationToken *token )
++{
++    return props_add_event( iface, "ColorProfileChanged", token );
++}
++
++static HRESULT WINAPI props_statics_remove_ColorProfileChanged( IDisplayPropertiesStatics *iface, EventRegistrationToken token )
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI props_statics_add_DisplayContentsInvalidated( IDisplayPropertiesStatics *iface,
++        IDisplayPropertiesEventHandler *handler, EventRegistrationToken *token )
++{
++    return props_add_event( iface, "DisplayContentsInvalidated", token );
++}
++
++static HRESULT WINAPI props_statics_remove_DisplayContentsInvalidated( IDisplayPropertiesStatics *iface, EventRegistrationToken token )
++{
++    return S_OK;
++}
++
++static const struct IDisplayPropertiesStaticsVtbl props_statics_vtbl =
++{
++    props_statics_QueryInterface,
++    props_statics_AddRef,
++    props_statics_Release,
++    /* IInspectable methods */
++    props_statics_GetIids,
++    props_statics_GetRuntimeClassName,
++    props_statics_GetTrustLevel,
++    /* IDisplayPropertiesStatics methods */
++    props_statics_get_CurrentOrientation,
++    props_statics_get_NativeOrientation,
++    props_statics_get_AutoRotationPreferences,
++    props_statics_put_AutoRotationPreferences,
++    props_statics_add_OrientationChanged,
++    props_statics_remove_OrientationChanged,
++    props_statics_get_ResolutionScale,
++    props_statics_get_LogicalDpi,
++    props_statics_add_LogicalDpiChanged,
++    props_statics_remove_LogicalDpiChanged,
++    props_statics_get_StereoEnabled,
++    props_statics_add_StereoEnabledChanged,
++    props_statics_remove_StereoEnabledChanged,
++    props_statics_GetColorProfileAsync,
++    props_statics_add_ColorProfileChanged,
++    props_statics_remove_ColorProfileChanged,
++    props_statics_add_DisplayContentsInvalidated,
++    props_statics_remove_DisplayContentsInvalidated,
++};
++
++static struct display_props_statics display_props_statics =
++{
++    {&props_factory_vtbl},
++    {&props_statics_vtbl},
++    DisplayOrientations_Landscape,
++};
++
++static IActivationFactory *display_props_factory = &display_props_statics.IActivationFactory_iface;
++
+ HRESULT WINAPI DllGetClassObject( REFCLSID clsid, REFIID riid, void **out )
+ {
+     FIXME( "clsid %s, riid %s, out %p stub!\n", debugstr_guid( clsid ), debugstr_guid( riid ), out );
+@@ -194,5 +429,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+     if (!wcscmp( name, RuntimeClass_Windows_Graphics_Display_DisplayInformation ))
+         IActivationFactory_QueryInterface( display_info_factory, &IID_IActivationFactory, (void **)factory );
+ 
++    if (!wcscmp( name, RuntimeClass_Windows_Graphics_Display_DisplayProperties ))
++        IActivationFactory_QueryInterface( display_props_factory, &IID_IActivationFactory, (void **)factory );
++
+     return *factory ? S_OK : CLASS_E_CLASSNOTAVAILABLE;
+ }
+diff --git a/dlls/windows.networking/Makefile.in b/dlls/windows.networking/Makefile.in
+index 09a8c64..c36a0e3 100644
+--- a/dlls/windows.networking/Makefile.in
++++ b/dlls/windows.networking/Makefile.in
+@@ -2,4 +2,7 @@ MODULE = windows.networking.dll
+ IMPORTS = combase
+ 
+ SOURCES = \
+-	main.c
++	classes.idl \
++	main.c \
++	streamsocket.c \
++	streamsocketlistener.c
+diff --git a/dlls/windows.networking/classes.idl b/dlls/windows.networking/classes.idl
+new file mode 100644
+index 0000000..ac5f9fa
+--- /dev/null
++++ b/dlls/windows.networking/classes.idl
+@@ -0,0 +1,27 @@
++/*
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#pragma makedep register
++#pragma winrt ns_prefix
++
++import "windows.networking.sockets.idl";
++
++namespace Windows.Networking.Sockets {
++    runtimeclass StreamSocket;
++    runtimeclass StreamSocketListener;
++}
+diff --git a/dlls/windows.networking/main.c b/dlls/windows.networking/main.c
+index 325ea83..ed0ade4 100644
+--- a/dlls/windows.networking/main.c
++++ b/dlls/windows.networking/main.c
+@@ -16,11 +16,21 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
+-#include <windef.h>
+-#include <winnt.h>
+-#include <winstring.h>
++#include <stdarg.h>
++
++#define COBJMACROS
++#include "windef.h"
++#include "winbase.h"
++#include "winstring.h"
++#include "activation.h"
+ #include "wine/debug.h"
+ 
++#define WIDL_using_Windows_Networking_Sockets
++#include "windows.networking.sockets.h"
++
++extern IActivationFactory *streamsocket_factory;
++extern IActivationFactory *streamsocketlistener_factory;
++
+ WINE_DEFAULT_DEBUG_CHANNEL(winsock);
+ 
+ HRESULT WINAPI SetSocketMediaStreamingMode(BOOL value)
+@@ -31,9 +41,18 @@ HRESULT WINAPI SetSocketMediaStreamingMode(BOOL value)
+ 
+ HRESULT WINAPI DllGetActivationFactory(HSTRING classid, void **factory)
+ {
+-    FIXME("class %s, factory %p.\n", debugstr_hstring(classid), factory);
++    const WCHAR *name = WindowsGetStringRawBuffer(classid, NULL);
++
++    TRACE("class %s, factory %p.\n", debugstr_hstring(classid), factory);
+ 
+     *factory = NULL;
+ 
++    if (!wcscmp(name, RuntimeClass_Windows_Networking_Sockets_StreamSocket))
++        return IActivationFactory_QueryInterface(streamsocket_factory, &IID_IActivationFactory, factory);
++
++    if (!wcscmp(name, RuntimeClass_Windows_Networking_Sockets_StreamSocketListener))
++        return IActivationFactory_QueryInterface(streamsocketlistener_factory, &IID_IActivationFactory, factory);
++
++    FIXME("class %s not implemented.\n", debugstr_hstring(classid));
+     return CLASS_E_CLASSNOTAVAILABLE;
+ }
+diff --git a/dlls/windows.networking/streamsocket.c b/dlls/windows.networking/streamsocket.c
+new file mode 100644
+index 0000000..8bdd9c4
+--- /dev/null
++++ b/dlls/windows.networking/streamsocket.c
+@@ -0,0 +1,508 @@
++/*
++ * Windows.Networking.Sockets.StreamSocket
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++
++#define COBJMACROS
++#include "initguid.h"
++#include "windef.h"
++#include "winbase.h"
++#include "winerror.h"
++#include "winsock2.h"
++#include "winstring.h"
++#include "activation.h"
++#include "wine/debug.h"
++
++#define WIDL_using_Windows_Foundation
++#define WIDL_using_Windows_Networking
++#define WIDL_using_Windows_Networking_Sockets
++#define WIDL_using_Windows_Storage_Streams
++#include "windows.networking.sockets.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(winsock);
++
++/* A StreamSocket that cannot connect: no network is reachable from here, so every connection fails the way it does
++ * on a machine that is offline, with an asynchronous error the app handles. */
++
++#define OFFLINE_ERROR HRESULT_FROM_WIN32( WSAENETUNREACH )
++
++/* an IAsyncAction that has already finished, with an error or without one */
++
++struct failed_action
++{
++    IAsyncAction IAsyncAction_iface;
++    IAsyncInfo IAsyncInfo_iface;
++    LONG ref;
++    HRESULT error;
++    AsyncStatus status;
++    UINT32 id;
++};
++
++static inline struct failed_action *impl_from_IAsyncAction( IAsyncAction *iface )
++{
++    return CONTAINING_RECORD( iface, struct failed_action, IAsyncAction_iface );
++}
++
++static inline struct failed_action *impl_from_IAsyncInfo( IAsyncInfo *iface )
++{
++    return CONTAINING_RECORD( iface, struct failed_action, IAsyncInfo_iface );
++}
++
++static HRESULT WINAPI action_QueryInterface( IAsyncAction *iface, REFIID iid, void **out )
++{
++    struct failed_action *impl = impl_from_IAsyncAction( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IAsyncAction ))
++        *out = &impl->IAsyncAction_iface;
++    else if (IsEqualGUID( iid, &IID_IAsyncInfo ))
++        *out = &impl->IAsyncInfo_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI action_AddRef( IAsyncAction *iface )
++{
++    return InterlockedIncrement( &impl_from_IAsyncAction( iface )->ref );
++}
++
++static ULONG WINAPI action_Release( IAsyncAction *iface )
++{
++    struct failed_action *impl = impl_from_IAsyncAction( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI action_GetIids( IAsyncAction *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p, count %p, iids %p stub!\n", iface, count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI action_GetRuntimeClassName( IAsyncAction *iface, HSTRING *name )
++{
++    FIXME( "iface %p, name %p stub!\n", iface, name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI action_GetTrustLevel( IAsyncAction *iface, TrustLevel *level )
++{
++    FIXME( "iface %p, level %p stub!\n", iface, level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI action_put_Completed( IAsyncAction *iface, IAsyncActionCompletedHandler *handler )
++{
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    /* it has already finished: tell the handler now */
++    if (handler) IAsyncActionCompletedHandler_Invoke( handler, iface, impl_from_IAsyncAction( iface )->status );
++    return S_OK;
++}
++
++static HRESULT WINAPI action_get_Completed( IAsyncAction *iface, IAsyncActionCompletedHandler **handler )
++{
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    *handler = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI action_GetResults( IAsyncAction *iface )
++{
++    struct failed_action *impl = impl_from_IAsyncAction( iface );
++    TRACE( "iface %p.\n", iface );
++    return impl->error;
++}
++
++static const IAsyncActionVtbl action_vtbl =
++{
++    action_QueryInterface,
++    action_AddRef,
++    action_Release,
++    action_GetIids,
++    action_GetRuntimeClassName,
++    action_GetTrustLevel,
++    action_put_Completed,
++    action_get_Completed,
++    action_GetResults,
++};
++
++static HRESULT WINAPI info_QueryInterface( IAsyncInfo *iface, REFIID iid, void **out )
++{
++    return action_QueryInterface( &impl_from_IAsyncInfo( iface )->IAsyncAction_iface, iid, out );
++}
++
++static ULONG WINAPI info_AddRef( IAsyncInfo *iface )
++{
++    return action_AddRef( &impl_from_IAsyncInfo( iface )->IAsyncAction_iface );
++}
++
++static ULONG WINAPI info_Release( IAsyncInfo *iface )
++{
++    return action_Release( &impl_from_IAsyncInfo( iface )->IAsyncAction_iface );
++}
++
++static HRESULT WINAPI info_GetIids( IAsyncInfo *iface, ULONG *count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI info_GetRuntimeClassName( IAsyncInfo *iface, HSTRING *name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI info_GetTrustLevel( IAsyncInfo *iface, TrustLevel *level )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI info_get_Id( IAsyncInfo *iface, UINT32 *id )
++{
++    *id = impl_from_IAsyncInfo( iface )->id;
++    return S_OK;
++}
++
++static HRESULT WINAPI info_get_Status( IAsyncInfo *iface, AsyncStatus *status )
++{
++    *status = impl_from_IAsyncInfo( iface )->status;
++    return S_OK;
++}
++
++static HRESULT WINAPI info_get_ErrorCode( IAsyncInfo *iface, HRESULT *error )
++{
++    *error = impl_from_IAsyncInfo( iface )->error;
++    return S_OK;
++}
++
++static HRESULT WINAPI info_Cancel( IAsyncInfo *iface )
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI info_Close( IAsyncInfo *iface )
++{
++    return S_OK;
++}
++
++static const IAsyncInfoVtbl info_vtbl =
++{
++    info_QueryInterface,
++    info_AddRef,
++    info_Release,
++    info_GetIids,
++    info_GetRuntimeClassName,
++    info_GetTrustLevel,
++    info_get_Id,
++    info_get_Status,
++    info_get_ErrorCode,
++    info_Cancel,
++    info_Close,
++};
++
++HRESULT async_action_create( HRESULT error, IAsyncAction **out )
++{
++    static LONG next_id;
++    struct failed_action *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IAsyncAction_iface.lpVtbl = &action_vtbl;
++    impl->IAsyncInfo_iface.lpVtbl = &info_vtbl;
++    impl->ref = 1;
++    impl->error = error;
++    impl->status = FAILED(error) ? Error : Completed;
++    impl->id = InterlockedIncrement( &next_id );
++    *out = &impl->IAsyncAction_iface;
++    return S_OK;
++}
++
++/* the socket */
++
++struct streamsocket
++{
++    IStreamSocket IStreamSocket_iface;
++    IClosable IClosable_iface;
++    LONG ref;
++};
++
++static inline struct streamsocket *impl_from_IStreamSocket( IStreamSocket *iface )
++{
++    return CONTAINING_RECORD( iface, struct streamsocket, IStreamSocket_iface );
++}
++
++static inline struct streamsocket *impl_from_IClosable( IClosable *iface )
++{
++    return CONTAINING_RECORD( iface, struct streamsocket, IClosable_iface );
++}
++
++static HRESULT WINAPI socket_QueryInterface( IStreamSocket *iface, REFIID iid, void **out )
++{
++    struct streamsocket *impl = impl_from_IStreamSocket( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IStreamSocket ))
++        *out = &impl->IStreamSocket_iface;
++    else if (IsEqualGUID( iid, &IID_IClosable ))
++        *out = &impl->IClosable_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI socket_AddRef( IStreamSocket *iface )
++{
++    return InterlockedIncrement( &impl_from_IStreamSocket( iface )->ref );
++}
++
++static ULONG WINAPI socket_Release( IStreamSocket *iface )
++{
++    struct streamsocket *impl = impl_from_IStreamSocket( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI socket_GetIids( IStreamSocket *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p, count %p, iids %p stub!\n", iface, count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI socket_GetRuntimeClassName( IStreamSocket *iface, HSTRING *name )
++{
++    return WindowsCreateString( RuntimeClass_Windows_Networking_Sockets_StreamSocket,
++                                wcslen( RuntimeClass_Windows_Networking_Sockets_StreamSocket ), name );
++}
++
++static HRESULT WINAPI socket_GetTrustLevel( IStreamSocket *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI socket_get_Control( IStreamSocket *iface, IInspectable **value )
++{
++    FIXME( "iface %p, value %p stub!\n", iface, value );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI socket_get_Information( IStreamSocket *iface, IInspectable **value )
++{
++    FIXME( "iface %p, value %p stub!\n", iface, value );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI socket_get_InputStream( IStreamSocket *iface, IInputStream **value )
++{
++    FIXME( "iface %p, value %p: not connected.\n", iface, value );
++    *value = NULL;
++    return HRESULT_FROM_WIN32( WSAENOTCONN );
++}
++
++static HRESULT WINAPI socket_get_OutputStream( IStreamSocket *iface, IOutputStream **value )
++{
++    FIXME( "iface %p, value %p: not connected.\n", iface, value );
++    *value = NULL;
++    return HRESULT_FROM_WIN32( WSAENOTCONN );
++}
++
++static HRESULT WINAPI socket_ConnectWithEndpointPairAsync( IStreamSocket *iface, IEndpointPair *pair, IAsyncAction **value )
++{
++    FIXME( "iface %p, pair %p: the network is unreachable.\n", iface, pair );
++    return async_action_create( OFFLINE_ERROR, value );
++}
++
++static HRESULT WINAPI socket_ConnectAsync( IStreamSocket *iface, IHostName *host, HSTRING service, IAsyncAction **value )
++{
++    FIXME( "iface %p, host %p, service %s: the network is unreachable.\n", iface, host, debugstr_hstring( service ) );
++    return async_action_create( OFFLINE_ERROR, value );
++}
++
++static HRESULT WINAPI socket_ConnectWithEndpointPairAndProtectionLevelAsync( IStreamSocket *iface, IEndpointPair *pair,
++        SocketProtectionLevel level, IAsyncAction **value )
++{
++    FIXME( "iface %p, pair %p, level %d: the network is unreachable.\n", iface, pair, level );
++    return async_action_create( OFFLINE_ERROR, value );
++}
++
++static HRESULT WINAPI socket_ConnectWithProtectionLevelAsync( IStreamSocket *iface, IHostName *host, HSTRING service,
++        SocketProtectionLevel level, IAsyncAction **value )
++{
++    FIXME( "iface %p, host %p, service %s, level %d: the network is unreachable.\n", iface, host, debugstr_hstring( service ), level );
++    return async_action_create( OFFLINE_ERROR, value );
++}
++
++static HRESULT WINAPI socket_UpgradeToSslAsync( IStreamSocket *iface, SocketProtectionLevel level, IHostName *host,
++        IAsyncAction **value )
++{
++    FIXME( "iface %p, level %d, host %p: not connected.\n", iface, level, host );
++    return async_action_create( HRESULT_FROM_WIN32( WSAENOTCONN ), value );
++}
++
++static const IStreamSocketVtbl socket_vtbl =
++{
++    socket_QueryInterface,
++    socket_AddRef,
++    socket_Release,
++    socket_GetIids,
++    socket_GetRuntimeClassName,
++    socket_GetTrustLevel,
++    socket_get_Control,
++    socket_get_Information,
++    socket_get_InputStream,
++    socket_get_OutputStream,
++    socket_ConnectWithEndpointPairAsync,
++    socket_ConnectAsync,
++    socket_ConnectWithEndpointPairAndProtectionLevelAsync,
++    socket_ConnectWithProtectionLevelAsync,
++    socket_UpgradeToSslAsync,
++};
++
++static HRESULT WINAPI closable_QueryInterface( IClosable *iface, REFIID iid, void **out )
++{
++    return socket_QueryInterface( &impl_from_IClosable( iface )->IStreamSocket_iface, iid, out );
++}
++
++static ULONG WINAPI closable_AddRef( IClosable *iface )
++{
++    return socket_AddRef( &impl_from_IClosable( iface )->IStreamSocket_iface );
++}
++
++static ULONG WINAPI closable_Release( IClosable *iface )
++{
++    return socket_Release( &impl_from_IClosable( iface )->IStreamSocket_iface );
++}
++
++static HRESULT WINAPI closable_GetIids( IClosable *iface, ULONG *count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI closable_GetRuntimeClassName( IClosable *iface, HSTRING *name )
++{
++    return socket_GetRuntimeClassName( &impl_from_IClosable( iface )->IStreamSocket_iface, name );
++}
++
++static HRESULT WINAPI closable_GetTrustLevel( IClosable *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI closable_Close( IClosable *iface )
++{
++    TRACE( "iface %p.\n", iface );
++    return S_OK;
++}
++
++static const IClosableVtbl closable_vtbl =
++{
++    closable_QueryInterface,
++    closable_AddRef,
++    closable_Release,
++    closable_GetIids,
++    closable_GetRuntimeClassName,
++    closable_GetTrustLevel,
++    closable_Close,
++};
++
++/* the activation factory */
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p, count %p, iids %p stub!\n", iface, count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name )
++{
++    FIXME( "iface %p, name %p stub!\n", iface, name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
++{
++    FIXME( "iface %p, level %p stub!\n", iface, level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    struct streamsocket *impl;
++
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IStreamSocket_iface.lpVtbl = &socket_vtbl;
++    impl->IClosable_iface.lpVtbl = &closable_vtbl;
++    impl->ref = 1;
++    *instance = (IInspectable *)&impl->IStreamSocket_iface;
++    return S_OK;
++}
++
++static const IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++static IActivationFactory streamsocket_activation_factory = { &factory_vtbl };
++IActivationFactory *streamsocket_factory = &streamsocket_activation_factory;
+diff --git a/dlls/windows.networking/streamsocketlistener.c b/dlls/windows.networking/streamsocketlistener.c
+new file mode 100644
+index 0000000..a2741d7
+--- /dev/null
++++ b/dlls/windows.networking/streamsocketlistener.c
+@@ -0,0 +1,363 @@
++/*
++ * Windows.Networking.Sockets.StreamSocketListener
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++
++#define COBJMACROS
++#include "windef.h"
++#include "winbase.h"
++#include "winerror.h"
++#include "winstring.h"
++#include "activation.h"
++#include "wine/debug.h"
++
++#define WIDL_using_Windows_Foundation
++#define WIDL_using_Windows_Networking
++#define WIDL_using_Windows_Networking_Sockets
++#include "windows.networking.sockets.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(winsock);
++
++HRESULT async_action_create( HRESULT error, IAsyncAction **out );
++
++/* A listener that accepts being bound (a game's local multiplayer server) and then never gets a connection: nothing
++ * else on the network is looking for it. */
++
++struct listener
++{
++    IStreamSocketListener IStreamSocketListener_iface;
++    IClosable IClosable_iface;
++    IStreamSocketListenerControl IStreamSocketListenerControl_iface;
++    IStreamSocketListenerInformation IStreamSocketListenerInformation_iface;
++    LONG ref;
++    INT32 quality;
++    HSTRING port;
++    LONG next_token;
++};
++
++static inline struct listener *impl_from_IStreamSocketListener( IStreamSocketListener *iface )
++{
++    return CONTAINING_RECORD( iface, struct listener, IStreamSocketListener_iface );
++}
++
++static inline struct listener *impl_from_IClosable( IClosable *iface )
++{
++    return CONTAINING_RECORD( iface, struct listener, IClosable_iface );
++}
++
++static inline struct listener *impl_from_IStreamSocketListenerControl( IStreamSocketListenerControl *iface )
++{
++    return CONTAINING_RECORD( iface, struct listener, IStreamSocketListenerControl_iface );
++}
++
++static inline struct listener *impl_from_IStreamSocketListenerInformation( IStreamSocketListenerInformation *iface )
++{
++    return CONTAINING_RECORD( iface, struct listener, IStreamSocketListenerInformation_iface );
++}
++
++static HRESULT WINAPI listener_QueryInterface( IStreamSocketListener *iface, REFIID iid, void **out )
++{
++    struct listener *impl = impl_from_IStreamSocketListener( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IStreamSocketListener ))
++        *out = &impl->IStreamSocketListener_iface;
++    else if (IsEqualGUID( iid, &IID_IClosable ))
++        *out = &impl->IClosable_iface;
++    else if (IsEqualGUID( iid, &IID_IStreamSocketListenerControl ))
++        *out = &impl->IStreamSocketListenerControl_iface;
++    else if (IsEqualGUID( iid, &IID_IStreamSocketListenerInformation ))
++        *out = &impl->IStreamSocketListenerInformation_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI listener_AddRef( IStreamSocketListener *iface )
++{
++    return InterlockedIncrement( &impl_from_IStreamSocketListener( iface )->ref );
++}
++
++static ULONG WINAPI listener_Release( IStreamSocketListener *iface )
++{
++    struct listener *impl = impl_from_IStreamSocketListener( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        WindowsDeleteString( impl->port );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI listener_GetIids( IStreamSocketListener *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p, count %p, iids %p stub!\n", iface, count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI listener_GetRuntimeClassName( IStreamSocketListener *iface, HSTRING *name )
++{
++    return WindowsCreateString( RuntimeClass_Windows_Networking_Sockets_StreamSocketListener,
++                                wcslen( RuntimeClass_Windows_Networking_Sockets_StreamSocketListener ), name );
++}
++
++static HRESULT WINAPI listener_GetTrustLevel( IStreamSocketListener *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI listener_get_Control( IStreamSocketListener *iface, IInspectable **value )
++{
++    struct listener *impl = impl_from_IStreamSocketListener( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    IStreamSocketListenerControl_AddRef( (IStreamSocketListenerControl *)(*value = (IInspectable *)&impl->IStreamSocketListenerControl_iface) );
++    return S_OK;
++}
++
++static HRESULT WINAPI listener_get_Information( IStreamSocketListener *iface, IInspectable **value )
++{
++    struct listener *impl = impl_from_IStreamSocketListener( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    IStreamSocketListenerInformation_AddRef( (IStreamSocketListenerInformation *)(*value = (IInspectable *)&impl->IStreamSocketListenerInformation_iface) );
++    return S_OK;
++}
++
++static HRESULT WINAPI listener_BindServiceNameAsync( IStreamSocketListener *iface, HSTRING service, IAsyncAction **value )
++{
++    struct listener *impl = impl_from_IStreamSocketListener( iface );
++    HSTRING copy;
++    HRESULT hr;
++
++    FIXME( "iface %p, service %s semi-stub: bound, but nothing will connect.\n", iface, debugstr_hstring( service ) );
++    if (FAILED(hr = WindowsDuplicateString( service, &copy ))) return hr;
++    WindowsDeleteString( impl->port );
++    impl->port = copy;
++    return async_action_create( S_OK, value );
++}
++
++static HRESULT WINAPI listener_BindEndpointAsync( IStreamSocketListener *iface, IHostName *host, HSTRING service, IAsyncAction **value )
++{
++    FIXME( "iface %p, host %p, service %s semi-stub.\n", iface, host, debugstr_hstring( service ) );
++    return listener_BindServiceNameAsync( iface, service, value );
++}
++
++static HRESULT WINAPI listener_add_ConnectionReceived( IStreamSocketListener *iface, IStreamSocketListenerConnectionReceivedHandler *handler, EventRegistrationToken *token )
++{
++    struct listener *impl = impl_from_IStreamSocketListener( iface );
++
++    FIXME( "iface %p, handler %p semi-stub: the handler is not kept.\n", iface, handler );
++    token->value = InterlockedIncrement( &impl->next_token );
++    return S_OK;
++}
++
++static HRESULT WINAPI listener_remove_ConnectionReceived( IStreamSocketListener *iface, EventRegistrationToken token )
++{
++    TRACE( "iface %p, token %#I64x.\n", iface, token.value );
++    return S_OK;
++}
++
++static const IStreamSocketListenerVtbl listener_vtbl =
++{
++    listener_QueryInterface,
++    listener_AddRef,
++    listener_Release,
++    listener_GetIids,
++    listener_GetRuntimeClassName,
++    listener_GetTrustLevel,
++    listener_get_Control,
++    listener_get_Information,
++    listener_BindServiceNameAsync,
++    listener_BindEndpointAsync,
++    listener_add_ConnectionReceived,
++    listener_remove_ConnectionReceived,
++};
++
++/* IClosable, IStreamSocketListenerControl and IStreamSocketListenerInformation share the listener's lifetime */
++
++#define FORWARD_INSPECTABLE( pfx, iface_type, from )                                                         \
++    static HRESULT WINAPI pfx##_QueryInterface( iface_type *iface, REFIID iid, void **out )                  \
++    {                                                                                                        \
++        return listener_QueryInterface( &from( iface )->IStreamSocketListener_iface, iid, out );             \
++    }                                                                                                        \
++    static ULONG WINAPI pfx##_AddRef( iface_type *iface )                                                    \
++    {                                                                                                        \
++        return listener_AddRef( &from( iface )->IStreamSocketListener_iface );                               \
++    }                                                                                                        \
++    static ULONG WINAPI pfx##_Release( iface_type *iface )                                                   \
++    {                                                                                                        \
++        return listener_Release( &from( iface )->IStreamSocketListener_iface );                              \
++    }                                                                                                        \
++    static HRESULT WINAPI pfx##_GetIids( iface_type *iface, ULONG *count, IID **iids )                       \
++    {                                                                                                        \
++        return E_NOTIMPL;                                                                                    \
++    }                                                                                                        \
++    static HRESULT WINAPI pfx##_GetRuntimeClassName( iface_type *iface, HSTRING *name )                      \
++    {                                                                                                        \
++        return listener_GetRuntimeClassName( &from( iface )->IStreamSocketListener_iface, name );            \
++    }                                                                                                        \
++    static HRESULT WINAPI pfx##_GetTrustLevel( iface_type *iface, TrustLevel *level )                        \
++    {                                                                                                        \
++        *level = BaseTrust;                                                                                  \
++        return S_OK;                                                                                         \
++    }
++
++FORWARD_INSPECTABLE( closable, IClosable, impl_from_IClosable )
++
++static HRESULT WINAPI closable_Close( IClosable *iface )
++{
++    TRACE( "iface %p.\n", iface );
++    return S_OK;
++}
++
++static const IClosableVtbl closable_vtbl =
++{
++    closable_QueryInterface,
++    closable_AddRef,
++    closable_Release,
++    closable_GetIids,
++    closable_GetRuntimeClassName,
++    closable_GetTrustLevel,
++    closable_Close,
++};
++
++FORWARD_INSPECTABLE( control, IStreamSocketListenerControl, impl_from_IStreamSocketListenerControl )
++
++static HRESULT WINAPI control_get_QualityOfService( IStreamSocketListenerControl *iface, INT32 *value )
++{
++    *value = impl_from_IStreamSocketListenerControl( iface )->quality;
++    return S_OK;
++}
++
++static HRESULT WINAPI control_put_QualityOfService( IStreamSocketListenerControl *iface, INT32 value )
++{
++    impl_from_IStreamSocketListenerControl( iface )->quality = value;
++    return S_OK;
++}
++
++static const IStreamSocketListenerControlVtbl control_vtbl =
++{
++    control_QueryInterface,
++    control_AddRef,
++    control_Release,
++    control_GetIids,
++    control_GetRuntimeClassName,
++    control_GetTrustLevel,
++    control_get_QualityOfService,
++    control_put_QualityOfService,
++};
++
++FORWARD_INSPECTABLE( information, IStreamSocketListenerInformation, impl_from_IStreamSocketListenerInformation )
++
++static HRESULT WINAPI information_get_LocalPort( IStreamSocketListenerInformation *iface, HSTRING *value )
++{
++    return WindowsDuplicateString( impl_from_IStreamSocketListenerInformation( iface )->port, value );
++}
++
++static const IStreamSocketListenerInformationVtbl information_vtbl =
++{
++    information_QueryInterface,
++    information_AddRef,
++    information_Release,
++    information_GetIids,
++    information_GetRuntimeClassName,
++    information_GetTrustLevel,
++    information_get_LocalPort,
++};
++
++/* the activation factory */
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p, count %p, iids %p stub!\n", iface, count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name )
++{
++    FIXME( "iface %p, name %p stub!\n", iface, name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
++{
++    FIXME( "iface %p, level %p stub!\n", iface, level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    struct listener *impl;
++
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IStreamSocketListener_iface.lpVtbl = &listener_vtbl;
++    impl->IClosable_iface.lpVtbl = &closable_vtbl;
++    impl->IStreamSocketListenerControl_iface.lpVtbl = &control_vtbl;
++    impl->IStreamSocketListenerInformation_iface.lpVtbl = &information_vtbl;
++    impl->ref = 1;
++    *instance = (IInspectable *)&impl->IStreamSocketListener_iface;
++    return S_OK;
++}
++
++static const IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++static IActivationFactory listener_activation_factory = { &factory_vtbl };
++IActivationFactory *streamsocketlistener_factory = &listener_activation_factory;
+diff --git a/dlls/windows.storage.applicationdata/applicationdata.c b/dlls/windows.storage.applicationdata/applicationdata.c
+index d18b500..f350974 100644
+--- a/dlls/windows.storage.applicationdata/applicationdata.c
++++ b/dlls/windows.storage.applicationdata/applicationdata.c
+@@ -524,6 +524,17 @@ struct app_container
+     LONG ref;
+     ApplicationDataLocality locality;
+     IPropertySet *values;
++    WCHAR *name;           /* "" for the root container */
++    WCHAR *path;           /* the file it is saved in, or NULL; children are saved beside it, in a folder of its name */
++    struct container_child *children;   /* the containers CreateContainer made, kept for the session */
++    CRITICAL_SECTION cs;
++};
++
++struct container_child
++{
++    struct container_child *next;
++    WCHAR *name;
++    IApplicationDataContainer *container;
+ };
+ 
+ static inline struct app_container *impl_from_IApplicationDataContainer( IApplicationDataContainer *iface )
+@@ -563,7 +574,18 @@ static ULONG WINAPI container_Release( IApplicationDataContainer *iface )
+     ULONG ref = InterlockedDecrement( &impl->ref );
+     if (!ref)
+     {
++        struct container_child *child;
++        while ((child = impl->children))
++        {
++            impl->children = child->next;
++            IApplicationDataContainer_Release( child->container );
++            free( child->name );
++            free( child );
++        }
+         IPropertySet_Release( impl->values );
++        free( impl->name );
++        free( impl->path );
++        DeleteCriticalSection( &impl->cs );
+         free( impl );
+     }
+     return ref;
+@@ -588,8 +610,10 @@ static HRESULT WINAPI container_GetTrustLevel( IApplicationDataContainer *iface,
+ 
+ static HRESULT WINAPI container_get_Name( IApplicationDataContainer *iface, HSTRING *value )
+ {
++    struct app_container *impl = impl_from_IApplicationDataContainer( iface );
++
+     TRACE( "iface %p, value %p.\n", iface, value );
+-    return WindowsCreateString( L"", 0, value );
++    return WindowsCreateString( impl->name, wcslen( impl->name ), value );
+ }
+ 
+ static HRESULT WINAPI container_get_Locality( IApplicationDataContainer *iface, ApplicationDataLocality *value )
+@@ -614,12 +638,97 @@ static HRESULT WINAPI container_get_Containers( IApplicationDataContainer *iface
+     return E_NOTIMPL;
+ }
+ 
++static const IApplicationDataContainerVtbl container_vtbl;
++
++static HRESULT container_create( ApplicationDataLocality locality, const WCHAR *name, const WCHAR *path,
++                                 IApplicationDataContainer **out )
++{
++    struct app_container *impl;
++    HRESULT hr;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IApplicationDataContainer_iface.lpVtbl = &container_vtbl;
++    impl->ref = 1;
++    impl->locality = locality;
++    impl->name = wcsdup( name );
++    impl->path = path ? wcsdup( path ) : NULL;
++    InitializeCriticalSectionEx( &impl->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    impl->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": app_container.cs");
++    if (path) hr = property_set_create_persistent( TRUE, path, &impl->values );
++    else hr = property_set_create( TRUE, &impl->values );
++    if (FAILED(hr) || !impl->name)
++    {
++        if (SUCCEEDED(hr)) IPropertySet_Release( impl->values );
++        DeleteCriticalSection( &impl->cs );
++        free( impl->name );
++        free( impl->path );
++        free( impl );
++        return FAILED(hr) ? hr : E_OUTOFMEMORY;
++    }
++    *out = &impl->IApplicationDataContainer_iface;
++    return S_OK;
++}
++
+ static HRESULT WINAPI container_CreateContainer( IApplicationDataContainer *iface, HSTRING name,
+                                                  ApplicationDataCreateDisposition disposition,
+                                                  IApplicationDataContainer **container )
+ {
+-    FIXME( "iface %p, name %s, disposition %d, container %p stub!\n", iface, debugstr_hstring( name ), disposition, container );
+-    return E_NOTIMPL;
++    struct app_container *impl = impl_from_IApplicationDataContainer( iface );
++    const WCHAR *buffer = WindowsGetStringRawBuffer( name, NULL );
++    struct container_child *child;
++    WCHAR path[MAX_PATH], *dot;
++    HRESULT hr;
++
++    TRACE( "iface %p, name %s, disposition %d, container %p.\n", iface, debugstr_hstring( name ), disposition, container );
++
++    if (!container) return E_POINTER;
++    *container = NULL;
++    if (!buffer || !*buffer) return E_INVALIDARG;
++
++    EnterCriticalSection( &impl->cs );
++    for (child = impl->children; child; child = child->next)
++        if (!wcsicmp( child->name, buffer )) break;
++    if (child)
++    {
++        IApplicationDataContainer_AddRef( (*container = child->container) );
++        LeaveCriticalSection( &impl->cs );
++        return S_OK;
++    }
++
++    /* saved in a folder next to the parent's file: Settings\local.dat, Settings\local\<name>.dat */
++    path[0] = 0;
++    if (impl->path && wcslen( impl->path ) + wcslen( buffer ) + 6 < MAX_PATH)
++    {
++        lstrcpyW( path, impl->path );
++        if ((dot = wcsrchr( path, '.' ))) *dot = 0;
++        lstrcatW( path, L"\\" );
++        lstrcatW( path, buffer );
++        lstrcatW( path, L".dat" );
++    }
++    if (disposition == ApplicationDataCreateDisposition_Existing && (!path[0] || GetFileAttributesW( path ) == INVALID_FILE_ATTRIBUTES))
++    {
++        LeaveCriticalSection( &impl->cs );
++        return HRESULT_FROM_WIN32( ERROR_FILE_NOT_FOUND );
++    }
++
++    if (!(child = calloc( 1, sizeof(*child) )) || !(child->name = wcsdup( buffer )))
++    {
++        free( child );
++        LeaveCriticalSection( &impl->cs );
++        return E_OUTOFMEMORY;
++    }
++    if (FAILED(hr = container_create( impl->locality, buffer, path[0] ? path : NULL, &child->container )))
++    {
++        free( child->name );
++        free( child );
++        LeaveCriticalSection( &impl->cs );
++        return hr;
++    }
++    child->next = impl->children;
++    impl->children = child;
++    IApplicationDataContainer_AddRef( (*container = child->container) );
++    LeaveCriticalSection( &impl->cs );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI container_DeleteContainer( IApplicationDataContainer *iface, HSTRING name )
+@@ -667,24 +776,17 @@ static IApplicationDataContainer *settings_containers[2];
+ static HRESULT get_settings_container( ApplicationDataLocality locality, IApplicationDataContainer **out )
+ {
+     IApplicationDataContainer *container, *old;
+-    struct app_container *impl;
+     HRESULT hr;
+ 
+     if (!out) return E_POINTER;
+ 
+     if (!(container = settings_containers[locality]))
+     {
+-        if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+-        impl->IApplicationDataContainer_iface.lpVtbl = &container_vtbl;
+-        impl->ref = 1;
+-        impl->locality = locality;
+         {
+             WCHAR path[MAX_PATH];
+-            if (settings_path( locality, path )) hr = property_set_create_persistent( TRUE, path, &impl->values );
+-            else hr = property_set_create( TRUE, &impl->values );
++            hr = container_create( locality, L"", settings_path( locality, path ) ? path : NULL, &container );
+         }
+-        if (FAILED(hr)) { free( impl ); return hr; }
+-        container = &impl->IApplicationDataContainer_iface;
++        if (FAILED(hr)) return hr;
+         if ((old = InterlockedCompareExchangePointer( (void **)&settings_containers[locality], container, NULL )))
+         {
+             IApplicationDataContainer_Release( container );
+diff --git a/dlls/windows.ui.xaml/classes.idl b/dlls/windows.ui.xaml/classes.idl
+index b212147..e88ff38 100644
+--- a/dlls/windows.ui.xaml/classes.idl
++++ b/dlls/windows.ui.xaml/classes.idl
+@@ -80,6 +80,7 @@ namespace Windows.UI.Xaml.Controls {
+     runtimeclass RowDefinition;
+     runtimeclass ScrollViewer;
+     runtimeclass Slider;
++    runtimeclass SwapChainBackgroundPanel;
+     runtimeclass SwapChainPanel;
+     runtimeclass SymbolIcon;
+     runtimeclass StackPanel;
+diff --git a/dlls/windows.ui.xaml/main.c b/dlls/windows.ui.xaml/main.c
+index 9c2cc27..aace15b 100644
+--- a/dlls/windows.ui.xaml/main.c
++++ b/dlls/windows.ui.xaml/main.c
+@@ -100,6 +100,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( font_icon_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_CompositionTarget ))
+         IActivationFactory_QueryInterface( composition_target_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_SwapChainBackgroundPanel ))
++        IActivationFactory_QueryInterface( swapchain_background_panel_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_SwapChainPanel ))
+         IActivationFactory_QueryInterface( swapchain_panel_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_ContentDialog ))
+diff --git a/dlls/windows.ui.xaml/panel.c b/dlls/windows.ui.xaml/panel.c
+index 79a4ac6..ecc274f 100644
+--- a/dlls/windows.ui.xaml/panel.c
++++ b/dlls/windows.ui.xaml/panel.c
+@@ -36,6 +36,7 @@ enum panel_kind
+     PANEL_WRAP,
+     PANEL_SWAPCHAIN,   /* swapchain.c: SwapChainPanel, a Grid */
+     PANEL_CANVAS,      /* children at their Canvas.Left/Top, at their desired size */
++    PANEL_SWAPCHAIN_BG,   /* swapchain.c: SwapChainBackgroundPanel, the Windows 8 SwapChainPanel */
+ };
+ 
+ struct panel
+@@ -491,8 +492,8 @@ static HRESULT panel_query_interface( struct xaml_element *element, REFIID iid,
+ 
+     if (IsEqualGUID( iid, &IID_IPanel )) *out = &impl->IPanel_iface;
+     else if (impl->kind == PANEL_STACK && IsEqualGUID( iid, &IID_IStackPanel )) *out = &impl->IStackPanel_iface;
+-    else if ((impl->kind == PANEL_GRID || impl->kind == PANEL_SWAPCHAIN) && IsEqualGUID( iid, &IID_IGrid )) *out = &impl->IGrid_iface;
+-    else if (impl->kind == PANEL_SWAPCHAIN) return swapchain_panel_query_interface( impl->swapchain, iid, out );
++    else if ((impl->kind == PANEL_GRID || impl->kind == PANEL_SWAPCHAIN || impl->kind == PANEL_SWAPCHAIN_BG) && IsEqualGUID( iid, &IID_IGrid )) *out = &impl->IGrid_iface;
++    else if (impl->kind == PANEL_SWAPCHAIN || impl->kind == PANEL_SWAPCHAIN_BG) return swapchain_panel_query_interface( impl->swapchain, iid, out );
+     else if (impl->kind == PANEL_ITEMS_STACK && IsEqualGUID( iid, &IID_IItemsStackPanel )) *out = &impl->IItemsStackPanel_iface;
+     else if (impl->kind == PANEL_WRAP && IsEqualGUID( iid, &IID_IItemsWrapGrid )) *out = &impl->IItemsWrapGrid_iface;
+     else if (impl->kind == PANEL_CANVAS && IsEqualGUID( iid, &IID_ICanvas )) *out = &impl->ICanvas_iface;
+@@ -982,6 +983,7 @@ static HRESULT panel_create( enum panel_kind kind, IInspectable *outer, IInspect
+         RuntimeClass_Windows_UI_Xaml_Controls_ItemsWrapGrid,
+         RuntimeClass_Windows_UI_Xaml_Controls_SwapChainPanel,
+         RuntimeClass_Windows_UI_Xaml_Controls_Canvas,
++        RuntimeClass_Windows_UI_Xaml_Controls_SwapChainBackgroundPanel,
+     };
+     void *iface;
+ 
+@@ -1000,12 +1002,13 @@ static HRESULT panel_create( enum panel_kind kind, IInspectable *outer, IInspect
+     impl->cache_length = 4.0;
+     if (FAILED(hr = vector_create( &uielement_collection_iids, &children_callbacks, &impl->element, &impl->children )))
+         goto failed;
+-    if (kind == PANEL_SWAPCHAIN && !(impl->swapchain = swapchain_panel_create( &impl->element )))
++    if ((kind == PANEL_SWAPCHAIN || kind == PANEL_SWAPCHAIN_BG) &&
++        !(impl->swapchain = swapchain_panel_create( &impl->element, kind == PANEL_SWAPCHAIN_BG )))
+     {
+         hr = E_OUTOFMEMORY;
+         goto failed;
+     }
+-    if (kind == PANEL_GRID || kind == PANEL_SWAPCHAIN)
++    if (kind == PANEL_GRID || kind == PANEL_SWAPCHAIN || kind == PANEL_SWAPCHAIN_BG)
+     {
+         if (FAILED(hr = vector_create( &row_collection_iids, &definitions_callbacks, impl, &impl->rows ))) goto failed;
+         if (FAILED(hr = vector_create( &column_collection_iids, &definitions_callbacks, impl, &impl->columns ))) goto failed;
+@@ -1016,7 +1019,8 @@ static HRESULT panel_create( enum panel_kind kind, IInspectable *outer, IInspect
+     case PANEL_STACK: iface = &impl->IStackPanel_iface; break;
+     case PANEL_GRID: iface = &impl->IGrid_iface; break;
+     case PANEL_ITEMS_STACK: iface = &impl->IItemsStackPanel_iface; break;
+-    case PANEL_SWAPCHAIN: iface = swapchain_panel_default_iface( impl->swapchain ); break;
++    case PANEL_SWAPCHAIN:
++    case PANEL_SWAPCHAIN_BG: iface = swapchain_panel_default_iface( impl->swapchain ); break;
+     case PANEL_CANVAS: iface = &impl->ICanvas_iface; break;
+     default: iface = &impl->IItemsWrapGrid_iface; break;
+     }
+@@ -1041,6 +1045,7 @@ struct panel_statics
+     ISwapChainPanelFactory ISwapChainPanelFactory_iface;
+     ICanvasFactory ICanvasFactory_iface;
+     ICanvasStatics ICanvasStatics_iface;
++    ISwapChainBackgroundPanelFactory ISwapChainBackgroundPanelFactory_iface;
+ };
+ 
+ static inline struct panel_statics *impl_from_IActivationFactory( IActivationFactory *iface )
+@@ -1063,6 +1068,8 @@ static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID
+         *out = &impl->IGridFactory_iface;
+     else if (impl->kind == PANEL_SWAPCHAIN && IsEqualGUID( iid, &IID_ISwapChainPanelFactory ))
+         *out = &impl->ISwapChainPanelFactory_iface;
++    else if (impl->kind == PANEL_SWAPCHAIN_BG && IsEqualGUID( iid, &IID_ISwapChainBackgroundPanelFactory ))
++        *out = &impl->ISwapChainBackgroundPanelFactory_iface;
+     else if (impl->kind == PANEL_GRID && IsEqualGUID( iid, &IID_IGridStatics ))
+         *out = &impl->IGridStatics_iface;
+     else if (impl->kind == PANEL_CANVAS && IsEqualGUID( iid, &IID_ICanvasFactory ))
+@@ -1283,6 +1290,39 @@ static struct panel_statics swapchain_statics =
+ 
+ IActivationFactory *swapchain_panel_factory = &swapchain_statics.IActivationFactory_iface;
+ 
++/* SwapChainBackgroundPanel: the same, with the composable ISwapChainBackgroundPanelFactory */
++
++DEFINE_IINSPECTABLE( swapchain_bg_factory, ISwapChainBackgroundPanelFactory, struct panel_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI swapchain_bg_factory_CreateInstance( ISwapChainBackgroundPanelFactory *iface, IInspectable *outer,
++                                                           IInspectable **inner, ISwapChainBackgroundPanel **value )
++{
++    TRACE( "iface %p, outer %p, inner %p, value %p.\n", iface, outer, inner, value );
++    return panel_create( PANEL_SWAPCHAIN_BG, outer, inner, (void **)value );
++}
++
++static const struct ISwapChainBackgroundPanelFactoryVtbl swapchain_bg_factory_vtbl =
++{
++    swapchain_bg_factory_QueryInterface,
++    swapchain_bg_factory_AddRef,
++    swapchain_bg_factory_Release,
++    /* IInspectable methods */
++    swapchain_bg_factory_GetIids,
++    swapchain_bg_factory_GetRuntimeClassName,
++    swapchain_bg_factory_GetTrustLevel,
++    /* ISwapChainBackgroundPanelFactory methods */
++    swapchain_bg_factory_CreateInstance,
++};
++
++static struct panel_statics swapchain_bg_statics =
++{
++    .IActivationFactory_iface = {&factory_vtbl}, .IStackPanelFactory_iface = {&stack_factory_vtbl},
++    .IGridFactory_iface = {&grid_factory_iface_vtbl}, .IGridStatics_iface = {&grid_statics_vtbl},
++    .kind = PANEL_SWAPCHAIN_BG, .ISwapChainBackgroundPanelFactory_iface = {&swapchain_bg_factory_vtbl},
++};
++
++IActivationFactory *swapchain_background_panel_factory = &swapchain_bg_statics.IActivationFactory_iface;
++
+ /* Canvas: IActivationFactory, the composable ICanvasFactory, and ICanvasStatics (Left, Top and ZIndex) */
+ 
+ DEFINE_IINSPECTABLE( canvas_factory_iface, ICanvasFactory, struct panel_statics, IActivationFactory_iface )
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index 2b2712d..29543cd 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -279,12 +279,13 @@ HRESULT xaml_get_dispatcher( ICoreDispatcher **value );
+ ICoreWindow *window_core_window(void);               /* the view's CoreWindow, not referenced */
+ /* swapchain.c: SwapChainPanel */
+ struct swapchain_panel;
+-struct swapchain_panel *swapchain_panel_create( struct xaml_element *element );
++struct swapchain_panel *swapchain_panel_create( struct xaml_element *element, BOOL background );
+ void *swapchain_panel_default_iface( struct swapchain_panel *impl );
+ HRESULT swapchain_panel_query_interface( struct swapchain_panel *impl, REFIID iid, void **out );
+ void swapchain_panel_destroy( struct swapchain_panel *impl );
+ BOOL window_swapchain_active(void);   /* a SwapChainPanel's swap chain is on the window: XAML doesn't draw */
+ extern IActivationFactory *swapchain_panel_factory;
++extern IActivationFactory *swapchain_background_panel_factory;   /* SwapChainBackgroundPanel (Windows 8) */
+ /* composition.c: CompositionTarget */
+ extern IActivationFactory *composition_target_factory;
+ void composition_frame(void);
+diff --git a/dlls/windows.ui.xaml/swapchain.c b/dlls/windows.ui.xaml/swapchain.c
+index bbd8cd8..6b20ce1 100644
+--- a/dlls/windows.ui.xaml/swapchain.c
++++ b/dlls/windows.ui.xaml/swapchain.c
+@@ -33,6 +33,8 @@ WINE_DEFAULT_DEBUG_CHANNEL(xaml);
+  * CoreWindow's pointer events (raised on the UI thread), with the CoreWindow's dispatcher. */
+ 
+ DEFINE_GUID( IID_ISwapChainPanelNative, 0xf92f19d2, 0x3ade, 0x45a6, 0xa2, 0x0c, 0xf6, 0xf1, 0xea, 0x90, 0x55, 0x4b );
++/* ISwapChainBackgroundPanelNative (windows.ui.xaml.media.dxinterop.h): SetSwapChain, as ISwapChainPanelNative's */
++DEFINE_GUID( IID_ISwapChainBackgroundPanelNative, 0x43bebd4e, 0xadd5, 0x4035, 0x8f, 0x85, 0x56, 0x08, 0xd0, 0x8e, 0x9d, 0xc9 );
+ DEFINE_GUID( IID_ISwapChainPanelNative2, 0xd5a2f60c, 0x37b2, 0x44a2, 0x93, 0x7b, 0x8d, 0x8e, 0xb9, 0x72, 0x68, 0x21 );
+ 
+ /* ISwapChainPanelNative2, which derives from ISwapChainPanelNative (windows.ui.xaml.media.dxinterop.h) */
+@@ -50,6 +52,8 @@ struct ISwapChainPanelNative2 { const struct ISwapChainPanelNative2Vtbl *lpVtbl;
+ struct swapchain_panel
+ {
+     ISwapChainPanel ISwapChainPanel_iface;
++    ISwapChainBackgroundPanel ISwapChainBackgroundPanel_iface;   /* SwapChainBackgroundPanel has this instead */
++    BOOL background;
+     ISwapChainPanelNative2 ISwapChainPanelNative2_iface;
+     struct xaml_element *element;
+     IUnknown *swapchain;
+@@ -118,6 +122,22 @@ static const struct ISwapChainPanelVtbl panel_iface_vtbl =
+     panel_iface_CreateCoreIndependentInputSource,
+ };
+ 
++/* ---- ISwapChainBackgroundPanel (no methods) ---- */
++
++DEFINE_IINSPECTABLE_( background_iface, ISwapChainBackgroundPanel, struct swapchain_panel, impl_from_ISwapChainBackgroundPanel,
++                      ISwapChainBackgroundPanel_iface, impl->element->outer )
++
++static const struct ISwapChainBackgroundPanelVtbl background_iface_vtbl =
++{
++    background_iface_QueryInterface,
++    background_iface_AddRef,
++    background_iface_Release,
++    /* IInspectable methods */
++    background_iface_GetIids,
++    background_iface_GetRuntimeClassName,
++    background_iface_GetTrustLevel,
++};
++
+ /* ---- ISwapChainPanelNative(2) ---- */
+ 
+ static inline struct swapchain_panel *impl_from_native( ISwapChainPanelNative2 *iface )
+@@ -171,25 +191,33 @@ static const struct ISwapChainPanelNative2Vtbl native_vtbl =
+ 
+ /* ---- the panel.c side ---- */
+ 
+-struct swapchain_panel *swapchain_panel_create( struct xaml_element *element )
++struct swapchain_panel *swapchain_panel_create( struct xaml_element *element, BOOL background )
+ {
+     struct swapchain_panel *impl;
+ 
+     if (!(impl = calloc( 1, sizeof(*impl) ))) return NULL;
+     impl->ISwapChainPanel_iface.lpVtbl = &panel_iface_vtbl;
++    impl->ISwapChainBackgroundPanel_iface.lpVtbl = &background_iface_vtbl;
+     impl->ISwapChainPanelNative2_iface.lpVtbl = &native_vtbl;
++    impl->background = background;
+     impl->element = element;
+     return impl;
+ }
+ 
+ void *swapchain_panel_default_iface( struct swapchain_panel *impl )
+ {
+-    return &impl->ISwapChainPanel_iface;
++    return impl->background ? (void *)&impl->ISwapChainBackgroundPanel_iface : (void *)&impl->ISwapChainPanel_iface;
+ }
+ 
+ HRESULT swapchain_panel_query_interface( struct swapchain_panel *impl, REFIID iid, void **out )
+ {
+-    if (IsEqualGUID( iid, &IID_ISwapChainPanel )) *out = &impl->ISwapChainPanel_iface;
++    if (impl->background)
++    {
++        if (IsEqualGUID( iid, &IID_ISwapChainBackgroundPanel )) *out = &impl->ISwapChainBackgroundPanel_iface;
++        else if (IsEqualGUID( iid, &IID_ISwapChainBackgroundPanelNative )) *out = &impl->ISwapChainPanelNative2_iface;
++        else return E_NOINTERFACE;
++    }
++    else if (IsEqualGUID( iid, &IID_ISwapChainPanel )) *out = &impl->ISwapChainPanel_iface;
+     else if (IsEqualGUID( iid, &IID_ISwapChainPanelNative ) || IsEqualGUID( iid, &IID_ISwapChainPanelNative2 ))
+         *out = &impl->ISwapChainPanelNative2_iface;
+     else return E_NOINTERFACE;
+diff --git a/dlls/windows.ui.xaml/window.c b/dlls/windows.ui.xaml/window.c
+index 2c31243..d20088f 100644
+--- a/dlls/windows.ui.xaml/window.c
++++ b/dlls/windows.ui.xaml/window.c
+@@ -40,6 +40,7 @@ struct xaml_window
+     /* popups over the content, the topmost last (referenced): a ContentDialog's layer, a menu */
+     int activation;                 /* the CoreWindowActivationState last raised, or -1 */
+     BOOL visible;                   /* VisibilityChanged has said it is visible */
++    float size_w, size_h;           /* the size SizeChanged last raised; both 0 before the first */
+     struct xaml_element *popups[8];
+     BOOL modal[8];                  /* a modal popup gets all the input; others what they hit */
+     UINT32 popup_count;
+@@ -327,6 +328,8 @@ static void window_wheel( struct xaml_window *window, WPARAM wparam, LPARAM lpar
+ /* Window.Activated: WindowActivatedEventArgs */
+ 
+ #define WM_XAML_ACTIVATED (WM_APP + 0x5ea)   /* raise Activated after Activate() has returned */
++#define SHOWN_TIMER_ID 0x5ea2                /* then SizeChanged and VisibilityChanged, a little later (see WM_XAML_ACTIVATED) */
++#define SHOWN_DELAY 100
+ 
+ struct activated_args
+ {
+@@ -548,6 +551,161 @@ static const struct ICoreWindowEventArgsVtbl visibility_core_args_vtbl =
+     visibility_core_args_put_Handled,
+ };
+ 
++/* Window.SizeChanged: WindowSizeChangedEventArgs */
++
++struct size_args
++{
++    IWindowSizeChangedEventArgs IWindowSizeChangedEventArgs_iface;
++    ICoreWindowEventArgs ICoreWindowEventArgs_iface;
++    LONG ref;
++    Size size;
++    boolean handled;
++};
++
++static inline struct size_args *impl_from_IWindowSizeChangedEventArgs( IWindowSizeChangedEventArgs *iface )
++{
++    return CONTAINING_RECORD( iface, struct size_args, IWindowSizeChangedEventArgs_iface );
++}
++
++static HRESULT WINAPI size_args_QueryInterface( IWindowSizeChangedEventArgs *iface, REFIID iid, void **out )
++{
++    struct size_args *impl = impl_from_IWindowSizeChangedEventArgs( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IWindowSizeChangedEventArgs ))
++        *out = &impl->IWindowSizeChangedEventArgs_iface;
++    else if (IsEqualGUID( iid, &IID_ICoreWindowEventArgs ))
++        *out = &impl->ICoreWindowEventArgs_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI size_args_AddRef( IWindowSizeChangedEventArgs *iface )
++{
++    return InterlockedIncrement( &impl_from_IWindowSizeChangedEventArgs( iface )->ref );
++}
++
++static ULONG WINAPI size_args_Release( IWindowSizeChangedEventArgs *iface )
++{
++    struct size_args *impl = impl_from_IWindowSizeChangedEventArgs( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI size_args_GetIids( IWindowSizeChangedEventArgs *iface, ULONG *count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI size_args_GetRuntimeClassName( IWindowSizeChangedEventArgs *iface, HSTRING *value )
++{
++    const WCHAR *name = RuntimeClass_Windows_UI_Core_WindowSizeChangedEventArgs;
++    return WindowsCreateString( name, wcslen( name ), value );
++}
++
++static HRESULT WINAPI size_args_GetTrustLevel( IWindowSizeChangedEventArgs *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI size_args_get_Size( IWindowSizeChangedEventArgs *iface, Size *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IWindowSizeChangedEventArgs( iface )->size;
++    return S_OK;
++}
++
++static const struct IWindowSizeChangedEventArgsVtbl size_args_vtbl =
++{
++    size_args_QueryInterface,
++    size_args_AddRef,
++    size_args_Release,
++    size_args_GetIids,
++    size_args_GetRuntimeClassName,
++    size_args_GetTrustLevel,
++    size_args_get_Size,
++};
++
++DEFINE_IINSPECTABLE_( size_core_args, ICoreWindowEventArgs, struct size_args, size_from_core_args,
++                      ICoreWindowEventArgs_iface, &impl->IWindowSizeChangedEventArgs_iface )
++
++static HRESULT WINAPI size_core_args_get_Handled( ICoreWindowEventArgs *iface, boolean *value )
++{
++    if (!value) return E_POINTER;
++    *value = size_from_core_args( iface )->handled;
++    return S_OK;
++}
++
++static HRESULT WINAPI size_core_args_put_Handled( ICoreWindowEventArgs *iface, boolean value )
++{
++    size_from_core_args( iface )->handled = value;
++    return S_OK;
++}
++
++static const struct ICoreWindowEventArgsVtbl size_core_args_vtbl =
++{
++    size_core_args_QueryInterface,
++    size_core_args_AddRef,
++    size_core_args_Release,
++    size_core_args_GetIids,
++    size_core_args_GetRuntimeClassName,
++    size_core_args_GetTrustLevel,
++    size_core_args_get_Handled,
++    size_core_args_put_Handled,
++};
++
++/* raise SizeChanged when the window has its first size (as it activates) and whenever its client size changes */
++static void window_raise_size_changed( struct xaml_window *window )
++{
++    struct size_args *args;
++    IUnknown **handlers;
++    UINT32 i, count = window->size_changed.count;
++    float scale = view_scale();
++    RECT client = {0};
++    float w, h;
++    HRESULT hr;
++
++    if (!window->hwnd) return;
++    GetClientRect( window->hwnd, &client );
++    w = client.right / scale;
++    h = client.bottom / scale;
++    if (window->size_w == w && window->size_h == h) return;
++    window->size_w = w;
++    window->size_h = h;
++    TRACE( "window %p: size %fx%f, %u handler slots.\n", window, w, h, count );
++    if (!count || !(args = calloc( 1, sizeof(*args) ))) return;
++    args->IWindowSizeChangedEventArgs_iface.lpVtbl = &size_args_vtbl;
++    args->ICoreWindowEventArgs_iface.lpVtbl = &size_core_args_vtbl;
++    args->ref = 1;
++    args->size.Width = w;
++    args->size.Height = h;
++    if ((handlers = calloc( count, sizeof(*handlers) )))
++    {
++        for (i = 0; i < count; i++) if ((handlers[i] = window->size_changed.handlers[i])) IUnknown_AddRef( handlers[i] );
++        IWindow_AddRef( &window->IWindow_iface );
++        for (i = 0; i < count; i++)
++        {
++            if (!handlers[i]) continue;
++            hr = IWindowSizeChangedEventHandler_Invoke( (IWindowSizeChangedEventHandler *)handlers[i],
++                                                        (IInspectable *)&window->IWindow_iface,
++                                                        &args->IWindowSizeChangedEventArgs_iface );
++            if (FAILED(hr)) WARN( "SizeChanged handler %p failed, hr %#lx.\n", handlers[i], hr );
++        }
++        for (i = 0; i < count; i++) if (handlers[i]) IUnknown_Release( handlers[i] );
++        IWindow_Release( &window->IWindow_iface );
++        free( handlers );
++    }
++    IWindowSizeChangedEventArgs_Release( &args->IWindowSizeChangedEventArgs_iface );
++}
++
+ /* raise VisibilityChanged when the window shows or hides */
+ static void window_raise_visibility( struct xaml_window *window, BOOL visible )
+ {
+@@ -630,7 +788,10 @@ static LRESULT CALLBACK window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM
+     case WM_XAML_ACTIVATED:
+         /* Activate() showed and activated the window, even if the desktop (a locked screen, say) didn't bring it
+          * forward */
+-        window_raise_visibility( window, TRUE );
++        /* On Windows the window's first size and its visibility arrive a moment after Activate() has returned, once it
++         * has been shown and laid out. Games that set themselves up on other threads from their Activated handler
++         * (Asphalt 7) count on that: its VisibilityChanged handler uses an object those threads are still making. */
++        SetTimer( hwnd, SHOWN_TIMER_ID, SHOWN_DELAY, NULL );
+         window_raise_activated( window, CoreWindowActivationState_CodeActivated );
+         return 0;
+     case WM_ACTIVATE:
+@@ -639,6 +800,13 @@ static LRESULT CALLBACK window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM
+                                 CoreWindowActivationState_CodeActivated );
+         break;
+     case WM_TIMER:
++        if (wparam == SHOWN_TIMER_ID)
++        {
++            KillTimer( hwnd, SHOWN_TIMER_ID );
++            window_raise_size_changed( window );
++            window_raise_visibility( window, TRUE );
++            return 0;
++        }
+         if (wparam != FRAME_TIMER_ID) break;
+         composition_frame();
+         return 0;
+@@ -646,6 +814,7 @@ static LRESULT CALLBACK window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM
+         window_paint( window );
+         return 0;
+     case WM_SIZE:
++        window_raise_size_changed( window );
+         InvalidateRect( hwnd, NULL, FALSE );
+         break;
+     case WM_SETTINGCHANGE:
+@@ -839,7 +1008,7 @@ static HRESULT WINAPI window_remove_Closed( IWindow *iface, EventRegistrationTok
+ 
+ static HRESULT WINAPI window_add_SizeChanged( IWindow *iface, IWindowSizeChangedEventHandler *handler, EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, handler %p: handler is kept but never raised.\n", iface, handler );
++    TRACE( "iface %p, handler %p.\n", iface, handler );
+     return event_list_add( &impl_from_IWindow( iface )->size_changed, (IUnknown *)handler, token );
+ }
+ 
+diff --git a/dlls/windows.ui.xaml/xbf.c b/dlls/windows.ui.xaml/xbf.c
+index e8f08b0..629bc99 100644
+--- a/dlls/windows.ui.xaml/xbf.c
++++ b/dlls/windows.ui.xaml/xbf.c
+@@ -3117,6 +3117,7 @@ IInspectable *create_builtin( const WCHAR *name )
+         { L"ListView", &list_view_factory },
+         { L"ContentDialog", &content_dialog_factory },
+         { L"SwapChainPanel", &swapchain_panel_factory },
++        { L"SwapChainBackgroundPanel", &swapchain_background_panel_factory },
+         { L"AppBarButton", &appbar_button_factory },
+         { L"AppBarToggleButton", &appbar_toggle_button_factory },
+         { L"AppBarSeparator", &appbar_separator_factory },
+diff --git a/dlls/windows.ui/Makefile.in b/dlls/windows.ui/Makefile.in
+index a4fea6f..0b36563 100644
+--- a/dlls/windows.ui/Makefile.in
++++ b/dlls/windows.ui/Makefile.in
+@@ -8,6 +8,7 @@ SOURCES = \
+ 	corewindow.c \
+ 	inputpane.c \
+ 	main.c \
++	settingspane.c \
+ 	uisettings.c \
+ 	uiviewsettings.c \
+ 	weakref.c
+diff --git a/dlls/windows.ui/classes.idl b/dlls/windows.ui/classes.idl
+index d32e257..be66170 100644
+--- a/dlls/windows.ui/classes.idl
++++ b/dlls/windows.ui/classes.idl
+@@ -34,6 +34,7 @@ import "windows.ui.core.idl";
+ import "windows.ui.input.idl";
+ import "windows.ui.windowmanagement.idl";
+ import "windows.ui.viewmanagement.idl";
++import "windows.ui.applicationsettings.idl";
+ 
+ /* Windows.UI.Core.CoreWindow is registered by twinapi.appcore, which implements it (as on Windows) */
+ 
+@@ -41,6 +42,10 @@ namespace Windows.UI {
+     runtimeclass Colors;
+ }
+ 
++namespace Windows.UI.ApplicationSettings {
++    runtimeclass SettingsPane;
++}
++
+ namespace Windows.UI.ViewManagement {
+     runtimeclass AccessibilitySettings;
+     runtimeclass UISettings;
+diff --git a/dlls/windows.ui/main.c b/dlls/windows.ui/main.c
+index fab74db..df6b7d5 100644
+--- a/dlls/windows.ui/main.c
++++ b/dlls/windows.ui/main.c
+@@ -50,6 +50,9 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_ViewManagement_InputPane ))
+         IActivationFactory_QueryInterface( inputpane_factory, &IID_IActivationFactory, (void **)factory );
+ 
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_ApplicationSettings_SettingsPane ))
++        IActivationFactory_QueryInterface( settingspane_factory, &IID_IActivationFactory, (void **)factory );
++
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Colors ))
+         IActivationFactory_QueryInterface( colors_factory, &IID_IActivationFactory, (void **)factory );
+ 
+diff --git a/dlls/windows.ui/private.h b/dlls/windows.ui/private.h
+index 88e23ea..c58085b 100644
+--- a/dlls/windows.ui/private.h
++++ b/dlls/windows.ui/private.h
+@@ -37,6 +37,8 @@
+ #include "windows.ui.core.h"
+ #define WIDL_using_Windows_UI_ViewManagement
+ #include "windows.ui.viewmanagement.h"
++#define WIDL_using_Windows_UI_ApplicationSettings
++#include "windows.ui.applicationsettings.h"
+ 
+ extern IActivationFactory *accessibilitysettings_factory;
+ extern IActivationFactory *uisettings_factory;
+@@ -44,6 +46,7 @@ extern IActivationFactory *uiviewsettings_factory;
+ extern IActivationFactory *inputpane_factory;
+ extern IActivationFactory *corewindow_factory;
+ extern IActivationFactory *colors_factory;
++extern IActivationFactory *settingspane_factory;
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \
+diff --git a/dlls/windows.ui/settingspane.c b/dlls/windows.ui/settingspane.c
+new file mode 100644
+index 0000000..27123c0
+--- /dev/null
++++ b/dlls/windows.ui/settingspane.c
+@@ -0,0 +1,200 @@
++/*
++ * Windows.UI.ApplicationSettings.SettingsPane: the Settings charm of Windows 8. There is no charms bar, so the pane
++ * never asks the app for its commands; handlers are accepted and kept nowhere.
++ */
++
++#include "private.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(ui);
++
++struct settingspane
++{
++    IActivationFactory IActivationFactory_iface;
++    ISettingsPaneStatics ISettingsPaneStatics_iface;
++    ISettingsPane ISettingsPane_iface;
++    LONG next_token;
++};
++
++static inline struct settingspane *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct settingspane, IActivationFactory_iface );
++}
++
++static struct settingspane settingspane;
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct settingspane *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    *out = NULL;
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_ISettingsPaneStatics ))
++        *out = &impl->ISettingsPaneStatics_iface;
++
++    if (!*out)
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        return E_NOINTERFACE;
++    }
++
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p, count %p, iids %p stub!\n", iface, count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name )
++{
++    FIXME( "iface %p, name %p stub!\n", iface, name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
++{
++    FIXME( "iface %p, level %p stub!\n", iface, level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    FIXME( "iface %p, instance %p stub!\n", iface, instance );
++    return E_NOTIMPL;
++}
++
++static const IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( statics, ISettingsPaneStatics, struct settingspane, IActivationFactory_iface )
++
++static HRESULT WINAPI statics_GetForCurrentView( ISettingsPaneStatics *iface, ISettingsPane **value )
++{
++    struct settingspane *impl = impl_from_ISettingsPaneStatics( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = &impl->ISettingsPane_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_Show( ISettingsPaneStatics *iface )
++{
++    FIXME( "iface %p semi-stub!\n", iface );
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_get_Edge( ISettingsPaneStatics *iface, SettingsEdgeLocation *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = SettingsEdgeLocation_Right;
++    return S_OK;
++}
++
++static const ISettingsPaneStaticsVtbl statics_vtbl =
++{
++    statics_QueryInterface,
++    statics_AddRef,
++    statics_Release,
++    statics_GetIids,
++    statics_GetRuntimeClassName,
++    statics_GetTrustLevel,
++    statics_GetForCurrentView,
++    statics_Show,
++    statics_get_Edge,
++};
++
++static HRESULT WINAPI pane_QueryInterface( ISettingsPane *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_ISettingsPane ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++
++    *out = NULL;
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI pane_AddRef( ISettingsPane *iface ) { return 2; }
++static ULONG WINAPI pane_Release( ISettingsPane *iface ) { return 1; }
++
++static HRESULT WINAPI pane_GetIids( ISettingsPane *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p, count %p, iids %p stub!\n", iface, count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI pane_GetRuntimeClassName( ISettingsPane *iface, HSTRING *name )
++{
++    FIXME( "iface %p, name %p stub!\n", iface, name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI pane_GetTrustLevel( ISettingsPane *iface, TrustLevel *level )
++{
++    FIXME( "iface %p, level %p stub!\n", iface, level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI pane_add_CommandsRequested( ISettingsPane *iface,
++        ITypedEventHandler_SettingsPane_SettingsPaneCommandsRequestedEventArgs *handler, EventRegistrationToken *token )
++{
++    FIXME( "iface %p, handler %p, token %p semi-stub!\n", iface, handler, token );
++    token->value = InterlockedIncrement( &settingspane.next_token );
++    return S_OK;
++}
++
++static HRESULT WINAPI pane_remove_CommandsRequested( ISettingsPane *iface, EventRegistrationToken token )
++{
++    FIXME( "iface %p, token %#I64x semi-stub!\n", iface, token.value );
++    return S_OK;
++}
++
++static const ISettingsPaneVtbl pane_vtbl =
++{
++    pane_QueryInterface,
++    pane_AddRef,
++    pane_Release,
++    pane_GetIids,
++    pane_GetRuntimeClassName,
++    pane_GetTrustLevel,
++    pane_add_CommandsRequested,
++    pane_remove_CommandsRequested,
++};
++
++static struct settingspane settingspane =
++{
++    .IActivationFactory_iface = { &factory_vtbl },
++    .ISettingsPaneStatics_iface = { &statics_vtbl },
++    .ISettingsPane_iface = { &pane_vtbl },
++};
++
++IActivationFactory *settingspane_factory = &settingspane.IActivationFactory_iface;
+diff --git a/dlls/wpnapps/Makefile.in b/dlls/wpnapps/Makefile.in
+index 60b26a2..b4dcfff 100644
+--- a/dlls/wpnapps/Makefile.in
++++ b/dlls/wpnapps/Makefile.in
+@@ -4,4 +4,8 @@ IMPORTS   = combase
+ SOURCES = \
+ 	classes.idl \
+ 	main.c \
++	notificationsextensions.idl \
++	sensors.c \
++	managed_components.c \
++	tile_notification.c \
+ 	toast_notification.c
+diff --git a/dlls/wpnapps/classes.idl b/dlls/wpnapps/classes.idl
+index 542b46d..0e7c776 100644
+--- a/dlls/wpnapps/classes.idl
++++ b/dlls/wpnapps/classes.idl
+@@ -20,9 +20,17 @@
+ #pragma winrt ns_prefix
+ 
+ import "windows.ui.notifications.idl";
++import "windows.devices.sensors.idl";
++
++namespace Windows.Devices.Sensors
++{
++    runtimeclass Accelerometer;
++}
+ 
+ namespace Windows.UI.Notifications
+ {
+     runtimeclass ToastNotificationManager;
+     runtimeclass ToastNotification;
++    runtimeclass TileUpdateManager;
++    runtimeclass TileNotification;
+ }
+diff --git a/dlls/wpnapps/main.c b/dlls/wpnapps/main.c
+index 9a34398..59b4926 100644
+--- a/dlls/wpnapps/main.c
++++ b/dlls/wpnapps/main.c
+@@ -44,6 +44,18 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+     if (!wcscmp( nameW, RuntimeClass_Windows_UI_Notifications_ToastNotification ))
+         return IActivationFactory_QueryInterface( toast_notification_factory, &IID_IActivationFactory, (void **)factory );
+ 
++    if (!wcscmp( nameW, RuntimeClass_Windows_UI_Notifications_TileUpdateManager ))
++        return IActivationFactory_QueryInterface( tile_manager_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( nameW, RuntimeClass_Windows_UI_Notifications_TileNotification ))
++        return IActivationFactory_QueryInterface( tile_notification_factory, &IID_IActivationFactory, (void **)factory );
++
++    if (!wcscmp( nameW, L"NotificationsExtensions.TileContent.TileContentFactory" ))
++        return IActivationFactory_QueryInterface( tile_content_factory_iface, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( nameW, L"Windows.Devices.Sensors.Accelerometer" ))
++        return IActivationFactory_QueryInterface( accelerometer_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( nameW, L"GA.GoogleAnalytics" ))
++        return IActivationFactory_QueryInterface( ga_factory_iface, &IID_IActivationFactory, (void **)factory );
++
+     *factory = NULL;
+     return CLASS_E_CLASSNOTAVAILABLE;
+ }
+diff --git a/dlls/wpnapps/managed_components.c b/dlls/wpnapps/managed_components.c
+new file mode 100644
+index 0000000..ab1101c
+--- /dev/null
++++ b/dlls/wpnapps/managed_components.c
+@@ -0,0 +1,870 @@
++/*
++ * Stand-ins for the managed (.NET) WinRT components Asphalt 7 ships: NotificationsExtensions (builds tile XML) and
++ * GA (Google Analytics). Windows hosts them through the system's CLRHost.dll. There is no tile to show on Linux and
++ * no analytics to send, so the objects only remember what the game sets on them.
++ */
++
++#define COBJMACROS
++#include <roapi.h>
++#include <winstring.h>
++
++#include "private.h"
++#include <initguid.h>
++#define WIDL_using_NotificationsExtensions
++#define WIDL_using_NotificationsExtensions_TileContent
++#define WIDL_using_GA
++#include "notificationsextensions.h"
++
++#include <wine/debug.h>
++
++WINE_DEFAULT_DEBUG_CHANNEL(wpnapps);
++
++/* a plain activation factory that also answers for one statics interface */
++struct statics_factory
++{
++    IActivationFactory IActivationFactory_iface;
++    IInspectable *statics;
++    const GUID *statics_iid;
++};
++
++static inline struct statics_factory *impl_from_statics_factory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct statics_factory, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI statics_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct statics_factory *impl = impl_from_statics_factory( iface );
++
++    TRACE( "(%p, %s, %p)\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        IActivationFactory_AddRef( (*out = &impl->IActivationFactory_iface) );
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, impl->statics_iid ))
++    {
++        IInspectable_AddRef( (*out = impl->statics) );
++        return S_OK;
++    }
++
++    *out = NULL;
++    FIXME( "%s not implemented, returning E_NOINTERFACE\n", debugstr_guid( iid ) );
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI statics_factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI statics_factory_Release( IActivationFactory *iface ) { return 1; }
++
++static HRESULT WINAPI statics_factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids )
++{
++    FIXME( "(%p, %p, %p): stub!\n", iface, count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI statics_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name )
++{
++    FIXME( "(%p, %p): stub!\n", iface, name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI statics_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
++{
++    FIXME( "(%p, %p): stub!\n", iface, level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI statics_factory_ActivateInstance( IActivationFactory *iface, IInspectable **out )
++{
++    FIXME( "(%p, %p): stub!\n", iface, out );
++    *out = NULL;
++    return E_NOTIMPL;
++}
++
++static const IActivationFactoryVtbl statics_factory_vtbl =
++{
++    statics_factory_QueryInterface,
++    statics_factory_AddRef,
++    statics_factory_Release,
++    statics_factory_GetIids,
++    statics_factory_GetRuntimeClassName,
++    statics_factory_GetTrustLevel,
++    statics_factory_ActivateInstance,
++};
++
++/* IInspectable boilerplate for objects and statics that live as long as the dll */
++#define STATIC_INSPECTABLE( pfx, iface_type )                                                              \
++    static HRESULT WINAPI pfx##_QueryInterface( iface_type *iface, REFIID iid, void **out )               \
++    {                                                                                                      \
++        if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||                  \
++            IsEqualGUID( iid, &IID_##iface_type ))                                                         \
++        {                                                                                                  \
++            *out = iface;                                                                                  \
++            return S_OK;                                                                                   \
++        }                                                                                                  \
++        *out = NULL;                                                                                       \
++        FIXME( "%s not implemented, returning E_NOINTERFACE\n", debugstr_guid( iid ) );                    \
++        return E_NOINTERFACE;                                                                              \
++    }                                                                                                      \
++    static ULONG WINAPI pfx##_AddRef( iface_type *iface ) { return 2; }                                    \
++    static ULONG WINAPI pfx##_Release( iface_type *iface ) { return 1; }                                   \
++    static HRESULT WINAPI pfx##_GetIids( iface_type *iface, ULONG *count, IID **iids )                     \
++    {                                                                                                      \
++        FIXME( "(%p, %p, %p): stub!\n", iface, count, iids );                                              \
++        return E_NOTIMPL;                                                                                  \
++    }                                                                                                      \
++    static HRESULT WINAPI pfx##_GetRuntimeClassName( iface_type *iface, HSTRING *name )                    \
++    {                                                                                                      \
++        FIXME( "(%p, %p): stub!\n", iface, name );                                                         \
++        return E_NOTIMPL;                                                                                  \
++    }                                                                                                      \
++    static HRESULT WINAPI pfx##_GetTrustLevel( iface_type *iface, TrustLevel *level )                      \
++    {                                                                                                      \
++        FIXME( "(%p, %p): stub!\n", iface, level );                                                        \
++        return E_NOTIMPL;                                                                                  \
++    }
++
++/* GA.GoogleAnalytics */
++
++static HSTRING tracking_id;
++
++STATIC_INSPECTABLE( ga_statics, IGoogleAnalyticsStatic )
++
++static HRESULT WINAPI ga_statics_get_TrackingID( IGoogleAnalyticsStatic *iface, HSTRING *value )
++{
++    TRACE( "(%p, %p)\n", iface, value );
++    return WindowsDuplicateString( tracking_id, value );
++}
++
++static HRESULT WINAPI ga_statics_Init( IGoogleAnalyticsStatic *iface, HSTRING id )
++{
++    TRACE( "(%p, %s)\n", iface, debugstr_hstring( id ) );
++    return WindowsDuplicateString( id, &tracking_id );
++}
++
++static HRESULT WINAPI ga_statics_put_TrackingID( IGoogleAnalyticsStatic *iface, HSTRING id )
++{
++    TRACE( "(%p, %s)\n", iface, debugstr_hstring( id ) );
++    return WindowsDuplicateString( id, &tracking_id );
++}
++
++static HRESULT WINAPI ga_statics_Run( IGoogleAnalyticsStatic *iface )
++{
++    TRACE( "(%p)\n", iface );
++    return S_OK;
++}
++
++static HRESULT WINAPI ga_statics_SendEvent( IGoogleAnalyticsStatic *iface, HSTRING category, HSTRING action,
++                                            HSTRING label, __FIReference_1_INT64 *value )
++{
++    TRACE( "(%p, %s, %s, %s, %p)\n", iface, debugstr_hstring( category ), debugstr_hstring( action ),
++           debugstr_hstring( label ), value );
++    return S_OK;
++}
++
++static HRESULT WINAPI ga_statics_SendView1( IGoogleAnalyticsStatic *iface )
++{
++    TRACE( "(%p)\n", iface );
++    return S_OK;
++}
++
++static HRESULT WINAPI ga_statics_SendView2( IGoogleAnalyticsStatic *iface, HSTRING screen )
++{
++    TRACE( "(%p, %s)\n", iface, debugstr_hstring( screen ) );
++    return S_OK;
++}
++
++static HRESULT WINAPI ga_statics_SetAppScreen( IGoogleAnalyticsStatic *iface, HSTRING screen )
++{
++    TRACE( "(%p, %s)\n", iface, debugstr_hstring( screen ) );
++    return S_OK;
++}
++
++static HRESULT WINAPI ga_statics_setCustomDimension( IGoogleAnalyticsStatic *iface, INT32 index, HSTRING value )
++{
++    TRACE( "(%p, %d, %s)\n", iface, index, debugstr_hstring( value ) );
++    return S_OK;
++}
++
++static HRESULT WINAPI ga_statics_setCustomMetric( IGoogleAnalyticsStatic *iface, INT32 index, __FIReference_1_INT64 *value )
++{
++    TRACE( "(%p, %d, %p)\n", iface, index, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI ga_statics_SetStartSession( IGoogleAnalyticsStatic *iface, boolean start )
++{
++    TRACE( "(%p, %d)\n", iface, start );
++    return S_OK;
++}
++
++static HRESULT WINAPI ga_statics_SetVideoAdapter( IGoogleAnalyticsStatic *iface, HSTRING name, INT64 dedicated, INT64 shared )
++{
++    TRACE( "(%p, %s, %I64d, %I64d)\n", iface, debugstr_hstring( name ), dedicated, shared );
++    return S_OK;
++}
++
++static HRESULT WINAPI ga_statics_SetVideoResolution( IGoogleAnalyticsStatic *iface, INT64 width, INT64 height )
++{
++    TRACE( "(%p, %I64d, %I64d)\n", iface, width, height );
++    return S_OK;
++}
++
++static const IGoogleAnalyticsStaticVtbl ga_statics_vtbl =
++{
++    ga_statics_QueryInterface,
++    ga_statics_AddRef,
++    ga_statics_Release,
++    ga_statics_GetIids,
++    ga_statics_GetRuntimeClassName,
++    ga_statics_GetTrustLevel,
++    ga_statics_get_TrackingID,
++    ga_statics_Init,
++    ga_statics_put_TrackingID,
++    ga_statics_Run,
++    ga_statics_SendEvent,
++    ga_statics_SendView1,
++    ga_statics_SendView2,
++    ga_statics_SetAppScreen,
++    ga_statics_setCustomDimension,
++    ga_statics_setCustomMetric,
++    ga_statics_SetStartSession,
++    ga_statics_SetVideoAdapter,
++    ga_statics_SetVideoResolution,
++};
++
++static IGoogleAnalyticsStatic ga_statics = { &ga_statics_vtbl };
++
++static struct statics_factory ga_factory =
++{
++    { &statics_factory_vtbl },
++    (IInspectable *)&ga_statics,
++    &IID_IGoogleAnalyticsStatic,
++};
++
++IActivationFactory *ga_factory_iface = &ga_factory.IActivationFactory_iface;
++
++/* NotificationsExtensions.TileContent.TileContentFactory */
++
++struct notification_image
++{
++    INotificationContentImage INotificationContentImage_iface;
++    HSTRING src, alt;
++    boolean add_image_query;
++    LONG ref;
++};
++
++static inline struct notification_image *impl_from_INotificationContentImage( INotificationContentImage *iface )
++{
++    return CONTAINING_RECORD( iface, struct notification_image, INotificationContentImage_iface );
++}
++
++static HRESULT WINAPI image_QueryInterface( INotificationContentImage *iface, REFIID iid, void **out )
++{
++    TRACE( "(%p, %s, %p)\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_INotificationContentImage ))
++    {
++        INotificationContentImage_AddRef( (*out = iface) );
++        return S_OK;
++    }
++
++    *out = NULL;
++    FIXME( "%s not implemented, returning E_NOINTERFACE\n", debugstr_guid( iid ) );
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI image_AddRef( INotificationContentImage *iface )
++{
++    struct notification_image *impl = impl_from_INotificationContentImage( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI image_Release( INotificationContentImage *iface )
++{
++    struct notification_image *impl = impl_from_INotificationContentImage( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        WindowsDeleteString( impl->src );
++        WindowsDeleteString( impl->alt );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI image_GetIids( INotificationContentImage *iface, ULONG *count, IID **iids )
++{
++    FIXME( "(%p, %p, %p): stub!\n", iface, count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI image_GetRuntimeClassName( INotificationContentImage *iface, HSTRING *name )
++{
++    FIXME( "(%p, %p): stub!\n", iface, name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI image_GetTrustLevel( INotificationContentImage *iface, TrustLevel *level )
++{
++    FIXME( "(%p, %p): stub!\n", iface, level );
++    return E_NOTIMPL;
++}
++
++static HRESULT replace_string( HSTRING *dest, HSTRING value )
++{
++    HSTRING copy;
++    HRESULT hr;
++
++    if (FAILED(hr = WindowsDuplicateString( value, &copy ))) return hr;
++    WindowsDeleteString( *dest );
++    *dest = copy;
++    return S_OK;
++}
++
++static HRESULT WINAPI image_get_Src( INotificationContentImage *iface, HSTRING *value )
++{
++    TRACE( "(%p, %p)\n", iface, value );
++    return WindowsDuplicateString( impl_from_INotificationContentImage( iface )->src, value );
++}
++
++static HRESULT WINAPI image_put_Src( INotificationContentImage *iface, HSTRING value )
++{
++    TRACE( "(%p, %s)\n", iface, debugstr_hstring( value ) );
++    return replace_string( &impl_from_INotificationContentImage( iface )->src, value );
++}
++
++static HRESULT WINAPI image_get_Alt( INotificationContentImage *iface, HSTRING *value )
++{
++    TRACE( "(%p, %p)\n", iface, value );
++    return WindowsDuplicateString( impl_from_INotificationContentImage( iface )->alt, value );
++}
++
++static HRESULT WINAPI image_put_Alt( INotificationContentImage *iface, HSTRING value )
++{
++    TRACE( "(%p, %s)\n", iface, debugstr_hstring( value ) );
++    return replace_string( &impl_from_INotificationContentImage( iface )->alt, value );
++}
++
++static HRESULT WINAPI image_get_AddImageQuery( INotificationContentImage *iface, boolean *value )
++{
++    TRACE( "(%p, %p)\n", iface, value );
++    *value = impl_from_INotificationContentImage( iface )->add_image_query;
++    return S_OK;
++}
++
++static HRESULT WINAPI image_put_AddImageQuery( INotificationContentImage *iface, boolean value )
++{
++    TRACE( "(%p, %d)\n", iface, value );
++    impl_from_INotificationContentImage( iface )->add_image_query = value;
++    return S_OK;
++}
++
++static const INotificationContentImageVtbl image_vtbl =
++{
++    image_QueryInterface,
++    image_AddRef,
++    image_Release,
++    image_GetIids,
++    image_GetRuntimeClassName,
++    image_GetTrustLevel,
++    image_get_Src,
++    image_put_Src,
++    image_get_Alt,
++    image_put_Alt,
++    image_get_AddImageQuery,
++    image_put_AddImageQuery,
++};
++
++static HRESULT create_image( INotificationContentImage **out )
++{
++    struct notification_image *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->INotificationContentImage_iface.lpVtbl = &image_vtbl;
++    impl->ref = 1;
++    *out = &impl->INotificationContentImage_iface;
++    return S_OK;
++}
++
++/* a tile with just an image: ITileWideImage or ITileSquareImage, depending on `wide` */
++struct tile_content
++{
++    INotificationContent INotificationContent_iface;
++    ITileNotificationContent ITileNotificationContent_iface;
++    IWideTileNotificationContent IWideTileNotificationContent_iface;
++    ISquareTileNotificationContent ISquareTileNotificationContent_iface;
++    ITileWideImage ITileWideImage_iface;
++    ITileSquareImage ITileSquareImage_iface;
++    BOOL wide;
++    INotificationContentImage *image;
++    ISquareTileNotificationContent *square_content;
++    HSTRING lang, base_uri;
++    TileBranding branding;
++    boolean strict_validation, add_image_query, require_square_content;
++    LONG ref;
++};
++
++static inline struct tile_content *impl_from_INotificationContent( INotificationContent *iface )
++{
++    return CONTAINING_RECORD( iface, struct tile_content, INotificationContent_iface );
++}
++
++static HRESULT WINAPI content_QueryInterface( INotificationContent *iface, REFIID iid, void **out )
++{
++    struct tile_content *impl = impl_from_INotificationContent( iface );
++
++    TRACE( "(%p, %s, %p)\n", iface, debugstr_guid( iid ), out );
++
++    *out = NULL;
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_INotificationContent ))
++        *out = &impl->INotificationContent_iface;
++    else if (IsEqualGUID( iid, &IID_ITileNotificationContent ))
++        *out = &impl->ITileNotificationContent_iface;
++    else if (impl->wide && IsEqualGUID( iid, &IID_IWideTileNotificationContent ))
++        *out = &impl->IWideTileNotificationContent_iface;
++    else if (!impl->wide && IsEqualGUID( iid, &IID_ISquareTileNotificationContent ))
++        *out = &impl->ISquareTileNotificationContent_iface;
++    else if (impl->wide && IsEqualGUID( iid, &IID_ITileWideImage ))
++        *out = &impl->ITileWideImage_iface;
++    else if (!impl->wide && IsEqualGUID( iid, &IID_ITileSquareImage ))
++        *out = &impl->ITileSquareImage_iface;
++
++    if (*out)
++    {
++        INotificationContent_AddRef( iface );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE\n", debugstr_guid( iid ) );
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI content_AddRef( INotificationContent *iface )
++{
++    struct tile_content *impl = impl_from_INotificationContent( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI content_Release( INotificationContent *iface )
++{
++    struct tile_content *impl = impl_from_INotificationContent( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        if (impl->image) INotificationContentImage_Release( impl->image );
++        if (impl->square_content) ISquareTileNotificationContent_Release( impl->square_content );
++        WindowsDeleteString( impl->lang );
++        WindowsDeleteString( impl->base_uri );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI content_GetIids( INotificationContent *iface, ULONG *count, IID **iids )
++{
++    FIXME( "(%p, %p, %p): stub!\n", iface, count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_GetRuntimeClassName( INotificationContent *iface, HSTRING *name )
++{
++    FIXME( "(%p, %p): stub!\n", iface, name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_GetTrustLevel( INotificationContent *iface, TrustLevel *level )
++{
++    FIXME( "(%p, %p): stub!\n", iface, level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_GetContent( INotificationContent *iface, HSTRING *value )
++{
++    FIXME( "(%p, %p): stub!\n", iface, value );
++    *value = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI content_GetXml( INotificationContent *iface, IXmlDocument **value )
++{
++    FIXME( "(%p, %p): stub!\n", iface, value );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static const INotificationContentVtbl content_vtbl =
++{
++    content_QueryInterface,
++    content_AddRef,
++    content_Release,
++    content_GetIids,
++    content_GetRuntimeClassName,
++    content_GetTrustLevel,
++    content_GetContent,
++    content_GetXml,
++};
++
++/* the other interfaces forward IUnknown and IInspectable to INotificationContent */
++DEFINE_IINSPECTABLE( tile_notif, ITileNotificationContent, struct tile_content, INotificationContent_iface );
++DEFINE_IINSPECTABLE( wide_notif, IWideTileNotificationContent, struct tile_content, INotificationContent_iface );
++DEFINE_IINSPECTABLE( square_notif, ISquareTileNotificationContent, struct tile_content, INotificationContent_iface );
++DEFINE_IINSPECTABLE( wide_image, ITileWideImage, struct tile_content, INotificationContent_iface );
++DEFINE_IINSPECTABLE( square_image, ITileSquareImage, struct tile_content, INotificationContent_iface );
++
++static HRESULT WINAPI tile_notif_get_StrictValidation( ITileNotificationContent *iface, boolean *value )
++{
++    *value = impl_from_ITileNotificationContent( iface )->strict_validation;
++    return S_OK;
++}
++
++static HRESULT WINAPI tile_notif_put_StrictValidation( ITileNotificationContent *iface, boolean value )
++{
++    impl_from_ITileNotificationContent( iface )->strict_validation = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI tile_notif_get_Lang( ITileNotificationContent *iface, HSTRING *value )
++{
++    return WindowsDuplicateString( impl_from_ITileNotificationContent( iface )->lang, value );
++}
++
++static HRESULT WINAPI tile_notif_put_Lang( ITileNotificationContent *iface, HSTRING value )
++{
++    return replace_string( &impl_from_ITileNotificationContent( iface )->lang, value );
++}
++
++static HRESULT WINAPI tile_notif_get_BaseUri( ITileNotificationContent *iface, HSTRING *value )
++{
++    return WindowsDuplicateString( impl_from_ITileNotificationContent( iface )->base_uri, value );
++}
++
++static HRESULT WINAPI tile_notif_put_BaseUri( ITileNotificationContent *iface, HSTRING value )
++{
++    return replace_string( &impl_from_ITileNotificationContent( iface )->base_uri, value );
++}
++
++static HRESULT WINAPI tile_notif_get_Branding( ITileNotificationContent *iface, TileBranding *value )
++{
++    *value = impl_from_ITileNotificationContent( iface )->branding;
++    return S_OK;
++}
++
++static HRESULT WINAPI tile_notif_put_Branding( ITileNotificationContent *iface, TileBranding value )
++{
++    impl_from_ITileNotificationContent( iface )->branding = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI tile_notif_get_AddImageQuery( ITileNotificationContent *iface, boolean *value )
++{
++    *value = impl_from_ITileNotificationContent( iface )->add_image_query;
++    return S_OK;
++}
++
++static HRESULT WINAPI tile_notif_put_AddImageQuery( ITileNotificationContent *iface, boolean value )
++{
++    impl_from_ITileNotificationContent( iface )->add_image_query = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI tile_notif_CreateNotification( ITileNotificationContent *iface, ITileNotification **value )
++{
++    ITileNotificationFactory *factory;
++    HRESULT hr;
++
++    TRACE( "(%p, %p)\n", iface, value );
++
++    if (FAILED(hr = IActivationFactory_QueryInterface( tile_notification_factory, &IID_ITileNotificationFactory,
++                                                      (void **)&factory ))) return hr;
++    /* there is no XmlDocument to build the tile's XML in */
++    hr = ITileNotificationFactory_CreateTileNotification( factory, NULL, value );
++    ITileNotificationFactory_Release( factory );
++    return hr;
++}
++
++static const ITileNotificationContentVtbl tile_notif_vtbl =
++{
++    tile_notif_QueryInterface,
++    tile_notif_AddRef,
++    tile_notif_Release,
++    tile_notif_GetIids,
++    tile_notif_GetRuntimeClassName,
++    tile_notif_GetTrustLevel,
++    tile_notif_get_StrictValidation,
++    tile_notif_put_StrictValidation,
++    tile_notif_get_Lang,
++    tile_notif_put_Lang,
++    tile_notif_get_BaseUri,
++    tile_notif_put_BaseUri,
++    tile_notif_get_Branding,
++    tile_notif_put_Branding,
++    tile_notif_get_AddImageQuery,
++    tile_notif_put_AddImageQuery,
++    tile_notif_CreateNotification,
++};
++
++static HRESULT WINAPI wide_notif_get_SquareContent( IWideTileNotificationContent *iface, ISquareTileNotificationContent **value )
++{
++    struct tile_content *impl = impl_from_IWideTileNotificationContent( iface );
++
++    TRACE( "(%p, %p)\n", iface, value );
++    if ((*value = impl->square_content)) ISquareTileNotificationContent_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI wide_notif_put_SquareContent( IWideTileNotificationContent *iface, ISquareTileNotificationContent *value )
++{
++    struct tile_content *impl = impl_from_IWideTileNotificationContent( iface );
++
++    TRACE( "(%p, %p)\n", iface, value );
++    if (value) ISquareTileNotificationContent_AddRef( value );
++    if (impl->square_content) ISquareTileNotificationContent_Release( impl->square_content );
++    impl->square_content = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI wide_notif_get_RequireSquareContent( IWideTileNotificationContent *iface, boolean *value )
++{
++    *value = impl_from_IWideTileNotificationContent( iface )->require_square_content;
++    return S_OK;
++}
++
++static HRESULT WINAPI wide_notif_put_RequireSquareContent( IWideTileNotificationContent *iface, boolean value )
++{
++    impl_from_IWideTileNotificationContent( iface )->require_square_content = value;
++    return S_OK;
++}
++
++static const IWideTileNotificationContentVtbl wide_notif_vtbl =
++{
++    wide_notif_QueryInterface,
++    wide_notif_AddRef,
++    wide_notif_Release,
++    wide_notif_GetIids,
++    wide_notif_GetRuntimeClassName,
++    wide_notif_GetTrustLevel,
++    wide_notif_get_SquareContent,
++    wide_notif_put_SquareContent,
++    wide_notif_get_RequireSquareContent,
++    wide_notif_put_RequireSquareContent,
++};
++
++static const ISquareTileNotificationContentVtbl square_notif_vtbl =
++{
++    square_notif_QueryInterface,
++    square_notif_AddRef,
++    square_notif_Release,
++    square_notif_GetIids,
++    square_notif_GetRuntimeClassName,
++    square_notif_GetTrustLevel,
++};
++
++static HRESULT WINAPI wide_image_get_Image( ITileWideImage *iface, INotificationContentImage **value )
++{
++    TRACE( "(%p, %p)\n", iface, value );
++    INotificationContentImage_AddRef( (*value = impl_from_ITileWideImage( iface )->image) );
++    return S_OK;
++}
++
++static const ITileWideImageVtbl wide_image_vtbl =
++{
++    wide_image_QueryInterface,
++    wide_image_AddRef,
++    wide_image_Release,
++    wide_image_GetIids,
++    wide_image_GetRuntimeClassName,
++    wide_image_GetTrustLevel,
++    wide_image_get_Image,
++};
++
++static HRESULT WINAPI square_image_get_Image( ITileSquareImage *iface, INotificationContentImage **value )
++{
++    TRACE( "(%p, %p)\n", iface, value );
++    INotificationContentImage_AddRef( (*value = impl_from_ITileSquareImage( iface )->image) );
++    return S_OK;
++}
++
++static const ITileSquareImageVtbl square_image_vtbl =
++{
++    square_image_QueryInterface,
++    square_image_AddRef,
++    square_image_Release,
++    square_image_GetIids,
++    square_image_GetRuntimeClassName,
++    square_image_GetTrustLevel,
++    square_image_get_Image,
++};
++
++static HRESULT create_image_tile( BOOL wide, struct tile_content **out )
++{
++    struct tile_content *impl;
++    HRESULT hr;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->INotificationContent_iface.lpVtbl = &content_vtbl;
++    impl->ITileNotificationContent_iface.lpVtbl = &tile_notif_vtbl;
++    impl->IWideTileNotificationContent_iface.lpVtbl = &wide_notif_vtbl;
++    impl->ISquareTileNotificationContent_iface.lpVtbl = &square_notif_vtbl;
++    impl->ITileWideImage_iface.lpVtbl = &wide_image_vtbl;
++    impl->ITileSquareImage_iface.lpVtbl = &square_image_vtbl;
++    impl->wide = wide;
++    impl->ref = 1;
++    if (FAILED(hr = create_image( &impl->image )))
++    {
++        free( impl );
++        return hr;
++    }
++    *out = impl;
++    return S_OK;
++}
++
++STATIC_INSPECTABLE( tile_content_statics, ITileContentFactoryStatic )
++
++static HRESULT WINAPI tile_content_statics_CreateTileWideImage( ITileContentFactoryStatic *iface, ITileWideImage **value )
++{
++    struct tile_content *impl;
++    HRESULT hr;
++
++    TRACE( "(%p, %p)\n", iface, value );
++    if (FAILED(hr = create_image_tile( TRUE, &impl ))) return hr;
++    *value = &impl->ITileWideImage_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI tile_content_statics_CreateTileSquareImage( ITileContentFactoryStatic *iface, ITileSquareImage **value )
++{
++    struct tile_content *impl;
++    HRESULT hr;
++
++    TRACE( "(%p, %p)\n", iface, value );
++    if (FAILED(hr = create_image_tile( FALSE, &impl ))) return hr;
++    *value = &impl->ITileSquareImage_iface;
++    return S_OK;
++}
++
++#define UNIMPLEMENTED_TILE( name, type )                                                                   \
++    static HRESULT WINAPI tile_content_statics_##name( ITileContentFactoryStatic *iface,                    \
++                                                         __x_ABI_CNotificationsExtensions_CTileContent_C##type **value ) \
++    {                                                                                                      \
++        FIXME( "(%p, %p): stub!\n", iface, value );                                                        \
++        *value = NULL;                                                                                     \
++        return E_NOTIMPL;                                                                                  \
++    }
++
++UNIMPLEMENTED_TILE( CreateTileSquareBlock, ITileSquareBlock )
++UNIMPLEMENTED_TILE( CreateTileSquarePeekImageAndText01, ITileSquarePeekImageAndText01 )
++UNIMPLEMENTED_TILE( CreateTileSquarePeekImageAndText02, ITileSquarePeekImageAndText02 )
++UNIMPLEMENTED_TILE( CreateTileSquarePeekImageAndText03, ITileSquarePeekImageAndText03 )
++UNIMPLEMENTED_TILE( CreateTileSquarePeekImageAndText04, ITileSquarePeekImageAndText04 )
++UNIMPLEMENTED_TILE( CreateTileSquareText01, ITileSquareText01 )
++UNIMPLEMENTED_TILE( CreateTileSquareText02, ITileSquareText02 )
++UNIMPLEMENTED_TILE( CreateTileSquareText03, ITileSquareText03 )
++UNIMPLEMENTED_TILE( CreateTileSquareText04, ITileSquareText04 )
++UNIMPLEMENTED_TILE( CreateTileWideBlockAndText01, ITileWideBlockAndText01 )
++UNIMPLEMENTED_TILE( CreateTileWideBlockAndText02, ITileWideBlockAndText02 )
++UNIMPLEMENTED_TILE( CreateTileWideImageAndText01, ITileWideImageAndText01 )
++UNIMPLEMENTED_TILE( CreateTileWideImageAndText02, ITileWideImageAndText02 )
++UNIMPLEMENTED_TILE( CreateTileWideImageCollection, ITileWideImageCollection )
++UNIMPLEMENTED_TILE( CreateTileWidePeekImage01, ITileWidePeekImage01 )
++UNIMPLEMENTED_TILE( CreateTileWidePeekImage02, ITileWidePeekImage02 )
++UNIMPLEMENTED_TILE( CreateTileWidePeekImage03, ITileWidePeekImage03 )
++UNIMPLEMENTED_TILE( CreateTileWidePeekImage04, ITileWidePeekImage04 )
++UNIMPLEMENTED_TILE( CreateTileWidePeekImage05, ITileWidePeekImage05 )
++UNIMPLEMENTED_TILE( CreateTileWidePeekImage06, ITileWidePeekImage06 )
++UNIMPLEMENTED_TILE( CreateTileWidePeekImageAndText01, ITileWidePeekImageAndText01 )
++UNIMPLEMENTED_TILE( CreateTileWidePeekImageAndText02, ITileWidePeekImageAndText02 )
++UNIMPLEMENTED_TILE( CreateTileWidePeekImageCollection01, ITileWidePeekImageCollection01 )
++UNIMPLEMENTED_TILE( CreateTileWidePeekImageCollection02, ITileWidePeekImageCollection02 )
++UNIMPLEMENTED_TILE( CreateTileWidePeekImageCollection03, ITileWidePeekImageCollection03 )
++UNIMPLEMENTED_TILE( CreateTileWidePeekImageCollection04, ITileWidePeekImageCollection04 )
++UNIMPLEMENTED_TILE( CreateTileWidePeekImageCollection05, ITileWidePeekImageCollection05 )
++UNIMPLEMENTED_TILE( CreateTileWidePeekImageCollection06, ITileWidePeekImageCollection06 )
++UNIMPLEMENTED_TILE( CreateTileWideSmallImageAndText01, ITileWideSmallImageAndText01 )
++UNIMPLEMENTED_TILE( CreateTileWideSmallImageAndText02, ITileWideSmallImageAndText02 )
++UNIMPLEMENTED_TILE( CreateTileWideSmallImageAndText03, ITileWideSmallImageAndText03 )
++UNIMPLEMENTED_TILE( CreateTileWideSmallImageAndText04, ITileWideSmallImageAndText04 )
++UNIMPLEMENTED_TILE( CreateTileWideSmallImageAndText05, ITileWideSmallImageAndText05 )
++UNIMPLEMENTED_TILE( CreateTileWideText01, ITileWideText01 )
++UNIMPLEMENTED_TILE( CreateTileWideText02, ITileWideText02 )
++UNIMPLEMENTED_TILE( CreateTileWideText03, ITileWideText03 )
++UNIMPLEMENTED_TILE( CreateTileWideText04, ITileWideText04 )
++UNIMPLEMENTED_TILE( CreateTileWideText05, ITileWideText05 )
++UNIMPLEMENTED_TILE( CreateTileWideText06, ITileWideText06 )
++UNIMPLEMENTED_TILE( CreateTileWideText07, ITileWideText07 )
++UNIMPLEMENTED_TILE( CreateTileWideText08, ITileWideText08 )
++UNIMPLEMENTED_TILE( CreateTileWideText09, ITileWideText09 )
++UNIMPLEMENTED_TILE( CreateTileWideText10, ITileWideText10 )
++UNIMPLEMENTED_TILE( CreateTileWideText11, ITileWideText11 )
++
++static const ITileContentFactoryStaticVtbl tile_content_statics_vtbl =
++{
++    tile_content_statics_QueryInterface,
++    tile_content_statics_AddRef,
++    tile_content_statics_Release,
++    tile_content_statics_GetIids,
++    tile_content_statics_GetRuntimeClassName,
++    tile_content_statics_GetTrustLevel,
++    tile_content_statics_CreateTileSquareBlock,
++    tile_content_statics_CreateTileSquareImage,
++    tile_content_statics_CreateTileSquarePeekImageAndText01,
++    tile_content_statics_CreateTileSquarePeekImageAndText02,
++    tile_content_statics_CreateTileSquarePeekImageAndText03,
++    tile_content_statics_CreateTileSquarePeekImageAndText04,
++    tile_content_statics_CreateTileSquareText01,
++    tile_content_statics_CreateTileSquareText02,
++    tile_content_statics_CreateTileSquareText03,
++    tile_content_statics_CreateTileSquareText04,
++    tile_content_statics_CreateTileWideBlockAndText01,
++    tile_content_statics_CreateTileWideBlockAndText02,
++    tile_content_statics_CreateTileWideImage,
++    tile_content_statics_CreateTileWideImageAndText01,
++    tile_content_statics_CreateTileWideImageAndText02,
++    tile_content_statics_CreateTileWideImageCollection,
++    tile_content_statics_CreateTileWidePeekImage01,
++    tile_content_statics_CreateTileWidePeekImage02,
++    tile_content_statics_CreateTileWidePeekImage03,
++    tile_content_statics_CreateTileWidePeekImage04,
++    tile_content_statics_CreateTileWidePeekImage05,
++    tile_content_statics_CreateTileWidePeekImage06,
++    tile_content_statics_CreateTileWidePeekImageAndText01,
++    tile_content_statics_CreateTileWidePeekImageAndText02,
++    tile_content_statics_CreateTileWidePeekImageCollection01,
++    tile_content_statics_CreateTileWidePeekImageCollection02,
++    tile_content_statics_CreateTileWidePeekImageCollection03,
++    tile_content_statics_CreateTileWidePeekImageCollection04,
++    tile_content_statics_CreateTileWidePeekImageCollection05,
++    tile_content_statics_CreateTileWidePeekImageCollection06,
++    tile_content_statics_CreateTileWideSmallImageAndText01,
++    tile_content_statics_CreateTileWideSmallImageAndText02,
++    tile_content_statics_CreateTileWideSmallImageAndText03,
++    tile_content_statics_CreateTileWideSmallImageAndText04,
++    tile_content_statics_CreateTileWideSmallImageAndText05,
++    tile_content_statics_CreateTileWideText01,
++    tile_content_statics_CreateTileWideText02,
++    tile_content_statics_CreateTileWideText03,
++    tile_content_statics_CreateTileWideText04,
++    tile_content_statics_CreateTileWideText05,
++    tile_content_statics_CreateTileWideText06,
++    tile_content_statics_CreateTileWideText07,
++    tile_content_statics_CreateTileWideText08,
++    tile_content_statics_CreateTileWideText09,
++    tile_content_statics_CreateTileWideText10,
++    tile_content_statics_CreateTileWideText11,
++};
++
++static ITileContentFactoryStatic tile_content_statics = { &tile_content_statics_vtbl };
++
++static struct statics_factory tile_content_factory =
++{
++    { &statics_factory_vtbl },
++    (IInspectable *)&tile_content_statics,
++    &IID_ITileContentFactoryStatic,
++};
++
++IActivationFactory *tile_content_factory_iface = &tile_content_factory.IActivationFactory_iface;
+diff --git a/dlls/wpnapps/notificationsextensions.idl b/dlls/wpnapps/notificationsextensions.idl
+new file mode 100644
+index 0000000..5b3b6e0
+--- /dev/null
++++ b/dlls/wpnapps/notificationsextensions.idl
+@@ -0,0 +1,294 @@
++/*
++ * Interfaces of the managed WinRT components Asphalt 7 ships (NotificationsExtensions.winmd and GA.winmd), which on
++ * Windows are hosted by the system's CLRHost.dll. Generated with scripts/winmd2idl.py.
++ */
++
++#pragma makedep header
++
++#ifdef __WIDL__
++#pragma winrt ns_prefix
++#endif
++
++import "inspectable.idl";
++import "asyncinfo.idl";
++import "eventtoken.idl";
++import "windowscontracts.idl";
++import "windows.foundation.idl";
++import "windows.data.xml.dom.idl";
++import "windows.ui.notifications.idl";
++
++
++namespace NotificationsExtensions {
++    interface INotificationContent;
++    interface INotificationContentImage;
++}
++
++namespace NotificationsExtensions.TileContent {
++    interface ISquareTileNotificationContent;
++    interface ITileContentFactoryClass;
++    interface ITileContentFactoryStatic;
++    interface ITileNotificationContent;
++    interface ITileSquareBlock;
++    interface ITileSquareImage;
++    interface ITileSquarePeekImageAndText01;
++    interface ITileSquarePeekImageAndText02;
++    interface ITileSquarePeekImageAndText03;
++    interface ITileSquarePeekImageAndText04;
++    interface ITileSquareText01;
++    interface ITileSquareText02;
++    interface ITileSquareText03;
++    interface ITileSquareText04;
++    interface ITileWideBlockAndText01;
++    interface ITileWideBlockAndText02;
++    interface ITileWideImage;
++    interface ITileWideImageAndText01;
++    interface ITileWideImageAndText02;
++    interface ITileWideImageCollection;
++    interface ITileWidePeekImage01;
++    interface ITileWidePeekImage02;
++    interface ITileWidePeekImage03;
++    interface ITileWidePeekImage04;
++    interface ITileWidePeekImage05;
++    interface ITileWidePeekImage06;
++    interface ITileWidePeekImageAndText01;
++    interface ITileWidePeekImageAndText02;
++    interface ITileWidePeekImageCollection01;
++    interface ITileWidePeekImageCollection02;
++    interface ITileWidePeekImageCollection03;
++    interface ITileWidePeekImageCollection04;
++    interface ITileWidePeekImageCollection05;
++    interface ITileWidePeekImageCollection06;
++    interface ITileWideSmallImageAndText01;
++    interface ITileWideSmallImageAndText02;
++    interface ITileWideSmallImageAndText03;
++    interface ITileWideSmallImageAndText04;
++    interface ITileWideSmallImageAndText05;
++    interface ITileWideText01;
++    interface ITileWideText02;
++    interface ITileWideText03;
++    interface ITileWideText04;
++    interface ITileWideText05;
++    interface ITileWideText06;
++    interface ITileWideText07;
++    interface ITileWideText08;
++    interface ITileWideText09;
++    interface ITileWideText10;
++    interface ITileWideText11;
++    interface IWideTileNotificationContent;
++    typedef enum TileBranding TileBranding;
++    runtimeclass TileContentFactory;
++}
++
++namespace NotificationsExtensions.TileContent {
++    enum TileBranding
++    {
++        None = 0,
++        Logo = 1,
++        Name = 2
++    };
++
++}
++
++namespace NotificationsExtensions {
++    [
++        uuid(2c0d137a-1fc8-5db6-4c9a-580221eef1f4)
++    ]
++    interface INotificationContent : IInspectable
++    {
++        HRESULT GetContent([out, retval] HSTRING *value);
++        HRESULT GetXml([out, retval] Windows.Data.Xml.Dom.XmlDocument * *value);
++    }
++
++    [
++        uuid(02e42ce2-2e61-5393-6e49-f9cb367c34d5)
++    ]
++    interface INotificationContentImage : IInspectable
++    {
++        [propget] HRESULT Src([out, retval] HSTRING *value);
++        [propput] HRESULT Src([in] HSTRING value);
++        [propget] HRESULT Alt([out, retval] HSTRING *value);
++        [propput] HRESULT Alt([in] HSTRING value);
++        [propget] HRESULT AddImageQuery([out, retval] boolean *value);
++        [propput] HRESULT AddImageQuery([in] boolean value);
++    }
++
++}
++
++namespace NotificationsExtensions.TileContent {
++    [
++        uuid(2537e592-94ff-5dcc-6279-0366c54998c5)
++    ]
++    interface ISquareTileNotificationContent : IInspectable
++        requires NotificationsExtensions.TileContent.ITileNotificationContent, NotificationsExtensions.INotificationContent
++    {
++    }
++
++    [
++        exclusiveto(NotificationsExtensions.TileContent.TileContentFactory),
++        uuid(2d2f3502-f65e-54a4-656f-af839dac8dcb)
++    ]
++    interface ITileContentFactoryClass : IInspectable
++    {
++    }
++
++    [
++        exclusiveto(NotificationsExtensions.TileContent.TileContentFactory),
++        uuid(d77b1b1e-207f-536b-7d0a-91e9cddb8cd5)
++    ]
++    interface ITileContentFactoryStatic : IInspectable
++    {
++        HRESULT CreateTileSquareBlock([out, retval] NotificationsExtensions.TileContent.ITileSquareBlock * *value);
++        HRESULT CreateTileSquareImage([out, retval] NotificationsExtensions.TileContent.ITileSquareImage * *value);
++        HRESULT CreateTileSquarePeekImageAndText01([out, retval] NotificationsExtensions.TileContent.ITileSquarePeekImageAndText01 * *value);
++        HRESULT CreateTileSquarePeekImageAndText02([out, retval] NotificationsExtensions.TileContent.ITileSquarePeekImageAndText02 * *value);
++        HRESULT CreateTileSquarePeekImageAndText03([out, retval] NotificationsExtensions.TileContent.ITileSquarePeekImageAndText03 * *value);
++        HRESULT CreateTileSquarePeekImageAndText04([out, retval] NotificationsExtensions.TileContent.ITileSquarePeekImageAndText04 * *value);
++        HRESULT CreateTileSquareText01([out, retval] NotificationsExtensions.TileContent.ITileSquareText01 * *value);
++        HRESULT CreateTileSquareText02([out, retval] NotificationsExtensions.TileContent.ITileSquareText02 * *value);
++        HRESULT CreateTileSquareText03([out, retval] NotificationsExtensions.TileContent.ITileSquareText03 * *value);
++        HRESULT CreateTileSquareText04([out, retval] NotificationsExtensions.TileContent.ITileSquareText04 * *value);
++        HRESULT CreateTileWideBlockAndText01([out, retval] NotificationsExtensions.TileContent.ITileWideBlockAndText01 * *value);
++        HRESULT CreateTileWideBlockAndText02([out, retval] NotificationsExtensions.TileContent.ITileWideBlockAndText02 * *value);
++        HRESULT CreateTileWideImage([out, retval] NotificationsExtensions.TileContent.ITileWideImage * *value);
++        HRESULT CreateTileWideImageAndText01([out, retval] NotificationsExtensions.TileContent.ITileWideImageAndText01 * *value);
++        HRESULT CreateTileWideImageAndText02([out, retval] NotificationsExtensions.TileContent.ITileWideImageAndText02 * *value);
++        HRESULT CreateTileWideImageCollection([out, retval] NotificationsExtensions.TileContent.ITileWideImageCollection * *value);
++        HRESULT CreateTileWidePeekImage01([out, retval] NotificationsExtensions.TileContent.ITileWidePeekImage01 * *value);
++        HRESULT CreateTileWidePeekImage02([out, retval] NotificationsExtensions.TileContent.ITileWidePeekImage02 * *value);
++        HRESULT CreateTileWidePeekImage03([out, retval] NotificationsExtensions.TileContent.ITileWidePeekImage03 * *value);
++        HRESULT CreateTileWidePeekImage04([out, retval] NotificationsExtensions.TileContent.ITileWidePeekImage04 * *value);
++        HRESULT CreateTileWidePeekImage05([out, retval] NotificationsExtensions.TileContent.ITileWidePeekImage05 * *value);
++        HRESULT CreateTileWidePeekImage06([out, retval] NotificationsExtensions.TileContent.ITileWidePeekImage06 * *value);
++        HRESULT CreateTileWidePeekImageAndText01([out, retval] NotificationsExtensions.TileContent.ITileWidePeekImageAndText01 * *value);
++        HRESULT CreateTileWidePeekImageAndText02([out, retval] NotificationsExtensions.TileContent.ITileWidePeekImageAndText02 * *value);
++        HRESULT CreateTileWidePeekImageCollection01([out, retval] NotificationsExtensions.TileContent.ITileWidePeekImageCollection01 * *value);
++        HRESULT CreateTileWidePeekImageCollection02([out, retval] NotificationsExtensions.TileContent.ITileWidePeekImageCollection02 * *value);
++        HRESULT CreateTileWidePeekImageCollection03([out, retval] NotificationsExtensions.TileContent.ITileWidePeekImageCollection03 * *value);
++        HRESULT CreateTileWidePeekImageCollection04([out, retval] NotificationsExtensions.TileContent.ITileWidePeekImageCollection04 * *value);
++        HRESULT CreateTileWidePeekImageCollection05([out, retval] NotificationsExtensions.TileContent.ITileWidePeekImageCollection05 * *value);
++        HRESULT CreateTileWidePeekImageCollection06([out, retval] NotificationsExtensions.TileContent.ITileWidePeekImageCollection06 * *value);
++        HRESULT CreateTileWideSmallImageAndText01([out, retval] NotificationsExtensions.TileContent.ITileWideSmallImageAndText01 * *value);
++        HRESULT CreateTileWideSmallImageAndText02([out, retval] NotificationsExtensions.TileContent.ITileWideSmallImageAndText02 * *value);
++        HRESULT CreateTileWideSmallImageAndText03([out, retval] NotificationsExtensions.TileContent.ITileWideSmallImageAndText03 * *value);
++        HRESULT CreateTileWideSmallImageAndText04([out, retval] NotificationsExtensions.TileContent.ITileWideSmallImageAndText04 * *value);
++        HRESULT CreateTileWideSmallImageAndText05([out, retval] NotificationsExtensions.TileContent.ITileWideSmallImageAndText05 * *value);
++        HRESULT CreateTileWideText01([out, retval] NotificationsExtensions.TileContent.ITileWideText01 * *value);
++        HRESULT CreateTileWideText02([out, retval] NotificationsExtensions.TileContent.ITileWideText02 * *value);
++        HRESULT CreateTileWideText03([out, retval] NotificationsExtensions.TileContent.ITileWideText03 * *value);
++        HRESULT CreateTileWideText04([out, retval] NotificationsExtensions.TileContent.ITileWideText04 * *value);
++        HRESULT CreateTileWideText05([out, retval] NotificationsExtensions.TileContent.ITileWideText05 * *value);
++        HRESULT CreateTileWideText06([out, retval] NotificationsExtensions.TileContent.ITileWideText06 * *value);
++        HRESULT CreateTileWideText07([out, retval] NotificationsExtensions.TileContent.ITileWideText07 * *value);
++        HRESULT CreateTileWideText08([out, retval] NotificationsExtensions.TileContent.ITileWideText08 * *value);
++        HRESULT CreateTileWideText09([out, retval] NotificationsExtensions.TileContent.ITileWideText09 * *value);
++        HRESULT CreateTileWideText10([out, retval] NotificationsExtensions.TileContent.ITileWideText10 * *value);
++        HRESULT CreateTileWideText11([out, retval] NotificationsExtensions.TileContent.ITileWideText11 * *value);
++    }
++
++    [
++        uuid(4f5a7235-6bb2-553d-4000-4a58562b7072)
++    ]
++    interface ITileNotificationContent : IInspectable
++        requires NotificationsExtensions.INotificationContent
++    {
++        [propget] HRESULT StrictValidation([out, retval] boolean *value);
++        [propput] HRESULT StrictValidation([in] boolean value);
++        [propget] HRESULT Lang([out, retval] HSTRING *value);
++        [propput] HRESULT Lang([in] HSTRING value);
++        [propget] HRESULT BaseUri([out, retval] HSTRING *value);
++        [propput] HRESULT BaseUri([in] HSTRING value);
++        [propget] HRESULT Branding([out, retval] NotificationsExtensions.TileContent.TileBranding *value);
++        [propput] HRESULT Branding([in] NotificationsExtensions.TileContent.TileBranding value);
++        [propget] HRESULT AddImageQuery([out, retval] boolean *value);
++        [propput] HRESULT AddImageQuery([in] boolean value);
++        HRESULT CreateNotification([out, retval] Windows.UI.Notifications.TileNotification * *value);
++    }
++
++    [
++        uuid(bcaa22f7-9a02-5fbb-6094-e865cf95a0af)
++    ]
++    interface ITileSquareImage : IInspectable
++        requires NotificationsExtensions.TileContent.ISquareTileNotificationContent, NotificationsExtensions.TileContent.ITileNotificationContent, NotificationsExtensions.INotificationContent
++    {
++        [propget] HRESULT Image([out, retval] NotificationsExtensions.INotificationContentImage * *value);
++    }
++
++    [
++        uuid(4dca931b-2d24-5435-78f2-49f4c6849a0d)
++    ]
++    interface ITileWideImage : IInspectable
++        requires NotificationsExtensions.TileContent.IWideTileNotificationContent, NotificationsExtensions.TileContent.ITileNotificationContent, NotificationsExtensions.INotificationContent
++    {
++        [propget] HRESULT Image([out, retval] NotificationsExtensions.INotificationContentImage * *value);
++    }
++
++    [
++        uuid(b803960c-2950-54e8-49c7-4b0033742ae4)
++    ]
++    interface IWideTileNotificationContent : IInspectable
++        requires NotificationsExtensions.TileContent.ITileNotificationContent, NotificationsExtensions.INotificationContent
++    {
++        [propget] HRESULT SquareContent([out, retval] NotificationsExtensions.TileContent.ISquareTileNotificationContent * *value);
++        [propput] HRESULT SquareContent([in] NotificationsExtensions.TileContent.ISquareTileNotificationContent * value);
++        [propget] HRESULT RequireSquareContent([out, retval] boolean *value);
++        [propput] HRESULT RequireSquareContent([in] boolean value);
++    }
++
++}
++
++namespace NotificationsExtensions.TileContent {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        static(NotificationsExtensions.TileContent.ITileContentFactoryStatic, Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass TileContentFactory
++    {
++        [default] interface NotificationsExtensions.TileContent.ITileContentFactoryClass;
++    }
++
++}
++
++namespace GA {
++    runtimeclass GoogleAnalytics;
++    interface IGoogleAnalyticsClass;
++    interface IGoogleAnalyticsStatic;
++}
++namespace GA {
++    [
++        exclusiveto(GA.GoogleAnalytics),
++        uuid(42fb5e8a-8a56-56a6-4506-56b17e7d3548)
++    ]
++    interface IGoogleAnalyticsClass : IInspectable
++    {
++    }
++    [
++        exclusiveto(GA.GoogleAnalytics),
++        uuid(5f781e60-c3ce-5c08-5a4c-cf5faa09ee8e)
++    ]
++    interface IGoogleAnalyticsStatic : IInspectable
++    {
++        [propget] HRESULT TrackingID([out, retval] HSTRING *value);
++        HRESULT Init([in] HSTRING trackingID);
++        [propput] HRESULT TrackingID([in] HSTRING value);
++        HRESULT Run();
++        HRESULT SendEvent([in] HSTRING category, [in] HSTRING action, [in] HSTRING label, [in] Windows.Foundation.IReference<INT64> * value);
++        [overload("SendView")] HRESULT SendView1();
++        [overload("SendView")] HRESULT SendView2([in] HSTRING appScreen);
++        HRESULT SetAppScreen([in] HSTRING appScreen);
++        HRESULT setCustomDimension([in] INT32 index, [in] HSTRING value);
++        HRESULT setCustomMetric([in] INT32 index, [in] Windows.Foundation.IReference<INT64> * value);
++        HRESULT SetStartSession([in] boolean startSession);
++        HRESULT SetVideoAdapter([in] HSTRING name, [in] INT64 dedicated, [in] INT64 shared);
++        HRESULT SetVideoResolution([in] INT64 width, [in] INT64 height);
++    }
++}
++namespace GA {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        static(GA.IGoogleAnalyticsStatic, Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass GoogleAnalytics
++    {
++        [default] interface GA.IGoogleAnalyticsClass;
++    }
++}
+diff --git a/dlls/wpnapps/private.h b/dlls/wpnapps/private.h
+index bc8c045..feaa358 100644
+--- a/dlls/wpnapps/private.h
++++ b/dlls/wpnapps/private.h
+@@ -29,6 +29,11 @@
+ 
+ extern IActivationFactory *toast_manager_factory;
+ extern IActivationFactory *toast_notification_factory;
++extern IActivationFactory *tile_manager_factory;
++extern IActivationFactory *tile_notification_factory;
++extern IActivationFactory *tile_content_factory_iface;
++extern IActivationFactory *ga_factory_iface;
++extern IActivationFactory *accelerometer_factory;
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \
+diff --git a/dlls/wpnapps/sensors.c b/dlls/wpnapps/sensors.c
+new file mode 100644
+index 0000000..baccdac
+--- /dev/null
++++ b/dlls/wpnapps/sensors.c
+@@ -0,0 +1,98 @@
++/*
++ * Windows.Devices.Sensors.Accelerometer: a PC has none. GetDefault answers null, as it does on a Windows PC without
++ * one, and games that steer by tilt (Asphalt 7) then use the keyboard and gamepad.
++ */
++
++#define COBJMACROS
++#include <winstring.h>
++
++#include "private.h"
++#include <initguid.h>
++#define WIDL_using_Windows_Devices_Sensors
++#include "windows.devices.sensors.h"
++
++#include <wine/debug.h>
++
++WINE_DEFAULT_DEBUG_CHANNEL(wpnapps);
++
++struct acc_factory
++{
++    IActivationFactory IActivationFactory_iface;
++    IAccelerometerStatics IAccelerometerStatics_iface;
++};
++
++static inline struct acc_factory *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct acc_factory, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI acc_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct acc_factory *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "(%p, %s, %p)\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IAccelerometerStatics ))
++        *out = &impl->IAccelerometerStatics_iface;
++    else
++    {
++        *out = NULL;
++        FIXME( "%s not implemented, returning E_NOINTERFACE\n", debugstr_guid( iid ) );
++        return E_NOINTERFACE;
++    }
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI acc_factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI acc_factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI acc_factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI acc_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI acc_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI acc_factory_ActivateInstance( IActivationFactory *iface, IInspectable **out )
++{
++    *out = NULL;
++    return E_NOTIMPL;
++}
++
++static const IActivationFactoryVtbl acc_factory_vtbl =
++{
++    acc_factory_QueryInterface,
++    acc_factory_AddRef,
++    acc_factory_Release,
++    acc_factory_GetIids,
++    acc_factory_GetRuntimeClassName,
++    acc_factory_GetTrustLevel,
++    acc_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( acc_statics, IAccelerometerStatics, struct acc_factory, IActivationFactory_iface )
++
++static HRESULT WINAPI acc_statics_GetDefault( IAccelerometerStatics *iface, IAccelerometer **value )
++{
++    TRACE( "(%p, %p): no accelerometer.\n", iface, value );
++    *value = NULL;
++    return S_OK;
++}
++
++static const IAccelerometerStaticsVtbl acc_statics_vtbl =
++{
++    acc_statics_QueryInterface,
++    acc_statics_AddRef,
++    acc_statics_Release,
++    acc_statics_GetIids,
++    acc_statics_GetRuntimeClassName,
++    acc_statics_GetTrustLevel,
++    acc_statics_GetDefault,
++};
++
++static struct acc_factory acc_factory_impl =
++{
++    { &acc_factory_vtbl },
++    { &acc_statics_vtbl },
++};
++
++IActivationFactory *accelerometer_factory = &acc_factory_impl.IActivationFactory_iface;
+diff --git a/dlls/wpnapps/tile_notification.c b/dlls/wpnapps/tile_notification.c
+new file mode 100644
+index 0000000..9dcca7c
+--- /dev/null
++++ b/dlls/wpnapps/tile_notification.c
+@@ -0,0 +1,561 @@
++/*
++ * Windows.UI.Notifications tiles: TileUpdateManager, TileUpdater and TileNotification.
++ * There is no start menu to show tiles in, so updates are accepted and dropped.
++ */
++
++#define COBJMACROS
++#include <roapi.h>
++#include <winstring.h>
++
++#include "private.h"
++
++#include <wine/debug.h>
++
++WINE_DEFAULT_DEBUG_CHANNEL(wpnapps);
++
++/* TileUpdater */
++
++struct tile_updater
++{
++    ITileUpdater ITileUpdater_iface;
++    LONG ref;
++};
++
++static inline struct tile_updater *impl_from_ITileUpdater( ITileUpdater *iface )
++{
++    return CONTAINING_RECORD( iface, struct tile_updater, ITileUpdater_iface );
++}
++
++static HRESULT WINAPI tile_updater_QueryInterface( ITileUpdater *iface, REFIID iid, void **out )
++{
++    struct tile_updater *impl = impl_from_ITileUpdater( iface );
++
++    TRACE( "(%p, %s, %p)\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_ITileUpdater ))
++    {
++        ITileUpdater_AddRef( (*out = &impl->ITileUpdater_iface) );
++        return S_OK;
++    }
++
++    *out = NULL;
++    FIXME( "%s not implemented, returning E_NOINTERFACE\n", debugstr_guid( iid ) );
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI tile_updater_AddRef( ITileUpdater *iface )
++{
++    struct tile_updater *impl = impl_from_ITileUpdater( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI tile_updater_Release( ITileUpdater *iface )
++{
++    struct tile_updater *impl = impl_from_ITileUpdater( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI tile_updater_GetIids( ITileUpdater *iface, ULONG *count, IID **iids )
++{
++    FIXME( "(%p, %p, %p): stub!\n", iface, count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI tile_updater_GetRuntimeClassName( ITileUpdater *iface, HSTRING *name )
++{
++    FIXME( "(%p, %p): stub!\n", iface, name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI tile_updater_GetTrustLevel( ITileUpdater *iface, TrustLevel *level )
++{
++    FIXME( "(%p, %p): stub!\n", iface, level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI tile_updater_Update( ITileUpdater *iface, ITileNotification *notification )
++{
++    FIXME( "(%p, %p): semi-stub!\n", iface, notification );
++    return S_OK;
++}
++
++static HRESULT WINAPI tile_updater_Clear( ITileUpdater *iface )
++{
++    FIXME( "(%p): semi-stub!\n", iface );
++    return S_OK;
++}
++
++static HRESULT WINAPI tile_updater_EnableNotificationQueue( ITileUpdater *iface, boolean enable )
++{
++    FIXME( "(%p, %d): semi-stub!\n", iface, enable );
++    return S_OK;
++}
++
++static HRESULT WINAPI tile_updater_get_Setting( ITileUpdater *iface, NotificationSetting *setting )
++{
++    FIXME( "(%p, %p): semi-stub!\n", iface, setting );
++    *setting = NotificationSetting_DisabledForApplication;
++    return S_OK;
++}
++
++static HRESULT WINAPI tile_updater_AddToSchedule( ITileUpdater *iface, IScheduledTileNotification *scheduled )
++{
++    FIXME( "(%p, %p): semi-stub!\n", iface, scheduled );
++    return S_OK;
++}
++
++static HRESULT WINAPI tile_updater_RemoveFromSchedule( ITileUpdater *iface, IScheduledTileNotification *scheduled )
++{
++    FIXME( "(%p, %p): semi-stub!\n", iface, scheduled );
++    return S_OK;
++}
++
++static HRESULT WINAPI tile_updater_GetScheduledTileNotifications( ITileUpdater *iface, __FIVectorView_1_Windows__CUI__CNotifications__CScheduledTileNotification **notifications )
++{
++    FIXME( "(%p, %p): stub!\n", iface, notifications );
++    *notifications = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI tile_updater_StartPeriodicUpdate( ITileUpdater *iface, __x_ABI_CWindows_CFoundation_CIUriRuntimeClass *uri, PeriodicUpdateRecurrence interval )
++{
++    FIXME( "(%p, %p, %d): semi-stub!\n", iface, uri, interval );
++    return S_OK;
++}
++
++static HRESULT WINAPI tile_updater_StartPeriodicUpdateAtTime( ITileUpdater *iface, __x_ABI_CWindows_CFoundation_CIUriRuntimeClass *uri, __x_ABI_CWindows_CFoundation_CDateTime start, PeriodicUpdateRecurrence interval )
++{
++    FIXME( "(%p, %p, %d): semi-stub!\n", iface, uri, interval );
++    return S_OK;
++}
++
++static HRESULT WINAPI tile_updater_StopPeriodicUpdate( ITileUpdater *iface )
++{
++    FIXME( "(%p): semi-stub!\n", iface );
++    return S_OK;
++}
++
++static HRESULT WINAPI tile_updater_StartPeriodicUpdateBatch( ITileUpdater *iface, __FIIterable_1_Windows__CFoundation__CUri *uris, PeriodicUpdateRecurrence interval )
++{
++    FIXME( "(%p, %p, %d): semi-stub!\n", iface, uris, interval );
++    return S_OK;
++}
++
++static HRESULT WINAPI tile_updater_StartPeriodicUpdateBatchAtTime( ITileUpdater *iface, __FIIterable_1_Windows__CFoundation__CUri *uris, __x_ABI_CWindows_CFoundation_CDateTime start, PeriodicUpdateRecurrence interval )
++{
++    FIXME( "(%p, %p, %d): semi-stub!\n", iface, uris, interval );
++    return S_OK;
++}
++
++static const ITileUpdaterVtbl tile_updater_vtbl =
++{
++    tile_updater_QueryInterface,
++    tile_updater_AddRef,
++    tile_updater_Release,
++    tile_updater_GetIids,
++    tile_updater_GetRuntimeClassName,
++    tile_updater_GetTrustLevel,
++    tile_updater_Update,
++    tile_updater_Clear,
++    tile_updater_EnableNotificationQueue,
++    tile_updater_get_Setting,
++    tile_updater_AddToSchedule,
++    tile_updater_RemoveFromSchedule,
++    tile_updater_GetScheduledTileNotifications,
++    tile_updater_StartPeriodicUpdate,
++    tile_updater_StartPeriodicUpdateAtTime,
++    tile_updater_StopPeriodicUpdate,
++    tile_updater_StartPeriodicUpdateBatch,
++    tile_updater_StartPeriodicUpdateBatchAtTime,
++};
++
++static HRESULT create_tile_updater( ITileUpdater **out )
++{
++    struct tile_updater *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->ITileUpdater_iface.lpVtbl = &tile_updater_vtbl;
++    impl->ref = 1;
++    *out = &impl->ITileUpdater_iface;
++    return S_OK;
++}
++
++/* TileUpdateManager */
++
++struct tile_manager_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    ITileUpdateManagerStatics ITileUpdateManagerStatics_iface;
++    LONG ref;
++};
++
++static inline struct tile_manager_statics *impl_from_manager_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct tile_manager_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI tile_manager_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct tile_manager_statics *impl = impl_from_manager_IActivationFactory( iface );
++
++    TRACE( "(%p, %s, %p)\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        IActivationFactory_AddRef( (*out = &impl->IActivationFactory_iface) );
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_ITileUpdateManagerStatics ))
++    {
++        ITileUpdateManagerStatics_AddRef( (*out = &impl->ITileUpdateManagerStatics_iface) );
++        return S_OK;
++    }
++
++    *out = NULL;
++    FIXME( "%s not implemented, returning E_NOINTERFACE\n", debugstr_guid( iid ) );
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI tile_manager_factory_AddRef( IActivationFactory *iface )
++{
++    struct tile_manager_statics *impl = impl_from_manager_IActivationFactory( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI tile_manager_factory_Release( IActivationFactory *iface )
++{
++    struct tile_manager_statics *impl = impl_from_manager_IActivationFactory( iface );
++    return InterlockedDecrement( &impl->ref );
++}
++
++static HRESULT WINAPI tile_manager_factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids )
++{
++    FIXME( "(%p, %p, %p): stub!\n", iface, count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI tile_manager_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name )
++{
++    FIXME( "(%p, %p): stub!\n", iface, name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI tile_manager_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
++{
++    FIXME( "(%p, %p): stub!\n", iface, level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI tile_manager_factory_ActivateInstance( IActivationFactory *iface, IInspectable **out )
++{
++    FIXME( "(%p, %p): stub!\n", iface, out );
++    return E_NOTIMPL;
++}
++
++static const IActivationFactoryVtbl tile_manager_factory_vtbl =
++{
++    tile_manager_factory_QueryInterface,
++    tile_manager_factory_AddRef,
++    tile_manager_factory_Release,
++    tile_manager_factory_GetIids,
++    tile_manager_factory_GetRuntimeClassName,
++    tile_manager_factory_GetTrustLevel,
++    tile_manager_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( tile_manager_statics, ITileUpdateManagerStatics, struct tile_manager_statics, IActivationFactory_iface );
++
++static HRESULT WINAPI tile_manager_statics_CreateTileUpdaterForApplication( ITileUpdateManagerStatics *iface, ITileUpdater **out )
++{
++    FIXME( "(%p, %p): semi-stub!\n", iface, out );
++    return create_tile_updater( out );
++}
++
++static HRESULT WINAPI tile_manager_statics_CreateTileUpdaterForApplicationWithId( ITileUpdateManagerStatics *iface, HSTRING app_id, ITileUpdater **out )
++{
++    FIXME( "(%p, %s, %p): semi-stub!\n", iface, debugstr_hstring( app_id ), out );
++    return create_tile_updater( out );
++}
++
++static HRESULT WINAPI tile_manager_statics_CreateTileUpdaterForSecondaryTile( ITileUpdateManagerStatics *iface, HSTRING tile_id, ITileUpdater **out )
++{
++    FIXME( "(%p, %s, %p): semi-stub!\n", iface, debugstr_hstring( tile_id ), out );
++    return create_tile_updater( out );
++}
++
++static HRESULT WINAPI tile_manager_statics_GetTemplateContent( ITileUpdateManagerStatics *iface, TileTemplateType type, IXmlDocument **out )
++{
++    FIXME( "(%p, %d, %p): stub!\n", iface, type, out );
++    *out = NULL;
++    return E_NOTIMPL;
++}
++
++static const ITileUpdateManagerStaticsVtbl tile_manager_statics_vtbl =
++{
++    tile_manager_statics_QueryInterface,
++    tile_manager_statics_AddRef,
++    tile_manager_statics_Release,
++    tile_manager_statics_GetIids,
++    tile_manager_statics_GetRuntimeClassName,
++    tile_manager_statics_GetTrustLevel,
++    tile_manager_statics_CreateTileUpdaterForApplication,
++    tile_manager_statics_CreateTileUpdaterForApplicationWithId,
++    tile_manager_statics_CreateTileUpdaterForSecondaryTile,
++    tile_manager_statics_GetTemplateContent,
++};
++
++static struct tile_manager_statics tile_manager_statics =
++{
++    { &tile_manager_factory_vtbl },
++    { &tile_manager_statics_vtbl },
++    1
++};
++
++IActivationFactory *tile_manager_factory = &tile_manager_statics.IActivationFactory_iface;
++
++/* TileNotification */
++
++struct tile_notification
++{
++    ITileNotification ITileNotification_iface;
++    IXmlDocument *content;
++    HSTRING tag;
++    LONG ref;
++};
++
++static inline struct tile_notification *impl_from_ITileNotification( ITileNotification *iface )
++{
++    return CONTAINING_RECORD( iface, struct tile_notification, ITileNotification_iface );
++}
++
++static HRESULT WINAPI tile_notification_QueryInterface( ITileNotification *iface, REFIID iid, void **out )
++{
++    struct tile_notification *impl = impl_from_ITileNotification( iface );
++
++    TRACE( "(%p, %s, %p)\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_ITileNotification ))
++    {
++        ITileNotification_AddRef( (*out = &impl->ITileNotification_iface) );
++        return S_OK;
++    }
++
++    *out = NULL;
++    FIXME( "%s not implemented, returning E_NOINTERFACE\n", debugstr_guid( iid ) );
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI tile_notification_AddRef( ITileNotification *iface )
++{
++    struct tile_notification *impl = impl_from_ITileNotification( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI tile_notification_Release( ITileNotification *iface )
++{
++    struct tile_notification *impl = impl_from_ITileNotification( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        if (impl->content) IXmlDocument_Release( impl->content );
++        WindowsDeleteString( impl->tag );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI tile_notification_GetIids( ITileNotification *iface, ULONG *count, IID **iids )
++{
++    FIXME( "(%p, %p, %p): stub!\n", iface, count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI tile_notification_GetRuntimeClassName( ITileNotification *iface, HSTRING *name )
++{
++    FIXME( "(%p, %p): stub!\n", iface, name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI tile_notification_GetTrustLevel( ITileNotification *iface, TrustLevel *level )
++{
++    FIXME( "(%p, %p): stub!\n", iface, level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI tile_notification_get_Content( ITileNotification *iface, IXmlDocument **value )
++{
++    struct tile_notification *impl = impl_from_ITileNotification( iface );
++
++    TRACE( "(%p, %p)\n", iface, value );
++    if ((*value = impl->content)) IXmlDocument_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI tile_notification_put_ExpirationTime( ITileNotification *iface, __FIReference_1_DateTime *value )
++{
++    FIXME( "(%p, %p): semi-stub!\n", iface, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI tile_notification_get_ExpirationTime( ITileNotification *iface, __FIReference_1_DateTime **value )
++{
++    TRACE( "(%p, %p)\n", iface, value );
++    *value = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI tile_notification_put_Tag( ITileNotification *iface, HSTRING value )
++{
++    struct tile_notification *impl = impl_from_ITileNotification( iface );
++    HSTRING copy;
++    HRESULT hr;
++
++    TRACE( "(%p, %s)\n", iface, debugstr_hstring( value ) );
++    if (FAILED(hr = WindowsDuplicateString( value, &copy ))) return hr;
++    WindowsDeleteString( impl->tag );
++    impl->tag = copy;
++    return S_OK;
++}
++
++static HRESULT WINAPI tile_notification_get_Tag( ITileNotification *iface, HSTRING *value )
++{
++    struct tile_notification *impl = impl_from_ITileNotification( iface );
++
++    TRACE( "(%p, %p)\n", iface, value );
++    return WindowsDuplicateString( impl->tag, value );
++}
++
++static const ITileNotificationVtbl tile_notification_vtbl =
++{
++    tile_notification_QueryInterface,
++    tile_notification_AddRef,
++    tile_notification_Release,
++    tile_notification_GetIids,
++    tile_notification_GetRuntimeClassName,
++    tile_notification_GetTrustLevel,
++    tile_notification_get_Content,
++    tile_notification_put_ExpirationTime,
++    tile_notification_get_ExpirationTime,
++    tile_notification_put_Tag,
++    tile_notification_get_Tag,
++};
++
++struct tile_factory
++{
++    IActivationFactory IActivationFactory_iface;
++    ITileNotificationFactory ITileNotificationFactory_iface;
++    LONG ref;
++};
++
++static inline struct tile_factory *impl_from_tile_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct tile_factory, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI tile_act_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct tile_factory *impl = impl_from_tile_IActivationFactory( iface );
++
++    TRACE( "(%p, %s, %p)\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        IActivationFactory_AddRef( (*out = &impl->IActivationFactory_iface) );
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_ITileNotificationFactory ))
++    {
++        ITileNotificationFactory_AddRef( (*out = &impl->ITileNotificationFactory_iface) );
++        return S_OK;
++    }
++
++    *out = NULL;
++    FIXME( "%s not implemented, returning E_NOINTERFACE\n", debugstr_guid( iid ) );
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI tile_act_factory_AddRef( IActivationFactory *iface )
++{
++    struct tile_factory *impl = impl_from_tile_IActivationFactory( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI tile_act_factory_Release( IActivationFactory *iface )
++{
++    struct tile_factory *impl = impl_from_tile_IActivationFactory( iface );
++    return InterlockedDecrement( &impl->ref );
++}
++
++static HRESULT WINAPI tile_act_factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids )
++{
++    FIXME( "(%p, %p, %p): stub!\n", iface, count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI tile_act_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name )
++{
++    FIXME( "(%p, %p): stub!\n", iface, name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI tile_act_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
++{
++    FIXME( "(%p, %p): stub!\n", iface, level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI tile_act_factory_ActivateInstance( IActivationFactory *iface, IInspectable **out )
++{
++    FIXME( "(%p, %p): stub!\n", iface, out );
++    return E_NOTIMPL;
++}
++
++static const IActivationFactoryVtbl tile_act_factory_vtbl =
++{
++    tile_act_factory_QueryInterface,
++    tile_act_factory_AddRef,
++    tile_act_factory_Release,
++    tile_act_factory_GetIids,
++    tile_act_factory_GetRuntimeClassName,
++    tile_act_factory_GetTrustLevel,
++    tile_act_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( tile_factory, ITileNotificationFactory, struct tile_factory, IActivationFactory_iface );
++
++static HRESULT WINAPI tile_factory_CreateTileNotification( ITileNotificationFactory *iface, IXmlDocument *content, ITileNotification **out )
++{
++    struct tile_notification *impl;
++
++    TRACE( "(%p, %p, %p)\n", iface, content, out );
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->ITileNotification_iface.lpVtbl = &tile_notification_vtbl;
++    if ((impl->content = content)) IXmlDocument_AddRef( content );
++    impl->ref = 1;
++    *out = &impl->ITileNotification_iface;
++    return S_OK;
++}
++
++static const ITileNotificationFactoryVtbl tile_factory_vtbl =
++{
++    tile_factory_QueryInterface,
++    tile_factory_AddRef,
++    tile_factory_Release,
++    tile_factory_GetIids,
++    tile_factory_GetRuntimeClassName,
++    tile_factory_GetTrustLevel,
++    tile_factory_CreateTileNotification,
++};
++
++static struct tile_factory tile_factory =
++{
++    { &tile_act_factory_vtbl },
++    { &tile_factory_vtbl },
++    1
++};
++
++IActivationFactory *tile_notification_factory = &tile_factory.IActivationFactory_iface;
+diff --git a/include/Makefile.in b/include/Makefile.in
+index d838650..8d03822 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -1038,6 +1038,7 @@ SOURCES = \
+ 	windows.devices.input.idl \
+ 	windows.devices.power.idl \
+ 	windows.devices.radios.idl \
++	windows.devices.sensors.idl \
+ 	windows.devices.usb.idl \
+ 	windows.foundation.collections.idl \
+ 	windows.foundation.idl \
+@@ -1107,6 +1108,7 @@ SOURCES = \
+ 	windows.ui.core.idl \
+ 	windows.ui.idl \
+ 	windows.ui.input.idl \
++	windows.ui.applicationsettings.idl \
+ 	windows.ui.popups.idl \
+ 	windows.ui.notifications.idl \
+ 	windows.ui.text.core.idl \
+diff --git a/include/windows.devices.sensors.idl b/include/windows.devices.sensors.idl
+new file mode 100644
+index 0000000..b54d138
+--- /dev/null
++++ b/include/windows.devices.sensors.idl
+@@ -0,0 +1,267 @@
++/* Generated from Windows.winmd by scripts/winmd2idl.py (Windows.Devices.Sensors.Accelerometer). */
++
++#ifdef __WIDL__
++#pragma winrt ns_prefix
++#endif
++
++import "inspectable.idl";
++import "asyncinfo.idl";
++import "eventtoken.idl";
++import "windowscontracts.idl";
++import "windows.foundation.idl";
++import "windows.graphics.display.idl";
++
++
++namespace Windows.Devices.Sensors {
++    runtimeclass Accelerometer;
++    runtimeclass AccelerometerDataThreshold;
++    runtimeclass AccelerometerReading;
++    runtimeclass AccelerometerReadingChangedEventArgs;
++    typedef enum AccelerometerReadingType AccelerometerReadingType;
++    runtimeclass AccelerometerShakenEventArgs;
++    interface IAccelerometer;
++    interface IAccelerometer2;
++    interface IAccelerometer3;
++    interface IAccelerometer4;
++    interface IAccelerometer5;
++    interface IAccelerometerDataThreshold;
++    interface IAccelerometerDeviceId;
++    interface IAccelerometerReading;
++    interface IAccelerometerReadingChangedEventArgs;
++    interface IAccelerometerShakenEventArgs;
++    interface IAccelerometerStatics;
++    interface IAccelerometerStatics2;
++    interface IAccelerometerStatics3;
++}
++
++namespace Windows.UI.Xaml {
++    declare {
++        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.Devices.Sensors.Accelerometer *>;
++        interface Windows.Foundation.IAsyncOperation<Windows.Devices.Sensors.Accelerometer *>;
++        interface Windows.Foundation.TypedEventHandler<Windows.Devices.Sensors.Accelerometer *, Windows.Devices.Sensors.AccelerometerReadingChangedEventArgs *>;
++        interface Windows.Foundation.TypedEventHandler<Windows.Devices.Sensors.Accelerometer *, Windows.Devices.Sensors.AccelerometerShakenEventArgs *>;
++        interface Windows.Foundation.IAsyncOperation<Windows.Devices.Sensors.Accelerometer *>;
++    }
++}
++
++namespace Windows.Devices.Sensors {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 3.0)
++    ]
++    enum AccelerometerReadingType
++    {
++        Standard = 0,
++        Linear = 1,
++        Gravity = 2
++    };
++
++}
++
++namespace Windows.Devices.Sensors {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.Sensors.Accelerometer),
++        uuid(df184548-2711-4da7-8098-4b82205d3c7d)
++    ]
++    interface IAccelerometer : IInspectable
++    {
++        HRESULT GetCurrentReading([out, retval] Windows.Devices.Sensors.AccelerometerReading * *value);
++        [propget] HRESULT MinimumReportInterval([out, retval] UINT32 *value);
++        [propput] HRESULT ReportInterval([in] UINT32 value);
++        [propget] HRESULT ReportInterval([out, retval] UINT32 *value);
++        [eventadd] HRESULT ReadingChanged([in] Windows.Foundation.TypedEventHandler<Windows.Devices.Sensors.Accelerometer *, Windows.Devices.Sensors.AccelerometerReadingChangedEventArgs *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT ReadingChanged([in] Windows.Foundation.EventRegistrationToken token);
++        [eventadd] HRESULT Shaken([in] Windows.Foundation.TypedEventHandler<Windows.Devices.Sensors.Accelerometer *, Windows.Devices.Sensors.AccelerometerShakenEventArgs *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT Shaken([in] Windows.Foundation.EventRegistrationToken token);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.Sensors.Accelerometer),
++        uuid(e8f092ee-4964-401a-b602-220d7153c60a)
++    ]
++    interface IAccelerometer2 : IInspectable
++    {
++        [propput] HRESULT ReadingTransform([in] Windows.Graphics.Display.DisplayOrientations value);
++        [propget] HRESULT ReadingTransform([out, retval] Windows.Graphics.Display.DisplayOrientations *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.Sensors.Accelerometer),
++        uuid(87e0022a-ed80-49eb-bf8a-a4ea31e5cd84)
++    ]
++    interface IAccelerometer3 : IInspectable
++    {
++        [propput] HRESULT ReportLatency([in] UINT32 value);
++        [propget] HRESULT ReportLatency([out, retval] UINT32 *value);
++        [propget] HRESULT MaxBatchSize([out, retval] UINT32 *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 3.0),
++        exclusiveto(Windows.Devices.Sensors.Accelerometer),
++        uuid(1d373c4f-42d3-45b2-8144-ab7fb665eb59)
++    ]
++    interface IAccelerometer4 : IInspectable
++    {
++        [propget] HRESULT ReadingType([out, retval] Windows.Devices.Sensors.AccelerometerReadingType *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 10.0),
++        exclusiveto(Windows.Devices.Sensors.Accelerometer),
++        uuid(7e7e7021-def4-53a6-af43-806fd538edf6)
++    ]
++    interface IAccelerometer5 : IInspectable
++    {
++        [propget] HRESULT ReportThreshold([out, retval] Windows.Devices.Sensors.AccelerometerDataThreshold * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 10.0),
++        exclusiveto(Windows.Devices.Sensors.AccelerometerDataThreshold),
++        uuid(f92c1b68-6320-5577-879e-9942621c3dd9)
++    ]
++    interface IAccelerometerDataThreshold : IInspectable
++    {
++        [propget] HRESULT XAxisInGForce([out, retval] DOUBLE *value);
++        [propput] HRESULT XAxisInGForce([in] DOUBLE value);
++        [propget] HRESULT YAxisInGForce([out, retval] DOUBLE *value);
++        [propput] HRESULT YAxisInGForce([in] DOUBLE value);
++        [propget] HRESULT ZAxisInGForce([out, retval] DOUBLE *value);
++        [propput] HRESULT ZAxisInGForce([in] DOUBLE value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.Sensors.Accelerometer),
++        uuid(7eac64a9-97d5-446d-ab5a-917df9b96a2c)
++    ]
++    interface IAccelerometerDeviceId : IInspectable
++    {
++        [propget] HRESULT DeviceId([out, retval] HSTRING *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.Sensors.AccelerometerReading),
++        uuid(b9fe7acb-d351-40af-8bb6-7aa9ae641fb7)
++    ]
++    interface IAccelerometerReading : IInspectable
++    {
++        [propget] HRESULT Timestamp([out, retval] Windows.Foundation.DateTime *value);
++        [propget] HRESULT AccelerationX([out, retval] DOUBLE *value);
++        [propget] HRESULT AccelerationY([out, retval] DOUBLE *value);
++        [propget] HRESULT AccelerationZ([out, retval] DOUBLE *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.Sensors.AccelerometerReadingChangedEventArgs),
++        uuid(0095c65b-b6ac-475a-9f44-8b32d35a3f25)
++    ]
++    interface IAccelerometerReadingChangedEventArgs : IInspectable
++    {
++        [propget] HRESULT Reading([out, retval] Windows.Devices.Sensors.AccelerometerReading * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.Sensors.AccelerometerShakenEventArgs),
++        uuid(95ff01d1-4a28-4f35-98e8-8178aae4084a)
++    ]
++    interface IAccelerometerShakenEventArgs : IInspectable
++    {
++        [propget] HRESULT Timestamp([out, retval] Windows.Foundation.DateTime *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.Sensors.Accelerometer),
++        uuid(a5e28b74-5a87-4a2d-becc-0f906ea061dd)
++    ]
++    interface IAccelerometerStatics : IInspectable
++    {
++        [overload("GetDefault")] HRESULT GetDefault([out, retval] Windows.Devices.Sensors.Accelerometer * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 3.0),
++        exclusiveto(Windows.Devices.Sensors.Accelerometer),
++        uuid(c4c4842f-d86b-4685-b2d7-3396f798d57b)
++    ]
++    interface IAccelerometerStatics2 : IInspectable
++    {
++        [overload("GetDefault")] HRESULT GetDefaultWithAccelerometerReadingType([in] Windows.Devices.Sensors.AccelerometerReadingType readingType, [out, retval] Windows.Devices.Sensors.Accelerometer * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 5.0),
++        exclusiveto(Windows.Devices.Sensors.Accelerometer),
++        uuid(9de218cf-455d-4cf3-8200-70e1410340f8)
++    ]
++    interface IAccelerometerStatics3 : IInspectable
++    {
++        HRESULT FromIdAsync([in] HSTRING deviceId, [out, retval] Windows.Foundation.IAsyncOperation<Windows.Devices.Sensors.Accelerometer *> * *value);
++        HRESULT GetDeviceSelector([in] Windows.Devices.Sensors.AccelerometerReadingType readingType, [out, retval] HSTRING *value);
++    }
++
++}
++
++namespace Windows.Devices.Sensors {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.Devices.Sensors.IAccelerometerStatics, Windows.Foundation.UniversalApiContract, 1.0),
++        static(Windows.Devices.Sensors.IAccelerometerStatics2, Windows.Foundation.UniversalApiContract, 3.0),
++        static(Windows.Devices.Sensors.IAccelerometerStatics3, Windows.Foundation.UniversalApiContract, 5.0),
++        threading(both)
++    ]
++    runtimeclass Accelerometer
++    {
++        [default] interface Windows.Devices.Sensors.IAccelerometer;
++        [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Devices.Sensors.IAccelerometerDeviceId;
++        [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Devices.Sensors.IAccelerometer2;
++        [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Devices.Sensors.IAccelerometer3;
++        [contract(Windows.Foundation.UniversalApiContract, 3.0)] interface Windows.Devices.Sensors.IAccelerometer4;
++        [contract(Windows.Foundation.UniversalApiContract, 10.0)] interface Windows.Devices.Sensors.IAccelerometer5;
++    }
++
++}
++
++namespace Windows.Devices.Sensors {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 10.0)
++    ]
++    runtimeclass AccelerometerDataThreshold
++    {
++        [default] interface Windows.Devices.Sensors.IAccelerometerDataThreshold;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass AccelerometerReading
++    {
++        [default] interface Windows.Devices.Sensors.IAccelerometerReading;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass AccelerometerReadingChangedEventArgs
++    {
++        [default] interface Windows.Devices.Sensors.IAccelerometerReadingChangedEventArgs;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass AccelerometerShakenEventArgs
++    {
++        [default] interface Windows.Devices.Sensors.IAccelerometerShakenEventArgs;
++    }
++
++}
++
+diff --git a/include/windows.graphics.display.idl b/include/windows.graphics.display.idl
+index 7a9750c..d01658e 100644
+--- a/include/windows.graphics.display.idl
++++ b/include/windows.graphics.display.idl
+@@ -36,14 +36,23 @@ namespace Windows.Graphics.Display {
+ 
+     interface IAdvancedColorInfo;
+     interface IDisplayInformationStatics;
++    interface IDisplayPropertiesStatics;
+ 
+     runtimeclass AdvancedColorInfo;
+     runtimeclass DisplayInformation;
++    runtimeclass DisplayProperties;
+ 
+     declare {
+         interface Windows.Foundation.TypedEventHandler<Windows.Graphics.Display.DisplayInformation *, IInspectable *>;
++        interface Windows.Foundation.IAsyncOperation<Windows.Storage.Streams.IRandomAccessStream *>;
+     }
+ 
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        uuid(dbdd8b01-f1a1-46d1-9ee3-543bcc995980)
++    ]
++    delegate HRESULT DisplayPropertiesEventHandler([in] IInspectable * sender);
++
+     [
+         contract(Windows.Foundation.UniversalApiContract, 6.0)
+     ]
+@@ -226,4 +235,40 @@ namespace Windows.Graphics.Display {
+         [contract(Windows.Foundation.UniversalApiContract, 3.0)] interface Windows.Graphics.Display.IDisplayInformation4;
+         [contract(Windows.Foundation.UniversalApiContract, 6.0)] interface Windows.Graphics.Display.IDisplayInformation5;
+     }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Graphics.Display.DisplayProperties),
++        uuid(6937ed8d-30ea-4ded-8271-4553ff02f68a)
++    ]
++    interface IDisplayPropertiesStatics : IInspectable
++    {
++        [propget] HRESULT CurrentOrientation([out, retval] Windows.Graphics.Display.DisplayOrientations *value);
++        [propget] HRESULT NativeOrientation([out, retval] Windows.Graphics.Display.DisplayOrientations *value);
++        [propget] HRESULT AutoRotationPreferences([out, retval] Windows.Graphics.Display.DisplayOrientations *value);
++        [propput] HRESULT AutoRotationPreferences([in] Windows.Graphics.Display.DisplayOrientations value);
++        [eventadd] HRESULT OrientationChanged([in] Windows.Graphics.Display.DisplayPropertiesEventHandler * handler, [out, retval] EventRegistrationToken *value);
++        [eventremove] HRESULT OrientationChanged([in] EventRegistrationToken token);
++        [propget] HRESULT ResolutionScale([out, retval] Windows.Graphics.Display.ResolutionScale *value);
++        [propget] HRESULT LogicalDpi([out, retval] FLOAT *value);
++        [eventadd] HRESULT LogicalDpiChanged([in] Windows.Graphics.Display.DisplayPropertiesEventHandler * handler, [out, retval] EventRegistrationToken *value);
++        [eventremove] HRESULT LogicalDpiChanged([in] EventRegistrationToken token);
++        [propget] HRESULT StereoEnabled([out, retval] boolean *value);
++        [eventadd] HRESULT StereoEnabledChanged([in] Windows.Graphics.Display.DisplayPropertiesEventHandler * handler, [out, retval] EventRegistrationToken *value);
++        [eventremove] HRESULT StereoEnabledChanged([in] EventRegistrationToken token);
++        HRESULT GetColorProfileAsync([out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.Streams.IRandomAccessStream *> * *value);
++        [eventadd] HRESULT ColorProfileChanged([in] Windows.Graphics.Display.DisplayPropertiesEventHandler * handler, [out, retval] EventRegistrationToken *value);
++        [eventremove] HRESULT ColorProfileChanged([in] EventRegistrationToken token);
++        [eventadd] HRESULT DisplayContentsInvalidated([in] Windows.Graphics.Display.DisplayPropertiesEventHandler * handler, [out, retval] EventRegistrationToken *value);
++        [eventremove] HRESULT DisplayContentsInvalidated([in] EventRegistrationToken token);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.Graphics.Display.IDisplayPropertiesStatics, Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass DisplayProperties
++    {
++    }
+ }
+diff --git a/include/windows.networking.sockets.idl b/include/windows.networking.sockets.idl
+index 5dfe586..7d34339 100644
+--- a/include/windows.networking.sockets.idl
++++ b/include/windows.networking.sockets.idl
+@@ -20,7 +20,13 @@
+ #pragma winrt ns_prefix
+ #endif
+ 
++import "inspectable.idl";
++import "asyncinfo.idl";
++import "eventtoken.idl";
+ import "windowscontracts.idl";
++import "windows.foundation.idl";
++import "windows.networking.idl";
++import "windows.storage.streams.idl";
+ 
+ namespace Windows.Networking.Sockets {
+     typedef enum SocketProtectionLevel SocketProtectionLevel;
+@@ -49,3 +55,103 @@ namespace Windows.Networking.Sockets {
+         Tls13 = 10,
+     };
+ }
++
++namespace Windows.Networking.Sockets {
++    interface IStreamSocket;
++    runtimeclass StreamSocket;
++
++    /* Generated from Windows.winmd by scripts/winmd2idl.py (Windows.Networking.Sockets.StreamSocket): its
++     * IStreamSocket only, with the class' other interfaces left out and Control and Information, whose classes
++     * aren't here, as IInspectable (the same pointers) */
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Networking.Sockets.StreamSocket),
++        uuid(69a22cf3-fc7b-4857-af38-f6e7de6a5b49)
++    ]
++    interface IStreamSocket : IInspectable
++        requires Windows.Foundation.IClosable
++    {
++        [propget] HRESULT Control([out, retval] IInspectable * *value);
++        [propget] HRESULT Information([out, retval] IInspectable * *value);
++        [propget] HRESULT InputStream([out, retval] Windows.Storage.Streams.IInputStream * *value);
++        [propget] HRESULT OutputStream([out, retval] Windows.Storage.Streams.IOutputStream * *value);
++        [overload("ConnectAsync")] HRESULT ConnectWithEndpointPairAsync([in] Windows.Networking.EndpointPair * endpointPair, [out, retval] Windows.Foundation.IAsyncAction * *value);
++        [default_overload] [overload("ConnectAsync")] HRESULT ConnectAsync([in] Windows.Networking.HostName * remoteHostName, [in] HSTRING remoteServiceName, [out, retval] Windows.Foundation.IAsyncAction * *value);
++        [overload("ConnectAsync")] HRESULT ConnectWithEndpointPairAndProtectionLevelAsync([in] Windows.Networking.EndpointPair * endpointPair, [in] Windows.Networking.Sockets.SocketProtectionLevel protectionLevel, [out, retval] Windows.Foundation.IAsyncAction * *value);
++        [overload("ConnectAsync")] HRESULT ConnectWithProtectionLevelAsync([in] Windows.Networking.HostName * remoteHostName, [in] HSTRING remoteServiceName, [in] Windows.Networking.Sockets.SocketProtectionLevel protectionLevel, [out, retval] Windows.Foundation.IAsyncAction * *value);
++        HRESULT UpgradeToSslAsync([in] Windows.Networking.Sockets.SocketProtectionLevel protectionLevel, [in] Windows.Networking.HostName * validationHostName, [out, retval] Windows.Foundation.IAsyncAction * *value);
++    }
++
++    [
++        activatable(Windows.Foundation.UniversalApiContract, 1.0),
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        threading(both)
++    ]
++    runtimeclass StreamSocket
++    {
++        [default] interface Windows.Networking.Sockets.IStreamSocket;
++        interface Windows.Foundation.IClosable;
++    }
++
++    interface IStreamSocketListener;
++    interface IStreamSocketListenerControl;
++    interface IStreamSocketListenerInformation;
++    runtimeclass StreamSocketListener;
++
++    /* StreamSocketListener, from Windows.winmd: IStreamSocketListener only. Its Control and Information are
++     * IInspectable here, and the handler of ConnectionReceived (a TypedEventHandler<StreamSocketListener *,
++     * StreamSocketListenerConnectionReceivedEventArgs *>, whose IID isn't needed as the handler is only kept) is a
++     * delegate of the same shape: the same pointers */
++    [
++        uuid(9a5c3a4e-6c61-4b1d-8f0b-2f4a52a8c0a1)
++    ]
++    delegate HRESULT StreamSocketListenerConnectionReceivedHandler([in] IInspectable *sender, [in] IInspectable *args);
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Networking.Sockets.StreamSocketListener),
++        uuid(ff513437-df9f-4df0-bf82-0ec5d7b35aae)
++    ]
++    interface IStreamSocketListener : IInspectable
++        requires Windows.Foundation.IClosable
++    {
++        [propget] HRESULT Control([out, retval] IInspectable * *value);
++        [propget] HRESULT Information([out, retval] IInspectable * *value);
++        HRESULT BindServiceNameAsync([in] HSTRING localServiceName, [out, retval] Windows.Foundation.IAsyncAction * *value);
++        HRESULT BindEndpointAsync([in] Windows.Networking.HostName * localHostName, [in] HSTRING localServiceName, [out, retval] Windows.Foundation.IAsyncAction * *value);
++        [eventadd] HRESULT ConnectionReceived([in] Windows.Networking.Sockets.StreamSocketListenerConnectionReceivedHandler * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT ConnectionReceived([in] Windows.Foundation.EventRegistrationToken token);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        uuid(20d8c576-8d8a-4dba-9722-a16c4d984980)
++    ]
++    interface IStreamSocketListenerControl : IInspectable
++    {
++        [propget] HRESULT QualityOfService([out, retval] INT32 *value);
++        [propput] HRESULT QualityOfService([in] INT32 value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        uuid(e62ba82f-a63a-430b-bf62-29e93e5633b4)
++    ]
++    interface IStreamSocketListenerInformation : IInspectable
++    {
++        [propget] HRESULT LocalPort([out, retval] HSTRING *value);
++    }
++
++    [
++        activatable(Windows.Foundation.UniversalApiContract, 1.0),
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        threading(both)
++    ]
++    runtimeclass StreamSocketListener
++    {
++        [default] interface Windows.Networking.Sockets.IStreamSocketListener;
++        interface Windows.Foundation.IClosable;
++    }
++}
+diff --git a/include/windows.ui.applicationsettings.idl b/include/windows.ui.applicationsettings.idl
+new file mode 100644
+index 0000000..0dac186
+--- /dev/null
++++ b/include/windows.ui.applicationsettings.idl
+@@ -0,0 +1,140 @@
++/* Generated from Windows.winmd by scripts/winmd2idl.py (Windows.UI.ApplicationSettings.SettingsPane). */
++
++#ifdef __WIDL__
++#pragma winrt ns_prefix
++#endif
++
++import "inspectable.idl";
++import "asyncinfo.idl";
++import "eventtoken.idl";
++import "windowscontracts.idl";
++import "windows.foundation.idl";
++import "windows.ui.popups.idl";
++
++namespace Windows.UI.ApplicationSettings {
++    [contractversion(1.0)]
++    apicontract ApplicationsSettingsContract
++    {};
++}
++
++
++namespace Windows.UI.ApplicationSettings {
++    interface ISettingsPane;
++    interface ISettingsPaneCommandsRequest;
++    interface ISettingsPaneCommandsRequestedEventArgs;
++    interface ISettingsPaneStatics;
++    runtimeclass SettingsCommand;
++    typedef enum SettingsEdgeLocation SettingsEdgeLocation;
++    runtimeclass SettingsPane;
++    runtimeclass SettingsPaneCommandsRequest;
++    runtimeclass SettingsPaneCommandsRequestedEventArgs;
++}
++
++namespace Windows.UI.Xaml {
++    declare {
++        interface Windows.Foundation.Collections.IIterator<Windows.UI.ApplicationSettings.SettingsCommand *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.UI.ApplicationSettings.SettingsCommand *>;
++        interface Windows.Foundation.Collections.IVectorView<Windows.UI.ApplicationSettings.SettingsCommand *>;
++        interface Windows.Foundation.Collections.IVector<Windows.UI.ApplicationSettings.SettingsCommand *>;
++        interface Windows.Foundation.TypedEventHandler<Windows.UI.ApplicationSettings.SettingsPane *, Windows.UI.ApplicationSettings.SettingsPaneCommandsRequestedEventArgs *>;
++    }
++}
++
++namespace Windows.UI.ApplicationSettings {
++    [
++        contract(Windows.UI.ApplicationSettings.ApplicationsSettingsContract, 1.0)
++    ]
++    enum SettingsEdgeLocation
++    {
++        Right = 0,
++        Left = 1
++    };
++
++}
++
++namespace Windows.UI.ApplicationSettings {
++    [
++        contract(Windows.UI.ApplicationSettings.ApplicationsSettingsContract, 1.0),
++        exclusiveto(Windows.UI.ApplicationSettings.SettingsPane),
++        uuid(b1cd0932-4570-4c69-8d38-89446561ace0)
++    ]
++    interface ISettingsPane : IInspectable
++    {
++        [eventadd] HRESULT CommandsRequested([in] Windows.Foundation.TypedEventHandler<Windows.UI.ApplicationSettings.SettingsPane *, Windows.UI.ApplicationSettings.SettingsPaneCommandsRequestedEventArgs *> * handler, [out, retval] Windows.Foundation.EventRegistrationToken *value);
++        [eventremove] HRESULT CommandsRequested([in] Windows.Foundation.EventRegistrationToken token);
++    }
++
++    [
++        contract(Windows.UI.ApplicationSettings.ApplicationsSettingsContract, 1.0),
++        exclusiveto(Windows.UI.ApplicationSettings.SettingsPaneCommandsRequest),
++        uuid(44df23ae-5d6e-4068-a168-f47643182114)
++    ]
++    interface ISettingsPaneCommandsRequest : IInspectable
++    {
++        [propget] HRESULT ApplicationCommands([out, retval] Windows.Foundation.Collections.IVector<Windows.UI.ApplicationSettings.SettingsCommand *> * *value);
++    }
++
++    [
++        contract(Windows.UI.ApplicationSettings.ApplicationsSettingsContract, 1.0),
++        exclusiveto(Windows.UI.ApplicationSettings.SettingsPaneCommandsRequestedEventArgs),
++        uuid(205f5d24-1b48-4629-a6ca-2fdfedafb75d)
++    ]
++    interface ISettingsPaneCommandsRequestedEventArgs : IInspectable
++    {
++        [propget] HRESULT Request([out, retval] Windows.UI.ApplicationSettings.SettingsPaneCommandsRequest * *value);
++    }
++
++    [
++        contract(Windows.UI.ApplicationSettings.ApplicationsSettingsContract, 1.0),
++        exclusiveto(Windows.UI.ApplicationSettings.SettingsPane),
++        uuid(1c6a52c5-ff19-471b-ba6b-f8f35694ad9a)
++    ]
++    interface ISettingsPaneStatics : IInspectable
++    {
++        HRESULT GetForCurrentView([out, retval] Windows.UI.ApplicationSettings.SettingsPane * *value);
++        HRESULT Show();
++        [propget] HRESULT Edge([out, retval] Windows.UI.ApplicationSettings.SettingsEdgeLocation *value);
++    }
++
++}
++
++namespace Windows.UI.ApplicationSettings {
++    [
++        contract(Windows.UI.ApplicationSettings.ApplicationsSettingsContract, 1.0),
++        marshaling_behavior(none),
++        static(Windows.UI.ApplicationSettings.ISettingsPaneStatics, Windows.UI.ApplicationSettings.ApplicationsSettingsContract, 1.0)
++    ]
++    runtimeclass SettingsPane
++    {
++        [default] interface Windows.UI.ApplicationSettings.ISettingsPane;
++    }
++
++}
++
++namespace Windows.UI.ApplicationSettings {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass SettingsCommand
++    {
++        [default] interface Windows.UI.Popups.IUICommand;
++    }
++
++    [
++        contract(Windows.UI.ApplicationSettings.ApplicationsSettingsContract, 1.0)
++    ]
++    runtimeclass SettingsPaneCommandsRequest
++    {
++        [default] interface Windows.UI.ApplicationSettings.ISettingsPaneCommandsRequest;
++    }
++
++    [
++        contract(Windows.UI.ApplicationSettings.ApplicationsSettingsContract, 1.0)
++    ]
++    runtimeclass SettingsPaneCommandsRequestedEventArgs
++    {
++        [default] interface Windows.UI.ApplicationSettings.ISettingsPaneCommandsRequestedEventArgs;
++    }
++
++}
++
+diff --git a/include/windows.ui.xaml.idl b/include/windows.ui.xaml.idl
+index bf1f919..abafbd3 100644
+--- a/include/windows.ui.xaml.idl
++++ b/include/windows.ui.xaml.idl
+@@ -14567,6 +14567,9 @@ namespace Windows.UI.Core {
+ }
+ 
+ namespace Windows.UI.Xaml.Controls {
++    interface ISwapChainBackgroundPanel;
++    interface ISwapChainBackgroundPanelFactory;
++    runtimeclass SwapChainBackgroundPanel;
+     interface ISwapChainPanel;
+     interface ISwapChainPanelFactory;
+     interface ISwapChainPanelStatics;
+@@ -14654,6 +14657,25 @@ namespace Windows.UI.Xaml.Controls {
+         HRESULT CreateCoreIndependentInputSource([in] Windows.UI.Core.CoreInputDeviceTypes deviceTypes, [out, retval] Windows.UI.Core.CoreIndependentInputSource * *value);
+     }
+ 
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Controls.SwapChainBackgroundPanel),
++        uuid(1c59db48-8233-4c0c-bcf5-02a5fb35ae00)
++    ]
++    interface ISwapChainBackgroundPanel : IInspectable
++    {
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Controls.SwapChainBackgroundPanel),
++        uuid(198289d4-c89b-49b2-896c-5917bf8adcae)
++    ]
++    interface ISwapChainBackgroundPanelFactory : IInspectable
++    {
++        HRESULT CreateInstance([in] IInspectable * baseInterface, [out] IInspectable * *innerInterface, [out, retval] Windows.UI.Xaml.Controls.SwapChainBackgroundPanel * *value);
++    }
++
+     [
+         contract(Windows.Foundation.UniversalApiContract, 1.0),
+         exclusiveto(Windows.UI.Xaml.Controls.SwapChainPanel),
+@@ -14678,6 +14700,17 @@ namespace Windows.UI.Xaml.Controls {
+ }
+ 
+ namespace Windows.UI.Xaml.Controls {
++    [
++        composable(Windows.UI.Xaml.Controls.ISwapChainBackgroundPanelFactory, public, Windows.Foundation.UniversalApiContract, 1.0),
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        threading(both)
++    ]
++    runtimeclass SwapChainBackgroundPanel : Windows.UI.Xaml.Controls.Grid
++    {
++        [default] interface Windows.UI.Xaml.Controls.ISwapChainBackgroundPanel;
++    }
++
+     [
+         composable(Windows.UI.Xaml.Controls.ISwapChainPanelFactory, public, Windows.Foundation.UniversalApiContract, 1.0),
+         contract(Windows.Foundation.UniversalApiContract, 1.0),
