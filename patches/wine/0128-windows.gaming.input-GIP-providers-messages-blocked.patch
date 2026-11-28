@@ -1,0 +1,1074 @@
+Subject: windows.gaming.input: GIP providers for Xbox controllers, with every message to the controller blocked
+
+On Windows, Xbox controllers attached by USB are GIP devices and apps' factories registered for a GIP interface
+get them as GipGameControllerProviders. Wine sees them as HID gamepads, so a Microsoft controller that is a GIP
+device over USB (Xbox One, One S, Elite, Elite 2, Adaptive, Series X|S) is now also wrapped in a GIP provider
+declaring the interfaces every gamepad declares ([MS-GIPUSB]: IController, IGamepad, INavigationController), and
+given to the factories registered for them: when it arrives, and when a factory registers after it did. Custom
+controllers are the app's own objects (only Wine's implement IGameControllerImpl).
+
+Nothing is sent to the controller. GipGameControllerProvider.SendMessage and SendReceiveMessage log the message
+and fail with E_ACCESSDENIED, UpdateFirmwareAsync fails at once, and LegacyGipGameControllerProvider (now given for
+these controllers) refuses SetHomeLedIntensity, SetStandardControllerButtonRemapping, ExecuteCommand, the headset
+settings and pilot/copilot pairing. Its reads answer what is known: the interfaces, a real and uncorrupted
+device, and an unknown battery (the host's driver doesn't report it).
+
+Also: providers' FirmwareVersionInfo (the HID version number, the USB bcdDevice in BCD, e.g. 5.17), an unknown
+HardwareVersionInfo, IsConnected, and NonRoamableId (the device path) were E_NOTIMPL. A GIP device's
+GameControllerProviderInfo.GetProviderId is a 64-bit id in hex, as apps parse it: a hash of the device id.
+TryGetFactoryControllerFromGameController matches by device.
+
+With these, Xbox Accessories lists an Xbox Series controller attached by USB.
+
+diff --git a/dlls/windows.gaming.input/Makefile.in b/dlls/windows.gaming.input/Makefile.in
+index 058f029..970fbd2 100644
+--- a/dlls/windows.gaming.input/Makefile.in
++++ b/dlls/windows.gaming.input/Makefile.in
+@@ -11,6 +11,7 @@ SOURCES = \
+ 	event_handlers.c \
+ 	force_feedback.c \
+ 	gamepad.c \
++	gip.c \
+ 	main.c \
+ 	manager.c \
+ 	preview.c \
+diff --git a/dlls/windows.gaming.input/gip.c b/dlls/windows.gaming.input/gip.c
+new file mode 100644
+index 0000000..9d98775
+--- /dev/null
++++ b/dlls/windows.gaming.input/gip.c
+@@ -0,0 +1,299 @@
++/* WinRT Windows.Gaming.Input.Custom GipGameControllerProvider
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#include "provider.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(input);
++
++/* On Windows, Xbox controllers attached by USB are GIP (Gaming Input Protocol) devices, driven by xboxgip.sys, and
++ * apps' custom controller factories registered for a GIP interface get them as GipGameControllerProviders. Here
++ * the host's own driver (Linux's xpad) drives the controller and Wine sees it as a HID gamepad, so a controller
++ * that is a GIP device on Windows is wrapped in a GIP provider that answers for the interfaces every gamepad
++ * declares ([MS-GIPUSB]: IController, IGamepad, INavigationController).
++ *
++ * Nothing is ever sent to the controller through it. SendMessage and SendReceiveMessage log the message and
++ * fail with E_ACCESSDENIED; UpdateFirmwareAsync fails at once. Sending GIP messages (settings, and above all
++ * firmware) needs the controller's real protocol traffic, recorded on Windows, and its own review. */
++
++/* Microsoft's controllers that are GIP devices over USB (on Bluetooth they are HID devices instead) */
++static const UINT16 gip_usb_products[] =
++{
++    0x02d1,   /* Xbox One Controller */
++    0x02dd,   /* Xbox One Controller (firmware 2015) */
++    0x02e3,   /* Xbox One Elite Controller */
++    0x02ea,   /* Xbox One S Controller */
++    0x0b00,   /* Xbox Elite Series 2 Controller */
++    0x0b0a,   /* Xbox Adaptive Controller */
++    0x0b12,   /* Xbox Series X|S Controller */
++};
++
++/* the interfaces a standard GIP gamepad declares, most specific first ([MS-GIPUSB] GIP Metadata Exchange) */
++static const GUID gip_gamepad_interfaces[] =
++{
++    {0x082e402c, 0x07df, 0x45e1, {0xa5, 0xab, 0xa3, 0x12, 0x7a, 0xf1, 0x97, 0xb5}},   /* IGamepad */
++    {0xb8f31fe7, 0x7386, 0x40e9, {0xa9, 0xf8, 0x2f, 0x21, 0x26, 0x3a, 0xcf, 0xb7}},   /* INavigationController */
++    {0x9776ff56, 0x9bfd, 0x4581, {0xad, 0x45, 0xb6, 0x45, 0xbb, 0xa5, 0x26, 0xd6}},   /* IController */
++};
++
++BOOL gip_is_device( IGameControllerProvider *provider )
++{
++    UINT16 vendor = 0, product = 0;
++    UINT32 i;
++
++    if (FAILED(IGameControllerProvider_get_HardwareVendorId( provider, &vendor )) || vendor != 0x045e) return FALSE;
++    if (FAILED(IGameControllerProvider_get_HardwareProductId( provider, &product ))) return FALSE;
++    for (i = 0; i < ARRAY_SIZE(gip_usb_products); i++) if (gip_usb_products[i] == product) return TRUE;
++    return FALSE;
++}
++
++BOOL gip_supports_interface( const GUID *interface_id )
++{
++    UINT32 i;
++    for (i = 0; i < ARRAY_SIZE(gip_gamepad_interfaces); i++)
++        if (IsEqualGUID( &gip_gamepad_interfaces[i], interface_id )) return TRUE;
++    return FALSE;
++}
++
++struct gip_provider
++{
++    IGipGameControllerProvider IGipGameControllerProvider_iface;
++    IGameControllerProvider IGameControllerProvider_iface;
++    LONG ref;
++    IGameControllerProvider *device;   /* the Wine provider for the same controller */
++};
++
++static inline struct gip_provider *impl_from_IGipGameControllerProvider( IGipGameControllerProvider *iface )
++{
++    return CONTAINING_RECORD( iface, struct gip_provider, IGipGameControllerProvider_iface );
++}
++
++static HRESULT WINAPI gip_QueryInterface( IGipGameControllerProvider *iface, REFIID iid, void **out )
++{
++    struct gip_provider *impl = impl_from_IGipGameControllerProvider( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IGipGameControllerProvider ))
++    {
++        IInspectable_AddRef( (*out = &impl->IGipGameControllerProvider_iface) );
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_IGameControllerProvider ))
++    {
++        IInspectable_AddRef( (*out = &impl->IGameControllerProvider_iface) );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI gip_AddRef( IGipGameControllerProvider *iface )
++{
++    return InterlockedIncrement( &impl_from_IGipGameControllerProvider( iface )->ref );
++}
++
++static ULONG WINAPI gip_Release( IGipGameControllerProvider *iface )
++{
++    struct gip_provider *impl = impl_from_IGipGameControllerProvider( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        IGameControllerProvider_Release( impl->device );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI gip_GetIids( IGipGameControllerProvider *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI gip_GetRuntimeClassName( IGipGameControllerProvider *iface, HSTRING *class_name )
++{
++    const WCHAR *name = RuntimeClass_Windows_Gaming_Input_Custom_GipGameControllerProvider;
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI gip_GetTrustLevel( IGipGameControllerProvider *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static void log_message( const char *what, GipMessageClass message_class, BYTE message_id, UINT32 size, const BYTE *data )
++{
++    char hex[3 * 64 + 4];
++    UINT32 i, len = 0;
++
++    for (i = 0; i < size && i < 64; i++) len += sprintf( hex + len, "%02x ", data[i] );
++    if (size > 64) strcpy( hex + len, "..." );
++    else hex[len] = 0;
++    FIXME( "%s blocked: class %d, message %#x, %u bytes: %s\n", what, message_class, message_id, size, hex );
++}
++
++static HRESULT WINAPI gip_SendMessage( IGipGameControllerProvider *iface, GipMessageClass message_class, BYTE message_id,
++                                       UINT32 size, BYTE *buffer )
++{
++    TRACE( "iface %p.\n", iface );
++    log_message( "SendMessage", message_class, message_id, size, buffer );
++    return E_ACCESSDENIED;
++}
++
++static HRESULT WINAPI gip_SendReceiveMessage( IGipGameControllerProvider *iface, GipMessageClass message_class,
++                                              BYTE message_id, UINT32 request_size, BYTE *request,
++                                              UINT32 response_size, BYTE *response )
++{
++    TRACE( "iface %p, response_size %u.\n", iface, response_size );
++    log_message( "SendReceiveMessage", message_class, message_id, request_size, request );
++    if (response && response_size) memset( response, 0, response_size );
++    return E_ACCESSDENIED;
++}
++
++static HRESULT WINAPI gip_UpdateFirmwareAsync( IGipGameControllerProvider *iface, __x_ABI_CWindows_CStorage_CStreams_CIInputStream *image,
++                                               IAsyncOperationWithProgress_GipFirmwareUpdateResult_GipFirmwareUpdateProgress **value )
++{
++    FIXME( "iface %p, image %p: firmware updates are disabled; nothing is sent to the controller.\n", iface, image );
++    if (value) *value = NULL;
++    return E_ACCESSDENIED;
++}
++
++static const struct IGipGameControllerProviderVtbl gip_vtbl =
++{
++    gip_QueryInterface,
++    gip_AddRef,
++    gip_Release,
++    /* IInspectable methods */
++    gip_GetIids,
++    gip_GetRuntimeClassName,
++    gip_GetTrustLevel,
++    /* IGipGameControllerProvider methods */
++    gip_SendMessage,
++    gip_SendReceiveMessage,
++    gip_UpdateFirmwareAsync,
++};
++
++/* IGameControllerProvider: the controller's ids and versions, from the Wine provider */
++
++DEFINE_IINSPECTABLE( gip_game, IGameControllerProvider, struct gip_provider, IGipGameControllerProvider_iface )
++
++static HRESULT WINAPI gip_game_get_FirmwareVersionInfo( IGameControllerProvider *iface, GameControllerVersionInfo *value )
++{
++    return IGameControllerProvider_get_FirmwareVersionInfo( impl_from_IGameControllerProvider( iface )->device, value );
++}
++
++static HRESULT WINAPI gip_game_get_HardwareProductId( IGameControllerProvider *iface, UINT16 *value )
++{
++    return IGameControllerProvider_get_HardwareProductId( impl_from_IGameControllerProvider( iface )->device, value );
++}
++
++static HRESULT WINAPI gip_game_get_HardwareVendorId( IGameControllerProvider *iface, UINT16 *value )
++{
++    return IGameControllerProvider_get_HardwareVendorId( impl_from_IGameControllerProvider( iface )->device, value );
++}
++
++static HRESULT WINAPI gip_game_get_HardwareVersionInfo( IGameControllerProvider *iface, GameControllerVersionInfo *value )
++{
++    return IGameControllerProvider_get_HardwareVersionInfo( impl_from_IGameControllerProvider( iface )->device, value );
++}
++
++static HRESULT WINAPI gip_game_get_IsConnected( IGameControllerProvider *iface, boolean *value )
++{
++    return IGameControllerProvider_get_IsConnected( impl_from_IGameControllerProvider( iface )->device, value );
++}
++
++static const struct IGameControllerProviderVtbl gip_game_vtbl =
++{
++    gip_game_QueryInterface,
++    gip_game_AddRef,
++    gip_game_Release,
++    /* IInspectable methods */
++    gip_game_GetIids,
++    gip_game_GetRuntimeClassName,
++    gip_game_GetTrustLevel,
++    /* IGameControllerProvider methods */
++    gip_game_get_FirmwareVersionInfo,
++    gip_game_get_HardwareProductId,
++    gip_game_get_HardwareVendorId,
++    gip_game_get_HardwareVersionInfo,
++    gip_game_get_IsConnected,
++};
++
++/* A GIP device's provider id on Windows is its 64-bit GIP device id in hex (from its Hello message), and apps
++ * parse it as a number. The host's driver doesn't pass the Hello message on, so the id here is a 64-bit FNV-1a
++ * hash of the controller's device id (its NonRoamableId): the same while it stays attached where it is. */
++HRESULT gip_provider_id( IGameControllerProvider *provider, HSTRING *value )
++{
++    IWineGameControllerProvider *wine_provider;
++    struct gip_provider *impl;
++    UINT64 hash = 0xcbf29ce484222325ull;
++    WCHAR buffer[17];
++    HSTRING id = NULL;
++    const WCHAR *str;
++    UINT32 len, i;
++
++    if (!provider || provider->lpVtbl != &gip_game_vtbl) return E_INVALIDARG;
++    impl = impl_from_IGameControllerProvider( provider );
++    if (FAILED(IGameControllerProvider_QueryInterface( impl->device, &IID_IWineGameControllerProvider,
++                                                       (void **)&wine_provider ))) return E_FAIL;
++    IWineGameControllerProvider_get_NonRoamableId( wine_provider, &id );
++    IWineGameControllerProvider_Release( wine_provider );
++    str = WindowsGetStringRawBuffer( id, &len );
++    for (i = 0; i < len; i++)
++    {
++        hash ^= towupper( str[i] );
++        hash *= 0x100000001b3ull;
++    }
++    WindowsDeleteString( id );
++    swprintf( buffer, ARRAY_SIZE(buffer), L"%016I64X", hash );
++    return WindowsCreateString( buffer, 16, value );
++}
++
++/* the Wine provider behind one of our GIP providers (referenced), or NULL for any other provider */
++IGameControllerProvider *gip_provider_device( IGameControllerProvider *provider )
++{
++    struct gip_provider *impl;
++
++    if (!provider || provider->lpVtbl != &gip_game_vtbl) return NULL;
++    impl = impl_from_IGameControllerProvider( provider );
++    IGameControllerProvider_AddRef( impl->device );
++    return impl->device;
++}
++
++HRESULT gip_provider_create( IGameControllerProvider *device, IGameControllerProvider **out )
++{
++    struct gip_provider *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IGipGameControllerProvider_iface.lpVtbl = &gip_vtbl;
++    impl->IGameControllerProvider_iface.lpVtbl = &gip_game_vtbl;
++    impl->ref = 1;
++    IGameControllerProvider_AddRef( (impl->device = device) );
++    *out = &impl->IGameControllerProvider_iface;
++    TRACE( "created GIP provider %p for %p.\n", impl, device );
++    return S_OK;
++}
+diff --git a/dlls/windows.gaming.input/manager.c b/dlls/windows.gaming.input/manager.c
+index b3c913a..44bf668 100644
+--- a/dlls/windows.gaming.input/manager.c
++++ b/dlls/windows.gaming.input/manager.c
+@@ -45,6 +45,7 @@ struct controller
+ 
+     struct list entry;
+     IGameControllerProvider *provider;
++    IGameControllerProvider *device;   /* the Wine provider the controller comes from (not referenced) */
+     ICustomGameControllerFactory *factory;
+ };
+ 
+@@ -397,6 +398,8 @@ struct custom_registration
+ 
+ static struct list custom_registrations = LIST_INIT( custom_registrations );
+ 
++static struct controller *gip_controller_create( struct custom_registration *reg, IGameControllerProvider *device );
++
+ static HRESULT add_registration( struct custom_registration *reg, ICustomGameControllerFactory *factory )
+ {
+     if (!factory)
+@@ -407,6 +410,26 @@ static HRESULT add_registration( struct custom_registration *reg, ICustomGameCon
+     ICustomGameControllerFactory_AddRef( (reg->factory = factory) );
+     EnterCriticalSection( &manager_cs );
+     list_add_tail( &custom_registrations, &reg->entry );
++    if (reg->kind == CUSTOM_GIP)
++    {
++        /* the GIP devices already attached: one controller each, from their built-in controller */
++        struct controller *controller, *added;
++        IGameControllerProvider *devices[16];
++        UINT32 i, count = 0;
++
++        LIST_FOR_EACH_ENTRY( controller, &controller_list, struct controller, entry )
++        {
++            if (controller->device != controller->provider || !gip_is_device( controller->device )) continue;
++            for (i = 0; i < count; i++) if (devices[i] == controller->device) break;
++            if (i == count && count < ARRAY_SIZE(devices)) devices[count++] = controller->device;
++        }
++        for (i = 0; i < count; i++)
++        {
++            if (!(added = gip_controller_create( reg, devices[i] ))) continue;
++            if (FAILED(ICustomGameControllerFactory_OnGameControllerAdded( factory, &added->IGameController_iface )))
++                WARN( "OnGameControllerAdded failed.\n" );
++        }
++    }
+     LeaveCriticalSection( &manager_cs );
+     return S_OK;
+ }
+@@ -496,7 +519,7 @@ statics2_TryGetFactoryControllerFromGameController( IGameControllerFactoryManage
+     else
+     {
+         LIST_FOR_EACH_ENTRY( other, &controller_list, struct controller, entry )
+-            if ((found = entry->provider == other->provider && other->factory == factory)) break;
++            if ((found = entry->device == other->device && other->factory == factory)) break;
+         if (!found) WARN( "Failed to find controller %p, factory %p\n", controller, factory );
+         else IGameController_AddRef( (*value = &other->IGameController_iface) );
+     }
+@@ -533,8 +556,9 @@ static struct manager_statics manager_statics =
+ 
+ IGameControllerFactoryManagerStatics2 *manager_factory = &manager_statics.IGameControllerFactoryManagerStatics2_iface;
+ 
+-static HRESULT controller_create( ICustomGameControllerFactory *factory, IGameControllerProvider *provider,
+-                                  struct controller **out )
++/* custom: an app's factory, whose controllers are its own objects (only ours implement IGameControllerImpl) */
++static HRESULT controller_create_ex( ICustomGameControllerFactory *factory, IGameControllerProvider *provider,
++                                     BOOL custom, struct controller **out )
+ {
+     IGameControllerImpl *inner_impl;
+     struct controller *impl;
+@@ -545,8 +569,13 @@ static HRESULT controller_create( ICustomGameControllerFactory *factory, IGameCo
+     impl->IGameControllerBatteryInfo_iface.lpVtbl = &battery_vtbl;
+     impl->ref = 1;
+ 
++    impl->IInspectable_inner = NULL;
+     if (FAILED(hr = ICustomGameControllerFactory_CreateGameController( factory, provider, &impl->IInspectable_inner )))
+         WARN( "Failed to create game controller, hr %#lx\n", hr );
++    else if (!impl->IInspectable_inner)
++        hr = E_FAIL;
++    else if (custom)
++        TRACE( "app factory %p made controller %p.\n", factory, impl->IInspectable_inner );
+     else if (FAILED(hr = IInspectable_QueryInterface( impl->IInspectable_inner, &IID_IGameControllerImpl, (void **)&inner_impl )))
+         WARN( "Failed to find IGameControllerImpl iface, hr %#lx\n", hr );
+     else
+@@ -565,11 +594,60 @@ static HRESULT controller_create( ICustomGameControllerFactory *factory, IGameCo
+ 
+     ICustomGameControllerFactory_AddRef( (impl->factory = factory) );
+     IGameControllerProvider_AddRef( (impl->provider = provider) );
++    impl->device = provider;
+ 
+     *out = impl;
+     return S_OK;
+ }
+ 
++static HRESULT controller_create( ICustomGameControllerFactory *factory, IGameControllerProvider *provider,
++                                  struct controller **out )
++{
++    return controller_create_ex( factory, provider, FALSE, out );
++}
++
++/* an app factory's controller for a GIP device, appended to the list (manager_cs held) */
++static struct controller *gip_controller_create( struct custom_registration *reg, IGameControllerProvider *device )
++{
++    IGameControllerProvider *gip;
++    struct controller *controller = NULL;
++
++    if (reg->kind != CUSTOM_GIP || !gip_supports_interface( &reg->interface_id )) return NULL;
++    if (FAILED(gip_provider_create( device, &gip ))) return NULL;
++    if (SUCCEEDED(controller_create_ex( reg->factory, gip, TRUE, &controller )))
++    {
++        controller->device = device;
++        list_add_tail( &controller_list, &controller->entry );
++        TRACE( "GIP controller %p for %s from factory %p.\n", controller, debugstr_guid( &reg->interface_id ), reg->factory );
++    }
++    IGameControllerProvider_Release( gip );
++    return controller;
++}
++
++/* the Wine provider behind a controller we made (referenced), or NULL */
++IGameControllerProvider *manager_get_device( IGameController *iface )
++{
++    IGameControllerProvider *device = NULL;
++    struct controller *controller;
++    IGameController *other;
++
++    EnterCriticalSection( &manager_cs );
++    LIST_FOR_EACH_ENTRY( controller, &controller_list, struct controller, entry )
++    {
++        /* the app may pass its own controller object (it aggregates ours) or ours */
++        if (&controller->IGameController_iface != iface)
++        {
++            if (FAILED(IGameController_QueryInterface( iface, &IID_IGameController, (void **)&other ))) continue;
++            IGameController_Release( other );
++            if (other != &controller->IGameController_iface) continue;
++        }
++        IGameControllerProvider_AddRef( (device = controller->device) );
++        break;
++    }
++    LeaveCriticalSection( &manager_cs );
++    return device;
++}
++
+ void manager_on_provider_created( IGameControllerProvider *provider )
+ {
+     IWineGameControllerProvider *wine_provider;
+@@ -614,6 +692,14 @@ void manager_on_provider_created( IGameControllerProvider *provider )
+         break;
+     }
+ 
++    /* an Xbox controller that is a GIP device on Windows goes to the apps' factories for its GIP interfaces */
++    if (gip_is_device( provider ))
++    {
++        struct custom_registration *reg;
++        LIST_FOR_EACH_ENTRY( reg, &custom_registrations, struct custom_registration, entry )
++            gip_controller_create( reg, provider );
++    }
++
+     LIST_FOR_EACH_SAFE( entry, next, list )
+     {
+         controller = LIST_ENTRY( entry, struct controller, entry );
+@@ -636,14 +722,14 @@ void manager_on_provider_removed( IGameControllerProvider *provider )
+ 
+     LIST_FOR_EACH_ENTRY( controller, &controller_list, struct controller, entry )
+     {
+-        if (controller->provider != provider) continue;
++        if (controller->device != provider) continue;
+         ICustomGameControllerFactory_OnGameControllerRemoved( controller->factory,
+                                                               &controller->IGameController_iface );
+     }
+ 
+     LIST_FOR_EACH_ENTRY_SAFE( controller, next, &controller_list, struct controller, entry )
+     {
+-        if (controller->provider != provider) continue;
++        if (controller->device != provider) continue;
+         list_remove( &controller->entry );
+         IGameController_Release( &controller->IGameController_iface );
+     }
+diff --git a/dlls/windows.gaming.input/preview.c b/dlls/windows.gaming.input/preview.c
+index ebe5ae8..790951e 100644
+--- a/dlls/windows.gaming.input/preview.c
++++ b/dlls/windows.gaming.input/preview.c
+@@ -26,10 +26,243 @@
+ WINE_DEFAULT_DEBUG_CHANNEL(input);
+ 
+ /* On Windows, LegacyGipGameControllerProvider is the Xbox accessory management interface of the GIP driver
+- * (xboxgip.sys): battery, firmware state, button remapping, pilot/copilot pairing. Wine has no GIP driver; Xbox
+- * controllers reach it through the host's driver as HID or SDL gamepads, so there is no GIP device to manage.
+- * FromGameController and FromGameControllerProvider therefore return no provider (NULL, like Windows does for a
+- * controller that isn't a GIP device), and nothing that would change a controller is ever sent. */
++ * (xboxgip.sys): battery, firmware state, button remapping, pilot/copilot pairing. Wine has no GIP driver: Xbox
++ * controllers reach it through the host's driver as HID gamepads. For a controller that is a GIP device on Windows
++ * (see gip.c), FromGameController and FromGameControllerProvider give a provider that answers what is known
++ * (its interfaces, that it is a real and uncorrupted device) and refuses everything that would change the
++ * controller (LED, remapping, reset, headset settings, pairing): nothing is ever sent to it. For other
++ * controllers they return no provider, as Windows does. */
++
++struct legacy_gip
++{
++    ILegacyGipGameControllerProvider ILegacyGipGameControllerProvider_iface;
++    LONG ref;
++    IGameControllerProvider *device;
++};
++
++static inline struct legacy_gip *impl_from_ILegacyGipGameControllerProvider( ILegacyGipGameControllerProvider *iface )
++{
++    return CONTAINING_RECORD( iface, struct legacy_gip, ILegacyGipGameControllerProvider_iface );
++}
++
++static HRESULT WINAPI legacy_gip_QueryInterface( ILegacyGipGameControllerProvider *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_ILegacyGipGameControllerProvider ))
++    {
++        IInspectable_AddRef( (*out = iface) );
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI legacy_gip_AddRef( ILegacyGipGameControllerProvider *iface )
++{
++    return InterlockedIncrement( &impl_from_ILegacyGipGameControllerProvider( iface )->ref );
++}
++
++static ULONG WINAPI legacy_gip_Release( ILegacyGipGameControllerProvider *iface )
++{
++    struct legacy_gip *impl = impl_from_ILegacyGipGameControllerProvider( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        IGameControllerProvider_Release( impl->device );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI legacy_gip_GetIids( ILegacyGipGameControllerProvider *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI legacy_gip_GetRuntimeClassName( ILegacyGipGameControllerProvider *iface, HSTRING *class_name )
++{
++    const WCHAR *name = RuntimeClass_Windows_Gaming_Input_Preview_LegacyGipGameControllerProvider;
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI legacy_gip_GetTrustLevel( ILegacyGipGameControllerProvider *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++/* the host's driver (xpad) doesn't report an Xbox One controller's battery */
++static HRESULT WINAPI legacy_gip_get_BatteryChargingState( ILegacyGipGameControllerProvider *iface,
++                                                           GameControllerBatteryChargingState *value )
++{
++    TRACE( "iface %p: unknown.\n", iface );
++    if (!value) return E_POINTER;
++    *value = GameControllerBatteryChargingState_Unknown;
++    return S_OK;
++}
++
++static HRESULT WINAPI legacy_gip_get_BatteryKind( ILegacyGipGameControllerProvider *iface, GameControllerBatteryKind *value )
++{
++    TRACE( "iface %p: unknown.\n", iface );
++    if (!value) return E_POINTER;
++    *value = GameControllerBatteryKind_Unknown;
++    return S_OK;
++}
++
++static HRESULT WINAPI legacy_gip_get_BatteryLevel( ILegacyGipGameControllerProvider *iface, GameControllerBatteryLevel *value )
++{
++    TRACE( "iface %p: unknown.\n", iface );
++    if (!value) return E_POINTER;
++    *value = GameControllerBatteryLevel_Unknown;
++    return S_OK;
++}
++
++/* a controller that works as a gamepad isn't stuck in its bootloader */
++static HRESULT WINAPI legacy_gip_GetDeviceFirmwareCorruptionState( ILegacyGipGameControllerProvider *iface,
++                                                                   GameControllerFirmwareCorruptReason *value )
++{
++    TRACE( "iface %p.\n", iface );
++    if (!value) return E_POINTER;
++    *value = GameControllerFirmwareCorruptReason_NotCorrupt;
++    return S_OK;
++}
++
++static HRESULT WINAPI legacy_gip_get_IsFirmwareCorrupted( ILegacyGipGameControllerProvider *iface, boolean *value )
++{
++    TRACE( "iface %p.\n", iface );
++    if (!value) return E_POINTER;
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI legacy_gip_IsInterfaceSupported( ILegacyGipGameControllerProvider *iface, GUID interface_id,
++                                                       boolean *value )
++{
++    if (!value) return E_POINTER;
++    *value = gip_supports_interface( &interface_id );
++    TRACE( "iface %p, interface %s -> %d.\n", iface, debugstr_guid( &interface_id ), *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI legacy_gip_get_IsSyntheticDevice( ILegacyGipGameControllerProvider *iface, boolean *value )
++{
++    TRACE( "iface %p.\n", iface );
++    if (!value) return E_POINTER;
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI legacy_gip_get_PreferredTypes( ILegacyGipGameControllerProvider *iface, IVectorView_HSTRING **value )
++{
++    FIXME( "iface %p, value %p: not implemented.\n", iface, value );
++    if (value) *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI legacy_gip_ExecuteCommand( ILegacyGipGameControllerProvider *iface, DeviceCommand command )
++{
++    FIXME( "iface %p, command %d: blocked, nothing is sent to the controller.\n", iface, command );
++    return E_ACCESSDENIED;
++}
++
++static HRESULT WINAPI legacy_gip_SetHomeLedIntensity( ILegacyGipGameControllerProvider *iface, BYTE intensity )
++{
++    FIXME( "iface %p, intensity %u: blocked, nothing is sent to the controller.\n", iface, intensity );
++    return E_ACCESSDENIED;
++}
++
++static HRESULT WINAPI legacy_gip_GetExtendedDeviceInfo( ILegacyGipGameControllerProvider *iface, UINT32 *size, BYTE **value )
++{
++    FIXME( "iface %p: the device's extended info isn't known here.\n", iface );
++    if (size) *size = 0;
++    if (value) *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI legacy_gip_SetHeadsetOperation( ILegacyGipGameControllerProvider *iface, HeadsetOperation operation,
++                                                      UINT32 size, BYTE *buffer )
++{
++    FIXME( "iface %p, operation %d, %u bytes: blocked, nothing is sent to the controller.\n", iface, operation, size );
++    return E_ACCESSDENIED;
++}
++
++static HRESULT WINAPI legacy_gip_GetHeadsetOperation( ILegacyGipGameControllerProvider *iface, HeadsetOperation operation,
++                                                      UINT32 *size, BYTE **value )
++{
++    FIXME( "iface %p, operation %d: no headset.\n", iface, operation );
++    if (size) *size = 0;
++    if (value) *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI legacy_gip_get_AppCompatVersion( ILegacyGipGameControllerProvider *iface, UINT32 *value )
++{
++    FIXME( "iface %p, value %p: unknown.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI legacy_gip_SetStandardControllerButtonRemapping( ILegacyGipGameControllerProvider *iface,
++                                                                       __x_ABI_CWindows_CSystem_CIUser *user,
++                                                                       boolean previous, void *remapping )
++{
++    FIXME( "iface %p, user %p, previous %d: blocked, nothing is sent to the controller.\n", iface, user, previous );
++    return E_ACCESSDENIED;
++}
++
++static HRESULT WINAPI legacy_gip_GetStandardControllerButtonRemapping( ILegacyGipGameControllerProvider *iface,
++                                                                       __x_ABI_CWindows_CSystem_CIUser *user,
++                                                                       boolean previous, void **value )
++{
++    FIXME( "iface %p, user %p, previous %d: the system remapping isn't known here.\n", iface, user, previous );
++    if (value) *value = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct ILegacyGipGameControllerProviderVtbl legacy_gip_vtbl =
++{
++    legacy_gip_QueryInterface,
++    legacy_gip_AddRef,
++    legacy_gip_Release,
++    /* IInspectable methods */
++    legacy_gip_GetIids,
++    legacy_gip_GetRuntimeClassName,
++    legacy_gip_GetTrustLevel,
++    /* ILegacyGipGameControllerProvider methods */
++    legacy_gip_get_BatteryChargingState,
++    legacy_gip_get_BatteryKind,
++    legacy_gip_get_BatteryLevel,
++    legacy_gip_GetDeviceFirmwareCorruptionState,
++    legacy_gip_get_IsFirmwareCorrupted,
++    legacy_gip_IsInterfaceSupported,
++    legacy_gip_get_IsSyntheticDevice,
++    legacy_gip_get_PreferredTypes,
++    legacy_gip_ExecuteCommand,
++    legacy_gip_SetHomeLedIntensity,
++    legacy_gip_GetExtendedDeviceInfo,
++    legacy_gip_SetHeadsetOperation,
++    legacy_gip_GetHeadsetOperation,
++    legacy_gip_get_AppCompatVersion,
++    (void *)legacy_gip_SetStandardControllerButtonRemapping,
++    (void *)legacy_gip_GetStandardControllerButtonRemapping,
++};
++
++/* a provider for a controller that is a GIP device on Windows, or NULL */
++static ILegacyGipGameControllerProvider *legacy_gip_create( IGameControllerProvider *device )
++{
++    struct legacy_gip *impl;
++
++    if (!device || !gip_is_device( device ) || !(impl = calloc( 1, sizeof(*impl) ))) return NULL;
++    impl->ILegacyGipGameControllerProvider_iface.lpVtbl = &legacy_gip_vtbl;
++    impl->ref = 1;
++    IGameControllerProvider_AddRef( (impl->device = device) );
++    return &impl->ILegacyGipGameControllerProvider_iface;
++}
+ 
+ struct preview_statics
+ {
+@@ -121,29 +354,46 @@ static HRESULT WINAPI legacy_gip_statics_FromGameController( ILegacyGipGameContr
+                                                              IGameController *controller,
+                                                              ILegacyGipGameControllerProvider **value )
+ {
+-    TRACE( "iface %p, controller %p, value %p: no GIP devices.\n", iface, controller, value );
++    IGameControllerProvider *device;
++
++    TRACE( "iface %p, controller %p, value %p.\n", iface, controller, value );
+     if (!value) return E_POINTER;
+     *value = NULL;
+-    return controller ? S_OK : E_INVALIDARG;
++    if (!controller) return E_INVALIDARG;
++    if ((device = manager_get_device( controller )))
++    {
++        *value = legacy_gip_create( device );
++        IGameControllerProvider_Release( device );
++    }
++    TRACE( "-> %p.\n", *value );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI legacy_gip_statics_FromGameControllerProvider( ILegacyGipGameControllerProviderStatics *iface,
+                                                                      IGameControllerProvider *provider,
+                                                                      ILegacyGipGameControllerProvider **value )
+ {
+-    TRACE( "iface %p, provider %p, value %p: no GIP devices.\n", iface, provider, value );
++    IGameControllerProvider *device;
++
++    TRACE( "iface %p, provider %p, value %p.\n", iface, provider, value );
+     if (!value) return E_POINTER;
+     *value = NULL;
+-    return provider ? S_OK : E_INVALIDARG;
++    if (!provider) return E_INVALIDARG;
++    /* our GIP provider stands for a Wine provider; any other provider is its own device */
++    if (!(device = gip_provider_device( provider ))) IGameControllerProvider_AddRef( (device = provider) );
++    *value = legacy_gip_create( device );
++    IGameControllerProvider_Release( device );
++    TRACE( "-> %p.\n", *value );
++    return S_OK;
+ }
+ 
+ /* pilot/copilot pairing belongs to the GIP driver; with no GIP devices there is nothing to pair */
+ static HRESULT WINAPI legacy_gip_statics_PairPilotToCopilot( ILegacyGipGameControllerProviderStatics *iface, __x_ABI_CWindows_CSystem_CIUser *user,
+                                                              HSTRING pilot_id, HSTRING copilot_id )
+ {
+-    FIXME( "iface %p, user %p, pilot %s, copilot %s: no GIP devices to pair.\n", iface, user,
++    FIXME( "iface %p, user %p, pilot %s, copilot %s: blocked, nothing is sent to the controllers.\n", iface, user,
+            debugstr_hstring( pilot_id ), debugstr_hstring( copilot_id ) );
+-    return E_NOTIMPL;
++    return E_ACCESSDENIED;
+ }
+ 
+ static HRESULT WINAPI legacy_gip_statics_ClearPairing( ILegacyGipGameControllerProviderStatics *iface, __x_ABI_CWindows_CSystem_CIUser *user,
+@@ -207,17 +457,29 @@ static HRESULT WINAPI provider_info_statics_GetProviderId( IGameControllerProvid
+                                                            IGameControllerProvider *provider, HSTRING *value )
+ {
+     IWineGameControllerProvider *wine_provider;
++    IGameControllerProvider *device;
+     HRESULT hr;
+ 
+     TRACE( "iface %p, provider %p, value %p.\n", iface, provider, value );
+     if (!value) return E_POINTER;
+     *value = NULL;
+     if (!provider) return E_INVALIDARG;
+-    /* the device's own identifier, as RawGameController.NonRoamableId reports it */
+-    if (FAILED(IGameControllerProvider_QueryInterface( provider, &IID_IWineGameControllerProvider, (void **)&wine_provider )))
+-        return S_OK;
++    /* a GIP device's id (a 64-bit number in hex), or the device's own identifier, as RawGameController's
++     * NonRoamableId reports it */
++    if ((device = gip_provider_device( provider )))
++    {
++        IGameControllerProvider_Release( device );
++        hr = gip_provider_id( provider, value );
++        TRACE( "-> %s.\n", debugstr_hstring( *value ) );
++        return hr;
++    }
++    IGameControllerProvider_AddRef( (device = provider) );
++    hr = IGameControllerProvider_QueryInterface( device, &IID_IWineGameControllerProvider, (void **)&wine_provider );
++    IGameControllerProvider_Release( device );
++    if (FAILED(hr)) return S_OK;
+     hr = IWineGameControllerProvider_get_NonRoamableId( wine_provider, value );
+     IWineGameControllerProvider_Release( wine_provider );
++    TRACE( "-> %s.\n", debugstr_hstring( *value ) );
+     return hr;
+ }
+ 
+diff --git a/dlls/windows.gaming.input/private.h b/dlls/windows.gaming.input/private.h
+index 594071b..fca278a 100644
+--- a/dlls/windows.gaming.input/private.h
++++ b/dlls/windows.gaming.input/private.h
+@@ -70,6 +70,12 @@ extern void provider_create( const WCHAR *device_path );
+ extern void provider_remove( const WCHAR *device_path );
+ 
+ extern void manager_on_provider_created( IGameControllerProvider *provider );
++extern BOOL gip_is_device( IGameControllerProvider *provider );
++extern IGameControllerProvider *gip_provider_device( IGameControllerProvider *provider );   /* referenced, or NULL */
++extern HRESULT gip_provider_id( IGameControllerProvider *provider, HSTRING *value );
++extern IGameControllerProvider *manager_get_device( IGameController *controller );          /* referenced, or NULL */
++extern BOOL gip_supports_interface( const GUID *interface_id );
++extern HRESULT gip_provider_create( IGameControllerProvider *device, IGameControllerProvider **out );
+ extern void manager_on_provider_removed( IGameControllerProvider *provider );
+ 
+ extern HRESULT event_handlers_append( struct list *list, IEventHandler_IInspectable *handler, EventRegistrationToken *token );
+diff --git a/dlls/windows.gaming.input/provider.c b/dlls/windows.gaming.input/provider.c
+index 5393f2b..cba89b7 100644
+--- a/dlls/windows.gaming.input/provider.c
++++ b/dlls/windows.gaming.input/provider.c
+@@ -142,10 +142,14 @@ static HRESULT WINAPI wine_provider_GetTrustLevel( IWineGameControllerProvider *
+     return S_OK;
+ }
+ 
++/* an opaque id for the device, stable while it stays attached where it is: its device path */
+ static HRESULT WINAPI wine_provider_get_NonRoamableId( IWineGameControllerProvider *iface, HSTRING *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct provider *impl = impl_from_IWineGameControllerProvider( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    return WindowsCreateString( impl->device_path, wcslen( impl->device_path ), value );
+ }
+ 
+ static HRESULT WINAPI wine_provider_get_DisplayName( IWineGameControllerProvider *iface, HSTRING *value )
+@@ -389,10 +393,22 @@ static const struct IWineGameControllerProviderVtbl wine_provider_vtbl =
+ 
+ DEFINE_IINSPECTABLE( game_provider, IGameControllerProvider, struct provider, IWineGameControllerProvider_iface )
+ 
++/* the device's firmware version: the HID version number, which is the USB bcdDevice (for an Xbox controller on
++ * Linux, xpad reports it), in binary-coded decimal major.minor; the build and revision aren't known */
+ static HRESULT WINAPI game_provider_get_FirmwareVersionInfo( IGameControllerProvider *iface, GameControllerVersionInfo *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct provider *impl = impl_from_IGameControllerProvider( iface );
++    HIDD_ATTRIBUTES attr = {.Size = sizeof(attr)};
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    memset( value, 0, sizeof(*value) );
++    if (!impl->device || !HidD_GetAttributes( impl->device, &attr )) return S_OK;
++    value->Major = (attr.VersionNumber >> 12) * 10 + ((attr.VersionNumber >> 8) & 0xf);
++    value->Minor = ((attr.VersionNumber >> 4) & 0xf) * 10 + (attr.VersionNumber & 0xf);
++    TRACE( "version %#x -> %u.%u.\n", attr.VersionNumber, value->Major, value->Minor );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI game_provider_get_HardwareProductId( IGameControllerProvider *iface, UINT16 *value )
+@@ -421,16 +437,22 @@ static HRESULT WINAPI game_provider_get_HardwareVendorId( IGameControllerProvide
+     return hr;
+ }
+ 
++/* the hardware revision isn't reported to us (a GIP device sends it only in its Hello message) */
+ static HRESULT WINAPI game_provider_get_HardwareVersionInfo( IGameControllerProvider *iface, GameControllerVersionInfo *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p: unknown.\n", iface, value );
++    if (!value) return E_POINTER;
++    memset( value, 0, sizeof(*value) );
++    return S_OK;
+ }
+ 
++/* a provider exists while its device is attached: it is removed when the device goes */
+ static HRESULT WINAPI game_provider_get_IsConnected( IGameControllerProvider *iface, boolean *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = TRUE;
++    return S_OK;
+ }
+ 
+ static const struct IGameControllerProviderVtbl game_provider_vtbl =
+diff --git a/include/windows.gaming.input.custom.idl b/include/windows.gaming.input.custom.idl
+index 0811b99..9d6db6f 100644
+--- a/include/windows.gaming.input.custom.idl
++++ b/include/windows.gaming.input.custom.idl
+@@ -225,3 +225,126 @@ namespace Windows.Gaming.Input.Custom {
+         interface Windows.Gaming.Input.Custom.IGameControllerProvider;
+     }
+ }
++
++/* Xbox Accessories, generated by scripts/winmd2idl.py: Custom.GipGameControllerProvider and IGipGameControllerInputSink. */
++
++cpp_quote("#undef SendMessage")
++
++namespace Windows.Gaming.Input.Custom {
++    typedef struct GipFirmwareUpdateProgress GipFirmwareUpdateProgress;
++    runtimeclass GipFirmwareUpdateResult;
++    typedef enum GipFirmwareUpdateStatus GipFirmwareUpdateStatus;
++    runtimeclass GipGameControllerProvider;
++    typedef enum GipMessageClass GipMessageClass;
++    interface IGipFirmwareUpdateResult;
++    interface IGipGameControllerInputSink;
++    interface IGipGameControllerProvider;
++}
++
++namespace Windows.Gaming.Input.Custom {
++    declare {
++        interface Windows.Foundation.AsyncOperationProgressHandler<Windows.Gaming.Input.Custom.GipFirmwareUpdateResult *, Windows.Gaming.Input.Custom.GipFirmwareUpdateProgress>;
++        interface Windows.Foundation.AsyncOperationWithProgressCompletedHandler<Windows.Gaming.Input.Custom.GipFirmwareUpdateResult *, Windows.Gaming.Input.Custom.GipFirmwareUpdateProgress>;
++        interface Windows.Foundation.IAsyncOperationWithProgress<Windows.Gaming.Input.Custom.GipFirmwareUpdateResult *, Windows.Gaming.Input.Custom.GipFirmwareUpdateProgress>;
++    }
++}
++
++namespace Windows.Gaming.Input.Custom {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 3.0)
++    ]
++    enum GipFirmwareUpdateStatus
++    {
++        Completed = 0,
++        UpToDate = 1,
++        Failed = 2
++    };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 3.0)
++    ]
++    enum GipMessageClass
++    {
++        Command = 0,
++        LowLatency = 1,
++        StandardLatency = 2
++    };
++
++}
++
++namespace Windows.Gaming.Input.Custom {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 3.0)
++    ]
++    struct GipFirmwareUpdateProgress
++    {
++        DOUBLE PercentCompleted;
++        UINT32 CurrentComponentId;
++    };
++
++}
++
++namespace Windows.Gaming.Input.Custom {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 3.0),
++        exclusiveto(Windows.Gaming.Input.Custom.GipFirmwareUpdateResult),
++        uuid(6b794d32-8553-4292-8e03-e16651a2f8bc)
++    ]
++    interface IGipFirmwareUpdateResult : IInspectable
++    {
++        [propget] HRESULT ExtendedErrorCode([out, retval] UINT32 *value);
++        [propget] HRESULT FinalComponentId([out, retval] UINT32 *value);
++        [propget] HRESULT Status([out, retval] Windows.Gaming.Input.Custom.GipFirmwareUpdateStatus *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 3.0),
++        uuid(a2108abf-09f1-43bc-a140-80f899ec36fb)
++    ]
++    interface IGipGameControllerInputSink : IInspectable
++        requires Windows.Gaming.Input.Custom.IGameControllerInputSink
++    {
++        HRESULT OnKeyReceived([in] UINT64 timestamp, [in] BYTE keyCode, [in] boolean isPressed);
++        HRESULT OnMessageReceived([in] UINT64 timestamp, [in] Windows.Gaming.Input.Custom.GipMessageClass messageClass, [in] BYTE messageId, [in] BYTE sequenceId, [in] UINT32 __messageBufferSize, [in, size_is(__messageBufferSize)] BYTE *messageBuffer);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 3.0),
++        exclusiveto(Windows.Gaming.Input.Custom.GipGameControllerProvider),
++        uuid(dbcf1e19-1af5-45a8-bf02-a0ee50c823fc)
++    ]
++    interface IGipGameControllerProvider : IInspectable
++        requires Windows.Gaming.Input.Custom.IGameControllerProvider
++    {
++        HRESULT SendMessage([in] Windows.Gaming.Input.Custom.GipMessageClass messageClass, [in] BYTE messageId, [in] UINT32 __messageBufferSize, [in, size_is(__messageBufferSize)] BYTE *messageBuffer);
++        HRESULT SendReceiveMessage([in] Windows.Gaming.Input.Custom.GipMessageClass messageClass, [in] BYTE messageId, [in] UINT32 __requestMessageBufferSize, [in, size_is(__requestMessageBufferSize)] BYTE *requestMessageBuffer, [in] UINT32 __responseMessageBufferSize, [out, size_is(__responseMessageBufferSize)] BYTE *responseMessageBuffer);
++        HRESULT UpdateFirmwareAsync([in] Windows.Storage.Streams.IInputStream * firmwareImage, [out, retval] Windows.Foundation.IAsyncOperationWithProgress<Windows.Gaming.Input.Custom.GipFirmwareUpdateResult *, Windows.Gaming.Input.Custom.GipFirmwareUpdateProgress> * *value);
++    }
++
++}
++
++namespace Windows.Gaming.Input.Custom {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 3.0),
++        marshaling_behavior(agile),
++        threading(both)
++    ]
++    runtimeclass GipGameControllerProvider
++    {
++        [default] interface Windows.Gaming.Input.Custom.IGipGameControllerProvider;
++        interface Windows.Gaming.Input.Custom.IGameControllerProvider;
++    }
++
++}
++
++namespace Windows.Gaming.Input.Custom {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 3.0)
++    ]
++    runtimeclass GipFirmwareUpdateResult
++    {
++        [default] interface Windows.Gaming.Input.Custom.IGipFirmwareUpdateResult;
++    }
++
++}
++
