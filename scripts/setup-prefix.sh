@@ -2,7 +2,8 @@
 # Creates the shared Wine prefix (once) and links one unpacked UWP package into it. The package folder is never modified.
 # An .appx/.msix file (or .appxbundle/.msixbundle) is first unpacked into ~/.local/share/wine-uwp/packages/<package name>.
 # Usage: scripts/setup-prefix.sh /path/to/package-folder|package.appx [--frameworks DIR] [--vclibs /path/to/Microsoft.VCLibs...appx|folder]
-#        [--verify] [--shortcut | --no-shortcut] [--prefix DIR] [--no-download]
+#        [--verify] [--shortcut | --no-shortcut] [--prefix DIR] [--no-download] [--data-slot NAME]
+#        scripts/setup-prefix.sh --switch PACKAGE-NAME SLOT
 #        scripts/setup-prefix.sh --update-all
 # Run it again for each app; they share the prefix. It offers to add a launcher (a .desktop file with the app's icon) to
 # the applications menu and the desktop; --shortcut adds it without asking, --no-shortcut skips it.
@@ -14,12 +15,18 @@
 # version of every framework its manifest depends on, linked into its folder. Frameworks it needs that the store lacks are
 # downloaded from Microsoft when there is a public copy (VC++ runtimes, .NET Native 2.2, WinUI 2.8; see uwptool.py
 # FRAMEWORK_DOWNLOADS, each checked against its SHA-256); --no-download turns that off.
+# --data-slot NAME keeps this version of the app apart from the others set up the same way: its saves and settings
+# (AppData\Local\Packages\<family>, linked to ~/.local/share/wine-uwp/versions/<package>/NAME/data), its per-user
+# settings file and its logs. NAME is usually the version ("1.21.114.1"). The first time, the saves made until then go to
+# a slot named after the version set up until then, so nothing is lost. A package file set up with a slot is unpacked
+# into that slot's folder, so versions don't replace each other. The slot is remembered: setting the app up again (or
+# --update-all) keeps it. --switch PACKAGE-NAME SLOT sets the app up again from the folder that slot was set up from.
 # --update-all sets up every app already in the prefix again, from the folders they were set up from (without the file
 # check or the launcher question): what an upgraded Wine build needs, and what fetch-release.sh runs.
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
 
-PKG_DIR="" VCLIBS="" FRAMEWORK_SRC=() VERIFY=0 SHORTCUT=ask UPDATE_ALL=0 OWN_PREFIX="" DOWNLOAD=1
+PKG_DIR="" VCLIBS="" FRAMEWORK_SRC=() VERIFY=0 SHORTCUT=ask UPDATE_ALL=0 OWN_PREFIX="" DOWNLOAD=1 SLOT="" SWITCH=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --vclibs) VCLIBS="$2"; shift 2 ;;
@@ -31,10 +38,20 @@ while [ $# -gt 0 ]; do
         --update-all) UPDATE_ALL=1; shift ;;
         --no-download) DOWNLOAD=0; shift ;;
         --prefix) mkdir -p "$2"; OWN_PREFIX="$(cd "$2" && pwd)"; shift 2 ;;
+        --data-slot) SLOT="$2"; shift 2 ;;
+        --switch) SWITCH="$2"; SLOT="$3"; shift 3 ;;
         -*) die "unknown option $1" ;;
         *) if [ -f "$1" ]; then PKG_DIR="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"; else PKG_DIR="$(cd "$1" && pwd)"; fi; shift ;;
     esac
 done
+if [ -n "$SLOT" ] && ! [[ "$SLOT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    die "a data slot name is letters, digits, dots, dashes and underscores (got '$SLOT')"
+fi
+if [ -n "$SWITCH" ]; then
+    [ -f "$VERSIONS/$SWITCH/$SLOT/source" ] || die "$SWITCH has no version slot $SLOT (see scripts/list-apps.sh)"
+    PKG_DIR="$(head -1 "$VERSIONS/$SWITCH/$SLOT/source")"
+    [ -f "$PKG_DIR/AppxManifest.xml" ] || die "the package folder of $SWITCH $SLOT is gone: $PKG_DIR"
+fi
 if [ "$UPDATE_ALL" = 1 ]; then
     mapfile -t names < <(list_apps | sort -u)
     [ ${#names[@]} -gt 0 ] || { info "No apps set up yet"; exit 0; }
@@ -62,8 +79,13 @@ fi
 [ -x "$WINE_ROOT/bin/wine" ] || die "patched Wine not found in $WINE_ROOT: run scripts/fetch-release.sh or scripts/build-wine.sh first"
 [ -f "$DXVK_DXGI" ] || die "patched dxgi.dll not found at $DXVK_DXGI: run scripts/fetch-release.sh or scripts/build-dxvk.sh first"
 if [ -f "$PKG_DIR" ]; then
-    # a package file: unpack it once into the packages folder (again when it is a different version), and set up from there
-    PKG_DIR="$(python3 -I "$REPO/scripts/uwptool.py" extract-package "$PKG_DIR" "$PACKAGES")" || die "could not unpack the package"
+    # a package file: unpack it once into the packages folder (again when it is a different version), and set up from
+    # there; with a version slot, into the slot's own folder, so it doesn't replace another version's files
+    IFS=$'\t' read -r file_name _ < <(python3 -I "$REPO/scripts/uwptool.py" package-identity "$PKG_DIR") || die "could not read the package"
+    [ -z "$SLOT" ] && SLOT="$(app_slot "$file_name")"
+    root="$PACKAGES"
+    [ -n "$SLOT" ] && root="$VERSIONS/$file_name/$SLOT"
+    PKG_DIR="$(python3 -I "$REPO/scripts/uwptool.py" extract-package "$PKG_DIR" "$root")" || die "could not unpack the package"
 fi
 IFS=$'\t' read -r PKG_NAME PKG_EXE < <(python3 -I "$REPO/scripts/uwptool.py" info "$PKG_DIR")
 # the manifest's Executable is a Windows path ("GearGame\Binaries\UWP64\GearGame.exe"), and its case need not match the
@@ -132,6 +154,54 @@ for vid in 054C 057E; do
         echo "warning: could not set up $vid controllers (WineBus\\Devices\\$vid)" >&2
 done
 
+# Version slots: the app's saves folder becomes a link to the slot's data folder, so each version has its own
+OLD_SRC="" OLD_SLOT=""
+if [ -f "$SOURCES/$PKG_NAME.source" ]; then
+    OLD_SRC="$(sed -n 1p "$SOURCES/$PKG_NAME.source")" OLD_SLOT="$(sed -n 4p "$SOURCES/$PKG_NAME.source")"
+fi
+[ -z "$SLOT" ] && SLOT="$OLD_SLOT"
+if [ -n "$SLOT" ]; then
+    FAMILY="$(python3 -I "$REPO/scripts/uwptool.py" family "$PKG_DIR")"
+    PKG_DATA="$PREFIX/drive_c/users/$(prefix_user)/AppData/Local/Packages/$FAMILY"
+    if [ -z "$OLD_SLOT" ] && [ -n "$OLD_SRC" ]; then
+        # the first version kept apart: the one set up until now becomes a slot of its own, named after its version,
+        # and keeps the saves made so far
+        keep="default"
+        [ -f "$OLD_SRC/AppxManifest.xml" ] && keep="$(python3 -I "$REPO/scripts/uwptool.py" version "$OLD_SRC")"
+        if [ "$keep" != "$SLOT" ]; then
+            mkdir -p "$VERSIONS/$PKG_NAME/$keep"
+            src="$OLD_SRC"
+            if [ "$src" = "$PACKAGES/$PKG_NAME" ] && [ -d "$src" ]; then
+                # unpacked from a package file: move it with its slot, so a later package file can't replace it
+                [ -e "$VERSIONS/$PKG_NAME/$keep/$PKG_NAME" ] || mv "$src" "$VERSIONS/$PKG_NAME/$keep/$PKG_NAME"
+                src="$VERSIONS/$PKG_NAME/$keep/$PKG_NAME"
+            fi
+            printf '%s\n' "$src" > "$VERSIONS/$PKG_NAME/$keep/source"
+            info "Kept the version set up until now as the data slot $keep"
+        fi
+        if [ -d "$PKG_DATA" ] && [ ! -L "$PKG_DATA" ]; then
+            [ -e "$VERSIONS/$PKG_NAME/$keep/data" ] && die "both $PKG_DATA and $VERSIONS/$PKG_NAME/$keep/data exist: move one aside"
+            mkdir -p "$VERSIONS/$PKG_NAME/$keep"
+            mv "$PKG_DATA" "$VERSIONS/$PKG_NAME/$keep/data"
+            info "Moved its saves and settings to $VERSIONS/$PKG_NAME/$keep/data"
+        fi
+        # its per-user settings go with it
+        [ -f "$SOURCES/$PKG_NAME.env" ] && [ ! -e "$SOURCES/$PKG_NAME@$keep.env" ] && mv "$SOURCES/$PKG_NAME.env" "$SOURCES/$PKG_NAME@$keep.env"
+    elif [ -d "$PKG_DATA" ] && [ ! -L "$PKG_DATA" ]; then
+        # a saves folder made while the app wasn't linked (set up again by hand): it belongs to the slot in use
+        if [ -e "$VERSIONS/$PKG_NAME/$OLD_SLOT/data" ]; then
+            die "$PKG_DATA is a folder, not a link to $VERSIONS/$PKG_NAME/$OLD_SLOT/data: move one aside"
+        fi
+        mkdir -p "$VERSIONS/$PKG_NAME/$OLD_SLOT"
+        mv "$PKG_DATA" "$VERSIONS/$PKG_NAME/$OLD_SLOT/data"
+    fi
+    mkdir -p "$VERSIONS/$PKG_NAME/$SLOT/data" "$(dirname "$PKG_DATA")"
+    [ -L "$PKG_DATA" ] && rm "$PKG_DATA"
+    ln -s "$VERSIONS/$PKG_NAME/$SLOT/data" "$PKG_DATA"
+    printf '%s\n' "$PKG_DIR" > "$VERSIONS/$PKG_NAME/$SLOT/source"
+    info "Data slot $SLOT: saves and settings in $VERSIONS/$PKG_NAME/$SLOT/data"
+fi
+
 APP="$PREFIX/drive_c/$APPS_DIR_NAME/$PKG_NAME"
 info "Linking the package into C:\\$APPS_DIR_NAME\\$PKG_NAME"
 mkdir -p "$APP"
@@ -161,7 +231,7 @@ while IFS=$'\t' read -r state name version; do
     esac
 done < <(python3 -I "$REPO/scripts/uwptool.py" link-frameworks "$PKG_DIR" "$FRAMEWORKS" "$APP")
 mkdir -p "$SOURCES"
-printf '%s\n%s\n%s\n' "$PKG_DIR" "" "$OWN_PREFIX" > "$SOURCES/$PKG_NAME.source"
+printf '%s\n%s\n%s\n%s\n' "$PKG_DIR" "" "$OWN_PREFIX" "$SLOT" > "$SOURCES/$PKG_NAME.source"
 
 info "Registering WinRT classes"
 python3 -I "$REPO/scripts/uwptool.py" registry "$PKG_DIR" "C:\\$APPS_DIR_NAME\\$PKG_NAME" "$FRAMEWORKS" > "$PREFIX/drive_c/uwp-$PKG_NAME.reg"
@@ -186,7 +256,6 @@ if [ "$SHORTCUT" = ask ]; then
 fi
 if [ "$SHORTCUT" = yes ]; then
     IFS=$'\t' read -r APP_TITLE APP_ICON < <(python3 -I "$REPO/scripts/uwptool.py" appinfo "$PKG_DIR")
-    APPLICATIONS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
     DESKTOP_DIR="$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")"
     ID="wine-uwp-$PKG_NAME"
     mkdir -p "$APPLICATIONS" "$DATA/icons"
@@ -195,7 +264,12 @@ if [ "$SHORTCUT" = yes ]; then
     exe_name="${PKG_EXE//\\//}"; exe_name="${exe_name##*/}"
     # Exec: quoted per the desktop entry spec; settings that move the prefix or data are passed on
     quote() { local v="${1//\\/\\\\}"; v="${v//\"/\\\"}"; v="${v//\$/\\\$}"; v="${v//\`/\\\`}"; printf '"%s"' "$v"; }
-    EXEC="$(quote "$REPO/scripts/run-app.sh") $(quote "$PKG_NAME")"
+    if [ -n "${UWP_LAUNCHER_EXEC:-}" ]; then
+        # a front end that starts apps itself (UWP Launcher: wine-uwp-gui --run): its command, then the package name
+        EXEC="$UWP_LAUNCHER_EXEC $(quote "$PKG_NAME")"
+    else
+        EXEC="$(quote "$REPO/scripts/run-app.sh") $(quote "$PKG_NAME")"
+    fi
     for var in UWP_PREFIX UWP_DATA_DIR UWP_LOGS UWP_BUILD_DIR; do
         [ -n "${!var:-}" ] && EXEC="env $var=$(quote "${!var}") ${EXEC#env }"
     done

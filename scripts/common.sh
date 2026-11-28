@@ -13,6 +13,8 @@ APPS_DIR_NAME="UWP"                                          # apps are linked i
 FRAMEWORKS="$DATA/frameworks"   # framework packages (VCLibs, .NET Native, WinUI ...), one copy for every app
 SOURCES="$DATA/apps"   # <package>.source: the package folder, its VCLibs package and its own prefix (empty: the shared one)
 PACKAGES="$DATA/packages"   # apps set up from .appx/.msix files, unpacked: one folder per package name
+VERSIONS="$DATA/versions"   # <package>/<version slot>/: versions kept apart (setup-prefix.sh --data-slot): source, data/
+APPLICATIONS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"   # where launchers go
 
 WINE_TAG="wine-11.22"
 UWP_VERSION="5"                                              # wine-uwp's own version, a whole number: raise it by one for each GitHub release
@@ -57,6 +59,22 @@ app_prefix() {
     [ -f "$SOURCES/$1.source" ] && p="$(sed -n 3p "$SOURCES/$1.source")"
     echo "${p:-$PREFIX}"
 }
+
+# The version slot an app was set up in (setup-prefix.sh --data-slot), or nothing.
+app_slot() {
+    [ -f "$SOURCES/$1.source" ] && sed -n 4p "$SOURCES/$1.source"
+    return 0
+}
+
+# The per-user settings file run-app.sh reads for an app: one per version slot when it has them.
+app_settings_file() {
+    local slot
+    slot="$(app_slot "$1")"
+    echo "$SOURCES/$1${slot:+@$slot}.env"
+}
+
+# The folder under drive_c/users the prefix's Windows user has: Wine names it after the Unix user.
+prefix_user() { echo "${USER:-$(id -un)}"; }
 
 # Every app set up: those in the shared prefix, and those recorded with a prefix of their own.
 list_apps() {

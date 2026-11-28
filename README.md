@@ -31,6 +31,18 @@ UWP apps don't create a normal Win32 window. They ask Windows for a `CoreApplica
 
 Other native C++ UWP apps may work; many will need WinRT classes this project doesn't have yet. XAML apps (built with `Windows.UI.Xaml` pages and markup) have partial support: simple ones start and work, real Store apps will often still stop or look wrong; see [XAML apps](#xaml-apps). Reports and patches are welcome.
 
+## Recommended: UWP Launcher
+
+The easiest way to use wine-uwp is **[UWP Launcher](https://github.com/geoffwoollams/wine-uwp-gui)**, its graphical front end. It is one file: download `wine-uwp-gui-x86_64` from its [releases](https://github.com/geoffwoollams/wine-uwp-gui/releases) and run it.
+
+```bash
+chmod +x wine-uwp-gui-x86_64 && ./wine-uwp-gui-x86_64
+```
+
+It offers to add itself to your applications menu under Games, then downloads wine-uwp's latest release and keeps it up to date (no git needed). From there you install apps from package files, folders or install discs (ISOs), or add the ones already on this PC, and play them from a library with their artwork, play time, logs, per-app options, versions kept side by side, and Steam shortcuts. It uses the same data folder as the scripts below, so you can use both. It needs wine-uwp 11.22-uwp6 or later.
+
+The rest of this README covers the scripts themselves, which UWP Launcher runs for you.
+
 ## Quick start: prebuilt release
 
 The [releases page](https://github.com/geoffwoollams/wine-uwp/releases) has the patched Wine, `dxgi.dll` and the D3D12/WinRT DLLs ready to use. No Docker, no compiling, no GE-Proton.
@@ -99,7 +111,21 @@ Given a package folder or package file, `run-app.sh` runs `setup-prefix.sh` on i
 
 The game window shows the app's icon in the taskbar, in Alt-Tab and in its title bar, and the desktop groups it under the launcher's icon. This works under X11 and under Wayland through XWayland, which is how Wine runs on a Wayland desktop by default. With Wine's own Wayland driver it needs a compositor that supports the `xdg-toplevel-icon` protocol (KDE Plasma 6.1 or later, for example). Elsewhere the launcher's icon still shows.
 
-Everything lives under `~/.local/share/wine-uwp/` (the prefix, logs and launcher icons) and the repo's `build/` folder, plus any launchers you added. Delete those to uninstall.
+`scripts/list-apps.sh` lists the apps set up, with their names, versions and version slots; `--json` prints the details (names, images, folders, versions) for front ends such as [UWP Launcher](https://github.com/geoffwoollams/wine-uwp-gui).
+
+**Several versions of one app.** Only one version of a package name is set up at a time, but versions can be kept side by side, each with its own saves, settings and logs. Set each one up with `--data-slot NAME` (usually its version), and switch between them with `--switch`:
+
+```bash
+scripts/setup-prefix.sh ~/Games/Minecraft/1.21.114.1 --data-slot 1.21.114.1
+scripts/setup-prefix.sh "Minecraft 1.19.83.1.appx" --data-slot 1.19.83.1
+scripts/setup-prefix.sh --switch Microsoft.MinecraftUWP 1.21.114.1
+```
+
+The app's saves folder (see [Saves and settings](#saves-and-settings)) becomes a link to `~/.local/share/wine-uwp/versions/<package>/<slot>/data`. The first time, the version set up until then becomes a slot named after its version and keeps the saves made so far. A package file set up with a slot is unpacked into the slot's folder, so versions don't replace each other. Setting an app up again without `--data-slot` keeps the slot it has, so a newer copy of the same version replaces it in place.
+
+**Removing an app:** `scripts/remove-app.sh <package name>` removes what wine-uwp made for it: its folder of links in the prefix, its WinRT class registrations, its launchers, its settings files and the copies unpacked from package files. Its saves are kept unless you add `--data`, and the folder you set it up from (a copy from Windows, a Lutris install) is never touched: the script prints its path. `--slot <slot>` removes one kept version instead. It asks first; `--yes` doesn't.
+
+Everything lives under `~/.local/share/wine-uwp/` (the prefix, logs and launcher icons) and the repo's `build/` folder, plus any launchers you added. Delete those to uninstall everything.
 
 ## Upgrading
 
@@ -160,9 +186,13 @@ tests/xaml/run.sh
 | `WINE_UWP_GAMERTAG=name` | The player name apps see for the offline Xbox user, and Minecraft's LAN name (default: your Linux user name). The user ID always differs between computers, so two people on the same LAN don't clash. |
 | `WINE_REPORT_HOSTNAMES=1` | Report the PC's real IP addresses to the app (off by default) |
 | `WINEDEBUG=-all` | Turn off logging (default logs errors, fixmes and the WinRT channel) |
+| `UWP_WRAPPER="mangohud gamemoderun"` | A command to start the app's Wine through, such as MangoHud or GameMode |
+| `UWP_LAUNCHER_EXEC=...` | The command launchers made by `setup-prefix.sh` run, followed by the package name (default: this repo's `run-app.sh`); UWP Launcher sets it to its own `--run` |
 | `UWP_PREFIX`, `UWP_DATA_DIR`, `UWP_LOGS`, `UWP_BUILD_DIR` | Move the shared prefix, data, logs or build folders |
 | `UWP_RELEASE_REPO` | GitHub `owner/repo` that `fetch-release.sh` downloads from (default: this project) |
 | `GE_PROTON` | Path to GE-Proton 11-14 when building from source, if it isn't found automatically |
+
+To set any of these for one app only, put `export` lines in `~/.local/share/wine-uwp/apps/<package name>.env` (or `<package name>@<slot>.env` for a [version kept apart](#set-up-an-app)): `run-app.sh` reads it after the repo's [`apps/<package name>.conf`](apps/README.md), so it wins, and launchers use it too. For example `export WINE_CORE_WINDOWED=1`.
 
 ## Saves and settings
 
@@ -214,7 +244,7 @@ Things specific to this game:
 
 ## Troubleshooting
 
-Each run writes `~/.local/share/wine-uwp/logs/run-<package>-<time>.log` (the last 8 are kept; `latest.log` points at the newest). The last line says how the app exited. If it crashed, a backtrace is saved next to it as `run-<package>-<time>.crash.txt`. Include both when reporting a problem.
+Each run writes `~/.local/share/wine-uwp/logs/run-<package>-<time>.log` (`run-<package>@<slot>-<time>.log` for a version kept apart; the last 8 of each are kept, and `latest.log` points at the newest). The last line says how the app exited. If it crashed, a backtrace is saved next to it as `run-<package>-<time>.crash.txt`. Include both when reporting a problem.
 
 ## Publishing a release
 
@@ -314,9 +344,10 @@ patches/wine/   patches against the wine-11.22 tag (apply in order with git appl
 patches/dxvk/   patches against DXVK f90f1bf1 (v3.1.1-235): CoreWindow and composition swap chains
 docker/         build containers
 apps/           optional per-app settings
-scripts/        fetch-release.sh, build-wine.sh, build-dxvk.sh, setup-prefix.sh, run-app.sh,
-                package-release.sh, uwptool.py, winmd2idl.py (WinRT IDL from Windows metadata),
+scripts/        fetch-release.sh, build-wine.sh, build-dxvk.sh, setup-prefix.sh, run-app.sh, list-apps.sh,
+                remove-app.sh, package-release.sh, uwptool.py, winmd2idl.py (WinRT IDL from Windows metadata),
                 xbf.py (dump compiled XAML, or compile test XAML)
 tests/xaml/     the XAML test clients (build.sh, run.sh): xamlhello (milestone 1), xamllayout (milestone 2),
                 xamlmarkup + markup/ (milestones 3 and 4)
+tests/scripts/  run.sh: version slots, list-apps.sh and remove-app.sh in a throwaway prefix
 ```

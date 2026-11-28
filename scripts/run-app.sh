@@ -4,8 +4,12 @@
 #        Without a name, the only app set up starts, or a numbered list of them asks which. Given a package folder or
 #        an .appx/.msix (or bundle), the app is set up with setup-prefix.sh the first time (a package file is unpacked
 #        into ~/.local/share/wine-uwp/packages/), then started. seconds is an optional time limit, for testing.
-# Each run is logged to $LOGS/run-<time>.log (the last 8 are kept); a crash backtrace is saved next to it.
-# Environment: WINE_CORE_WINDOWED=1 keeps the app in a window; WINEDEBUG overrides the logging channels.
+# Each run is logged to $LOGS/run-<package>[@<slot>]-<time>.log (the last 8 of each app version are kept); a crash
+# backtrace is saved next to it.
+# Environment: WINE_CORE_WINDOWED=1 keeps the app in a window; WINEDEBUG overrides the logging channels;
+# UWP_WRAPPER is a command to start Wine through ("mangohud", "gamemoderun", "mangohud gamemoderun").
+# Per-user settings: ~/.local/share/wine-uwp/apps/<package>.env (or <package>@<slot>.env for a version kept apart with
+# setup-prefix.sh --data-slot) is sourced after the repository's apps/<package>.conf, so what it sets wins.
 set -uo pipefail
 source "$(dirname "$0")/common.sh"
 [ -x "$WINE_ROOT/bin/wine" ] || die "patched Wine not found in $WINE_ROOT: run scripts/fetch-release.sh or scripts/build-wine.sh"
@@ -65,23 +69,33 @@ export WINEDLLOVERRIDES="${UWP_DLLOVERRIDES:-mscoree,mshtml=d;dxgi=n;d3d11=n;d3d
 export WINEDEBUG="${WINEDEBUG:-err+all,fixme+all,+twinapi}"
 export DXVK_LOG_LEVEL="${DXVK_LOG_LEVEL:-warn}" DXVK_LOG_PATH="$LOGS"
 [ -f "$REPO/apps/$NAME.conf" ] && source "$REPO/apps/$NAME.conf"
+SLOT="$(app_slot "$NAME")"
+SETTINGS="$(app_settings_file "$NAME")"
+[ -f "$SETTINGS" ] && source "$SETTINGS"
+WRAPPER=()
+[ -n "${UWP_WRAPPER:-}" ] && read -ra WRAPPER <<< "$UWP_WRAPPER"
 mkdir -p "$LOGS"
 cd "$APP" || exit 1
 rm -f "$PREFIX/drive_c/crash.txt"
-LOG="$LOGS/run-$NAME-$(date +%Y%m%d-%H%M%S).log"
+LOG_NAME="run-$NAME${SLOT:+@$SLOT}"
+LOG="$LOGS/$LOG_NAME-$(date +%Y%m%d-%H%M%S).log"
 ln -sf "$LOG" "$LOGS/latest.log"
 echo "Logging to $LOG"
 # Everything appends: wineserver inherits this handle and keeps writing after the app exits (a development build of
 # Wine lists its remaining objects when it shuts down), which would otherwise overwrite the lines after its position.
 : > "$LOG"
-if [ -n "${1:-}" ]; then timeout "$1" wine "$EXE" >> "$LOG" 2>&1; else wine "$EXE" >> "$LOG" 2>&1; fi
+if [ -n "${1:-}" ]; then timeout "$1" "${WRAPPER[@]}" wine "$EXE" >> "$LOG" 2>&1; else "${WRAPPER[@]}" wine "$EXE" >> "$LOG" 2>&1; fi
 RC=$?
 wineserver -w   # let the prefix shut down first, so the exit line is the log's last
 echo "=== process exited with status $RC at $(date +%T) ===" >> "$LOG"
-[ -f "$PREFIX/drive_c/crash.txt" ] && cp "$PREFIX/drive_c/crash.txt" "${LOG%.log}.crash.txt"
-# keep the newest 8 logs and backtraces. Not "ls -1t pattern": with nullglob (set above), a pattern matching nothing
+if [ -f "$PREFIX/drive_c/crash.txt" ]; then
+    cp "$PREFIX/drive_c/crash.txt" "${LOG%.log}.crash.txt"
+    echo "Crash backtrace saved to ${LOG%.log}.crash.txt"
+fi
+echo "Exited with status $RC"
+# keep the newest 8 logs and backtraces of this app (version). Not "ls -1t pattern": with nullglob (set above), a pattern matching nothing
 # leaves a bare ls of the current directory, the app's folder, and that removed its package links.
 prune() { find "$LOGS" -maxdepth 1 -type f -name "$1" -printf '%T@ %p\n' | sort -rn | tail -n +9 | cut -d' ' -f2- | xargs -r -d '\n' rm -f --; }
-prune 'run-*.log'
-prune 'run-*.crash.txt'
+prune "$LOG_NAME-[0-9]*.log"
+prune "$LOG_NAME-[0-9]*.crash.txt"
 exit $RC

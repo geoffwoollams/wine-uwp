@@ -20,6 +20,13 @@
   uwptool.py download-frameworks PACKAGE_DIR STORE
                                            download and import the frameworks the package needs that STORE lacks and
                                            Microsoft publishes (FRAMEWORK_DOWNLOADS); print DOWNLOADED/FAILED<TAB>name
+  uwptool.py appinfo-json PACKAGE_DIR      print the app's manifest details (names, version, images, family) as JSON
+  uwptool.py apps-json USER_DIR_NAME       turn list-apps.sh's lines on stdin into a JSON array (see list-apps.sh)
+  uwptool.py family PACKAGE_DIR            print the package family name wine-uwp gives the app (its saves folder name)
+  uwptool.py version PACKAGE_DIR           print the package version
+  uwptool.py package-identity FILE         print the name and version of a package file (name<TAB>version)
+  uwptool.py unregister REG_FILE           print a REGEDIT4 file removing what a registry file made by "registry"
+                                           added for the app alone (its own WinRT classes, see remove-app.sh)
   uwptool.py extract-package FILE ROOT    unpack an .appx/.msix (or the x64 app package of an .appxbundle/.msixbundle) into
                                            ROOT/<package name> unless that version is already there; print the folder
 """
@@ -468,6 +475,19 @@ def registry(game_dir, app_dir, store=None):
     sys.stdout.write("\r\n".join(out) + "\r\n")
 
 
+def unregister(reg_file):
+    """Undo the app's own part of a registry file written by registry(): its package's WinRT classes. The global keys
+    it writes (Wine's stand-in classes, the crash handler) serve every app and stay; so do proxy/stub classes, which
+    other apps built with the same library can share and which do nothing once the app's files are gone."""
+    text = open(reg_file, encoding="utf-8", errors="replace").read()
+    packages = sorted(set(re.findall(r"^\[HKEY_LOCAL_MACHINE\\Software\\Wine\\WindowsRuntime\\Packages\\([^\\\]]+)\\",
+                                     text, re.M)))
+    out = ["REGEDIT4", ""]
+    for package in packages:
+        out += ["[-HKEY_LOCAL_MACHINE\\Software\\Wine\\WindowsRuntime\\Packages\\%s]" % package, ""]
+    sys.stdout.write("\r\n".join(out) + "\r\n")
+
+
 def timezone_mui(exported):
     # Wine gives each time zone MUI_Display/MUI_Std/MUI_Dlt values ("@tzres.dll,-n"). .NET resolves those through
     # Environment.SystemDirectory, which IL2CPP refuses in a UWP app ("Failed getting the path of a special folder"),
@@ -555,24 +575,157 @@ def best_icon(package_dir, logo):
     return best[2] if best else None
 
 
-def appinfo(package_dir):
+def best_image(package_dir, logo):
+    """The largest variant (by file size) of a tile or splash image, any scale, PNG or JPEG, skipping high-contrast
+    ones: for showing the app's artwork large, where best_icon's 256-pixel limit doesn't apply."""
+    logo = logo.replace("\\", "/")
+    folder = find_case_insensitive(package_dir, os.path.dirname(logo))
+    base, ext = os.path.splitext(os.path.basename(logo))
+    if folder is None:
+        return None
+    best = None
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return None
+    for name in names:
+        stem, e = os.path.splitext(name)
+        if e.lower() != ext.lower() or not stem.lower().startswith(base.lower()):
+            continue
+        qualifiers = stem[len(base):].lower()
+        if (qualifiers and not qualifiers.startswith(".")) or "contrast-" in qualifiers:
+            continue
+        path = os.path.join(folder, name)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        if best is None or size > best[0]:
+            best = (size, path)
+    return os.path.abspath(best[1]) if best else None
+
+
+def manifest_display_name(manifest, visual):
+    for m in (re.search(r'\bDisplayName="([^"]+)"', visual), re.search(r"<DisplayName>([^<]+)</DisplayName>", manifest)):
+        if m and not m.group(1).startswith("ms-resource:"):
+            return html.unescape(m.group(1))   # "Solitaire &amp; Casual Games"
+    return re.search(r"<Identity\b[^>]*\bName=\"([^\"]+)\"", manifest).group(1)
+
+
+def package_family(manifest):
+    """The package family name, made the way wine-uwp's kernelbase makes it (patch 0001): Microsoft's publisher id
+    for Microsoft's publisher string, otherwise thirteen zeros. Saves live in AppData\\Local\\Packages\\<family>."""
+    ident = dict(re.findall(r'(\w+)="([^"]*)"', re.search(r"<Identity\b([^>]*)>", manifest).group(1)))
+    ms = "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"
+    return "%s_%s" % (ident["Name"], "8wekyb3d8bbwe" if html.unescape(ident.get("Publisher", "")) == ms else "0000000000000")
+
+
+def app_details(package_dir):
+    """Everything a front end shows about a package folder, as a dict."""
     manifest = open(os.path.join(package_dir, "AppxManifest.xml"), encoding="utf-8").read()
     visual = re.search(r"<(?:\w+:)?VisualElements\b[^>]*>", manifest)
     visual = visual.group(0) if visual else ""
-    name = None
-    for m in (re.search(r'\bDisplayName="([^"]+)"', visual), re.search(r"<DisplayName>([^<]+)</DisplayName>", manifest)):
-        if m and not m.group(1).startswith("ms-resource:"):
-            name = m.group(1)
-            break
-    if not name:
-        name = re.search(r"<Identity\b[^>]*\bName=\"([^\"]+)\"", manifest).group(1)
+    tile = re.search(r"<(?:\w+:)?DefaultTile\b[^>]*>", manifest)
+    tile = tile.group(0) if tile else ""
+    splash = re.search(r"<(?:\w+:)?SplashScreen\b[^>]*>", manifest)
+    splash = splash.group(0) if splash else ""
     icon = None
-    for attr in ("Square44x44Logo", "Square150x150Logo"):
+    # Windows 10 names, then Windows 8's (SmallLogo, Logo)
+    # a 30-pixel SmallLogo loses to a 150-pixel Logo; otherwise the first found wins
+    for attr in ("Square44x44Logo", "Square150x150Logo", "SmallLogo", "Logo"):
         m = re.search(r'\b%s="([^"]+)"' % attr, visual)
-        if m and (icon := best_icon(package_dir, m.group(1))):
+        found = best_icon(package_dir, m.group(1)) if m else None
+        if found and (not icon or png_width(icon) < 64 <= png_width(found)):
+            icon = found
+        if icon and png_width(icon) >= 64:
             break
-    name = html.unescape(name)   # "Solitaire &amp; Casual Games"
-    print("%s\t%s" % (name.replace("\t", " "), os.path.abspath(icon) if icon else ""))
+
+    def attr(tag, name):
+        m = re.search(r'\b%s="([^"]*)"' % name, tag)
+        return html.unescape(m.group(1)) if m else None
+
+    def image(tag, name):
+        value = attr(tag, name)
+        return best_image(package_dir, value) if value else None
+
+    def element(name):
+        m = re.search(r"<%s>([^<]*)</%s>" % (name, name), manifest)
+        return html.unescape(m.group(1).strip()) if m and not m.group(1).startswith("ms-resource:") else None
+
+    name, version, arch, _ = manifest_identity(manifest)
+    exe = re.search(r"<Application\b[^>]*\bExecutable=\"([^\"]+)\"", manifest)
+    description = attr(visual, "Description")
+    return {
+        "name": name,
+        "version": version,
+        "architecture": arch,
+        "display_name": manifest_display_name(manifest, visual),
+        "publisher": element("PublisherDisplayName"),
+        "description": description if description and not description.startswith("ms-resource:") else element("Description"),
+        "background_color": attr(visual, "BackgroundColor"),
+        "executable": exe.group(1) if exe else None,
+        "family": package_family(manifest),
+        "icon": os.path.abspath(icon) if icon else None,
+        "square_image": image(tile, "Square310x310Logo") or image(visual, "Square150x150Logo") or image(visual, "Logo"),
+        "wide_image": image(tile, "Wide310x150Logo") or image(tile, "WideLogo"),
+        "splash_image": image(splash, "Image"),
+        "splash_color": attr(splash, "BackgroundColor"),
+        "dependencies": [dict(re.findall(r'(\w+)="([^"]*)"', d)).get("Name") for d in
+                         re.findall(r"<PackageDependency\b([^>]*)>", manifest)],
+    }
+
+
+def appinfo(package_dir):
+    details = app_details(package_dir)
+    print("%s\t%s" % (details["display_name"].replace("\t", " "), details["icon"] or ""))
+
+
+def apps_json(users_dir_name):
+    """Read the apps set up, one per line from list-apps.sh (name, prefix, package folder, version slot, app folder,
+    launcher file, settings file), and print them as a JSON array with their manifest details, saves folder and versions."""
+    import json
+    versions_root = os.path.join(os.environ["UWP_VERSIONS"])
+    out = []
+    for line in sys.stdin.read().splitlines():
+        if not line.strip():
+            continue
+        name, prefix, source, slot, app_dir, launcher, env_file, own = (line.split("\t") + [""] * 8)[:8]
+        try:
+            details = app_details(app_dir)
+        except Exception as e:   # a broken link or manifest shouldn't hide every other app
+            details = {"name": name, "display_name": name, "error": str(e)}
+        data_dir = os.path.join(prefix, "drive_c", "users", users_dir_name, "AppData", "Local", "Packages",
+                                details.get("family") or name)
+        versions = []
+        folder = os.path.join(versions_root, name)
+        if os.path.isdir(folder):
+            for s in sorted(os.listdir(folder)):
+                src_file = os.path.join(folder, s, "source")
+                if not os.path.isfile(src_file):
+                    continue
+                vsrc = open(src_file, encoding="utf-8").read().strip()
+                try:
+                    vver = manifest_identity(open(os.path.join(vsrc, "AppxManifest.xml"), encoding="utf-8",
+                                                  errors="replace").read())[1]
+                except (OSError, TypeError):
+                    vver = None
+                versions.append({"slot": s, "source": vsrc, "version": vver, "active": s == slot,
+                                 "data_dir": os.path.join(folder, s, "data"),
+                                 "available": vver is not None})
+        details.update({
+            "prefix": prefix,
+            "own_prefix": own == "1",
+            "source": source or None,
+            "slot": slot or None,
+            "app_dir": app_dir,
+            "data_dir": data_dir,
+            "launcher": launcher or None,
+            "settings_file": env_file,
+            "versions": versions,
+        })
+        out.append(details)
+    json.dump(out, sys.stdout, indent=1)
+    sys.stdout.write("\n")
 
 
 def native_copy(src, dest):
@@ -622,13 +775,31 @@ def open_member(path, info, scratch):
     return tmp
 
 
-def extract_package(source, root):
-    """Unpack a package file into root/<package name>, replacing an older version there; returns the folder."""
+def open_package_file(source):
     try:
-        z = zipfile.ZipFile(source)
+        return zipfile.ZipFile(source)
     except (zipfile.BadZipFile, OSError):
         sys.exit("%s is not a readable package: encrypted Store downloads (.eappx, .emsix) can't be used, "
                  "only plain .appx/.msix files" % source)
+
+
+def package_file_identity(source):
+    """(name, version) of a package file without unpacking it; for a bundle, the bundle's own identity, which has
+    the same name as its application package."""
+    z = open_package_file(source)
+    names = set(z.namelist())
+    for member in ("AppxMetadata/AppxBundleManifest.xml", "AppxManifest.xml"):
+        if member in names:
+            ident = re.search(r"<Identity\b([^>]*)>", z.read(member).decode("utf-8", "replace"))
+            attrs = dict(re.findall(r'(\w+)="([^"]*)"', ident.group(1))) if ident else {}
+            if attrs.get("Name"):
+                return attrs["Name"], attrs.get("Version", "0")
+    sys.exit("%s has no AppxManifest.xml: is it a UWP package?" % source)
+
+
+def extract_package(source, root):
+    """Unpack a package file into root/<package name>, replacing an older version there; returns the folder."""
+    z = open_package_file(source)
     names = set(z.namelist())
     if "AppxMetadata/AppxBundleManifest.xml" in names:
         # a bundle: its x64 (or neutral) application package; the resource packages (languages, scales) aren't needed
@@ -711,6 +882,21 @@ if __name__ == "__main__":
         print(path)
     elif len(sys.argv) == 3 and sys.argv[1] == "appinfo":
         appinfo(sys.argv[2])
+    elif len(sys.argv) == 3 and sys.argv[1] == "appinfo-json":
+        import json
+        json.dump(app_details(sys.argv[2]), sys.stdout, indent=1)
+        sys.stdout.write("\n")
+    elif len(sys.argv) == 3 and sys.argv[1] == "apps-json":
+        apps_json(sys.argv[2])
+    elif len(sys.argv) == 3 and sys.argv[1] == "family":
+        print(package_family(open(os.path.join(sys.argv[2], "AppxManifest.xml"), encoding="utf-8").read()))
+    elif len(sys.argv) == 3 and sys.argv[1] == "version":
+        print(manifest_identity(open(os.path.join(sys.argv[2], "AppxManifest.xml"), encoding="utf-8",
+                                     errors="replace").read())[1])
+    elif len(sys.argv) == 3 and sys.argv[1] == "package-identity":
+        print("%s\t%s" % package_file_identity(sys.argv[2]))
+    elif len(sys.argv) == 3 and sys.argv[1] == "unregister":
+        unregister(sys.argv[2])
     elif len(sys.argv) == 4 and sys.argv[1] == "native-copy":
         native_copy(sys.argv[2], sys.argv[3])
     elif len(sys.argv) in (4, 5) and sys.argv[1] == "registry":
