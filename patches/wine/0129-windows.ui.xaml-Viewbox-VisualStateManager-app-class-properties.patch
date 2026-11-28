@@ -1,0 +1,1096 @@
+Subject: windows.ui.xaml: Viewbox, VisualStateManager.GoToState, bindings to an app class's own properties
+
+Viewbox measures its Child at its natural size and scales it to fit by Stretch and StretchDirection. The child keeps
+its natural layout and is scaled by a layout scale on the element, which drawing and hit testing apply after its
+RenderTransform, as WinUI's Viewbox does with a scale transform.
+
+Markup and {Binding}s now reach the properties an app class composing an element declares itself (a UserControl's
+Device or Type): the element remembers the app class markup created it as, and the value goes through the app's
+IXamlMember (its metadata provider) for that class, or to a DependencyProperty the app registered under that name.
+.NET Native's objects don't report their class names, so the recorded one is used.
+
+VisualStateManager's statics are registered. GoToState switches the states of a control's template or, for a
+UserControl, of its content root, whose named elements are the setters' targets; states apply without transitions.
+GetVisualStateGroups and custom visual state managers are not supported.
+
+diff --git a/dlls/windows.ui.xaml/Makefile.in b/dlls/windows.ui.xaml/Makefile.in
+index 42c7e73..f09d92c 100644
+--- a/dlls/windows.ui.xaml/Makefile.in
++++ b/dlls/windows.ui.xaml/Makefile.in
+@@ -45,7 +45,9 @@ SOURCES = \
+ 	textbox.c \
+ 	timer.c \
+ 	uid.c \
++	viewbox.c \
+ 	visual_tree.c \
++	vsm.c \
+ 	window.c \
+ 	windows.ui.xaml.rc \
+ 	xbf.c
+diff --git a/dlls/windows.ui.xaml/application.c b/dlls/windows.ui.xaml/application.c
+index 45f09fd..054d980 100644
+--- a/dlls/windows.ui.xaml/application.c
++++ b/dlls/windows.ui.xaml/application.c
+@@ -135,6 +135,18 @@ HRESULT app_create_instance_from_type( TypeName type, IInspectable **out )
+     return activate_xaml_type( xaml_type, out );
+ }
+ 
++/* remembers the app class composing an element, which owns the dependency properties the app registered */
++void element_set_app_class( IInspectable *object, const WCHAR *full_name )
++{
++    struct xaml_element *element = element_from_object( object );
++    WCHAR *copy;
++
++    if (!element || (element->app_class && !wcscmp( element->app_class, full_name ))) return;
++    if (!(copy = wcsdup( full_name ))) return;
++    free( element->app_class );
++    element->app_class = copy;
++}
++
+ IInspectable *app_create_instance( const WCHAR *full_name )
+ {
+     IXamlMetadataProvider *provider = app_metadata_provider();
+@@ -149,6 +161,7 @@ IInspectable *app_create_instance( const WCHAR *full_name )
+     WindowsDeleteString( name );
+     IXamlMetadataProvider_Release( provider );
+     if (!object) ERR( "could not create %s through the app's metadata provider.\n", debugstr_w(full_name) );
++    else element_set_app_class( object, full_name );
+     return object;
+ }
+ 
+diff --git a/dlls/windows.ui.xaml/binding.c b/dlls/windows.ui.xaml/binding.c
+index be6165f..7d2e2df 100644
+--- a/dlls/windows.ui.xaml/binding.c
++++ b/dlls/windows.ui.xaml/binding.c
+@@ -109,15 +109,19 @@ static void unsubscribe( struct data_binding *b )
+ }
+ 
+ /* the app's metadata for object's class: its IXamlMember for name */
+-static IXamlMember *xaml_member( IInspectable *object, const WCHAR *name )
++/* the app's metadata for a member of its type: class_name, or without one the object's runtime class */
++static IXamlMember *xaml_member_of( IInspectable *object, const WCHAR *class, const WCHAR *name )
+ {
+     IXamlMetadataProvider *provider;
+     IXamlMember *member = NULL;
+     IXamlType *type = NULL;
+     HSTRING class_name = NULL, str;
++    HRESULT hr;
+ 
+     if (!(provider = app_metadata_provider())) return NULL;
+-    if (SUCCEEDED(IInspectable_GetRuntimeClassName( object, &class_name )) && class_name &&
++    if (class) hr = WindowsCreateString( class, wcslen( class ), &class_name );
++    else hr = IInspectable_GetRuntimeClassName( object, &class_name );
++    if (SUCCEEDED(hr) && class_name &&
+         SUCCEEDED(IXamlMetadataProvider_GetXamlTypeByFullName( provider, class_name, &type )) && type)
+     {
+         WindowsCreateString( name, wcslen( name ), &str );
+@@ -130,6 +134,35 @@ static IXamlMember *xaml_member( IInspectable *object, const WCHAR *name )
+     return member;
+ }
+ 
++static IXamlMember *xaml_member( IInspectable *object, const WCHAR *name )
++{
++    return xaml_member_of( object, NULL, name );
++}
++
++/* sets or gets a member of an element an app class composes, through the app's metadata; FALSE if it has none */
++BOOL app_member_set( IInspectable *object, const WCHAR *class, const WCHAR *name, IInspectable *value )
++{
++    IXamlMember *member;
++    HRESULT hr;
++
++    if (!(member = xaml_member_of( object, class, name ))) return FALSE;
++    hr = IXamlMember_SetValue( member, object, value );
++    IXamlMember_Release( member );
++    if (FAILED(hr)) WARN( "setting %s.%s failed, hr %#lx.\n", debugstr_w(class), debugstr_w(name), hr );
++    return TRUE;
++}
++
++BOOL app_member_get( IInspectable *object, const WCHAR *class, const WCHAR *name, IInspectable **value )
++{
++    IXamlMember *member;
++
++    *value = NULL;
++    if (!(member = xaml_member_of( object, class, name ))) return FALSE;
++    IXamlMember_GetValue( member, object, value );
++    IXamlMember_Release( member );
++    return TRUE;
++}
++
+ static ICustomProperty *custom_property( IInspectable *object, const WCHAR *name )
+ {
+     ICustomPropertyProvider *provider;
+diff --git a/dlls/windows.ui.xaml/classes.idl b/dlls/windows.ui.xaml/classes.idl
+index dd78c1a..b212147 100644
+--- a/dlls/windows.ui.xaml/classes.idl
++++ b/dlls/windows.ui.xaml/classes.idl
+@@ -29,6 +29,7 @@ namespace Windows.UI {
+ }
+ 
+ namespace Windows.UI.Xaml {
++    runtimeclass VisualStateManager;
+     runtimeclass Application;
+     runtimeclass DependencyObject;
+     runtimeclass DependencyProperty;
+@@ -53,6 +54,7 @@ namespace Windows.UI.Xaml.Controls {
+     runtimeclass AppBarSeparator;
+     runtimeclass AppBarToggleButton;
+     runtimeclass Border;
++    runtimeclass Viewbox;
+     runtimeclass Button;
+     runtimeclass Flyout;
+     runtimeclass CheckBox;
+diff --git a/dlls/windows.ui.xaml/dependency.c b/dlls/windows.ui.xaml/dependency.c
+index fee32d0..bfb05ba 100644
+--- a/dlls/windows.ui.xaml/dependency.c
++++ b/dlls/windows.ui.xaml/dependency.c
+@@ -471,6 +471,33 @@ IDependencyProperty *dp_attached( const WCHAR *owner, const WCHAR *name, const W
+     return &impl->IDependencyProperty_iface;
+ }
+ 
++/* a property the app registered (DependencyProperty.Register) by name: the one owned by owner_class (the app class
++ * composing the element) or, without one, the only one of that name; not referenced */
++IDependencyProperty *dp_find_registered( const WCHAR *owner_class, const WCHAR *name )
++{
++    struct dependency_property *impl, *found = NULL;
++    SIZE_T len = owner_class ? wcslen( owner_class ) : 0;
++    UINT32 count = 0;
++
++    EnterCriticalSection( &dp_cs );
++    for (impl = properties; impl; impl = impl->next)
++    {
++        if (impl->builtin || impl->attached || wcscmp( impl->name, name )) continue;
++        /* owners are assembly-qualified: "Namespace.Class, Assembly, Version=..." */
++        if (len && !wcsncmp( impl->owner, owner_class, len ) && (!impl->owner[len] || impl->owner[len] == ','))
++        {
++            found = impl;
++            count = 1;
++            break;
++        }
++        found = impl;
++        count++;
++    }
++    LeaveCriticalSection( &dp_cs );
++    if (count != 1) return NULL;
++    return &found->IDependencyProperty_iface;
++}
++
+ /* the property's name and, for built-ins, its owner's short name; NULL if it isn't ours */
+ const WCHAR *dp_name( IDependencyProperty *iface, const WCHAR **owner, BOOL *builtin )
+ {
+diff --git a/dlls/windows.ui.xaml/element.c b/dlls/windows.ui.xaml/element.c
+index 705ec27..44bb7e0 100644
+--- a/dlls/windows.ui.xaml/element.c
++++ b/dlls/windows.ui.xaml/element.c
+@@ -90,6 +90,7 @@ static ULONG WINAPI inner_Release( IInspectable *iface )
+         if (impl->style) IInspectable_Release( impl->style );
+         if (impl->visual_state_groups) IInspectable_Release( impl->visual_state_groups );
+         template_free( impl->template_instance );
++        template_free( impl->state_instance );
+         if (impl->template) IInspectable_Release( impl->template );
+         if (impl->implicit_style) IInspectable_Release( impl->implicit_style );
+         element_free_theme_refs( impl );
+@@ -107,6 +108,7 @@ static ULONG WINAPI inner_Release( IInspectable *iface )
+         event_list_clear( &impl->unloaded );
+         event_list_clear( &impl->size_changed );
+         free( impl->font_family );
++        free( impl->app_class );
+         impl->ops->destroy( impl );
+     }
+     return ref;
+@@ -1550,6 +1552,7 @@ void element_init( struct xaml_element *element, const struct element_ops *ops,
+     element->vertical_alignment = VerticalAlignment_Stretch;
+     element->visibility = Visibility_Visible;
+     element->opacity = 1.0;
++    element->layout_scale_x = element->layout_scale_y = 1;
+     element->hit_test_visible = TRUE;
+     element->row_span = element->column_span = 1;
+     element->is_tab_stop = TRUE;
+@@ -1987,16 +1990,26 @@ static void render_with_opacity( struct xaml_element *element, struct layout_con
+     DeleteDC( mem );
+ }
+ 
+-/* the element's RenderTransform about its RenderTransformOrigin, in window coordinates; FALSE for none */
++/* the element's RenderTransform about its RenderTransformOrigin, then a Viewbox's scale of it, in window
++ * coordinates; FALSE for neither */
+ static BOOL element_matrix( struct xaml_element *element, float *m )
+ {
+     float ox = element->bounds.x + element->render_transform_origin.X * element->bounds.width;
+     float oy = element->bounds.y + element->render_transform_origin.Y * element->bounds.height;
+     float t[6] = { 1, 0, 0, 1, -ox, -oy }, back[6] = { 1, 0, 0, 1, ox, oy }, r[6];
++    float sx = element->layout_scale_x, sy = element->layout_scale_y;
++    float scale[6] = { sx, 0, 0, sy, element->layout_origin_x * (1 - sx), element->layout_origin_y * (1 - sy) };
++    BOOL scaled = sx != 1 || sy != 1;
+ 
+-    if (!element->render_transform || !transform_matrix( element->render_transform, r )) return FALSE;
++    if (!element->render_transform || !transform_matrix( element->render_transform, r ))
++    {
++        if (!scaled) return FALSE;
++        memcpy( m, scale, sizeof(scale) );
++        return TRUE;
++    }
+     matrix_multiply( t, r, m );
+     matrix_multiply( m, back, m );
++    if (scaled) matrix_multiply( m, scale, m );
+     return TRUE;
+ }
+ 
+diff --git a/dlls/windows.ui.xaml/main.c b/dlls/windows.ui.xaml/main.c
+index 25c2311..9c2cc27 100644
+--- a/dlls/windows.ui.xaml/main.c
++++ b/dlls/windows.ui.xaml/main.c
+@@ -52,6 +52,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( grid_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Border ))
+         IActivationFactory_QueryInterface( border_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Viewbox ))
++        IActivationFactory_QueryInterface( viewbox_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Button ))
+         IActivationFactory_QueryInterface( button_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Primitives_ToggleButton ))
+@@ -134,6 +136,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( font_family_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Flyout ))
+         IActivationFactory_QueryInterface( flyout_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_VisualStateManager ))
++        IActivationFactory_QueryInterface( visual_state_manager_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_VisualTreeHelper ))
+         IActivationFactory_QueryInterface( visual_tree_helper_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_DispatcherTimer ))
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index de5d428..b585e98 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -75,6 +75,7 @@ extern IActivationFactory *stack_panel_factory;
+ extern IActivationFactory *grid_factory;
+ extern IActivationFactory *canvas_factory;
+ extern IActivationFactory *border_factory;
++extern IActivationFactory *viewbox_factory;
+ extern IActivationFactory *button_factory;
+ extern IActivationFactory *toggle_button_factory;
+ extern IActivationFactory *check_box_factory;
+@@ -224,6 +225,10 @@ IInspectable *dp_unset_value(void);
+ IDependencyProperty *dp_builtin( const WCHAR *owner, const WCHAR *name );   /* not referenced */
+ IDependencyProperty *dp_attached( const WCHAR *owner, const WCHAR *name, const WCHAR *type );   /* not referenced */
+ const WCHAR *dp_name( IDependencyProperty *dp, const WCHAR **owner, BOOL *builtin );
++void element_set_app_class( IInspectable *object, const WCHAR *full_name );
++BOOL app_member_set( IInspectable *object, const WCHAR *app_class, const WCHAR *name, IInspectable *value );
++BOOL app_member_get( IInspectable *object, const WCHAR *app_class, const WCHAR *name, IInspectable **value );
++IDependencyProperty *dp_find_registered( const WCHAR *owner_class, const WCHAR *name );   /* not referenced */
+ void dp_store_free( IDependencyObject *key );
+ void dp_notify_builtin( IDependencyObject *key, const WCHAR *owner, const WCHAR *name );
+ HRESULT dp_get_value( IDependencyObject *key, IDependencyProperty *dp, IInspectable **result );
+@@ -404,6 +409,8 @@ struct xaml_element
+     CornerRadius corner_radius;               /* Control, ContentPresenter, Grid (Border keeps its own) */
+     IInspectable *render_transform;           /* UIElement.RenderTransform */
+     Point render_transform_origin;
++    float layout_scale_x, layout_scale_y;      /* a Viewbox's scale of its child, about layout_origin; 1 for none */
++    float layout_origin_x, layout_origin_y;
+     IInspectable *clip;                       /* UIElement.Clip, a RectangleGeometry */
+     HorizontalAlignment horizontal_alignment;
+     VerticalAlignment vertical_alignment;
+@@ -429,6 +436,7 @@ struct xaml_element
+     IInspectable *visual_state_groups;         /* VisualStateManager.VisualStateGroups (a template's root) */
+     IInspectable *template;                    /* Control.Template */
+     struct template_instance *template_instance;
++    struct template_instance *state_instance;  /* VisualStateManager.GoToState on a UserControl's content */
+     WCHAR **local_properties;                  /* set directly (not by a style): styles don't override them */
+     UINT32 local_count;
+     struct event_list key_down, key_up, got_focus, lost_focus;   /* UIElement's routed key and focus events */
+@@ -441,6 +449,7 @@ struct xaml_element
+     /* layout results */
+     float desired_width, desired_height;  /* including margin */
+     WCHAR *font_family;                   /* FontFamily set on it, inherited by its text; NULL: its parent's */
++    WCHAR *app_class;                     /* the app's class composing it, when markup created it */
+     struct layout_rect bounds;            /* arranged, excluding margin, window coordinates */
+ };
+ 
+@@ -478,6 +487,8 @@ struct xaml_element *template_root( struct template_instance *instance );
+ void template_go_to_state( struct template_instance *instance, const WCHAR *state );
+ /* each visual state group goes to the first of the states it has */
+ void template_go_to_states( struct template_instance *instance, const WCHAR *const *states, UINT32 count );
++BOOL element_go_to_state( struct xaml_element *control, const WCHAR *state );
++extern IActivationFactory *visual_state_manager_factory;
+ /* the templated parent's property changed: update the TemplateBindings to it */
+ void template_property_changed( struct template_instance *instance, const WCHAR *property );
+ void template_free( struct template_instance *instance );
+@@ -594,6 +605,7 @@ void text_draw_argb( struct layout_context *ctx, const struct text_format *forma
+                      const struct layout_rect *rect, Color color );
+ 
+ void window_invalidate(void);
++BOOL viewbox_set_markup( IInspectable *target, const WCHAR *name, IInspectable *object, INT32 number );
+ void element_raise_layout_events(void);   /* element.c: Loaded and SizeChanged, after a layout pass */
+ void window_theme_changed(void);   /* re-resolve the whole tree's theme resources on the next layout */
+ BOOL brush_get_color( IBrush *brush, Color *color );
+diff --git a/dlls/windows.ui.xaml/viewbox.c b/dlls/windows.ui.xaml/viewbox.c
+new file mode 100644
+index 0000000..ae68092
+--- /dev/null
++++ b/dlls/windows.ui.xaml/viewbox.c
+@@ -0,0 +1,331 @@
++/* WinRT Windows.UI.Xaml.Controls.Viewbox implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <math.h>
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* A Viewbox measures its Child at the child's natural size, then scales it to fit by Stretch (Uniform by
++ * default) and StretchDirection (Both). The child is arranged at its natural size and scaled by a layout scale
++ * (element->layout_scale), which drawing and hit testing both apply, as WinUI's Viewbox does with its scale
++ * transform. */
++
++struct viewbox
++{
++    struct xaml_element element;
++    IViewbox IViewbox_iface;
++    IUIElement *child;
++    Stretch stretch;
++    StretchDirection direction;
++};
++
++static inline struct viewbox *impl_from_element( struct xaml_element *element )
++{
++    return CONTAINING_RECORD( element, struct viewbox, element );
++}
++
++static struct xaml_element *viewbox_child( struct viewbox *impl )
++{
++    return impl->child ? element_from_iinspectable( (IInspectable *)impl->child ) : NULL;
++}
++
++/* the scales that fit content of the given size into the available size */
++static void viewbox_scale( struct viewbox *impl, float content_width, float content_height, float avail_width,
++                           float avail_height, float *sx, float *sy )
++{
++    float x = content_width > 0 && isfinite( avail_width ) ? avail_width / content_width : INFINITY;
++    float y = content_height > 0 && isfinite( avail_height ) ? avail_height / content_height : INFINITY;
++
++    switch (impl->stretch)
++    {
++    case Stretch_None:
++        x = y = 1;
++        break;
++    case Stretch_Fill:
++        if (!isfinite( x )) x = isfinite( y ) ? y : 1;
++        if (!isfinite( y )) y = x;
++        break;
++    case Stretch_UniformToFill:
++        x = y = isfinite( x ) && isfinite( y ) ? max( x, y ) : isfinite( x ) ? x : isfinite( y ) ? y : 1;
++        break;
++    default:   /* Uniform */
++        x = y = min( x, y );
++        if (!isfinite( x )) x = y = 1;
++        break;
++    }
++    if (impl->direction == StretchDirection_UpOnly) { x = max( x, 1.0f ); y = max( y, 1.0f ); }
++    else if (impl->direction == StretchDirection_DownOnly) { x = min( x, 1.0f ); y = min( y, 1.0f ); }
++    *sx = x;
++    *sy = y;
++}
++
++static HRESULT viewbox_query_interface( struct xaml_element *element, REFIID iid, void **out )
++{
++    struct viewbox *impl = impl_from_element( element );
++
++    if (!IsEqualGUID( iid, &IID_IViewbox )) return E_NOINTERFACE;
++    *out = &impl->IViewbox_iface;
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static void viewbox_measure( struct xaml_element *element, struct layout_context *ctx, float avail_width,
++                             float avail_height, float *width, float *height )
++{
++    struct viewbox *impl = impl_from_element( element );
++    struct xaml_element *child = viewbox_child( impl );
++    float sx, sy;
++
++    *width = *height = 0;
++    if (!child) return;
++    element_measure( child, ctx, INFINITY, INFINITY );
++    viewbox_scale( impl, child->desired_width, child->desired_height, avail_width, avail_height, &sx, &sy );
++    *width = child->desired_width * sx;
++    *height = child->desired_height * sy;
++}
++
++static void viewbox_arrange( struct xaml_element *element, struct layout_context *ctx )
++{
++    struct viewbox *impl = impl_from_element( element );
++    struct xaml_element *child = viewbox_child( impl );
++    const struct layout_rect *b = &element->bounds;
++    float sx, sy, cw, ch;
++
++    if (!child) return;
++    cw = child->desired_width;
++    ch = child->desired_height;
++    viewbox_scale( impl, cw, ch, b->width, b->height, &sx, &sy );
++    /* the scaled content is centred; the child keeps its natural size and is scaled from its corner */
++    child->layout_scale_x = sx;
++    child->layout_scale_y = sy;
++    child->layout_origin_x = b->x + (b->width - cw * sx) / 2;
++    child->layout_origin_y = b->y + (b->height - ch * sy) / 2;
++    element_arrange( child, ctx, child->layout_origin_x, child->layout_origin_y, cw, ch );
++}
++
++static void viewbox_render( struct xaml_element *element, struct layout_context *ctx )
++{
++    struct xaml_element *child = viewbox_child( impl_from_element( element ) );
++    if (child) element_render( child, ctx );
++}
++
++static UINT32 viewbox_child_count( struct xaml_element *element )
++{
++    return viewbox_child( impl_from_element( element ) ) ? 1 : 0;
++}
++
++static struct xaml_element *viewbox_child_at( struct xaml_element *element, UINT32 index )
++{
++    return index ? NULL : viewbox_child( impl_from_element( element ) );
++}
++
++static BOOL viewbox_hit_self( struct xaml_element *element, float x, float y )
++{
++    return FALSE;
++}
++
++static void viewbox_destroy( struct xaml_element *element )
++{
++    struct viewbox *impl = impl_from_element( element );
++    struct xaml_element *child = viewbox_child( impl );
++
++    if (child && child->parent == element) element_set_parent( child, NULL );
++    if (impl->child) IUIElement_Release( impl->child );
++    free( impl );
++}
++
++static const struct element_ops viewbox_ops =
++{
++    .query_interface = viewbox_query_interface,
++    .measure = viewbox_measure,
++    .arrange = viewbox_arrange,
++    .render = viewbox_render,
++    .child_count = viewbox_child_count,
++    .child_at = viewbox_child_at,
++    .hit_self = viewbox_hit_self,
++    .destroy = viewbox_destroy,
++};
++
++DEFINE_IINSPECTABLE_( viewbox_iface, IViewbox, struct viewbox, impl_from_IViewbox, IViewbox_iface, impl->element.outer )
++
++static HRESULT WINAPI viewbox_iface_get_Child( IViewbox *iface, IUIElement **value )
++{
++    if (!value) return E_POINTER;
++    if ((*value = impl_from_IViewbox( iface )->child)) IUIElement_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI viewbox_iface_put_Child( IViewbox *iface, IUIElement *value )
++{
++    struct viewbox *impl = impl_from_IViewbox( iface );
++    struct xaml_element *old = viewbox_child( impl ), *child = NULL;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (value && !(child = element_from_iinspectable( (IInspectable *)value ))) return E_INVALIDARG;
++    if (child && child->parent && child->parent != &impl->element) return E_INVALIDARG;
++    if (value) IUIElement_AddRef( value );
++    if (old && old->parent == &impl->element)
++    {
++        old->layout_scale_x = old->layout_scale_y = 1;
++        element_set_parent( old, NULL );
++    }
++    if (impl->child) IUIElement_Release( impl->child );
++    impl->child = value;
++    if (child) element_set_parent( child, &impl->element );
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI viewbox_iface_get_Stretch( IViewbox *iface, Stretch *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IViewbox( iface )->stretch;
++    return S_OK;
++}
++
++static HRESULT WINAPI viewbox_iface_put_Stretch( IViewbox *iface, Stretch value )
++{
++    impl_from_IViewbox( iface )->stretch = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI viewbox_iface_get_StretchDirection( IViewbox *iface, StretchDirection *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IViewbox( iface )->direction;
++    return S_OK;
++}
++
++static HRESULT WINAPI viewbox_iface_put_StretchDirection( IViewbox *iface, StretchDirection value )
++{
++    impl_from_IViewbox( iface )->direction = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static const struct IViewboxVtbl viewbox_iface_vtbl =
++{
++    viewbox_iface_QueryInterface,
++    viewbox_iface_AddRef,
++    viewbox_iface_Release,
++    /* IInspectable methods */
++    viewbox_iface_GetIids,
++    viewbox_iface_GetRuntimeClassName,
++    viewbox_iface_GetTrustLevel,
++    /* IViewbox methods */
++    viewbox_iface_get_Child,
++    viewbox_iface_put_Child,
++    viewbox_iface_get_Stretch,
++    viewbox_iface_put_Stretch,
++    viewbox_iface_get_StretchDirection,
++    viewbox_iface_put_StretchDirection,
++};
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    return 2;
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    return 1;
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    struct viewbox *impl;
++
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    element_init( &impl->element, &viewbox_ops, RuntimeClass_Windows_UI_Xaml_Controls_Viewbox, NULL );
++    impl->IViewbox_iface.lpVtbl = &viewbox_iface_vtbl;
++    impl->stretch = Stretch_Uniform;
++    impl->direction = StretchDirection_Both;
++    *instance = (IInspectable *)&impl->IViewbox_iface;
++    return S_OK;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++static IActivationFactory viewbox_statics = { &factory_vtbl };
++IActivationFactory *viewbox_factory = &viewbox_statics;
++
++/* markup: Child, Stretch and StretchDirection */
++BOOL viewbox_set_markup( IInspectable *target, const WCHAR *name, IInspectable *object, INT32 number )
++{
++    IViewbox *viewbox;
++    IUIElement *ui;
++    BOOL done = TRUE;
++
++    if (!target || FAILED(IInspectable_QueryInterface( target, &IID_IViewbox, (void **)&viewbox ))) return FALSE;
++    if (!wcscmp( name, L"Child" ) && object && SUCCEEDED(IInspectable_QueryInterface( object, &IID_IUIElement, (void **)&ui )))
++    {
++        IViewbox_put_Child( viewbox, ui );
++        IUIElement_Release( ui );
++    }
++    else if (!wcscmp( name, L"Stretch" ) && number >= 0) IViewbox_put_Stretch( viewbox, number );
++    else if (!wcscmp( name, L"StretchDirection" ) && number >= 0) IViewbox_put_StretchDirection( viewbox, number );
++    else done = FALSE;
++    IViewbox_Release( viewbox );
++    return done;
++}
+diff --git a/dlls/windows.ui.xaml/vsm.c b/dlls/windows.ui.xaml/vsm.c
+new file mode 100644
+index 0000000..306e2ca
+--- /dev/null
++++ b/dlls/windows.ui.xaml/vsm.c
+@@ -0,0 +1,137 @@
++/* WinRT Windows.UI.Xaml.VisualStateManager implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* VisualStateManager's statics: GoToState switches the visual states of a control's template or, for a
++ * UserControl, of its content root, without transitions (states apply at once, as they do for templates). */
++
++struct vsm_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IVisualStateManagerStatics IVisualStateManagerStatics_iface;
++};
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct vsm_statics *impl = CONTAINING_RECORD( iface, struct vsm_statics, IActivationFactory_iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IVisualStateManagerStatics ))
++        *out = &impl->IVisualStateManagerStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    FIXME( "iface %p, instance %p: custom visual state managers are not supported.\n", iface, instance );
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( statics, IVisualStateManagerStatics, struct vsm_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI statics_GetVisualStateGroups( IVisualStateManagerStatics *iface, IFrameworkElement *obj, IInspectable **value )
++{
++    FIXME( "iface %p, obj %p, value %p: the groups aren't exposed as objects.\n", iface, obj, value );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI statics_get_CustomVisualStateManagerProperty( IVisualStateManagerStatics *iface, IDependencyProperty **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = dp_attached( L"VisualStateManager", L"CustomVisualStateManager", L"Windows.UI.Xaml.VisualStateManager" );
++    if (*value) IDependencyProperty_AddRef( *value );
++    return *value ? S_OK : E_OUTOFMEMORY;
++}
++
++static HRESULT WINAPI statics_GetCustomVisualStateManager( IVisualStateManagerStatics *iface, IFrameworkElement *obj,
++                                                           IVisualStateManager **value )
++{
++    TRACE( "iface %p, obj %p, value %p.\n", iface, obj, value );
++    *value = NULL;   /* none can be set */
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_SetCustomVisualStateManager( IVisualStateManagerStatics *iface, IFrameworkElement *obj,
++                                                           IVisualStateManager *value )
++{
++    FIXME( "iface %p, obj %p, value %p: custom visual state managers are not supported.\n", iface, obj, value );
++    return value ? E_NOTIMPL : S_OK;
++}
++
++static HRESULT WINAPI statics_GoToState( IVisualStateManagerStatics *iface, IControl *control, HSTRING name,
++                                         boolean transitions, boolean *value )
++{
++    struct xaml_element *element = element_from_object( (IInspectable *)control );
++
++    TRACE( "iface %p, control %p, name %s, transitions %d, value %p.\n", iface, control, debugstr_hstring(name), transitions, value );
++    if (!control || !value) return E_POINTER;
++    *value = element && element_go_to_state( element, WindowsGetStringRawBuffer( name, NULL ) );
++    if (!*value) TRACE( "no state %s.\n", debugstr_hstring(name) );
++    return S_OK;
++}
++
++static const struct IVisualStateManagerStaticsVtbl statics_vtbl =
++{
++    statics_QueryInterface,
++    statics_AddRef,
++    statics_Release,
++    /* IInspectable methods */
++    statics_GetIids,
++    statics_GetRuntimeClassName,
++    statics_GetTrustLevel,
++    /* IVisualStateManagerStatics methods */
++    statics_GetVisualStateGroups,
++    statics_get_CustomVisualStateManagerProperty,
++    statics_GetCustomVisualStateManager,
++    statics_SetCustomVisualStateManager,
++    statics_GoToState,
++};
++
++static struct vsm_statics vsm_statics = { { &factory_vtbl }, { &statics_vtbl } };
++IActivationFactory *visual_state_manager_factory = &vsm_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/xbf.c b/dlls/windows.ui.xaml/xbf.c
+index 7145479..ec44993 100644
+--- a/dlls/windows.ui.xaml/xbf.c
++++ b/dlls/windows.ui.xaml/xbf.c
+@@ -2171,6 +2171,7 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+         {
+             if (QI( target, IImage, &image )) { IImage_put_Stretch( image, e ); IImage_Release( image ); return S_OK; }
+             if (QI( target, ITileBrush, &tile )) { ITileBrush_put_Stretch( tile, e ); ITileBrush_Release( tile ); return S_OK; }
++            if (viewbox_set_markup( target, L"Stretch", NULL, e )) return S_OK;
+         }
+         if (prop_is( prop, L"AlignmentX" ) && to_enum( value, align_x_names, 3, &e ) && QI( target, ITileBrush, &tile ))
+         {
+@@ -2248,6 +2249,12 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+         return S_OK;
+     }
+ 
++    /* Viewbox: its Child and StretchDirection */
++    if ((value->kind == XV_OBJECT || value->kind == XV_ENUM) &&
++        viewbox_set_markup( target, prop->name, value->kind == XV_OBJECT ? value->object : NULL,
++                            value->kind == XV_ENUM ? value->e.value : -1 ))
++        return S_OK;
++
+     /* Flyout: its Content and Placement */
+     if ((value->kind == XV_OBJECT || value->kind == XV_STRING || value->kind == XV_ENUM) &&
+         flyout_set_markup( target, prop->name, value->kind == XV_OBJECT ? value->object : NULL,
+@@ -2919,6 +2926,31 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+     }
+     if (done) return S_OK;
+ 
++    /* a property the app registered on its own class, given an object (a binding's value) */
++    if (!prop->owner[0] && (value->kind == XV_OBJECT || value->kind == XV_NULL || value->kind == XV_BOOL ||
++                            value->kind == XV_STRING || value->kind == XV_SIGNED || value->kind == XV_FLOAT))
++    {
++        struct xaml_element *element = element_from_object( target );
++        IDependencyProperty *dp = dp_find_registered( element ? element->app_class : NULL, prop->name );
++        IDependencyObject *object;
++
++        if (element && element->app_class)
++        {
++            if (value->kind != XV_OBJECT && value->kind != XV_NULL) box_value( value );
++            if (app_member_set( target, element->app_class, prop->name, value->kind == XV_OBJECT ? value->object : NULL ))
++                return S_OK;
++        }
++        if (dp && QI( target, IDependencyObject, &object ))
++        {
++            HRESULT hr;
++            if (value->kind != XV_OBJECT && value->kind != XV_NULL) box_value( value );
++            hr = IDependencyObject_SetValue( object, dp, value->kind == XV_OBJECT ? value->object : NULL );
++            IDependencyObject_Release( object );
++            if (FAILED(hr)) WARN( "setting %s failed, hr %#lx.\n", debugstr_w(prop->name), hr );
++            return S_OK;
++        }
++    }
++
+ unsupported:
+     FIXME( "setting %s.%s (value kind %d) on %p is not supported.\n", debugstr_w(prop->owner), debugstr_w(prop->name),
+            value->kind, target );
+@@ -2998,7 +3030,20 @@ static IInspectable *get_property( IInspectable *target, const struct xprop *pro
+             IResourceDictionary_Release( dict );
+         }
+     }
+-    else FIXME( "getting %s.%s from %p is not supported.\n", debugstr_w(prop->owner), debugstr_w(prop->name), target );
++    else
++    {
++        struct xaml_element *element = element_from_object( target );
++        IDependencyProperty *dp = prop->owner[0] ? NULL : dp_find_registered( element ? element->app_class : NULL, prop->name );
++        IDependencyObject *object;
++
++        if (!prop->owner[0] && element && element->app_class && app_member_get( target, element->app_class, prop->name, &result )) ;
++        else if (dp && QI( target, IDependencyObject, &object ))
++        {
++            IDependencyObject_GetValue( object, dp, &result );
++            IDependencyObject_Release( object );
++        }
++        else FIXME( "getting %s.%s from %p is not supported.\n", debugstr_w(prop->owner), debugstr_w(prop->name), target );
++    }
+     return result;
+ }
+ 
+@@ -3038,6 +3083,7 @@ IInspectable *create_builtin( const WCHAR *name )
+         { L"Frame", &frame_factory },
+         { L"Grid", &grid_factory },
+         { L"Page", &page_factory },
++        { L"Viewbox", &viewbox_factory },
+         { L"RadioButton", &radio_button_factory },
+         { L"ResourceDictionary", &resource_dictionary_factory },
+         { L"RowDefinition", &row_definition_factory },
+@@ -3544,6 +3590,7 @@ static void run_stream( struct writer *w, UINT32 stream, UINT32 offset, enum run
+         case NODE_CHECK_PEER_TYPE:
+             str = read_string( &r );
+             TRACE( "x:Class %s.\n", debugstr_w(str) );
++            if (str && (object = top_object( w ))) element_set_app_class( object, str );
+             free( str );
+             break;
+         case NODE_SET_CONNECTION_ID:
+@@ -4412,6 +4459,7 @@ static BOOL content_property( IInspectable *object, const WCHAR *type, struct xp
+     }
+     else if (SUCCEEDED(IInspectable_QueryInterface( object, &IID_IPanel, (void **)&iface ))) name = L"Children";
+     else if (SUCCEEDED(IInspectable_QueryInterface( object, &IID_IBorder, (void **)&iface ))) name = L"Child";
++    else if (SUCCEEDED(IInspectable_QueryInterface( object, &IID_IViewbox, (void **)&iface ))) name = L"Child";
+     else if (SUCCEEDED(IInspectable_QueryInterface( object, &IID_ITextBlock, (void **)&iface ))) name = L"Text";
+     else if (SUCCEEDED(IInspectable_QueryInterface( object, &IID_IContentControl, (void **)&iface )) ||
+              SUCCEEDED(IInspectable_QueryInterface( object, &IID_IUserControl, (void **)&iface )) ||
+@@ -5280,8 +5328,13 @@ IInspectable *template_load_content( IInspectable *template )
+ 
+ static IInspectable *find_name( struct template_instance *instance, const WCHAR *name )
+ {
++    struct xaml_element *root, *found;
+     UINT32 i;
++
+     for (i = 0; i < instance->name_count; i++) if (!wcscmp( instance->names[i].name, name )) return instance->names[i].object;
++    /* a UserControl's states: its names are in its content */
++    if (!instance->name_count && (root = template_root( instance )) && (found = element_find_name( root, name )))
++        return found->outer;
+     return NULL;
+ }
+ 
+@@ -5465,6 +5518,59 @@ void template_go_to_states( struct template_instance *instance, const WCHAR *con
+     }
+ }
+ 
++static BOOL has_state( struct template_instance *instance, const WCHAR *name )
++{
++    struct xaml_element *root = template_root( instance );
++    struct bag *groups, *group;
++    UINT32 i;
++
++    if (!root || !(groups = bag_from_object( root->visual_state_groups ))) return FALSE;
++    for (i = 0; i < groups->item_count; i++)
++        if ((group = bag_from_object( groups->items[i] )) && group_state( group, name )) return TRUE;
++    return FALSE;
++}
++
++static struct xaml_element *states_root( struct xaml_element *element, UINT32 depth )
++{
++    struct xaml_element *child, *found;
++    UINT32 i, count;
++
++    if (element->visual_state_groups) return element;
++    if (depth > 4 || !element->ops->child_count) return NULL;
++    count = element->ops->child_count( element );
++    for (i = 0; i < count; i++)
++        if ((child = element->ops->child_at( element, i )) && (found = states_root( child, depth + 1 ))) return found;
++    return NULL;
++}
++
++/* VisualStateManager.GoToState: the states of the control's template or, for a UserControl, of its content root */
++BOOL element_go_to_state( struct xaml_element *control, const WCHAR *state )
++{
++    struct template_instance *instance = control->template_instance;
++    struct xaml_element *root;
++
++    if (!instance)
++    {
++        if (!(root = states_root( control, 0 ))) return FALSE;
++        if (control->state_instance && template_root( control->state_instance ) != root)
++        {
++            template_free( control->state_instance );
++            control->state_instance = NULL;
++        }
++        if (!control->state_instance)
++        {
++            if (!(control->state_instance = calloc( 1, sizeof(*control->state_instance) ))) return FALSE;
++            control->state_instance->root = root->outer;
++            IInspectable_AddRef( root->outer );
++            control->state_instance->templated_parent = control->outer;
++        }
++        instance = control->state_instance;
++    }
++    if (!has_state( instance, state )) return FALSE;
++    template_go_to_states( instance, &state, 1 );
++    return TRUE;
++}
++
+ void template_go_to_state( struct template_instance *instance, const WCHAR *state_name )
+ {
+     template_go_to_states( instance, &state_name, 1 );
+diff --git a/include/windows.ui.xaml.idl b/include/windows.ui.xaml.idl
+index 12efc16..bf1f919 100644
+--- a/include/windows.ui.xaml.idl
++++ b/include/windows.ui.xaml.idl
+@@ -15747,3 +15747,110 @@ namespace Windows.UI.Xaml.Media {
+ 
+ }
+ 
++
++namespace Windows.UI.Xaml.Controls {
++    interface IViewbox;
++    interface IViewboxStatics;
++    typedef enum StretchDirection StretchDirection;
++    runtimeclass Viewbox;
++}
++
++namespace Windows.UI.Xaml.Controls {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum StretchDirection
++    {
++        UpOnly = 0,
++        DownOnly = 1,
++        Both = 2
++    };
++
++}
++
++namespace Windows.UI.Xaml.Controls {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Controls.Viewbox),
++        uuid(05252c58-ba9d-4809-9ec3-fa0d16710ba1)
++    ]
++    interface IViewbox : IInspectable
++    {
++        [propget] HRESULT Child([out, retval] Windows.UI.Xaml.UIElement * *value);
++        [propput] HRESULT Child([in] Windows.UI.Xaml.UIElement * value);
++        [propget] HRESULT Stretch([out, retval] Windows.UI.Xaml.Media.Stretch *value);
++        [propput] HRESULT Stretch([in] Windows.UI.Xaml.Media.Stretch value);
++        [propget] HRESULT StretchDirection([out, retval] Windows.UI.Xaml.Controls.StretchDirection *value);
++        [propput] HRESULT StretchDirection([in] Windows.UI.Xaml.Controls.StretchDirection value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.Controls.Viewbox),
++        uuid(5cd1e72d-e8d3-4865-8f08-b6b2d689adf1)
++    ]
++    interface IViewboxStatics : IInspectable
++    {
++        [propget] HRESULT StretchProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        [propget] HRESULT StretchDirectionProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++    }
++
++}
++
++namespace Windows.UI.Xaml.Controls {
++    [
++        activatable(Windows.Foundation.UniversalApiContract, 1.0),
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.UI.Xaml.Controls.IViewboxStatics, Windows.Foundation.UniversalApiContract, 1.0),
++        threading(both)
++    ]
++    runtimeclass Viewbox : Windows.UI.Xaml.FrameworkElement
++    {
++        [default] interface Windows.UI.Xaml.Controls.IViewbox;
++    }
++
++}
++
++
++/* Windows.UI.Xaml.VisualStateManager's statics, from Windows.winmd (IIDs and vtable order exact). VisualStateGroup isn't
++ * declared here: GetVisualStateGroups's IVector<VisualStateGroup> is given as IInspectable, which has the same ABI. */
++namespace Windows.UI.Xaml {
++    interface IVisualStateManager;
++    interface IVisualStateManagerStatics;
++    runtimeclass VisualStateManager;
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.VisualStateManager),
++        uuid(6fda9f9a-6fab-4112-9258-1006a3c3476e)
++    ]
++    interface IVisualStateManager : IInspectable
++    {
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.UI.Xaml.VisualStateManager),
++        uuid(01d0e9e0-d713-414e-a74e-e63ec7ac8c3d)
++    ]
++    interface IVisualStateManagerStatics : IInspectable
++    {
++        HRESULT GetVisualStateGroups([in] Windows.UI.Xaml.FrameworkElement *obj, [out, retval] IInspectable **value);
++        [propget] HRESULT CustomVisualStateManagerProperty([out, retval] Windows.UI.Xaml.DependencyProperty **value);
++        HRESULT GetCustomVisualStateManager([in] Windows.UI.Xaml.FrameworkElement *obj, [out, retval] Windows.UI.Xaml.VisualStateManager **value);
++        HRESULT SetCustomVisualStateManager([in] Windows.UI.Xaml.FrameworkElement *obj, [in] Windows.UI.Xaml.VisualStateManager *value);
++        HRESULT GoToState([in] Windows.UI.Xaml.Controls.Control *control, [in] HSTRING stateName, [in] boolean useTransitions, [out, retval] boolean *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.UI.Xaml.IVisualStateManagerStatics, Windows.Foundation.UniversalApiContract, 1.0),
++        threading(both)
++    ]
++    runtimeclass VisualStateManager
++    {
++        [default] interface Windows.UI.Xaml.IVisualStateManager;
++    }
++}
