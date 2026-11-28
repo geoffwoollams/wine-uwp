@@ -605,10 +605,296 @@ def best_image(package_dir, logo):
     return os.path.abspath(best[1]) if best else None
 
 
-def manifest_display_name(manifest, visual):
+# ---- resources.pri: names a manifest gives as "ms-resource:..." (port of patches 0100 and 0122's reader) ----
+
+def _u16(d, o):
+    return int.from_bytes(d[o:o + 2], "little")
+
+
+def _u32(d, o):
+    return int.from_bytes(d[o:o + 4], "little")
+
+
+def _user_languages():
+    """The user's languages, best first, from LANGUAGE and LANG ("en_NZ.UTF-8" -> "en-NZ"), then en-US."""
+    out = []
+    for var in ("LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"):
+        for v in os.environ.get(var, "").split(":"):
+            v = v.split(".")[0].split("@")[0].replace("_", "-")
+            if v and v not in ("C", "POSIX") and v not in out:
+                out.append(v)
+    if "en-US" not in out:
+        out.append("en-US")
+    return out[:8]
+
+
+def _language_match(value, language):
+    a, b = value.lower().split("-"), language.lower().split("-")
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            return n
+        n += 1
+    return n + 8 if len(a) == len(b) == n else n
+
+
+def _language_score(value, languages):
+    best = 0
+    for one in value.split(";"):
+        for i, lang in enumerate(languages):
+            m = _language_match(one, lang)
+            if m:
+                best = max(best, (8 - i) * 16 + m)
+    return best
+
+
+class Pri:
+    """The strings of a package's resources.pri, by name ("Resources/AppName"), in the user's language."""
+
+    def __init__(self, path):
+        d = open(path, "rb").read()
+        if len(d) < 32 or d[:7] != b"mrm_pri":
+            raise ValueError("not a PRI file")
+        self.d = d
+        toc, start, count = _u32(d, 16), _u32(d, 20), _u16(d, 24)
+        self.sections = []
+        for i in range(count):
+            e = toc + i * 32
+            ident = d[e:e + 16]
+            offset, length = start + _u32(d, e + 24), _u32(d, e + 28)
+            # a section: a 32-byte header, its content, an 8-byte footer
+            self.sections.append((ident, d[offset + 32:offset + length - 8] if length >= 40 else b""))
+        self.languages = _user_languages()
+
+        def find(*names):
+            for i, (ident, body) in enumerate(self.sections):
+                if body and any(ident.startswith(n) for n in names):
+                    return i
+            return -1
+        schema = find(b"[mrm_hschemaex]", b"[mrm_hschema]")
+        self.map = find(b"[mrm_res_map2_]", b"[mrm_res_map__]")
+        self.decisions = find(b"[mrm_decn_info]")
+        if schema < 0 or self.map < 0:
+            raise ValueError("no schema or resource map")
+        self.names = self._schema(self.sections[schema][1], self.sections[schema][0].startswith(b"[mrm_hschemaex]"))
+
+    def _schema(self, s, extended):
+        if _u16(s, 0) != 1:
+            raise ValueError("unknown schema version")
+        unique_length, name_length = _u16(s, 2), _u16(s, 4)
+        pos = 8
+        extended_names = False
+        if extended:
+            extended_names = s[pos:pos + 13] == b"[def_hnamesx]"
+            pos += 16
+        scopes, items = _u32(s, pos + 12), _u32(s, pos + 16)
+        pos += 20 + (unique_length + name_length) * 2 + 2
+        unicode_length = _u32(s, pos + 16)
+        pos += 24 + (4 if extended_names else 0)
+        count = scopes + items
+        entries = pos
+        unicode = entries + count * 12 + scopes * 8 + items * 2
+        ascii_ = unicode + unicode_length * 2
+        table = []
+        for i in range(count):
+            p = entries + i * 12
+            flags = s[p + 7]
+            table.append((_u16(s, p), _u16(s, p + 2), flags, _u16(s, p + 8) | ((flags & 0xF) << 16), _u16(s, p + 10)))
+
+        def name(e):
+            parent, full_len, flags, off, _ = e
+            if not full_len:
+                return ""
+            if flags & 0x20:
+                end = s.index(b"\0", ascii_ + off)
+                return s[ascii_ + off:end].decode("ascii", "replace")
+            o = unicode + off * 2
+            chars = []
+            while o + 1 < len(s) and _u16(s, o):
+                chars.append(_u16(s, o))
+                o += 2
+            return "".join(map(chr, chars))
+        names = {}
+        for i, e in enumerate(table):
+            if e[2] & 0x10:
+                continue   # a scope
+            chain, k = [], i
+            while k and len(chain) < 64:
+                chain.append(k)
+                if table[k][0] >= count or table[k][0] == k:
+                    break
+                k = table[k][0]
+            path = "/".join(name(table[c]) for c in reversed(chain))
+            names[path.lower()] = e[4]
+        return names
+
+    def _choose(self, decision, count):
+        if self.decisions < 0 or count <= 1:
+            return 0
+        s = self.sections[self.decisions][1]
+        distinct, qualifiers, sets, decisions, index_entries = (_u16(s, 0), _u16(s, 2), _u16(s, 4), _u16(s, 6), _u16(s, 8))
+        data_length = _u16(s, 10) * 2
+        quals = 12
+        set_infos = quals + decisions * 4
+        qual_infos = set_infos + sets * 4
+        distinct_infos = qual_infos + qualifiers * 8
+        index_table = distinct_infos + distinct * 12
+        strings = index_table + index_entries * 2
+        if decision >= decisions:
+            return 0
+        first_set, set_count = _u16(s, quals + decision * 4), _u16(s, quals + decision * 4 + 2)
+        best, best_score = 0, 0
+        for i in range(min(count, set_count)):
+            if first_set + i >= index_entries:
+                break
+            st = _u16(s, index_table + (first_set + i) * 2)
+            if st >= sets:
+                break
+            first_qual, qual_count = _u16(s, set_infos + st * 4), _u16(s, set_infos + st * 4 + 2)
+            score = 1
+            for j in range(qual_count):
+                q = _u16(s, index_table + (first_qual + j) * 2)
+                if q >= qualifiers:
+                    break
+                dq, fallback = _u16(s, qual_infos + q * 8), _u16(s, qual_infos + q * 8 + 4)
+                if dq >= distinct:
+                    break
+                qtype = _u16(s, distinct_infos + dq * 12 + 2)
+                offset = _u32(s, distinct_infos + dq * 12 + 8) * 2
+                if qtype != 0 or offset >= data_length:
+                    continue
+                raw = s[strings + offset:strings + data_length]
+                end = next((k for k in range(0, len(raw) - 1, 2) if raw[k] == 0 and raw[k + 1] == 0), len(raw))
+                value = raw[:end].decode("utf-16-le", "replace")
+                m = _language_score(value, self.languages)
+                score = 1024 + m if m else (2 if fallback else 0)
+            if score > best_score:
+                best, best_score = i, score
+        return best
+
+    def string(self, name):
+        item = self.names.get(name.lower())
+        if item is None:
+            return None
+        s = self.sections[self.map][1]
+        env_length, schema_ref_length, types = _u16(s, 0), _u16(s, 6), _u16(s, 10)
+        map_count, group_count = _u16(s, 12), _u16(s, 14)
+        info_count, candidates, data_length, large_length = _u32(s, 16), _u32(s, 20), _u32(s, 24), _u32(s, 28)
+        types_pos = 32 + env_length + schema_ref_length
+        maps = types_pos + types * 8
+        groups = maps + map_count * 4
+        infos = groups + group_count * 4
+        pos = infos + info_count * 4
+        large = pos
+        large_maps = large_groups = large_infos = 0
+        if large_length:
+            large_maps, large_groups, large_infos = _u32(s, large), _u32(s, large + 4), _u32(s, large + 8)
+        pos += large_length
+        string_data = pos + candidates * 8
+        total_maps, total_groups = map_count + large_maps, group_count + large_groups
+        for i in range(total_maps):
+            if i < map_count:
+                first_item, group = _u16(s, maps + i * 4), _u16(s, maps + i * 4 + 2)
+            else:
+                first_item, group = _u32(s, large + 12 + (i - map_count) * 8), _u32(s, large + 12 + (i - map_count) * 8 + 4)
+            if group < group_count:
+                group_size, first_info = _u16(s, groups + group * 4), _u16(s, groups + group * 4 + 2)
+            elif group < total_groups:
+                g = large + 12 + large_maps * 8 + (group - group_count) * 8
+                group_size, first_info = _u32(s, g), _u32(s, g + 4)
+            else:
+                group_size, first_info = 1, group - total_groups
+            if not first_item <= item < first_item + group_size:
+                continue
+            j = first_info + (item - first_item)
+            if j < info_count:
+                decision, info = _u16(s, infos + j * 4), _u16(s, infos + j * 4 + 2)
+            elif j - info_count < large_infos:
+                e = large + 12 + large_maps * 8 + large_groups * 8 + (j - info_count) * 8
+                decision, info = _u32(s, e), _u32(s, e + 4)
+            else:
+                return None
+            info += self._choose(decision, candidates - info)
+            if info >= candidates:
+                return None
+            c = pos + info * 8
+            vtype = _u32(s, types_pos + s[c + 1] * 8 + 4) if s[c + 1] < types else 2
+            if s[c] == 1:
+                source, location, section = _u16(s, c + 2), _u16(s, c + 4), _u16(s, c + 6)
+                if source or section >= len(self.sections):
+                    return None
+                data = self._data_item(self.sections[section][1], location)
+            elif s[c] == 0:
+                size, offset = _u16(s, c + 2), _u32(s, c + 4)
+                data = s[string_data + offset:string_data + offset + size]
+            else:
+                return None
+            if data is None:
+                return None
+            if vtype in (0, 1):   # UTF-16 string or path
+                text = data.decode("utf-16-le", "replace")
+            elif vtype in (3, 4, 5, 6):
+                text = data.decode("utf-8", "replace")
+            else:
+                return None
+            return text.split("\0")[0]
+        return None
+
+    @staticmethod
+    def _data_item(s, index):
+        strings, blobs = _u16(s, 4), _u16(s, 6)
+        start = 12 + strings * 4 + blobs * 8
+        if index < strings:
+            offset, size = _u16(s, 12 + index * 4), _u16(s, 12 + index * 4 + 2)
+        elif index < strings + blobs:
+            offset, size = _u32(s, 12 + strings * 4 + (index - strings) * 8), _u32(s, 12 + strings * 4 + (index - strings) * 8 + 4)
+        else:
+            return None
+        return s[start + offset:start + offset + size]
+
+
+def resource_string(package_dir, ref, _cache={}):
+    """The text of an "ms-resource:" reference from the manifest, from the package's resources.pri, or None."""
+    if not ref.startswith("ms-resource:"):
+        return ref
+    path = find_case_insensitive(package_dir, "resources.pri")
+    if not path:
+        return None
+    if path not in _cache:
+        try:
+            _cache[path] = Pri(path)
+        except (OSError, ValueError, IndexError):
+            _cache[path] = None
+    pri = _cache[path]
+    if not pri:
+        return None
+    name = ref[len("ms-resource:"):]
+    if name.startswith("//"):
+        name = name[2:].split("/", 1)[1] if "/" in name[2:] else ""   # ms-resource://Package.Name/Resources/X
+    # a name without a leading slash is in the Resources map ("ms-resource:LandingPageTitle\\Text"); with one, it is
+    # from the root ("ms-resource:///Resources/AppName")
+    absolute = name.startswith("/")
+    name = name.replace("\\", "/").lstrip("/")
+    candidates = [name] if absolute else ["Resources/" + name, name]
+    for n in candidates:
+        try:
+            v = pri.string(n)
+        except (IndexError, ValueError):
+            v = None
+        if v:
+            return v
+    return None
+
+
+def manifest_display_name(manifest, visual, package_dir=None):
     for m in (re.search(r'\bDisplayName="([^"]+)"', visual), re.search(r"<DisplayName>([^<]+)</DisplayName>", manifest)):
-        if m and not m.group(1).startswith("ms-resource:"):
-            return html.unescape(m.group(1))   # "Solitaire &amp; Casual Games"
+        if not m:
+            continue
+        value = html.unescape(m.group(1))   # "Solitaire &amp; Casual Games"
+        if value.startswith("ms-resource:"):
+            value = resource_string(package_dir, value) if package_dir else None
+        if value:
+            return value
     return re.search(r"<Identity\b[^>]*\bName=\"([^\"]+)\"", manifest).group(1)
 
 
@@ -650,7 +936,7 @@ def app_details(package_dir):
 
     def element(name):
         m = re.search(r"<%s>([^<]*)</%s>" % (name, name), manifest)
-        return html.unescape(m.group(1).strip()) if m and not m.group(1).startswith("ms-resource:") else None
+        return resource_string(package_dir, html.unescape(m.group(1).strip())) if m else None
 
     name, version, arch, _ = manifest_identity(manifest)
     exe = re.search(r"<Application\b[^>]*\bExecutable=\"([^\"]+)\"", manifest)
@@ -659,9 +945,9 @@ def app_details(package_dir):
         "name": name,
         "version": version,
         "architecture": arch,
-        "display_name": manifest_display_name(manifest, visual),
+        "display_name": manifest_display_name(manifest, visual, package_dir),
         "publisher": element("PublisherDisplayName"),
-        "description": description if description and not description.startswith("ms-resource:") else element("Description"),
+        "description": (resource_string(package_dir, description) if description else None) or element("Description"),
         "background_color": attr(visual, "BackgroundColor"),
         "executable": exe.group(1) if exe else None,
         "family": package_family(manifest),
