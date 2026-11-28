@@ -1,0 +1,54 @@
+Subject: windows.ui.xaml: a UserControl's visual state setters find their targets in its own content
+
+GoToState on a UserControl resolved a setter's target by name from the window's root, so with two instances of the
+control (Xbox Accessories' device tiles) the second one's state changed the first one's elements. Targets are now
+looked up within the control's content only.
+
+diff --git a/dlls/windows.ui.xaml/element.c b/dlls/windows.ui.xaml/element.c
+index 44bb7e0..03df5b5 100644
+--- a/dlls/windows.ui.xaml/element.c
++++ b/dlls/windows.ui.xaml/element.c
+@@ -1258,6 +1258,16 @@ static struct xaml_element *find_name( struct xaml_element *element, HSTRING nam
+     return NULL;
+ }
+ 
++/* a named element within scope's own subtree */
++struct xaml_element *element_find_name_within( struct xaml_element *scope, const WCHAR *name )
++{
++    HSTRING_HEADER header;
++    HSTRING str;
++
++    WindowsCreateStringReference( name, wcslen( name ), &header, &str );
++    return find_name( scope, str );
++}
++
+ struct xaml_element *element_find_name( struct xaml_element *scope, const WCHAR *name )
+ {
+     HSTRING_HEADER header;
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index b585e98..2b2712d 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -498,6 +498,7 @@ void element_arrange( struct xaml_element *element, struct layout_context *ctx,
+ void element_render( struct xaml_element *element, struct layout_context *ctx );
+ struct xaml_element *element_hit_test( struct xaml_element *element, float x, float y );
+ struct xaml_element *element_find_name( struct xaml_element *scope, const WCHAR *name );
++struct xaml_element *element_find_name_within( struct xaml_element *scope, const WCHAR *name );
+ void element_device_rect( const struct layout_rect *rect, struct layout_context *ctx, RECT *out );
+ void element_fill( struct layout_context *ctx, const struct layout_rect *rect, IBrush *brush );
+ void element_frame( struct layout_context *ctx, const struct layout_rect *rect, const Thickness *thickness, IBrush *brush );
+diff --git a/dlls/windows.ui.xaml/xbf.c b/dlls/windows.ui.xaml/xbf.c
+index ec44993..e8f08b0 100644
+--- a/dlls/windows.ui.xaml/xbf.c
++++ b/dlls/windows.ui.xaml/xbf.c
+@@ -5332,8 +5332,8 @@ static IInspectable *find_name( struct template_instance *instance, const WCHAR
+     UINT32 i;
+ 
+     for (i = 0; i < instance->name_count; i++) if (!wcscmp( instance->names[i].name, name )) return instance->names[i].object;
+-    /* a UserControl's states: its names are in its content */
+-    if (!instance->name_count && (root = template_root( instance )) && (found = element_find_name( root, name )))
++    /* a UserControl's states: its names are in its content (only: other instances of it have the same names) */
++    if (!instance->name_count && (root = template_root( instance )) && (found = element_find_name_within( root, name )))
+         return found->outer;
+     return NULL;
+ }

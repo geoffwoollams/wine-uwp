@@ -1,0 +1,94 @@
+Subject: windows.storage.applicationdata: StorageFile's RandomAccessStreamReference.OpenReadAsync
+
+OpenReadAsync opens the file read-only, as a stream that is also an IRandomAccessStreamWithContentType (its content
+type is what StorageFile.ContentType reports). Xbox Accessories reads its cached firmware images this way.
+
+diff --git a/dlls/windows.storage.applicationdata/storagefile.c b/dlls/windows.storage.applicationdata/storagefile.c
+index d1f3adb..5e52a7c 100644
+--- a/dlls/windows.storage.applicationdata/storagefile.c
++++ b/dlls/windows.storage.applicationdata/storagefile.c
+@@ -241,6 +241,7 @@ struct file_stream
+     IInputStream IInputStream_iface;
+     IOutputStream IOutputStream_iface;
+     IClosable IClosable_iface;
++    IContentTypeProvider IContentTypeProvider_iface;
+     LONG ref;
+     HANDLE file;      /* each stream object has its own handle (and position) */
+     UINT64 position;
+@@ -267,6 +268,10 @@ static HRESULT WINAPI file_stream_QueryInterface(IRandomAccessStream *iface, REF
+         *out = &impl->IOutputStream_iface;
+     else if (IsEqualGUID(iid, &IID_IClosable))
+         *out = &impl->IClosable_iface;
++    else if (IsEqualGUID(iid, &IID_IContentTypeProvider))
++        *out = &impl->IContentTypeProvider_iface;
++    else if (IsEqualGUID(iid, &IID_IRandomAccessStreamWithContentType))
++        *out = &impl->IRandomAccessStream_iface;   /* it adds no methods to IInspectable's */
+     else
+     {
+         *out = NULL;
+@@ -572,6 +577,38 @@ static const IClosableVtbl closable_vtbl =
+     closable_Close,
+ };
+ 
++static inline struct file_stream *impl_from_IContentTypeProvider(IContentTypeProvider *iface)
++{
++    return CONTAINING_RECORD(iface, struct file_stream, IContentTypeProvider_iface);
++}
++
++static HRESULT WINAPI content_type_QueryInterface(IContentTypeProvider *iface, REFIID iid, void **out)
++{ return file_stream_QueryInterface(&impl_from_IContentTypeProvider(iface)->IRandomAccessStream_iface, iid, out); }
++static ULONG WINAPI content_type_AddRef(IContentTypeProvider *iface)
++{ return file_stream_AddRef(&impl_from_IContentTypeProvider(iface)->IRandomAccessStream_iface); }
++static ULONG WINAPI content_type_Release(IContentTypeProvider *iface)
++{ return file_stream_Release(&impl_from_IContentTypeProvider(iface)->IRandomAccessStream_iface); }
++static HRESULT WINAPI content_type_GetIids(IContentTypeProvider *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI content_type_GetRuntimeClassName(IContentTypeProvider *iface, HSTRING *name) { return E_NOTIMPL; }
++static HRESULT WINAPI content_type_GetTrustLevel(IContentTypeProvider *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++
++static HRESULT WINAPI content_type_get_ContentType(IContentTypeProvider *iface, HSTRING *value)
++{
++    /* what StorageFile.ContentType reports */
++    return WindowsCreateString(L"application/octet-stream", 24, value);
++}
++
++static const IContentTypeProviderVtbl content_type_vtbl =
++{
++    content_type_QueryInterface,
++    content_type_AddRef,
++    content_type_Release,
++    content_type_GetIids,
++    content_type_GetRuntimeClassName,
++    content_type_GetTrustLevel,
++    content_type_get_ContentType,
++};
++
+ static HRESULT file_stream_create(HANDLE file, UINT64 position, BOOL can_write, struct file_stream **out)
+ {
+     struct file_stream *impl;
+@@ -585,6 +622,7 @@ static HRESULT file_stream_create(HANDLE file, UINT64 position, BOOL can_write,
+     impl->IInputStream_iface.lpVtbl = &input_vtbl;
+     impl->IOutputStream_iface.lpVtbl = &output_vtbl;
+     impl->IClosable_iface.lpVtbl = &closable_vtbl;
++    impl->IContentTypeProvider_iface.lpVtbl = &content_type_vtbl;
+     impl->ref = 1;
+     impl->file = file;
+     impl->position = position;
+@@ -1111,8 +1149,16 @@ static HRESULT WINAPI stream_ref_GetTrustLevel(IRandomAccessStreamReference *ifa
+ 
+ static HRESULT WINAPI stream_ref_OpenReadAsync(IRandomAccessStreamReference *iface, IAsyncOperation_IRandomAccessStreamWithContentType **operation)
+ {
+-    FIXME("iface %p, operation %p stub!\n", iface, operation);
+-    return E_NOTIMPL;
++    struct storage_file *impl = impl_from_IRandomAccessStreamReference(iface);
++    struct file_stream *stream = NULL;
++    HRESULT hr;
++
++    TRACE("iface %p, operation %p, path %s.\n", iface, operation, debugstr_w(impl->path));
++
++    if (!operation) return E_POINTER;
++    hr = open_file_stream(impl->path, FALSE, &stream);
++    return done_create(DONE_OPERATION, &IID_IAsyncOperation_IRandomAccessStreamWithContentType, hr,
++                       stream ? (IUnknown *)&stream->IRandomAccessStream_iface : NULL, NULL, 0, (void **)operation);
+ }
+ 
+ static const IRandomAccessStreamReferenceVtbl stream_ref_vtbl =

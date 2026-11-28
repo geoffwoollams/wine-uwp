@@ -1,0 +1,94 @@
+Subject: windows.gaming.input: LegacyGipGameControllerProvider.GetExtendedDeviceInfo gives the serial number
+
+Microsoft's Xbox Series X|S controllers report their GIP serial number, hex-encoded, as their USB serial number
+string (checked against the controller's answer to the GIP extended command for it: "09VL3203426050" and
+"3039564C33323033343236303530"), and winebus passes that string on as the HID device's serial number.
+GetExtendedDeviceInfo returns it in the layout Xbox Accessories' Devices.Abstraction.dll reads (its serial number
+getter): the total size, the serial number's size and the serial number, nul-terminated. It is used only when it
+decodes to 13 or more letters and digits; otherwise the call is still E_NOTIMPL. Other contents of Windows' extended
+device info are not known.
+
+diff --git a/dlls/windows.gaming.input/preview.c b/dlls/windows.gaming.input/preview.c
+index 790951e..2f6fb64 100644
+--- a/dlls/windows.gaming.input/preview.c
++++ b/dlls/windows.gaming.input/preview.c
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include "private.h"
++#include "ddk/hidsdi.h"
+ 
+ 
+ #define WIDL_using_Windows_Gaming_Input_Preview
+@@ -175,12 +176,67 @@ static HRESULT WINAPI legacy_gip_SetHomeLedIntensity( ILegacyGipGameControllerPr
+     return E_ACCESSDENIED;
+ }
+ 
++/* The controller's GIP serial number. Microsoft's Xbox Series X|S controllers report it, hex-encoded, as their USB
++ * serial number string, which the host passes on (winebus reads it from the USB device); it is used only when it
++ * decodes to the 13 or more letters and digits a serial number is. */
++static BOOL gip_serial_number( IGameControllerProvider *device, char *serial, UINT32 size )
++{
++    IWineGameControllerProvider *wine_provider;
++    WCHAR string[128];
++    HSTRING path = NULL;
++    HANDLE file;
++    UINT32 len, i;
++    BOOL ret;
++
++    if (FAILED(IGameControllerProvider_QueryInterface( device, &IID_IWineGameControllerProvider, (void **)&wine_provider )))
++        return FALSE;
++    IWineGameControllerProvider_get_NonRoamableId( wine_provider, &path );
++    IWineGameControllerProvider_Release( wine_provider );
++    file = CreateFileW( WindowsGetStringRawBuffer( path, NULL ), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
++                        OPEN_EXISTING, 0, NULL );
++    WindowsDeleteString( path );
++    if (file == INVALID_HANDLE_VALUE) return FALSE;
++    ret = HidD_GetSerialNumberString( file, string, sizeof(string) );
++    CloseHandle( file );
++    string[ARRAY_SIZE(string) - 1] = 0;
++    if (!ret || (len = wcslen( string )) % 2 || len / 2 < 13 || len / 2 >= size) return FALSE;
++    for (i = 0; i < len / 2; i++)
++    {
++        WCHAR hex[3] = { string[2 * i], string[2 * i + 1], 0 }, *end;
++        unsigned long c = wcstoul( hex, &end, 16 );
++        if (*end || !iswxdigit( hex[0] ) || !isalnum( (unsigned char)c ) || c >= 0x80) return FALSE;
++        serial[i] = c;
++    }
++    serial[i] = 0;
++    return TRUE;
++}
++
++/* The device's extended info as the Xbox Accessories app's Devices.Abstraction.dll reads it: its total size (32-bit),
++ * the serial number's size (32-bit), then the serial number, nul-terminated. Only the serial number is known here. */
+ static HRESULT WINAPI legacy_gip_GetExtendedDeviceInfo( ILegacyGipGameControllerProvider *iface, UINT32 *size, BYTE **value )
+ {
+-    FIXME( "iface %p: the device's extended info isn't known here.\n", iface );
+-    if (size) *size = 0;
+-    if (value) *value = NULL;
+-    return E_NOTIMPL;
++    struct legacy_gip *impl = impl_from_ILegacyGipGameControllerProvider( iface );
++    char serial[64];
++    UINT32 len, total;
++
++    TRACE( "iface %p, size %p, value %p.\n", iface, size, value );
++    if (!size || !value) return E_POINTER;
++    *size = 0;
++    *value = NULL;
++    if (!gip_serial_number( impl->device, serial, sizeof(serial) ))
++    {
++        FIXME( "iface %p: the controller's serial number isn't known.\n", iface );
++        return E_NOTIMPL;
++    }
++    len = strlen( serial ) + 1;
++    total = 8 + len;
++    if (!(*value = CoTaskMemAlloc( total ))) return E_OUTOFMEMORY;
++    memcpy( *value, &total, 4 );
++    memcpy( *value + 4, &len, 4 );
++    memcpy( *value + 8, serial, len );
++    *size = total;
++    TRACE( "serial number %s.\n", debugstr_a(serial) );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI legacy_gip_SetHeadsetOperation( ILegacyGipGameControllerProvider *iface, HeadsetOperation operation,
