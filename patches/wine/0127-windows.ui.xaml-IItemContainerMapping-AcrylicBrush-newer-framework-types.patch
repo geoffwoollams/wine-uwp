@@ -1,0 +1,1027 @@
+Subject: windows.ui.xaml: IItemContainerMapping, AcrylicBrush, and framework types newer than XBF's table
+
+ItemsControl, ListView and GridView implement IItemContainerMapping (ItemFromContainer, ContainerFromItem,
+IndexFromContainer, ContainerFromIndex); an ItemsControl's containers are now remembered for it.
+
+AcrylicBrush (a XamlCompositionBrushBase) keeps all its properties and draws the way Windows draws it with
+transparency effects off: as its FallbackColor at the brush's Opacity. It can be created from code (composable)
+and markup.
+
+A framework type that XBF's table of built-in types doesn't have (AcrylicBrush is newer) comes in compiled markup
+with the presentation namespace; such types are now created as built-ins instead of being asked of the app.
+
+diff --git a/dlls/windows.ui.xaml/Makefile.in b/dlls/windows.ui.xaml/Makefile.in
+index 4bf1f78..42c7e73 100644
+--- a/dlls/windows.ui.xaml/Makefile.in
++++ b/dlls/windows.ui.xaml/Makefile.in
+@@ -3,6 +3,7 @@ IMPORTS = combase user32 gdi32 advapi32 d2d1 dwrite ole32 uuid
+ 
+ SOURCES = \
+ 	animation.c \
++	acrylic.c \
+ 	application.c \
+ 	automation.c \
+ 	binding.c \
+diff --git a/dlls/windows.ui.xaml/acrylic.c b/dlls/windows.ui.xaml/acrylic.c
+new file mode 100644
+index 0000000..a9bea6e
+--- /dev/null
++++ b/dlls/windows.ui.xaml/acrylic.c
+@@ -0,0 +1,583 @@
++/* WinRT Windows.UI.Xaml.Media.AcrylicBrush implementation
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(xaml);
++
++/* An AcrylicBrush (a XamlCompositionBrushBase) is drawn the way Windows draws it with transparency effects off or
++ * AlwaysUseFallback set: as its FallbackColor, at the brush's Opacity. Its acrylic properties (tint, tint opacity,
++ * luminosity, background source) are kept for the app but not drawn: there is no blur of what lies behind. */
++
++struct acrylic_brush
++{
++    IInspectable IInspectable_inner;
++    IAcrylicBrush IAcrylicBrush_iface;
++    IAcrylicBrush2 IAcrylicBrush2_iface;
++    IXamlCompositionBrushBase IXamlCompositionBrushBase_iface;
++    IBrush IBrush_iface;
++    IDependencyObject IDependencyObject_iface;
++    IInspectable *outer;
++    LONG ref;
++    Color fallback, tint;
++    double tint_opacity, opacity;
++    IReference_DOUBLE *luminosity;
++    AcrylicBackgroundSource source;
++    TimeSpan tint_transition;
++    boolean always_fallback;
++};
++
++static const struct IXamlCompositionBrushBaseVtbl composition_base_vtbl;
++
++static inline struct acrylic_brush *impl_from_IInspectable( IInspectable *iface )
++{
++    return CONTAINING_RECORD( iface, struct acrylic_brush, IInspectable_inner );
++}
++
++/* the colour an AcrylicBrush draws with, for brush_get_color */
++BOOL acrylic_get_color( IBrush *brush, Color *color )
++{
++    IXamlCompositionBrushBase *base;
++    struct acrylic_brush *impl;
++
++    if (FAILED(IBrush_QueryInterface( brush, &IID_IXamlCompositionBrushBase, (void **)&base ))) return FALSE;
++    if (base->lpVtbl != &composition_base_vtbl)
++    {
++        IXamlCompositionBrushBase_Release( base );
++        return FALSE;
++    }
++    impl = CONTAINING_RECORD( base, struct acrylic_brush, IXamlCompositionBrushBase_iface );
++    *color = impl->fallback;
++    color->A = (BYTE)(color->A * max( 0.0, min( 1.0, impl->opacity ) ));
++    IXamlCompositionBrushBase_Release( base );
++    return TRUE;
++}
++
++static HRESULT WINAPI inner_QueryInterface( IInspectable *iface, REFIID iid, void **out )
++{
++    struct acrylic_brush *impl = impl_from_IInspectable( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ))
++        *out = &impl->IInspectable_inner;
++    else if (IsEqualGUID( iid, &IID_IAcrylicBrush ))
++        *out = &impl->IAcrylicBrush_iface;
++    else if (IsEqualGUID( iid, &IID_IAcrylicBrush2 ))
++        *out = &impl->IAcrylicBrush2_iface;
++    else if (IsEqualGUID( iid, &IID_IXamlCompositionBrushBase ))
++        *out = &impl->IXamlCompositionBrushBase_iface;
++    else if (IsEqualGUID( iid, &IID_IBrush ))
++        *out = &impl->IBrush_iface;
++    else if (IsEqualGUID( iid, &IID_IDependencyObject ))
++        *out = &impl->IDependencyObject_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI inner_AddRef( IInspectable *iface )
++{
++    return InterlockedIncrement( &impl_from_IInspectable( iface )->ref );
++}
++
++static ULONG WINAPI inner_Release( IInspectable *iface )
++{
++    struct acrylic_brush *impl = impl_from_IInspectable( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        dp_store_free( &impl->IDependencyObject_iface );
++        if (impl->luminosity) IReference_DOUBLE_Release( impl->luminosity );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI inner_GetIids( IInspectable *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI inner_GetRuntimeClassName( IInspectable *iface, HSTRING *class_name )
++{
++    const WCHAR *name = RuntimeClass_Windows_UI_Xaml_Media_AcrylicBrush;
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI inner_GetTrustLevel( IInspectable *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static const struct IInspectableVtbl inner_vtbl =
++{
++    inner_QueryInterface,
++    inner_AddRef,
++    inner_Release,
++    /* IInspectable methods */
++    inner_GetIids,
++    inner_GetRuntimeClassName,
++    inner_GetTrustLevel,
++};
++
++/* IAcrylicBrush */
++
++DEFINE_IINSPECTABLE_( acrylic, IAcrylicBrush, struct acrylic_brush, impl_from_IAcrylicBrush, IAcrylicBrush_iface,
++                      impl->outer )
++
++static HRESULT WINAPI acrylic_get_BackgroundSource( IAcrylicBrush *iface, AcrylicBackgroundSource *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IAcrylicBrush( iface )->source;
++    return S_OK;
++}
++
++static HRESULT WINAPI acrylic_put_BackgroundSource( IAcrylicBrush *iface, AcrylicBackgroundSource value )
++{
++    impl_from_IAcrylicBrush( iface )->source = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI acrylic_get_TintColor( IAcrylicBrush *iface, Color *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IAcrylicBrush( iface )->tint;
++    return S_OK;
++}
++
++static HRESULT WINAPI acrylic_put_TintColor( IAcrylicBrush *iface, Color value )
++{
++    impl_from_IAcrylicBrush( iface )->tint = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI acrylic_get_TintOpacity( IAcrylicBrush *iface, DOUBLE *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IAcrylicBrush( iface )->tint_opacity;
++    return S_OK;
++}
++
++static HRESULT WINAPI acrylic_put_TintOpacity( IAcrylicBrush *iface, DOUBLE value )
++{
++    impl_from_IAcrylicBrush( iface )->tint_opacity = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI acrylic_get_TintTransitionDuration( IAcrylicBrush *iface, TimeSpan *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IAcrylicBrush( iface )->tint_transition;
++    return S_OK;
++}
++
++static HRESULT WINAPI acrylic_put_TintTransitionDuration( IAcrylicBrush *iface, TimeSpan value )
++{
++    impl_from_IAcrylicBrush( iface )->tint_transition = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI acrylic_get_AlwaysUseFallback( IAcrylicBrush *iface, boolean *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IAcrylicBrush( iface )->always_fallback;
++    return S_OK;
++}
++
++static HRESULT WINAPI acrylic_put_AlwaysUseFallback( IAcrylicBrush *iface, boolean value )
++{
++    impl_from_IAcrylicBrush( iface )->always_fallback = value;
++    return S_OK;
++}
++
++static const struct IAcrylicBrushVtbl acrylic_vtbl =
++{
++    acrylic_QueryInterface,
++    acrylic_AddRef,
++    acrylic_Release,
++    /* IInspectable methods */
++    acrylic_GetIids,
++    acrylic_GetRuntimeClassName,
++    acrylic_GetTrustLevel,
++    /* IAcrylicBrush methods */
++    acrylic_get_BackgroundSource,
++    acrylic_put_BackgroundSource,
++    acrylic_get_TintColor,
++    acrylic_put_TintColor,
++    acrylic_get_TintOpacity,
++    acrylic_put_TintOpacity,
++    acrylic_get_TintTransitionDuration,
++    acrylic_put_TintTransitionDuration,
++    acrylic_get_AlwaysUseFallback,
++    acrylic_put_AlwaysUseFallback,
++};
++
++/* IAcrylicBrush2 */
++
++DEFINE_IINSPECTABLE_( acrylic2, IAcrylicBrush2, struct acrylic_brush, impl_from_IAcrylicBrush2, IAcrylicBrush2_iface,
++                      impl->outer )
++
++static HRESULT WINAPI acrylic2_get_TintLuminosityOpacity( IAcrylicBrush2 *iface, IReference_DOUBLE **value )
++{
++    if (!value) return E_POINTER;
++    if ((*value = impl_from_IAcrylicBrush2( iface )->luminosity)) IReference_DOUBLE_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI acrylic2_put_TintLuminosityOpacity( IAcrylicBrush2 *iface, IReference_DOUBLE *value )
++{
++    struct acrylic_brush *impl = impl_from_IAcrylicBrush2( iface );
++
++    if (value) IReference_DOUBLE_AddRef( value );
++    if (impl->luminosity) IReference_DOUBLE_Release( impl->luminosity );
++    impl->luminosity = value;
++    return S_OK;
++}
++
++static const struct IAcrylicBrush2Vtbl acrylic2_vtbl =
++{
++    acrylic2_QueryInterface,
++    acrylic2_AddRef,
++    acrylic2_Release,
++    /* IInspectable methods */
++    acrylic2_GetIids,
++    acrylic2_GetRuntimeClassName,
++    acrylic2_GetTrustLevel,
++    /* IAcrylicBrush2 methods */
++    acrylic2_get_TintLuminosityOpacity,
++    acrylic2_put_TintLuminosityOpacity,
++};
++
++/* IXamlCompositionBrushBase */
++
++DEFINE_IINSPECTABLE_( composition_base, IXamlCompositionBrushBase, struct acrylic_brush, impl_from_IXamlCompositionBrushBase,
++                      IXamlCompositionBrushBase_iface, impl->outer )
++
++static HRESULT WINAPI composition_base_get_FallbackColor( IXamlCompositionBrushBase *iface, Color *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IXamlCompositionBrushBase( iface )->fallback;
++    return S_OK;
++}
++
++static HRESULT WINAPI composition_base_put_FallbackColor( IXamlCompositionBrushBase *iface, Color value )
++{
++    TRACE( "iface %p, value #%02x%02x%02x%02x.\n", iface, value.A, value.R, value.G, value.B );
++    impl_from_IXamlCompositionBrushBase( iface )->fallback = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static const struct IXamlCompositionBrushBaseVtbl composition_base_vtbl =
++{
++    composition_base_QueryInterface,
++    composition_base_AddRef,
++    composition_base_Release,
++    /* IInspectable methods */
++    composition_base_GetIids,
++    composition_base_GetRuntimeClassName,
++    composition_base_GetTrustLevel,
++    /* IXamlCompositionBrushBase methods */
++    composition_base_get_FallbackColor,
++    composition_base_put_FallbackColor,
++};
++
++/* IBrush */
++
++DEFINE_IINSPECTABLE_( acrylic_brush, IBrush, struct acrylic_brush, impl_from_IBrush, IBrush_iface, impl->outer )
++
++static HRESULT WINAPI acrylic_brush_get_Opacity( IBrush *iface, DOUBLE *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IBrush( iface )->opacity;
++    return S_OK;
++}
++
++static HRESULT WINAPI acrylic_brush_put_Opacity( IBrush *iface, DOUBLE value )
++{
++    impl_from_IBrush( iface )->opacity = value;
++    window_invalidate();
++    return S_OK;
++}
++
++static HRESULT WINAPI acrylic_brush_get_Transform( IBrush *iface, ITransform **value )
++{
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI acrylic_brush_put_Transform( IBrush *iface, ITransform *value )
++{
++    FIXME( "iface %p, value %p: a solid colour needs no transform.\n", iface, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI acrylic_brush_get_RelativeTransform( IBrush *iface, ITransform **value )
++{
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI acrylic_brush_put_RelativeTransform( IBrush *iface, ITransform *value )
++{
++    FIXME( "iface %p, value %p: a solid colour needs no transform.\n", iface, value );
++    return S_OK;
++}
++
++static const struct IBrushVtbl acrylic_brush_vtbl =
++{
++    acrylic_brush_QueryInterface,
++    acrylic_brush_AddRef,
++    acrylic_brush_Release,
++    /* IInspectable methods */
++    acrylic_brush_GetIids,
++    acrylic_brush_GetRuntimeClassName,
++    acrylic_brush_GetTrustLevel,
++    /* IBrush methods */
++    acrylic_brush_get_Opacity,
++    acrylic_brush_put_Opacity,
++    acrylic_brush_get_Transform,
++    acrylic_brush_put_Transform,
++    acrylic_brush_get_RelativeTransform,
++    acrylic_brush_put_RelativeTransform,
++};
++
++/* IDependencyObject: values in the property store */
++
++DEFINE_IINSPECTABLE_( acrylic_do, IDependencyObject, struct acrylic_brush, impl_from_IDependencyObject,
++                      IDependencyObject_iface, impl->outer )
++
++static HRESULT WINAPI acrylic_do_GetValue( IDependencyObject *iface, IDependencyProperty *dp, IInspectable **result )
++{
++    return dp_get_value( iface, dp, result );
++}
++
++static HRESULT WINAPI acrylic_do_SetValue( IDependencyObject *iface, IDependencyProperty *dp, IInspectable *value )
++{
++    return dp_set_value( iface, dp, value );
++}
++
++static HRESULT WINAPI acrylic_do_ClearValue( IDependencyObject *iface, IDependencyProperty *dp )
++{
++    return dp_clear_value( iface, dp );
++}
++
++static HRESULT WINAPI acrylic_do_ReadLocalValue( IDependencyObject *iface, IDependencyProperty *dp, IInspectable **result )
++{
++    return dp_read_local_value( iface, dp, result );
++}
++
++static HRESULT WINAPI acrylic_do_GetAnimationBaseValue( IDependencyObject *iface, IDependencyProperty *dp,
++                                                         IInspectable **result )
++{
++    return dp_get_value( iface, dp, result );
++}
++
++static HRESULT WINAPI acrylic_do_get_Dispatcher( IDependencyObject *iface, ICoreDispatcher **value )
++{
++    return xaml_get_dispatcher( value );
++}
++
++static const struct IDependencyObjectVtbl acrylic_do_vtbl =
++{
++    acrylic_do_QueryInterface,
++    acrylic_do_AddRef,
++    acrylic_do_Release,
++    /* IInspectable methods */
++    acrylic_do_GetIids,
++    acrylic_do_GetRuntimeClassName,
++    acrylic_do_GetTrustLevel,
++    /* IDependencyObject methods */
++    acrylic_do_GetValue,
++    acrylic_do_SetValue,
++    acrylic_do_ClearValue,
++    acrylic_do_ReadLocalValue,
++    acrylic_do_GetAnimationBaseValue,
++    acrylic_do_get_Dispatcher,
++};
++
++static HRESULT acrylic_create( IInspectable *outer, IInspectable **inner, IAcrylicBrush **value )
++{
++    struct acrylic_brush *impl;
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (inner) *inner = NULL;
++    if (outer && !inner) return E_INVALIDARG;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IInspectable_inner.lpVtbl = &inner_vtbl;
++    impl->IAcrylicBrush_iface.lpVtbl = &acrylic_vtbl;
++    impl->IAcrylicBrush2_iface.lpVtbl = &acrylic2_vtbl;
++    impl->IXamlCompositionBrushBase_iface.lpVtbl = &composition_base_vtbl;
++    impl->IBrush_iface.lpVtbl = &acrylic_brush_vtbl;
++    impl->IDependencyObject_iface.lpVtbl = &acrylic_do_vtbl;
++    impl->ref = 1;
++    impl->opacity = 1.0;
++    impl->source = AcrylicBackgroundSource_Backdrop;
++    impl->outer = outer ? outer : &impl->IInspectable_inner;
++    *value = &impl->IAcrylicBrush_iface;
++    if (outer)
++    {
++        *inner = &impl->IInspectable_inner;
++        IInspectable_AddRef( outer );
++    }
++    TRACE( "created %p, outer %p.\n", impl, outer );
++    return S_OK;
++}
++
++/* markup: the brush's colours and numbers */
++BOOL acrylic_set_markup( IInspectable *target, const WCHAR *name, const Color *color, const double *number,
++                         const boolean *flag )
++{
++    IXamlCompositionBrushBase *base;
++    struct acrylic_brush *impl;
++    BOOL done = TRUE;
++
++    if (!target || FAILED(IInspectable_QueryInterface( target, &IID_IXamlCompositionBrushBase, (void **)&base )))
++        return FALSE;
++    if (base->lpVtbl != &composition_base_vtbl)
++    {
++        IXamlCompositionBrushBase_Release( base );
++        return FALSE;
++    }
++    impl = CONTAINING_RECORD( base, struct acrylic_brush, IXamlCompositionBrushBase_iface );
++    if (!wcscmp( name, L"FallbackColor" ) && color) impl->fallback = *color;
++    else if (!wcscmp( name, L"TintColor" ) && color) impl->tint = *color;
++    else if (!wcscmp( name, L"TintOpacity" ) && number) impl->tint_opacity = *number;
++    else if (!wcscmp( name, L"Opacity" ) && number) impl->opacity = *number;
++    else if (!wcscmp( name, L"AlwaysUseFallback" ) && flag) impl->always_fallback = *flag;
++    else if (!wcscmp( name, L"BackgroundSource" ) && number) impl->source = *number;
++    else done = FALSE;
++    IXamlCompositionBrushBase_Release( base );
++    if (done) window_invalidate();
++    return done;
++}
++
++/* the factory: IActivationFactory and the composable IAcrylicBrushFactory */
++
++struct acrylic_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IAcrylicBrushFactory IAcrylicBrushFactory_iface;
++};
++
++static inline struct acrylic_statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct acrylic_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct acrylic_statics *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IAcrylicBrushFactory ))
++        *out = &impl->IAcrylicBrushFactory_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    return 2;
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    return 1;
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    return acrylic_create( NULL, NULL, (IAcrylicBrush **)instance );
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( acrylic_factory, IAcrylicBrushFactory, struct acrylic_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI acrylic_factory_CreateInstance( IAcrylicBrushFactory *iface, IInspectable *outer,
++                                                      IInspectable **inner, IAcrylicBrush **value )
++{
++    TRACE( "iface %p, outer %p, inner %p, value %p.\n", iface, outer, inner, value );
++    return acrylic_create( outer, inner, value );
++}
++
++static const struct IAcrylicBrushFactoryVtbl acrylic_factory_vtbl =
++{
++    acrylic_factory_QueryInterface,
++    acrylic_factory_AddRef,
++    acrylic_factory_Release,
++    /* IInspectable methods */
++    acrylic_factory_GetIids,
++    acrylic_factory_GetRuntimeClassName,
++    acrylic_factory_GetTrustLevel,
++    /* IAcrylicBrushFactory methods */
++    acrylic_factory_CreateInstance,
++};
++
++static struct acrylic_statics acrylic_statics = { {&factory_vtbl}, {&acrylic_factory_vtbl} };
++
++IActivationFactory *acrylic_brush_factory = &acrylic_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.ui.xaml/brush.c b/dlls/windows.ui.xaml/brush.c
+index 5cc573e..de45913 100644
+--- a/dlls/windows.ui.xaml/brush.c
++++ b/dlls/windows.ui.xaml/brush.c
+@@ -265,6 +265,7 @@ BOOL brush_get_color( IBrush *brush, Color *color )
+         color->A = (BYTE)(color->A * gradient.opacity);
+         return TRUE;
+     }
++    if (acrylic_get_color( brush, color )) return TRUE;
+     if (FAILED(IBrush_QueryInterface( brush, &IID_ISolidColorBrush, (void **)&solid )))
+     {
+         FIXME( "brush %p is not a SolidColorBrush.\n", brush );
+diff --git a/dlls/windows.ui.xaml/classes.idl b/dlls/windows.ui.xaml/classes.idl
+index 0c95ad1..dd78c1a 100644
+--- a/dlls/windows.ui.xaml/classes.idl
++++ b/dlls/windows.ui.xaml/classes.idl
+@@ -115,6 +115,7 @@ namespace Windows.UI.Xaml.Media.Imaging {
+ }
+ 
+ namespace Windows.UI.Xaml.Media {
++    runtimeclass AcrylicBrush;
+     runtimeclass CompositionTarget;
+     runtimeclass ImageBrush;
+     runtimeclass CompositeTransform;
+diff --git a/dlls/windows.ui.xaml/items.c b/dlls/windows.ui.xaml/items.c
+index fab2da0..e85601d 100644
+--- a/dlls/windows.ui.xaml/items.c
++++ b/dlls/windows.ui.xaml/items.c
+@@ -46,6 +46,7 @@ struct items_control
+ {
+     struct xaml_element element;
+     IItemsControl IItemsControl_iface;
++    IItemContainerMapping IItemContainerMapping_iface;
+     IObservableVector_IInspectable IObservableVector_iface;   /* Items */
+     IVectorChangedEventHandler_IInspectable IVectorChangedEventHandler_iface;
+     IInspectable *items;              /* our IVector<Object> */
+@@ -128,6 +129,7 @@ static HRESULT items_control_query_interface( struct xaml_element *element, REFI
+     struct items_control *impl = impl_from_element( element );
+ 
+     if (IsEqualGUID( iid, &IID_IItemsControl )) *out = &impl->IItemsControl_iface;
++    else if (IsEqualGUID( iid, &IID_IItemContainerMapping )) *out = &impl->IItemContainerMapping_iface;
+     else if (impl->kind != ITEMS_CONTROL && IsEqualGUID( iid, &IID_ISelector )) *out = &impl->ISelector_iface;
+     else if (impl->kind != ITEMS_CONTROL && IsEqualGUID( iid, &IID_IListViewBase )) *out = &impl->IListViewBase_iface;
+     else if (impl->kind == ITEMS_LIST_VIEW && IsEqualGUID( iid, &IID_IListView )) *out = &impl->IListView_iface;
+@@ -175,6 +177,19 @@ static IUIElement *container_for( struct items_control *impl, IInspectable *item
+     return ui;
+ }
+ 
++static BOOL grow_data( struct items_control *impl )
++{
++    UINT32 capacity = max( 16, impl->capacity * 2 );
++    void *grow;
++
++    if (!(grow = realloc( impl->data, capacity * sizeof(*impl->data) ))) return FALSE;
++    impl->data = grow;
++    if (!(grow = realloc( impl->containers, capacity * sizeof(*impl->containers) ))) return FALSE;
++    impl->containers = grow;
++    impl->capacity = capacity;
++    return TRUE;
++}
++
+ static void add_item( struct items_control *impl, IVector_UIElement *children, IInspectable *item )
+ {
+     IUIElement *ui;
+@@ -187,6 +202,12 @@ static void add_item( struct items_control *impl, IVector_UIElement *children, I
+     ui = container_for( impl, item );
+     if (!ui) return;
+     IVector_UIElement_Append( children, ui );
++    /* remembered for IItemContainerMapping: an ItemsControl's container is the item's visual itself */
++    if (impl->count < impl->capacity || grow_data( impl ))
++    {
++        if ((impl->data[impl->count] = item)) IInspectable_AddRef( item );
++        impl->containers[impl->count++] = element_from_object( (IInspectable *)ui );
++    }
+     IUIElement_Release( ui );
+ }
+ 
+@@ -748,7 +769,7 @@ static void list_free_data( struct items_control *impl )
+ 
+     for (i = 0; i < impl->count; i++)
+     {
+-        if (impl->containers[i]) selector_item_attach( impl->containers[i], NULL );
++        if (impl->containers[i] && impl->kind != ITEMS_CONTROL) selector_item_attach( impl->containers[i], NULL );
+         if (impl->data[i]) IInspectable_Release( impl->data[i] );
+     }
+     impl->count = 0;
+@@ -1146,6 +1167,92 @@ static void ensure_items( struct items_control *impl )
+     if (impl->dirty) generate( impl );
+ }
+ 
++/* IItemContainerMapping: an item, its container and its index, once the containers are generated */
++
++DEFINE_IINSPECTABLE_( mapping, IItemContainerMapping, struct items_control, impl_from_IItemContainerMapping,
++                      IItemContainerMapping_iface, impl->element.outer )
++
++static IDependencyObject *container_object( struct items_control *impl, INT32 index )
++{
++    IDependencyObject *object = NULL;
++
++    if (index < 0 || index >= impl->count || !impl->containers[index]) return NULL;
++    IInspectable_QueryInterface( impl->containers[index]->outer, &IID_IDependencyObject, (void **)&object );
++    return object;
++}
++
++static INT32 index_of_container_object( struct items_control *impl, IDependencyObject *container )
++{
++    struct xaml_element *element = container ? element_from_object( (IInspectable *)container ) : NULL;
++    return element ? index_of_container( impl, element ) : -1;
++}
++
++static HRESULT WINAPI mapping_ItemFromContainer( IItemContainerMapping *iface, IDependencyObject *container,
++                                                 IInspectable **value )
++{
++    struct items_control *impl = impl_from_IItemContainerMapping( iface );
++    INT32 index;
++
++    TRACE( "iface %p, container %p.\n", iface, container );
++    if (!value) return E_POINTER;
++    ensure_items( impl );
++    *value = NULL;
++    if ((index = index_of_container_object( impl, container )) >= 0 && (*value = impl->data[index]))
++        IInspectable_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI mapping_ContainerFromItem( IItemContainerMapping *iface, IInspectable *item,
++                                                 IDependencyObject **value )
++{
++    struct items_control *impl = impl_from_IItemContainerMapping( iface );
++
++    TRACE( "iface %p, item %p.\n", iface, item );
++    if (!value) return E_POINTER;
++    ensure_items( impl );
++    *value = container_object( impl, index_of_item( impl, item ) );
++    return S_OK;
++}
++
++static HRESULT WINAPI mapping_IndexFromContainer( IItemContainerMapping *iface, IDependencyObject *container,
++                                                  INT32 *value )
++{
++    struct items_control *impl = impl_from_IItemContainerMapping( iface );
++
++    TRACE( "iface %p, container %p.\n", iface, container );
++    if (!value) return E_POINTER;
++    ensure_items( impl );
++    *value = index_of_container_object( impl, container );
++    return S_OK;
++}
++
++static HRESULT WINAPI mapping_ContainerFromIndex( IItemContainerMapping *iface, INT32 index, IDependencyObject **value )
++{
++    struct items_control *impl = impl_from_IItemContainerMapping( iface );
++
++    TRACE( "iface %p, index %d.\n", iface, index );
++    if (!value) return E_POINTER;
++    ensure_items( impl );
++    *value = container_object( impl, index );
++    return S_OK;
++}
++
++static const struct IItemContainerMappingVtbl mapping_vtbl =
++{
++    mapping_QueryInterface,
++    mapping_AddRef,
++    mapping_Release,
++    /* IInspectable methods */
++    mapping_GetIids,
++    mapping_GetRuntimeClassName,
++    mapping_GetTrustLevel,
++    /* IItemContainerMapping methods */
++    mapping_ItemFromContainer,
++    mapping_ContainerFromItem,
++    mapping_IndexFromContainer,
++    mapping_ContainerFromIndex,
++};
++
+ static INT32 first_selected( struct items_control *impl )
+ {
+     UINT32 i;
+@@ -1851,6 +1958,7 @@ static HRESULT items_control_create( enum items_kind kind, IInspectable *outer,
+     impl->incremental_trigger = IncrementalLoadingTrigger_Edge;
+     impl->current = impl->anchor = impl->pending_index = -1;
+     impl->IItemsControl_iface.lpVtbl = &items_control_vtbl;
++    impl->IItemContainerMapping_iface.lpVtbl = &mapping_vtbl;
+     impl->IObservableVector_iface.lpVtbl = &items_vector_vtbl;
+     impl->IVectorChangedEventHandler_iface.lpVtbl = &source_changed_vtbl;
+     if (FAILED(hr = vector_create( &items_iids, &items_callbacks, impl, &impl->items )))
+diff --git a/dlls/windows.ui.xaml/main.c b/dlls/windows.ui.xaml/main.c
+index c453902..25c2311 100644
+--- a/dlls/windows.ui.xaml/main.c
++++ b/dlls/windows.ui.xaml/main.c
+@@ -126,6 +126,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( page_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Controls_Frame ))
+         IActivationFactory_QueryInterface( frame_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_AcrylicBrush ))
++        IActivationFactory_QueryInterface( acrylic_brush_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Text_FontWeights ))
+         IActivationFactory_QueryInterface( font_weights_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_Xaml_Media_FontFamily ))
+diff --git a/dlls/windows.ui.xaml/private.h b/dlls/windows.ui.xaml/private.h
+index d5da5a1..de5d428 100644
+--- a/dlls/windows.ui.xaml/private.h
++++ b/dlls/windows.ui.xaml/private.h
+@@ -131,6 +131,10 @@ extern IActivationFactory *frame_factory;
+ extern IActivationFactory *dispatcher_timer_factory;
+ extern IActivationFactory *flyout_factory;
+ extern IActivationFactory *font_family_factory;
++extern IActivationFactory *acrylic_brush_factory;
++BOOL acrylic_get_color( IBrush *brush, Color *color );   /* acrylic.c: its FallbackColor */
++BOOL acrylic_set_markup( IInspectable *target, const WCHAR *name, const Color *color, const double *number,
++                         const boolean *flag );
+ extern IActivationFactory *font_weights_factory;
+ IWindow *window_current(void);   /* window.c: referenced, or NULL */
+ WCHAR *uid_string( const WCHAR *uid, const WCHAR *property );   /* uid.c: x:Uid's localized value, or NULL */
+diff --git a/dlls/windows.ui.xaml/xbf.c b/dlls/windows.ui.xaml/xbf.c
+index ff8a75f..7145479 100644
+--- a/dlls/windows.ui.xaml/xbf.c
++++ b/dlls/windows.ui.xaml/xbf.c
+@@ -2212,6 +2212,26 @@ static HRESULT set_property( struct writer *w, IInspectable *target, const struc
+         }
+     }
+ 
++    /* AcrylicBrush: its colours, opacities and flags */
++    {
++        static const WCHAR *const sources[] = { L"HostBackdrop", L"Backdrop" };
++        Color c;
++        double d;
++        INT32 e;
++        boolean b;
++        BOOL is_color = prop_is( prop, L"FallbackColor" ) || prop_is( prop, L"TintColor" );
++        BOOL is_flag = prop_is( prop, L"AlwaysUseFallback" );
++        BOOL is_enum = prop_is( prop, L"BackgroundSource" );
++
++        if (is_color && to_color( value, &c ) && acrylic_set_markup( target, prop->name, &c, NULL, NULL )) return S_OK;
++        if (is_flag && value->kind == XV_BOOL && (b = value->b, TRUE) &&
++            acrylic_set_markup( target, prop->name, NULL, NULL, &b )) return S_OK;
++        if (is_enum && to_enum( value, sources, 2, &e ) && (d = e, TRUE) &&
++            acrylic_set_markup( target, prop->name, NULL, &d, NULL )) return S_OK;
++        if ((prop_is( prop, L"TintOpacity" ) || prop_is( prop, L"Opacity" )) && to_double( value, &d ) &&
++            acrylic_set_markup( target, prop->name, NULL, &d, NULL )) return S_OK;
++    }
++
+     /* FontFamily, on any element: its text and its children's inherit it */
+     if (prop_is( prop, L"FontFamily" ) && (element = element_from_object( target )) &&
+         (value->kind == XV_STRING || value->kind == XV_OBJECT || value->kind == XV_NULL))
+@@ -3064,6 +3084,7 @@ IInspectable *create_builtin( const WCHAR *name )
+         { L"ItemsWrapGrid", &items_wrap_grid_factory },
+         { L"UserControl", &user_control_factory },
+         { L"Flyout", &flyout_factory },
++        { L"AcrylicBrush", &acrylic_brush_factory },
+     };
+     IInspectable *object;
+     UINT32 i;
+@@ -3118,6 +3139,17 @@ static IInspectable *create_type( struct writer *w, const struct xtype *type )
+         if (object) set_namescope( w, object );
+         return object;
+     }
++    /* a framework type newer than XBF's table of built-in types comes with the presentation namespace */
++    if (!wcscmp( type->ns, L"http://schemas.microsoft.com/client/2007" ) ||
++        !wcscmp( type->ns, L"http://schemas.microsoft.com/winfx/2006/xaml/presentation" ))
++    {
++        IInspectable *object = create_builtin( type->name );
++        if (object)
++        {
++            set_namescope( w, object );
++            return object;
++        }
++    }
+     swprintf( full, ARRAY_SIZE(full), L"%s.%s", type->ns, type->name );
+     return app_create_instance( full );
+ }
+diff --git a/include/windows.ui.xaml.idl b/include/windows.ui.xaml.idl
+index 1f08dec..12efc16 100644
+--- a/include/windows.ui.xaml.idl
++++ b/include/windows.ui.xaml.idl
+@@ -15613,3 +15613,137 @@ namespace Windows.UI.Text {
+ 
+ }
+ 
++
++/* Xbox Accessories, generated by scripts/winmd2idl.py: Media.AcrylicBrush and XamlCompositionBrushBase. */
++
++namespace Windows.UI.Xaml.Media {
++    typedef enum AcrylicBackgroundSource AcrylicBackgroundSource;
++    runtimeclass AcrylicBrush;
++    interface IAcrylicBrush;
++    interface IAcrylicBrush2;
++    interface IAcrylicBrushFactory;
++    interface IAcrylicBrushStatics;
++    interface IAcrylicBrushStatics2;
++    interface IXamlCompositionBrushBase;
++    runtimeclass XamlCompositionBrushBase;
++}
++
++
++namespace Windows.UI.Xaml.Media {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 5.0)
++    ]
++    enum AcrylicBackgroundSource
++    {
++        HostBackdrop = 0,
++        Backdrop = 1
++    };
++
++}
++
++namespace Windows.UI.Xaml.Media {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 5.0),
++        exclusiveto(Windows.UI.Xaml.Media.AcrylicBrush),
++        uuid(79bbcf4e-cd66-4f1b-a8b6-cd6d2977c18d)
++    ]
++    interface IAcrylicBrush : IInspectable
++    {
++        [propget] HRESULT BackgroundSource([out, retval] Windows.UI.Xaml.Media.AcrylicBackgroundSource *value);
++        [propput] HRESULT BackgroundSource([in] Windows.UI.Xaml.Media.AcrylicBackgroundSource value);
++        [propget] HRESULT TintColor([out, retval] Windows.UI.Color *value);
++        [propput] HRESULT TintColor([in] Windows.UI.Color value);
++        [propget] HRESULT TintOpacity([out, retval] DOUBLE *value);
++        [propput] HRESULT TintOpacity([in] DOUBLE value);
++        [propget] HRESULT TintTransitionDuration([out, retval] Windows.Foundation.TimeSpan *value);
++        [propput] HRESULT TintTransitionDuration([in] Windows.Foundation.TimeSpan value);
++        [propget] HRESULT AlwaysUseFallback([out, retval] boolean *value);
++        [propput] HRESULT AlwaysUseFallback([in] boolean value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 8.0),
++        exclusiveto(Windows.UI.Xaml.Media.AcrylicBrush),
++        uuid(c9645383-b19e-5ac0-86ff-3d90506dbcda)
++    ]
++    interface IAcrylicBrush2 : IInspectable
++    {
++        [propget] HRESULT TintLuminosityOpacity([out, retval] Windows.Foundation.IReference<DOUBLE> * *value);
++        [propput] HRESULT TintLuminosityOpacity([in] Windows.Foundation.IReference<DOUBLE> * value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 5.0),
++        exclusiveto(Windows.UI.Xaml.Media.AcrylicBrush),
++        uuid(81a32568-f6cc-4013-8363-928ae23b7a61)
++    ]
++    interface IAcrylicBrushFactory : IInspectable
++    {
++        HRESULT CreateInstance([in] IInspectable * baseInterface, [out] IInspectable * *innerInterface, [out, retval] Windows.UI.Xaml.Media.AcrylicBrush * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 5.0),
++        exclusiveto(Windows.UI.Xaml.Media.AcrylicBrush),
++        uuid(2787fd79-a3da-423f-b81a-599147971523)
++    ]
++    interface IAcrylicBrushStatics : IInspectable
++    {
++        [propget] HRESULT BackgroundSourceProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        [propget] HRESULT TintColorProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        [propget] HRESULT TintOpacityProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        [propget] HRESULT TintTransitionDurationProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++        [propget] HRESULT AlwaysUseFallbackProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 8.0),
++        exclusiveto(Windows.UI.Xaml.Media.AcrylicBrush),
++        uuid(129188a8-bf11-5bbc-8445-8c510e5926c0)
++    ]
++    interface IAcrylicBrushStatics2 : IInspectable
++    {
++        [propget] HRESULT TintLuminosityOpacityProperty([out, retval] Windows.UI.Xaml.DependencyProperty * *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 4.0),
++        exclusiveto(Windows.UI.Xaml.Media.XamlCompositionBrushBase),
++        uuid(03e432d9-b35c-4a79-811c-c5652004da0e)
++    ]
++    interface IXamlCompositionBrushBase : IInspectable
++    {
++        [propget] HRESULT FallbackColor([out, retval] Windows.UI.Color *value);
++        [propput] HRESULT FallbackColor([in] Windows.UI.Color value);
++    }
++
++}
++
++namespace Windows.UI.Xaml.Media {
++    [
++        composable(Windows.UI.Xaml.Media.IAcrylicBrushFactory, public, Windows.Foundation.UniversalApiContract, 5.0),
++        contract(Windows.Foundation.UniversalApiContract, 5.0),
++        marshaling_behavior(agile),
++        static(Windows.UI.Xaml.Media.IAcrylicBrushStatics, Windows.Foundation.UniversalApiContract, 5.0),
++        static(Windows.UI.Xaml.Media.IAcrylicBrushStatics2, Windows.Foundation.UniversalApiContract, 8.0),
++        threading(both)
++    ]
++    runtimeclass AcrylicBrush : Windows.UI.Xaml.Media.XamlCompositionBrushBase
++    {
++        [default] interface Windows.UI.Xaml.Media.IAcrylicBrush;
++        [contract(Windows.Foundation.UniversalApiContract, 8.0)] interface Windows.UI.Xaml.Media.IAcrylicBrush2;
++    }
++
++}
++
++namespace Windows.UI.Xaml.Media {
++    [
++        contract(Windows.Foundation.UniversalApiContract, 4.0)
++    ]
++    runtimeclass XamlCompositionBrushBase
++    {
++        [default] interface Windows.UI.Xaml.Media.IXamlCompositionBrushBase;
++    }
++
++}
++
